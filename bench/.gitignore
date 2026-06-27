@@ -1,0 +1,26 @@
+# bench 产物忽略规则
+# 原始基准结果与镜像体积大、不可复现的二进制，不入库；保留目录占位与汇总 CSV。
+
+# fio 原始 JSON 输出与运行目录（按时间戳归档，体积大）
+results/*/
+# 但保留汇总 CSV 与说明，方便对照报告引用
+!results/**/summary.csv
+!results/.gitkeep
+
+# loop image / 任何镜像文件
+*.img
+*.img.*
+
+# fio 工作数据文件（万一落在 bench 内）
+fio-work/
+*.fio.tmp
+
+# 临时探针写测试文件
+.run-suite-write-test.*
+
+# 旗舰真实数据集副本（~/.claude/projects 只读副本，1-2GB 子集或 8.7GB 全量，不入库）
+datasets/claude-projects/
+
+# B0 backing 目录与挂载点（FUSE 透传，运行时产物）
+.b0-backing/
+.mnt/

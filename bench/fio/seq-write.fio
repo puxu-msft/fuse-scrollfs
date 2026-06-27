@@ -1,0 +1,28 @@
+# seq-write.fio — 顺序写吞吐（路线对照的「拷贝/备份」类负载）。
+#
+# 目标目录由环境变量 DIR 指定，例如:
+#   DIR=/mnt/zipfs-btrfs fio --output-format=json --output=out.json bench/fio/seq-write.fio
+#
+# 设计说明:
+#   - buffer_compress_percentage=50：写入数据约 50% 可压缩，贴近「混合树」数据集，
+#     避免默认全随机数据让压缩路线（A/B2）失真为「不可压缩」。
+#   - end_fsync=1 + fsync 让数据真正落盘，纳入压缩 CPU 与回写成本。
+#   - size 适中（1G），单文件，单 job；并发对照另由 run-suite 用 NUMJOBS 覆盖。
+
+[global]
+directory=${DIR}
+ioengine=psync
+direct=0
+group_reporting=1
+runtime=0
+buffer_compress_percentage=50
+buffer_pattern=
+refill_buffers=1
+fsync=64
+end_fsync=1
+
+[seq-write]
+rw=write
+bs=1M
+size=1G
+numjobs=1

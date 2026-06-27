@@ -1,0 +1,30 @@
+# rand-write.fio — 随机写吞吐与延迟（4k + 64k 两个 job）。
+#
+# 这是路线 B（FUSE 压缩）的核心痛点负载：整文件模型（B2/fuse-zstd）在随机写下
+# 会因「读改写整个流」严重劣化，分块模型（BS/BV）表现取决于块大小。务必覆盖。
+#
+# 目标目录由环境变量 DIR 指定。两个 job 独立计时（group_reporting 关闭）。
+# 写入数据 50% 可压缩，避免压缩路线被「全随机不可压缩」数据失真。
+
+[global]
+directory=${DIR}
+ioengine=psync
+direct=0
+size=1G
+runtime=0
+percentile_list=50:99
+buffer_compress_percentage=50
+refill_buffers=1
+fsync=64
+end_fsync=1
+group_reporting=0
+
+[rand-write-4k]
+rw=randwrite
+bs=4k
+numjobs=1
+
+[rand-write-64k]
+rw=randwrite
+bs=64k
+numjobs=1

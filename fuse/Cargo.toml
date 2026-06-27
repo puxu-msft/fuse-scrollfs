@@ -1,0 +1,40 @@
+[package]
+name = "zipfs"
+version = "0.0.0"
+edition = "2021"
+description = "zipfs：自研 Rust FUSE 透明压缩文件系统（P0 透传骨架）"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# P1 起引入 lib：archive 格式 / core / store / 两个 FUSE 前端 / fixture 逻辑都放进 lib，
+# 供 zipfs 主二进制、mkfixture 工具与集成测试共享，避免跨 bin 复制（见 §11）。
+[lib]
+name = "zipfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zipfs"
+path = "src/main.rs"
+
+# 离线 fixture 工具（§12 P1）：把源目录递归转成布局 S 的 BACKING archive 树。
+# 只读路径「鸡生蛋」：没有写路径却要有可读数据，故独立 bin 离线生成。
+[[bin]]
+name = "mkfixture"
+path = "src/bin/mkfixture.rs"
+
+[dependencies]
+# default-features = false 关闭 libfuse 链接：本机未装 libfuse3-dev（无 fuse3.pc），
+# 改用 fusermount3 二进制挂载，避免 build 依赖 pkg-config 找不到 fuse3 而失败。
+# 见 docs/01-zipfs-design.md §6.1 积木选型与本机 environment 约束。
+fuser = { version = "0.17", default-features = false }
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+# P1：每块独立 zstd 压缩（布局 S archive 用），见 §3。lz4 留作后续对照（codec::Algo::Lz4）。
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+# P1 引入 zstd；lz4_flex / redb / rusqlite 仍留待 P2+（写路径 / 容器布局 V）。
