@@ -147,6 +147,30 @@ impl ZipfsRw {
         let end = (offset + size as u64).min(uncompressed_size);
         let want = (end - offset) as usize;
         let cs = chunk_size as u64;
+
+        // 发现读快路径（docs/02）：整个请求区间落在 head 缓存覆盖前缀内时，解压一小段 head
+        // 缓存切片返回，跳过整块（1MiB）解压。Store 仅在「完全覆盖 + 无挂起写会话」时返回 Some
+        // （脏块 0 时回退逐块）；不支持的后端默认 None。命中即免去块循环。
+        if let Some((bytes, verbatim)) = self
+            .store
+            .read_head_cache(ino, offset, want as u64)
+            .map_err(|e| io_to_errno(&e))?
+        {
+            let plain = decompress_block(
+                &bytes,
+                self.params.algo,
+                verbatim,
+                self.params.dict.as_deref(),
+            )
+            .map_err(|e| io_to_errno(&e))?;
+            let start = offset as usize;
+            let stop = start + want;
+            if stop <= plain.len() {
+                return Ok(plain[start..stop].to_vec());
+            }
+            // 解压长度与缓存 rawlen 承诺不符（理论不应发生）：回退逐块路径，不返回错误切片。
+        }
+
         let (first, last) = block_range(offset, (end - offset).max(1), cs);
 
         let mut out = Vec::with_capacity(want);

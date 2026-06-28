@@ -94,7 +94,32 @@ pub(crate) fn store_plain_block(
             stored_verbatim: verbatim,
         },
         new_size,
-    )
+    )?;
+    maybe_build_head_cache(store, ino, idx, plain, new_size, params)?;
+    Ok(())
+}
+
+/// head 缓存（发现读快路径，docs/02 §4.3）：仅当块 0 成为**满的不可变正文块**（其后还有内容，
+/// `new_size > 块0逻辑长度`）且覆盖窗口（`>= HEAD_CACHE_BYTES`）时，把首 `HEAD_CACHE_BYTES` 字节
+/// 单独压一份交 Store。块 0 明文此刻在手，免事后 `get_block`+解压回捞（审查 M2）。append 主负载下
+/// 块 0 一旦满封即不再变，故缓存写一次永不失效；块 0 被 RMW 时本函数重建、Store 端脏会话期间
+/// 读快路径自动回退（见 ShadowStore::read_head_cache）。非块 0 / 小文件（块 0 即末块）不建。
+fn maybe_build_head_cache(
+    store: &dyn Store,
+    ino: u64,
+    idx: u64,
+    plain: &[u8],
+    new_size: u64,
+    params: &CodecParams,
+) -> io::Result<()> {
+    let head_bytes = crate::archive::HEAD_CACHE_BYTES;
+    if idx != 0 || (plain.len() as u64) < head_bytes || new_size <= plain.len() as u64 {
+        return Ok(());
+    }
+    let head = &plain[..head_bytes as usize];
+    let (hbytes, hverbatim) =
+        compress_block(head, params.algo, params.level, params.dict.as_deref())?;
+    store.set_head_cache(ino, hbytes, hverbatim, head_bytes)
 }
 
 /// 在逻辑文件 `ino` 的偏移 `offset` 处写入 `data`，返回写入字节数（恒为 data.len()）。

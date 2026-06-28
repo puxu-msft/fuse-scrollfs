@@ -89,6 +89,32 @@ pub trait Store: Send + Sync {
     /// `keep_from` = ceil(new_size / chunk_size)（末块若被部分截断由 Core 先 RMW 再调本方法）。
     fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> io::Result<()>;
 
+    // ---- head 缓存（发现读快路径，docs/02）----
+    /// 设置 head 缓存：Core 在块 0 封为满的不可变正文块时，把首 `rawlen` 字节的**已压缩**字节
+    /// 交来（压缩在 Core 完成，§2/M2：明文此刻在手，免事后解压回捞）。Store 累积进脏会话，
+    /// 随 fsync 落盘。默认 no-op——不支持快路径的后端（ContainerStore 首版）忽略。
+    fn set_head_cache(
+        &self,
+        _ino: Ino,
+        _stored_bytes: Vec<u8>,
+        _verbatim: bool,
+        _rawlen: u64,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// 读 head 缓存覆盖区内 `[off, off+len)` 所需的**压缩字节 + verbatim**（解压 + 切片交 Core）。
+    /// 仅当 `[off,off+len)` 完全落在缓存覆盖前缀内、且无挂起写会话（脏块 0 可能与盘上缓存不一致）
+    /// 时返回 `Some`；否则 `None`，调用方回退逐块路径。默认 None——不支持快路径的后端。
+    fn read_head_cache(
+        &self,
+        _ino: Ino,
+        _off: u64,
+        _len: u64,
+    ) -> io::Result<Option<(Vec<u8>, bool)>> {
+        Ok(None)
+    }
+
     // ---- 持久化 ----
     /// 单文件持久化（POSIX fsync 语义）：把该 inode 的脏缓冲落盘 + 后端 fsync。
     fn fsync(&self, ino: Ino) -> io::Result<()>;

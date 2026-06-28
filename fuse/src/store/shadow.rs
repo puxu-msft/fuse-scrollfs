@@ -95,6 +95,9 @@ struct WriteSession {
     chunk_size: u32,
     /// 若 Some(keep_from)：提交时先把块数截到 keep_from。
     truncate_to: Option<u64>,
+    /// 本会话内 Core 交来的新 head 缓存（已压缩字节, verbatim, 覆盖前缀长度），发现读快路径，
+    /// docs/02。None = 本会话未更新 head 缓存（提交时 ArchiveUpdater 沿用盘上既有缓存）。
+    head_cache: Option<(Vec<u8>, bool, u64)>,
 }
 
 /// 影子树后端（布局 S）。`backing` 为底层目录根（archive 树）。
@@ -216,6 +219,7 @@ impl ShadowStore {
                     size,
                     chunk_size,
                     truncate_to: None,
+                    head_cache: None,
                 }))
             }
         }
@@ -287,6 +291,11 @@ impl ShadowStore {
         for idx in idxs {
             let blk = &session.dirty[&idx];
             up.set_block(idx, &blk.bytes, blk.stored_verbatim, session.size)?;
+        }
+        // 本会话若更新了 head 缓存（Core 在块 0 封块时交来），写入 updater；否则 updater 沿用
+        // open 时从盘上 footer 载入的既有缓存（块 0 未变时保持有效）。docs/02 §4.3。
+        if let Some((bytes, verbatim, rawlen)) = session.head_cache {
+            up.set_head_cache(bytes, verbatim, rawlen);
         }
         up.commit()?;
         // 底层 archive 已变更（commit 内部已 sync_data 落新 footer/index）。在 up.sync() 之前就
@@ -515,6 +524,42 @@ impl Store for ShadowStore {
         });
         s.size = new_size;
         Ok(())
+    }
+
+    fn set_head_cache(
+        &self,
+        ino: Ino,
+        stored_bytes: Vec<u8>,
+        verbatim: bool,
+        rawlen: u64,
+    ) -> io::Result<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let s = self.ensure_session(ino, &mut sessions)?;
+        s.head_cache = Some((stored_bytes, verbatim, rawlen));
+        Ok(())
+    }
+
+    fn read_head_cache(&self, ino: Ino, off: u64, len: u64) -> io::Result<Option<(Vec<u8>, bool)>> {
+        // 有挂起写会话时跳过快路径：脏块 0 可能与盘上 head 缓存不一致（如块 0 刚被 RMW 尚未
+        // 提交）→ 回退逐块路径（get_block read-through 脏块）。fsync 后会话移除、快路径恢复。
+        if self.sessions.lock().unwrap().contains_key(&ino) {
+            return Ok(None);
+        }
+        let Some(reader) = self.cached_reader(ino)? else {
+            return Ok(None);
+        };
+        let rawlen = reader.head_cache_rawlen();
+        // 仅当请求区间 [off, off+len) 完全落在缓存覆盖前缀内才命中（避免部分命中拼接）。
+        let covered = rawlen > 0
+            && off
+                .checked_add(len)
+                .map(|end| end <= rawlen)
+                .unwrap_or(false);
+        if covered {
+            reader.read_head_cache()
+        } else {
+            Ok(None)
+        }
     }
 
     fn fsync(&self, ino: Ino) -> io::Result<()> {
@@ -746,5 +791,149 @@ mod tests {
             Some(&b"NEWNEWNE"[..]),
             "rename 覆盖后读到新内容"
         );
+    }
+
+    // ----- head 缓存端到端：Core(rmw) 封块时建 → Store 读快路径（docs/02）-----
+
+    use crate::archive::HEAD_CACHE_BYTES;
+    use crate::core::rmw::{self, CodecParams};
+
+    fn codec_params() -> CodecParams {
+        CodecParams {
+            algo: Algo::Zstd,
+            level: 3,
+            dict: None,
+        }
+    }
+
+    /// 确定性可压缩字节（非随机，保证压缩启发式不置 verbatim、贴近 jsonl 文本特性）。
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| b"abcdefghij \n"[i % 12]).collect()
+    }
+
+    #[test]
+    fn head_cache_块0封为正文块时建_读快路径解压等于前缀() {
+        // 块大小 128KiB（> HEAD_CACHE_BYTES 64KiB）。写 200KiB（2 块）：块0 满封为不可变正文块
+        // （new_size 200K > 块0 128K）→ Core 建 head 缓存。fsync 落盘后 read_head_cache 命中。
+        let cs = 128 * 1024u32;
+        let (store, _d, ino) = store_with_file(cs);
+        let data = patterned(200 * 1024);
+        rmw::write_at(&store, ino, 0, &data, &codec_params()).unwrap();
+        store.fsync(ino).unwrap();
+
+        let hc = store.read_head_cache(ino, 0, HEAD_CACHE_BYTES).unwrap();
+        assert!(hc.is_some(), "块0 封为正文块后应建 head 缓存");
+        let (bytes, verbatim) = hc.unwrap();
+        let plain = decompress(&bytes, Algo::Zstd, verbatim).unwrap();
+        assert_eq!(
+            plain.len() as u64,
+            HEAD_CACHE_BYTES,
+            "head 缓存解压长度应为 HEAD_CACHE_BYTES"
+        );
+        assert_eq!(
+            &plain[..],
+            &data[..HEAD_CACHE_BYTES as usize],
+            "head 缓存解压应逐字节等于文件前 64KB"
+        );
+    }
+
+    #[test]
+    fn head_cache_单块小文件不建() {
+        // 写 100KiB（< 128KiB 块，单块、块0 即末块）→ 不建缓存（无放大、块0 仍可变）。
+        let cs = 128 * 1024u32;
+        let (store, _d, ino) = store_with_file(cs);
+        let data = patterned(100 * 1024);
+        rmw::write_at(&store, ino, 0, &data, &codec_params()).unwrap();
+        store.fsync(ino).unwrap();
+        assert!(
+            store
+                .read_head_cache(ino, 0, HEAD_CACHE_BYTES)
+                .unwrap()
+                .is_none(),
+            "单块文件不建 head 缓存"
+        );
+    }
+
+    #[test]
+    fn head_cache_请求越出覆盖前缀返回_none() {
+        let cs = 128 * 1024u32;
+        let (store, _d, ino) = store_with_file(cs);
+        let data = patterned(200 * 1024);
+        rmw::write_at(&store, ino, 0, &data, &codec_params()).unwrap();
+        store.fsync(ino).unwrap();
+        // 请求 [0, 64KB+1) 越出缓存覆盖前缀（rawlen=64KB）→ 不命中，回退逐块。
+        assert!(
+            store
+                .read_head_cache(ino, 0, HEAD_CACHE_BYTES + 1)
+                .unwrap()
+                .is_none(),
+            "越出覆盖前缀应回退（避免部分命中拼接）"
+        );
+    }
+
+    #[test]
+    fn head_cache_脏会话期间回退逐块() {
+        // 块0 封块建缓存 + fsync。再开新写会话（脏块）→ read_head_cache 回退 None（脏块0 可能
+        // 与盘上缓存不一致），保证读快路径不读陈旧前缀。fsync 后恢复命中。
+        let cs = 128 * 1024u32;
+        let (store, _d, ino) = store_with_file(cs);
+        let data = patterned(200 * 1024);
+        rmw::write_at(&store, ino, 0, &data, &codec_params()).unwrap();
+        store.fsync(ino).unwrap();
+        assert!(store
+            .read_head_cache(ino, 0, HEAD_CACHE_BYTES)
+            .unwrap()
+            .is_some());
+
+        // 开脏会话（append 块2 的一部分，制造未提交写）。
+        store
+            .put_block(ino, 2, mk_block(b"tail"), 200 * 1024 + 4)
+            .unwrap();
+        assert!(
+            store
+                .read_head_cache(ino, 0, HEAD_CACHE_BYTES)
+                .unwrap()
+                .is_none(),
+            "挂起写会话期间应回退逐块"
+        );
+        store.fsync(ino).unwrap();
+        assert!(
+            store
+                .read_head_cache(ino, 0, HEAD_CACHE_BYTES)
+                .unwrap()
+                .is_some(),
+            "fsync 后快路径恢复"
+        );
+    }
+
+    #[test]
+    fn head_cache_跨_append_提交保留() {
+        // 块0 封块建缓存后，继续 append 增长（不动块0）。多次 fsync 后 head 缓存仍在且内容不变
+        // ——验证 ArchiveUpdater 跨提交从 footer 载入并重写既有缓存。
+        let cs = 128 * 1024u32;
+        let (store, _d, ino) = store_with_file(cs);
+        let data = patterned(200 * 1024);
+        rmw::write_at(&store, ino, 0, &data, &codec_params()).unwrap();
+        store.fsync(ino).unwrap();
+        let before = store
+            .read_head_cache(ino, 0, HEAD_CACHE_BYTES)
+            .unwrap()
+            .unwrap();
+
+        // 再 append 一段（落在末块之后，不触块0）。
+        let more = patterned(50 * 1024);
+        rmw::write_at(&store, ino, 200 * 1024, &more, &codec_params()).unwrap();
+        store.fsync(ino).unwrap();
+
+        let after = store
+            .read_head_cache(ino, 0, HEAD_CACHE_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.0, after.0,
+            "append 后 head 缓存字节应不变（块0 未动）"
+        );
+        let plain = decompress(&after.0, Algo::Zstd, after.1).unwrap();
+        assert_eq!(&plain[..], &data[..HEAD_CACHE_BYTES as usize]);
     }
 }

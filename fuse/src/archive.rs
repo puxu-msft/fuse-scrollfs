@@ -8,13 +8,20 @@
 //! ```text
 //! [magic|version]                                  ← 文件头（固定）
 //! [compressed chunk 0]...[compressed chunk N]      ← 数据区
+//! [compressed head-cache]                          ← 可选：首 HEAD_CACHE_BYTES 独立压缩流（仅大文件，发现读快路径）
 //! [chunk_index: (offset, clen, flags) × count]     ← 索引（footer 前）
-//! [footer: chunk_size|uncompressed_size|chunk_count|index_offset|crc] ← 尾部固定大小
+//! [footer: chunk_size|uncompressed_size|chunk_count|index_offset|crc
+//!          |head_cache_offset|head_cache_clen|head_cache_rawlen|head_cache_flags] ← 尾部固定大小
 //! ```
 //!
-//! 本模块只做「格式读写」，不碰压缩（压缩在 core::codec，§2）。`ArchiveReader::read_block`
-//! 返回压缩字节 + flags，由上层 Core 解压。`ArchiveWriter` 仅供离线 fixture 工具使用
-//! （P1 无在线写路径），从已压缩块写出 footer 布局。
+//! **head 缓存（docs/02-layered-chunking.md）**：会话发现读每文件首 64KB（harness `tan`）。若整文件
+//! 命中均匀大块（1MiB），读 64KB 要解压整块（16x 放大，实测 HOT 352us）。head 缓存把首
+//! `HEAD_CACHE_BYTES` 单独压一份存档内（~20KB），发现读经 Core 快路径解压它（~62us）。缓存随 index/footer
+//! 在每次 commit 的「元数据尾区」重写（非永久 fixture，靠相同 barrier + EOF footer fail-closed 兜底）。
+//! `head_cache_* = 0` 表示无缓存（小文件 / 未触发）。项目无历史 archive，故单一格式、不背向后兼容。
+//!
+//! 本模块只做「格式读写」，不碰压缩（压缩在 core::codec，§2）。`ArchiveReader::read_block` /
+//! `read_head_cache` 返回压缩字节 + flags，由上层 Core 解压。
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -33,9 +40,14 @@ const HEADER_LEN: u64 = 12;
 /// 单个块索引项的序列化大小：offset(8) + clen(8) + flags(4) = 20 字节。
 const INDEX_ENTRY_LEN: u64 = 20;
 
-/// footer 固定大小：
-/// chunk_size(4) + uncompressed_size(8) + chunk_count(8) + index_offset(8) + crc(4) = 32 字节。
-const FOOTER_LEN: u64 = 32;
+/// footer 固定大小 60 字节，两段：
+/// 既有 32B（chunk_size 4 + uncompressed_size 8 + chunk_count 8 + index_offset 8 + crc 4），
+/// head 缓存 28B（head_cache_offset 8 + head_cache_clen 8 + head_cache_rawlen 8 + head_cache_flags 4）。
+/// head 缓存字段全 0 表示无缓存。
+const FOOTER_LEN: u64 = 60;
+
+/// head 缓存的发现读窗口（= harness `Rv`，docs/02 §4.4）。首版默认 64KiB。
+pub const HEAD_CACHE_BYTES: u64 = 65536;
 
 /// 块 flags 位：原样存储（不可压缩启发式置位，读时跳过解压）。
 pub const FLAG_VERBATIM: u32 = 0b0000_0001;
@@ -58,6 +70,22 @@ impl ChunkEntry {
     }
 }
 
+/// head 缓存（发现读快路径）：首 `rawlen` 逻辑字节的独立压缩流在 archive 中的位置。
+///
+/// `rawlen == min(HEAD_CACHE_BYTES, uncompressed_size)`，**不行对齐**（恒满窗口，避免部分命中）。
+/// `verbatim` 同块语义：不可压缩则原样存、读时跳过解压。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadCache {
+    /// 压缩流在文件中的字节偏移。
+    pub offset: u64,
+    /// 压缩后字节长度（verbatim 时即原始长度）。
+    pub clen: u64,
+    /// 解压后逻辑字节数（= 覆盖的前缀长度）。
+    pub rawlen: u64,
+    /// 是否原样存储。
+    pub verbatim: bool,
+}
+
 /// archive 的 footer（解析后的视图）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footer {
@@ -71,6 +99,8 @@ pub struct Footer {
     pub index_offset: u64,
     /// 索引区的 CRC32，开包时校验，及早发现尾部损坏。
     pub crc: u32,
+    /// head 缓存（无则 None）。发现读快路径用，docs/02。
+    pub head_cache: Option<HeadCache>,
 }
 
 // ===========================================================================
@@ -178,6 +208,18 @@ impl ArchiveReader {
             }
         }
 
+        // 6) head 缓存（若有）同样须落在数据区 [HEADER_LEN, index_offset) 内自洽：
+        // 防 read_head_cache 据不可信 clen 无界分配 / seek 越界（同块的及早拒绝）。
+        if let Some(hc) = footer.head_cache {
+            let end = hc
+                .offset
+                .checked_add(hc.clen)
+                .ok_or_else(|| corrupt("head 缓存 offset+clen 溢出"))?;
+            if hc.offset < HEADER_LEN || end > data_end {
+                return Err(corrupt("head 缓存越出数据区"));
+            }
+        }
+
         Ok(Self {
             file,
             footer,
@@ -193,15 +235,31 @@ impl ArchiveReader {
         let chunk_count = u64::from_le_bytes(buf[12..20].try_into().unwrap());
         let index_offset = u64::from_le_bytes(buf[20..28].try_into().unwrap());
         let crc = u32::from_le_bytes(buf[28..32].try_into().unwrap());
+        // head 缓存字段（28B）：全 0 = 无缓存。
+        let hc_offset = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+        let hc_clen = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        let hc_rawlen = u64::from_le_bytes(buf[48..56].try_into().unwrap());
+        let hc_flags = u32::from_le_bytes(buf[56..60].try_into().unwrap());
         if chunk_size == 0 {
             return Err(corrupt("chunk_size 不能为 0"));
         }
+        let head_cache = if hc_offset == 0 && hc_clen == 0 && hc_rawlen == 0 {
+            None
+        } else {
+            Some(HeadCache {
+                offset: hc_offset,
+                clen: hc_clen,
+                rawlen: hc_rawlen,
+                verbatim: hc_flags & FLAG_VERBATIM != 0,
+            })
+        };
         Ok(Footer {
             chunk_size,
             uncompressed_size,
             chunk_count,
             index_offset,
             crc,
+            head_cache,
         })
     }
 
@@ -232,6 +290,23 @@ impl ArchiveReader {
         read_exact_at(&self.file, &mut buf, entry.offset)?;
         Ok(Some((buf, entry)))
     }
+
+    /// head 缓存覆盖的逻辑前缀字节数（无缓存则 0）。供 Core 读快路径判定 `off+len <= rawlen`。
+    pub fn head_cache_rawlen(&self) -> u64 {
+        self.footer.head_cache.map(|h| h.rawlen).unwrap_or(0)
+    }
+
+    /// 读 head 缓存的**压缩字节**（不解压）+ verbatim 标志；无缓存返回 `Ok(None)`。
+    ///
+    /// 解压交给 Core（§2，与 `read_block` 同口径）。`open` 已校验缓存落在数据区内，故 clen 可信。
+    pub fn read_head_cache(&self) -> io::Result<Option<(Vec<u8>, bool)>> {
+        let Some(hc) = self.footer.head_cache else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; hc.clen as usize];
+        read_exact_at(&self.file, &mut buf, hc.offset)?;
+        Ok(Some((buf, hc.verbatim)))
+    }
 }
 
 /// 解析索引区字节为 `ChunkEntry` 列表。
@@ -251,6 +326,50 @@ fn parse_index(bytes: &[u8], count: usize) -> Vec<ChunkEntry> {
         .collect()
 }
 
+/// 序列化索引区为字节（与 `parse_index` 对偶）。Writer/Updater 共用，避免布局漂移。
+fn serialize_index(index: &[ChunkEntry]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(index.len() * INDEX_ENTRY_LEN as usize);
+    for e in index {
+        bytes.extend_from_slice(&e.offset.to_le_bytes());
+        bytes.extend_from_slice(&e.clen.to_le_bytes());
+        bytes.extend_from_slice(&e.flags.to_le_bytes());
+    }
+    bytes
+}
+
+/// 序列化 footer（固定 `FOOTER_LEN` 字节，与 `read_footer` 对偶）。Writer/Updater 共用。
+/// `head_cache == None` 时三字段全 0（= 无缓存）。
+fn serialize_footer(
+    chunk_size: u32,
+    uncompressed_size: u64,
+    chunk_count: u64,
+    index_offset: u64,
+    crc: u32,
+    head_cache: Option<HeadCache>,
+) -> Vec<u8> {
+    let mut f = Vec::with_capacity(FOOTER_LEN as usize);
+    f.extend_from_slice(&chunk_size.to_le_bytes());
+    f.extend_from_slice(&uncompressed_size.to_le_bytes());
+    f.extend_from_slice(&chunk_count.to_le_bytes());
+    f.extend_from_slice(&index_offset.to_le_bytes());
+    f.extend_from_slice(&crc.to_le_bytes());
+    let (off, clen, raw, flags) = match head_cache {
+        Some(h) => (
+            h.offset,
+            h.clen,
+            h.rawlen,
+            if h.verbatim { FLAG_VERBATIM } else { 0 },
+        ),
+        None => (0, 0, 0, 0),
+    };
+    f.extend_from_slice(&off.to_le_bytes());
+    f.extend_from_slice(&clen.to_le_bytes());
+    f.extend_from_slice(&raw.to_le_bytes());
+    f.extend_from_slice(&flags.to_le_bytes());
+    debug_assert_eq!(f.len() as u64, FOOTER_LEN);
+    f
+}
+
 // ===========================================================================
 // ArchiveWriter：从已压缩块写出 footer 布局（仅供离线 fixture 工具）
 // ===========================================================================
@@ -266,6 +385,8 @@ pub struct ArchiveWriter<W: Write + Seek> {
     /// 下一个块写入位置（当前文件长度）。
     cursor: u64,
     index: Vec<ChunkEntry>,
+    /// 可选 head 缓存：(已压缩字节, verbatim, 解压后逻辑长度)。`finish` 时写在索引之前。
+    head_cache: Option<(Vec<u8>, bool, u64)>,
 }
 
 impl ArchiveWriter<File> {
@@ -294,7 +415,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             uncompressed_size: 0,
             cursor: HEADER_LEN,
             index: Vec::new(),
+            head_cache: None,
         })
+    }
+
+    /// 设置 head 缓存（发现读快路径，docs/02）。`stored_bytes` 是 core::codec 对首
+    /// `min(HEAD_CACHE_BYTES, 文件大小)` 字节的压缩输出；`verbatim` 为不可压缩 flag；
+    /// `raw_len` 是覆盖的逻辑前缀长度。`finish` 时写在索引之前。
+    pub fn set_head_cache(&mut self, stored_bytes: Vec<u8>, verbatim: bool, raw_len: u64) {
+        self.head_cache = Some((stored_bytes, verbatim, raw_len));
     }
 
     /// 追加一个**已压缩**块。
@@ -319,28 +448,37 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         Ok(())
     }
 
-    /// 写出索引区 + footer，收尾。返回内部 writer（便于 flush/同步）。
+    /// 写出 [head 缓存] + 索引区 + footer，收尾。返回内部 writer（便于 flush/同步）。
     pub fn finish(mut self) -> io::Result<W> {
-        let index_offset = self.cursor;
+        // head 缓存（若有）写在索引之前、数据块之后（docs/02 §4.1 布局）。
+        let head_cache = match &self.head_cache {
+            Some((bytes, verbatim, raw_len)) => {
+                let offset = self.cursor;
+                self.inner.write_all(bytes)?;
+                self.cursor += bytes.len() as u64;
+                Some(HeadCache {
+                    offset,
+                    clen: bytes.len() as u64,
+                    rawlen: *raw_len,
+                    verbatim: *verbatim,
+                })
+            }
+            None => None,
+        };
 
-        // 序列化索引区。
-        let mut index_bytes = Vec::with_capacity(self.index.len() * INDEX_ENTRY_LEN as usize);
-        for e in &self.index {
-            index_bytes.extend_from_slice(&e.offset.to_le_bytes());
-            index_bytes.extend_from_slice(&e.clen.to_le_bytes());
-            index_bytes.extend_from_slice(&e.flags.to_le_bytes());
-        }
+        let index_offset = self.cursor;
+        let index_bytes = serialize_index(&self.index);
         let crc = crc32(&index_bytes);
         self.inner.write_all(&index_bytes)?;
 
-        // 写 footer（固定大小）。
-        let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
-        footer.extend_from_slice(&self.chunk_size.to_le_bytes());
-        footer.extend_from_slice(&self.uncompressed_size.to_le_bytes());
-        footer.extend_from_slice(&(self.index.len() as u64).to_le_bytes());
-        footer.extend_from_slice(&index_offset.to_le_bytes());
-        footer.extend_from_slice(&crc.to_le_bytes());
-        debug_assert_eq!(footer.len() as u64, FOOTER_LEN);
+        let footer = serialize_footer(
+            self.chunk_size,
+            self.uncompressed_size,
+            self.index.len() as u64,
+            index_offset,
+            crc,
+            head_cache,
+        );
         self.inner.write_all(&footer)?;
         self.inner.flush()?;
         Ok(self.inner)
@@ -390,6 +528,10 @@ pub struct ArchiveUpdater {
     /// 下一个新块的写入位置。初始 = **live 数据区末尾**（回收尾部已死 index/footer/旧块版本
     /// 空洞），随 `set_block` 追加推进。见 `live_data_end` 与 `open` 文档。
     write_cursor: u64,
+    /// head 缓存（发现读快路径，docs/02）：(已压缩字节, verbatim, 解压后逻辑长度)。
+    /// open 时从既有 footer 载入、随每次 `commit` 在元数据尾区重写——故不进 `live_data_end`，
+    /// 与 index/footer 同生命周期、靠相同 barrier + EOF footer fail-closed 兜底（无 Frankenstein 之虞）。
+    head_cache: Option<(Vec<u8>, bool, u64)>,
 }
 
 impl ArchiveUpdater {
@@ -398,6 +540,10 @@ impl ArchiveUpdater {
         let reader = ArchiveReader::open(path)?;
         let footer = *reader.footer();
         let index = reader.index.clone();
+        // 载入既有 head 缓存（若有）：随后每次 commit 在元数据尾区重写。块 0 不变时它仍有效。
+        let head_cache = reader
+            .read_head_cache()?
+            .map(|(bytes, verbatim)| (bytes, verbatim, reader.head_cache_rawlen()));
         // 复用同一 fd 读写：以读写模式重开（ArchiveReader 持只读 fd）。
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -405,7 +551,7 @@ impl ArchiveUpdater {
             .open(path)?;
         // 写游标置于**当前 live 数据区末尾**（= 所有索引项 offset+clen 的最大值，空 archive 则
         // 紧随 header），而非物理文件末尾。这样上次提交遗留在尾部的「已被取代的旧尾块版本 +
-        // 旧 index + 旧 footer」空洞会在本次提交时被新数据覆盖回收（碎片化修复 §A）。
+        // 旧 head 缓存 + 旧 index + 旧 footer」空洞会在本次提交时被新数据覆盖回收（碎片化修复 §A）。
         //
         // 崩溃安全（承接 rust-review C3/CRITICAL 的诚实边界，§10 已将 S 一致性定级为「较弱、须文档化」）：
         // 两类写各自 fail-closed：
@@ -414,7 +560,7 @@ impl ArchiveUpdater {
         // (2) **reuse 原地覆盖最末 live 块**（set_block 的 reuse_tail_slot，碎片化修复主路径）：会就地
         //     改写盘上字节，故在覆盖**前**先 set_len 截掉该 slot 之后的旧 index/footer 再 sync——崩溃
         //     窗口内 EOF 不再是合法 footer，open 检测损坏报错，绝不静默读出「新前缀+旧残尾」。
-        // 提交内仍是「写 index → sync_data → 写 footer → sync_data」两段 barrier。两路均 fail-closed
+        // 提交内仍是「写 [head 缓存] → 写 index → sync_data → 写 footer → sync_data」两段 barrier。两路均 fail-closed
         // （见 updater_未提交即崩溃_* 与 updater_reuse_尾块原地覆盖中崩溃_* 测试）。
         let live_data_end = live_data_end(&index);
         Ok(Self {
@@ -423,7 +569,19 @@ impl ArchiveUpdater {
             index,
             uncompressed_size: footer.uncompressed_size,
             write_cursor: live_data_end,
+            head_cache,
         })
+    }
+
+    /// 设置 / 更新 head 缓存（块 0 首次封存或头区 RMW 后由上层调用，docs/02 §4.3）。
+    /// `stored_bytes` 是 core::codec 对首 `min(HEAD_CACHE_BYTES, size)` 字节的压缩输出。
+    pub fn set_head_cache(&mut self, stored_bytes: Vec<u8>, verbatim: bool, raw_len: u64) {
+        self.head_cache = Some((stored_bytes, verbatim, raw_len));
+    }
+
+    /// 当前 head 缓存覆盖的逻辑前缀长度（无则 0）。
+    pub fn head_cache_rawlen(&self) -> u64 {
+        self.head_cache.as_ref().map(|(_, _, r)| *r).unwrap_or(0)
     }
 
     /// 当前块数。
@@ -520,35 +678,46 @@ impl ArchiveUpdater {
         self.uncompressed_size = new_size;
     }
 
-    /// 提交：在数据区末尾写新 index + footer，截断文件到 footer 末尾，fsync 落盘。
+    /// 提交：在数据区末尾写 [head 缓存] + 新 index + footer，截断文件到 footer 末尾，fsync 落盘。
     ///
-    /// 崩溃安全：先写 index + fsync，再写 footer + fsync。footer 的 CRC 覆盖 index，
-    /// open 时不一致即拒绝（不会用到半截 index）。前部数据块从不被覆盖，故旧数据安全。
+    /// 崩溃安全：先写 head 缓存 + index + sync_data，再写 footer + sync_data。footer 的 CRC 覆盖
+    /// index、且 footer 引用的 head 缓存已在第一段 barrier 落盘；open 时不一致即拒绝。前部数据块
+    /// 从不被覆盖，故旧数据安全。head 缓存随每次 commit 在元数据尾区重写（与 index 同生命周期）。
     pub fn commit(&mut self) -> io::Result<()> {
-        let index_offset = self.write_cursor;
+        // head 缓存（若有）写在 index 之前、数据块之后（docs/02 §4.1 布局）。
+        self.file.seek(SeekFrom::Start(self.write_cursor))?;
+        let head_cache = match &self.head_cache {
+            Some((bytes, verbatim, raw_len)) => {
+                let offset = self.write_cursor;
+                self.file.write_all(bytes)?;
+                self.write_cursor += bytes.len() as u64;
+                Some(HeadCache {
+                    offset,
+                    clen: bytes.len() as u64,
+                    rawlen: *raw_len,
+                    verbatim: *verbatim,
+                })
+            }
+            None => None,
+        };
 
-        // 序列化 index。
-        let mut index_bytes = Vec::with_capacity(self.index.len() * INDEX_ENTRY_LEN as usize);
-        for e in &self.index {
-            index_bytes.extend_from_slice(&e.offset.to_le_bytes());
-            index_bytes.extend_from_slice(&e.clen.to_le_bytes());
-            index_bytes.extend_from_slice(&e.flags.to_le_bytes());
-        }
+        let index_offset = self.write_cursor;
+        let index_bytes = serialize_index(&self.index);
         let crc = crc32(&index_bytes);
 
         self.file.seek(SeekFrom::Start(index_offset))?;
         self.file.write_all(&index_bytes)?;
-        // 阶段一 barrier：确保 index 已落盘，再写 footer 指向它。
+        // 阶段一 barrier：确保 head 缓存 + index 已落盘，再写 footer 指向它们。
         self.file.sync_data()?;
 
-        // footer（固定大小）。
-        let mut footer = Vec::with_capacity(FOOTER_LEN as usize);
-        footer.extend_from_slice(&self.chunk_size.to_le_bytes());
-        footer.extend_from_slice(&self.uncompressed_size.to_le_bytes());
-        footer.extend_from_slice(&(self.index.len() as u64).to_le_bytes());
-        footer.extend_from_slice(&index_offset.to_le_bytes());
-        footer.extend_from_slice(&crc.to_le_bytes());
-        debug_assert_eq!(footer.len() as u64, FOOTER_LEN);
+        let footer = serialize_footer(
+            self.chunk_size,
+            self.uncompressed_size,
+            self.index.len() as u64,
+            index_offset,
+            crc,
+            head_cache,
+        );
         self.file.write_all(&footer)?;
 
         // 截断掉可能残留的旧尾部（若新文件比旧文件短）。
@@ -909,6 +1078,134 @@ mod tests {
         assert!(
             final_len < one_block_envelope * 3,
             "尾块反复重写后文件应保持紧凑（不累积空洞）：final_len={final_len}，单块封套≈{one_block_envelope}，sizes={sizes:?}"
+        );
+    }
+
+    // ----- head 缓存（发现读快路径，docs/02）-----
+
+    #[test]
+    fn head_cache_无时_reader_返回_none() {
+        // 不设 head 缓存 → footer 字段全 0 → read_head_cache None、rawlen 0。
+        let bytes = build_archive(64, &[(b"blk0".to_vec(), false, 4)]);
+        let r = reader_from_bytes(&bytes);
+        assert!(r.footer().head_cache.is_none());
+        assert_eq!(r.head_cache_rawlen(), 0);
+        assert!(r.read_head_cache().unwrap().is_none());
+    }
+
+    #[test]
+    fn head_cache_writer_round_trip() {
+        // Writer 设 head 缓存 → reader 读回同样字节 + rawlen + verbatim。
+        let cursor = Cursor::new(Vec::new());
+        let mut w = ArchiveWriter::new(cursor, 64).unwrap();
+        w.append_block(b"compressed-block-0", false, 50).unwrap();
+        w.set_head_cache(b"HEADCACHE-COMPRESSED".to_vec(), false, 64);
+        let bytes = w.finish().unwrap().into_inner();
+
+        let r = reader_from_bytes(&bytes);
+        assert_eq!(r.head_cache_rawlen(), 64);
+        let (hc, verbatim) = r.read_head_cache().unwrap().unwrap();
+        assert_eq!(hc, b"HEADCACHE-COMPRESSED");
+        assert!(!verbatim);
+        // 块仍正常可读（head 缓存不干扰块索引）。
+        assert_eq!(r.read_block(0).unwrap().unwrap().0, b"compressed-block-0");
+    }
+
+    #[test]
+    fn head_cache_verbatim_flag_保真() {
+        let cursor = Cursor::new(Vec::new());
+        let mut w = ArchiveWriter::new(cursor, 64).unwrap();
+        w.append_block(b"x", false, 1).unwrap();
+        w.set_head_cache(b"RAWHEAD".to_vec(), true, 7); // verbatim head
+        let bytes = w.finish().unwrap().into_inner();
+        let r = reader_from_bytes(&bytes);
+        let (_, verbatim) = r.read_head_cache().unwrap().unwrap();
+        assert!(verbatim, "verbatim head 缓存 flag 应保真");
+    }
+
+    #[test]
+    fn head_cache_越界_offset_在_open_期被拒() {
+        // footer 的 head_cache_offset 改成越界值（> index_offset）→ open 期 bounds 校验拒绝。
+        // head 缓存无 CRC，靠 from_file 的范围自洽检查兜底（同块的及早拒绝）。
+        let cursor = Cursor::new(Vec::new());
+        let mut w = ArchiveWriter::new(cursor, 64).unwrap();
+        w.append_block(b"abc", false, 3).unwrap();
+        w.set_head_cache(b"HEAD".to_vec(), false, 64);
+        let mut bytes = w.finish().unwrap().into_inner();
+        // footer 末 28 字节是 head 字段：offset(8)|clen(8)|rawlen(8)|flags(4)。
+        // head_cache_offset 在 footer 内偏移 32，即文件尾 FOOTER_LEN-32=28 处起 8 字节。
+        let n = bytes.len();
+        let hc_off_pos = n - FOOTER_LEN as usize + 32;
+        let huge = u64::MAX.to_le_bytes();
+        bytes[hc_off_pos..hc_off_pos + 8].copy_from_slice(&huge);
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&bytes).unwrap();
+        tmp.flush().unwrap();
+        let err = expect_open_err(tmp.path());
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "越界 head 缓存应被拒：{err}"
+        );
+    }
+
+    #[test]
+    fn updater_保留_head_cache_跨提交_append() {
+        // build 一个带 head 缓存的 archive，open updater append 一块（不动 head 缓存），
+        // commit 后 head 缓存仍在（rawlen + 字节保真）—— 验证 updater 跨提交重写元数据尾区时
+        // 从 footer 载入并重新落盘 head 缓存。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.archive");
+        {
+            let mut w = ArchiveWriter::create(&path, 8).unwrap();
+            w.append_block(b"AAAAAAAA", false, 8).unwrap();
+            w.set_head_cache(b"HC-COMPRESSED-BYTES".to_vec(), false, 8);
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        assert_eq!(up.head_cache_rawlen(), 8, "open 应从 footer 载入 head 缓存");
+        up.set_block(1, b"BBBB", false, 12).unwrap();
+        up.commit().unwrap();
+
+        let r = ArchiveReader::open(&path).unwrap();
+        assert_eq!(r.chunk_count(), 2);
+        assert_eq!(r.head_cache_rawlen(), 8, "append 后 head 缓存应保留");
+        assert_eq!(
+            r.read_head_cache().unwrap().unwrap().0,
+            b"HC-COMPRESSED-BYTES"
+        );
+        assert_eq!(r.read_block(1).unwrap().unwrap().0, b"BBBB");
+    }
+
+    #[test]
+    fn updater_set_head_cache_后提交可读回() {
+        // 无 head 缓存的 archive，open updater 设 head 缓存并 commit → reader 读回。
+        let (_d, path) = build_archive_file(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        assert_eq!(up.head_cache_rawlen(), 0);
+        up.set_head_cache(b"NEW-HEAD".to_vec(), false, 8);
+        up.commit().unwrap();
+        let r = ArchiveReader::open(&path).unwrap();
+        assert_eq!(r.head_cache_rawlen(), 8);
+        assert_eq!(r.read_head_cache().unwrap().unwrap().0, b"NEW-HEAD");
+        // 块数据不受影响。
+        assert_eq!(r.read_block(0).unwrap().unwrap().0, b"AAAAAAAA");
+    }
+
+    #[test]
+    fn updater_含head_cache_未提交即崩溃_fail_closed() {
+        // 崩溃安全（M1 变体）：set_head_cache + set_block 后不 commit（drop），
+        // 模拟「写了新尾区但 footer 未落盘即崩溃」。open 必须检测损坏报错，绝不静默错读。
+        let (_d, path) = build_archive_file(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);
+        {
+            let mut up = ArchiveUpdater::open(&path).unwrap();
+            up.set_head_cache(b"HEAD-PENDING".to_vec(), false, 8);
+            up.set_block(1, b"BBBB", false, 12).unwrap();
+            drop(up); // 不 commit
+        }
+        assert!(
+            ArchiveReader::open(&path).is_err(),
+            "未提交的 head 缓存 + 尾块追加应被检测为损坏，不能静默错读"
         );
     }
 }
