@@ -22,6 +22,7 @@ fn params() -> CodecParams {
     CodecParams {
         algo: Algo::Zstd,
         level: 3,
+        dict: None,
     }
 }
 
@@ -166,7 +167,7 @@ fn run_differential(store: &dyn Store, seed: u64) {
                     };
                 }
                 let attr = store.lookup(ROOT_INO, &name).unwrap();
-                rmw::write_at(store, attr.ino, offset, &data, params()).unwrap();
+                rmw::write_at(store, attr.ino, offset, &data, &params()).unwrap();
 
                 // 更新参照模型：越 EOF 零填充。
                 let content = model.files.get_mut(&name).unwrap();
@@ -186,7 +187,7 @@ fn run_differential(store: &dyn Store, seed: u64) {
                 let cur_len = model.files[&name].len() as u64;
                 let new_size = rng.below(cur_len + 150);
                 let attr = store.lookup(ROOT_INO, &name).unwrap();
-                rmw::truncate(store, attr.ino, new_size, params()).unwrap();
+                rmw::truncate(store, attr.ino, new_size, &params()).unwrap();
                 let content = model.files.get_mut(&name).unwrap();
                 content.resize(new_size as usize, 0);
             }
@@ -281,7 +282,7 @@ fn check_namespace(store: &dyn Store) {
 
     // create 文件、写、fsync、rename、读回。
     let fino = store.create(ROOT_INO, "f1", new_attr(0o644)).unwrap();
-    rmw::write_at(store, fino, 0, b"hello world payload", params()).unwrap();
+    rmw::write_at(store, fino, 0, b"hello world payload", &params()).unwrap();
     store.fsync(fino).unwrap();
     assert_eq!(read_whole(store, fino), b"hello world payload");
 

@@ -162,6 +162,7 @@ fn run_on_store(
     let params = CodecParams {
         algo: Algo::Zstd,
         level: cli.level,
+        dict: None,
     };
     let ws = TailSessions::new(enabled);
     let mut logical_bytes = 0u64;
@@ -173,15 +174,15 @@ fn run_on_store(
     for i in 0..cli.lines {
         let line = make_line(i, cli.line_size);
         let off = ws.geometry(store, ino).unwrap().0;
-        ws.write_at(store, ino, off, &line, params).unwrap();
+        ws.write_at(store, ino, off, &line, &params).unwrap();
         logical_bytes += line.len() as u64;
         if fsync_every > 0 && i % fsync_every == fsync_every - 1 {
-            ws.seal(store, ino, params).unwrap();
+            ws.seal(store, ino, &params).unwrap();
             store.fsync(ino).unwrap();
         }
     }
     // 收尾 fsync。
-    ws.seal(store, ino, params).unwrap();
+    ws.seal(store, ino, &params).unwrap();
     store.fsync(ino).unwrap();
     let elapsed_s = start.elapsed().as_secs_f64();
 

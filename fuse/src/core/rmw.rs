@@ -15,9 +15,10 @@
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::core::chunk::block_range;
-use crate::core::codec::{compress, decompress, Algo};
+use crate::core::codec::{compress_block, decompress_block, Algo, SharedDict};
 use crate::store::{Store, StoredBlock};
 
 /// 块压缩（重压）计数器：每次 `store_plain_block` 把一个逻辑块压缩落 Store 记一次。
@@ -37,11 +38,15 @@ pub fn reset_block_compress_count() {
     BLOCK_COMPRESS_COUNT.store(0, Ordering::Relaxed);
 }
 
-/// 一次写所需的 codec 参数（算法 + zstd 等级）。
-#[derive(Debug, Clone, Copy)]
+/// 一次写所需的 codec 参数（算法 + zstd 等级 + 可选共享字典）。
+///
+/// `dict` 非空时所有块走字典压缩/解压（CDict 已含等级，`level` 仅无字典路径生效）。
+/// 含 `Arc<SharedDict>` 故不再是 `Copy`；按引用 `&CodecParams` 传递（Arc clone 仅在需要持有时）。
+#[derive(Debug, Clone)]
 pub struct CodecParams {
     pub algo: Algo,
     pub level: i32,
+    pub dict: Option<Arc<SharedDict>>,
 }
 
 /// 单次写允许的最大稀疏扩展跨度（字节）：写起点越过当前 EOF 超过此值则拒绝（ENOSPC 语义）。
@@ -56,10 +61,15 @@ pub(crate) fn load_plain_block(
     store: &dyn Store,
     ino: u64,
     idx: u64,
-    params: CodecParams,
+    params: &CodecParams,
 ) -> io::Result<Vec<u8>> {
     match store.get_block(ino, idx)? {
-        Some(b) => decompress(&b.bytes, params.algo, b.stored_verbatim),
+        Some(b) => decompress_block(
+            &b.bytes,
+            params.algo,
+            b.stored_verbatim,
+            params.dict.as_deref(),
+        ),
         None => Ok(Vec::new()),
     }
 }
@@ -71,9 +81,10 @@ pub(crate) fn store_plain_block(
     idx: u64,
     plain: &[u8],
     new_size: u64,
-    params: CodecParams,
+    params: &CodecParams,
 ) -> io::Result<()> {
-    let (bytes, verbatim) = compress(plain, params.algo, params.level)?;
+    let (bytes, verbatim) =
+        compress_block(plain, params.algo, params.level, params.dict.as_deref())?;
     BLOCK_COMPRESS_COUNT.fetch_add(1, Ordering::Relaxed);
     store.put_block(
         ino,
@@ -95,7 +106,7 @@ pub fn write_at(
     ino: u64,
     offset: u64,
     data: &[u8],
-    params: CodecParams,
+    params: &CodecParams,
 ) -> io::Result<usize> {
     if data.is_empty() {
         return Ok(0);
@@ -183,7 +194,12 @@ pub fn write_at(
 /// - 缩小：末块若被部分截断 → 取旧末块解压、截到块内长度、重压写回；再丢弃其后的块。
 /// - 扩展：末块零填充到 chunk_size（或新 EOF），后续块作为空洞由读路径零填充；
 ///   仅重写「被部分触及」的末块，不为纯空洞块写零块（保持稀疏，省空间）。
-pub fn truncate(store: &dyn Store, ino: u64, new_size: u64, params: CodecParams) -> io::Result<()> {
+pub fn truncate(
+    store: &dyn Store,
+    ino: u64,
+    new_size: u64,
+    params: &CodecParams,
+) -> io::Result<()> {
     let Some((old_size, chunk_size)) = store.block_geometry(ino) else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -254,12 +270,14 @@ pub fn truncate(store: &dyn Store, ino: u64, new_size: u64, params: CodecParams)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::codec::decompress;
     use crate::store::tests_support::MemStore;
 
     fn params() -> CodecParams {
         CodecParams {
             algo: Algo::Zstd,
             level: 3,
+            dict: None,
         }
     }
 
@@ -284,7 +302,7 @@ mod tests {
     fn 顺序写单块_round_trip() {
         let store = MemStore::new(16);
         let ino = store.new_file();
-        write_at(&store, ino, 0, b"hello", params()).unwrap();
+        write_at(&store, ino, 0, b"hello", &params()).unwrap();
         assert_eq!(read_all(&store, ino), b"hello");
         assert_eq!(store.block_geometry(ino).unwrap().0, 5);
     }
@@ -293,8 +311,8 @@ mod tests {
     fn append_延伸跨块() {
         let store = MemStore::new(8);
         let ino = store.new_file();
-        write_at(&store, ino, 0, b"abcdefgh", params()).unwrap(); // 块0满
-        write_at(&store, ino, 8, b"ijkl", params()).unwrap(); // append 块1
+        write_at(&store, ino, 0, b"abcdefgh", &params()).unwrap(); // 块0满
+        write_at(&store, ino, 8, b"ijkl", &params()).unwrap(); // append 块1
         assert_eq!(read_all(&store, ino), b"abcdefghijkl");
         assert_eq!(store.block_geometry(ino).unwrap().0, 12);
     }
@@ -303,9 +321,9 @@ mod tests {
     fn 中间块_rmw_保留两侧字节() {
         let store = MemStore::new(8);
         let ino = store.new_file();
-        write_at(&store, ino, 0, b"AAAAAAAABBBBBBBB", params()).unwrap();
+        write_at(&store, ino, 0, b"AAAAAAAABBBBBBBB", &params()).unwrap();
         // 覆盖块0中间 [2,5)。
-        write_at(&store, ino, 2, b"xyz", params()).unwrap();
+        write_at(&store, ino, 2, b"xyz", &params()).unwrap();
         assert_eq!(read_all(&store, ino), b"AAxyzAAABBBBBBBB");
     }
 
@@ -313,9 +331,9 @@ mod tests {
     fn 越_eof_写产生空洞零填充() {
         let store = MemStore::new(8);
         let ino = store.new_file();
-        write_at(&store, ino, 0, b"ab", params()).unwrap();
+        write_at(&store, ino, 0, b"ab", &params()).unwrap();
         // 在 offset 20 写（跨过空洞），中间 [2,20) 应为零。
-        write_at(&store, ino, 20, b"Z", params()).unwrap();
+        write_at(&store, ino, 20, b"Z", &params()).unwrap();
         let got = read_all(&store, ino);
         assert_eq!(got.len(), 21);
         assert_eq!(&got[0..2], b"ab");
@@ -327,8 +345,8 @@ mod tests {
     fn truncate_缩小到块中间() {
         let store = MemStore::new(8);
         let ino = store.new_file();
-        write_at(&store, ino, 0, b"0123456789ABCDEF", params()).unwrap(); // 16 字节 / 2 块
-        truncate(&store, ino, 5, params()).unwrap();
+        write_at(&store, ino, 0, b"0123456789ABCDEF", &params()).unwrap(); // 16 字节 / 2 块
+        truncate(&store, ino, 5, &params()).unwrap();
         assert_eq!(read_all(&store, ino), b"01234");
         assert_eq!(store.block_geometry(ino).unwrap().0, 5);
     }
@@ -337,8 +355,8 @@ mod tests {
     fn truncate_扩展产生空洞() {
         let store = MemStore::new(8);
         let ino = store.new_file();
-        write_at(&store, ino, 0, b"abc", params()).unwrap();
-        truncate(&store, ino, 10, params()).unwrap();
+        write_at(&store, ino, 0, b"abc", &params()).unwrap();
+        truncate(&store, ino, 10, &params()).unwrap();
         let got = read_all(&store, ino);
         assert_eq!(got.len(), 10);
         assert_eq!(&got[0..3], b"abc");
@@ -349,9 +367,9 @@ mod tests {
     fn 整块覆盖跳过读仍正确() {
         let store = MemStore::new(4);
         let ino = store.new_file();
-        write_at(&store, ino, 0, b"WXYZ", params()).unwrap();
+        write_at(&store, ino, 0, b"WXYZ", &params()).unwrap();
         // 整块覆盖块0。
-        write_at(&store, ino, 0, b"1234", params()).unwrap();
+        write_at(&store, ino, 0, b"1234", &params()).unwrap();
         assert_eq!(read_all(&store, ino), b"1234");
     }
 
@@ -361,7 +379,7 @@ mod tests {
         let ino = store.new_file();
         // 在远超上限的 offset 写，应拒绝（防写放大 / OOM），而非物化海量零块。
         let huge_offset = MAX_SPARSE_EXTENSION + 1;
-        let err = write_at(&store, ino, huge_offset, b"x", params()).unwrap_err();
+        let err = write_at(&store, ino, huge_offset, b"x", &params()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
@@ -369,7 +387,7 @@ mod tests {
     fn 写偏移溢出被拒() {
         let store = MemStore::new(64);
         let ino = store.new_file();
-        let err = write_at(&store, ino, u64::MAX, b"xx", params()).unwrap_err();
+        let err = write_at(&store, ino, u64::MAX, b"xx", &params()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

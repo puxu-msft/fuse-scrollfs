@@ -19,6 +19,7 @@ fn params() -> CodecParams {
     CodecParams {
         algo: Algo::Zstd,
         level: 3,
+        dict: None,
     }
 }
 
@@ -53,7 +54,7 @@ fn shadow_append_只增量增长不重写全文() {
 
     // 写一个「大」文件（200KiB 不可压缩）。
     let big = incompressible(200 * 1024, 0xABCD);
-    rmw::write_at(&store, ino, 0, &big, params()).unwrap();
+    rmw::write_at(&store, ino, 0, &big, &params()).unwrap();
     store.fsync(ino).unwrap();
 
     let archive_path = dir.path().join("big.dat");
@@ -61,7 +62,7 @@ fn shadow_append_只增量增长不重写全文() {
 
     // append 一小段（100 字节）。
     let tail = incompressible(100, 0x1234);
-    rmw::write_at(&store, ino, big.len() as u64, &tail, params()).unwrap();
+    rmw::write_at(&store, ino, big.len() as u64, &tail, &params()).unwrap();
     store.fsync(ino).unwrap();
     let size_after = fs::metadata(&archive_path).unwrap().len();
 
@@ -84,12 +85,12 @@ fn container_append_只增量增长() {
     let ino = store.create(ROOT_INO, "big.dat", new_attr()).unwrap();
 
     let big = incompressible(200 * 1024, 0xABCD);
-    rmw::write_at(&store, ino, 0, &big, params()).unwrap();
+    rmw::write_at(&store, ino, 0, &big, &params()).unwrap();
     store.fsync(ino).unwrap();
     let size_before = fs::metadata(&path).unwrap().len();
 
     let tail = incompressible(100, 0x1234);
-    rmw::write_at(&store, ino, big.len() as u64, &tail, params()).unwrap();
+    rmw::write_at(&store, ino, big.len() as u64, &tail, &params()).unwrap();
     store.fsync(ino).unwrap();
     let size_after = fs::metadata(&path).unwrap().len();
 
@@ -112,7 +113,7 @@ fn container_批量事务_读写后重开一致() {
     {
         let store = ContainerStore::open_with_chunk_size(&path, CHUNK_SIZE).unwrap();
         ino = store.create(ROOT_INO, "f", new_attr()).unwrap();
-        rmw::write_at(&store, ino, 0, &payload, params()).unwrap();
+        rmw::write_at(&store, ino, 0, &payload, &params()).unwrap();
         // fsync 前：read-through 挂起暂存应已可见。
         let (size, _) = store.block_geometry(ino).unwrap();
         assert_eq!(

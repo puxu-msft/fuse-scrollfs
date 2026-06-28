@@ -24,7 +24,7 @@ use fuser::{
 use log::warn;
 
 use crate::core::chunk::block_range;
-use crate::core::codec::{decompress, Algo};
+use crate::core::codec::{decompress_block, Algo, SharedDict};
 use crate::core::rmw::CodecParams;
 use crate::core::wsession::TailSessions;
 use crate::store::{Attr, Store};
@@ -44,20 +44,22 @@ pub struct ZipfsRw {
 
 impl ZipfsRw {
     pub fn new(store: Arc<dyn Store>, algo: Algo, level: i32, default_chunk_size: u32) -> Self {
-        Self::with_tail_buffer(store, algo, level, default_chunk_size, true)
+        Self::with_tail_buffer(store, algo, level, default_chunk_size, true, None)
     }
 
-    /// 同 `new`，但显式控制是否启用开放尾块缓冲（`--no-tail-buffer` → false 走旧路径）。
+    /// 同 `new`，但显式控制是否启用开放尾块缓冲（`--no-tail-buffer` → false 走旧路径），
+    /// 并可注入共享字典（`dict=Some` 时所有块走字典压缩/解压，T3 研究项）。
     pub fn with_tail_buffer(
         store: Arc<dyn Store>,
         algo: Algo,
         level: i32,
         default_chunk_size: u32,
         tail_buffer: bool,
+        dict: Option<Arc<SharedDict>>,
     ) -> Self {
         Self {
             store,
-            params: CodecParams { algo, level },
+            params: CodecParams { algo, level, dict },
             default_chunk_size,
             locks: Mutex::new(HashMap::new()),
             tails: TailSessions::new(tail_buffer),
@@ -182,8 +184,13 @@ impl ZipfsRw {
                     continue;
                 }
             };
-            let plain = decompress(&stored.bytes, self.params.algo, stored.stored_verbatim)
-                .map_err(|e| io_to_errno(&e))?;
+            let plain = decompress_block(
+                &stored.bytes,
+                self.params.algo,
+                stored.stored_verbatim,
+                self.params.dict.as_deref(),
+            )
+            .map_err(|e| io_to_errno(&e))?;
             let in_block_start = (copy_start - block_start) as usize;
             let in_block_end = ((copy_end - block_start) as usize).min(plain.len());
             if in_block_start < in_block_end {
@@ -276,7 +283,7 @@ impl Filesystem for ZipfsRw {
         let _guard = lock.lock().unwrap();
         match self
             .tails
-            .write_at(self.store.as_ref(), ino.0, offset, data, self.params)
+            .write_at(self.store.as_ref(), ino.0, offset, data, &self.params)
         {
             Ok(n) => reply.written(n as u32),
             Err(e) => reply.error(io_to_errno(&e)),
@@ -409,7 +416,7 @@ impl Filesystem for ZipfsRw {
         if let Some(src) = self.store.lookup(parent.0, name).map(|a| a.ino) {
             let lock = self.lock_for(src);
             let _guard = lock.lock().unwrap();
-            if let Err(e) = self.tails.seal(self.store.as_ref(), src, self.params) {
+            if let Err(e) = self.tails.seal(self.store.as_ref(), src, &self.params) {
                 // 非致命（rename 仍可进行，源内容由底层路径承载），但不静默吞——记日志。
                 warn!("rename：封源 ino={src} 尾块失败：{e}");
             }
@@ -454,7 +461,7 @@ impl Filesystem for ZipfsRw {
             let _guard = lock.lock().unwrap();
             if let Err(e) = self
                 .tails
-                .truncate(self.store.as_ref(), ino.0, new_size, self.params)
+                .truncate(self.store.as_ref(), ino.0, new_size, &self.params)
             {
                 reply.error(io_to_errno(&e));
                 return;
@@ -493,7 +500,7 @@ impl Filesystem for ZipfsRw {
         // 持 inode 写锁再封块 + 提交，避免与并发 write/truncate 的 RMW 序列交错（rust-review C1）。
         let lock = self.lock_for(ino.0);
         let _guard = lock.lock().unwrap();
-        if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, self.params) {
+        if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
             reply.error(io_to_errno(&e));
             return;
         }
@@ -515,7 +522,7 @@ impl Filesystem for ZipfsRw {
         // 再让 Store 持久化，符合 POSIX fsync 契约（§10），且不能与同 inode 的 RMW 交错。
         let lock = self.lock_for(ino.0);
         let _guard = lock.lock().unwrap();
-        if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, self.params) {
+        if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
             reply.error(io_to_errno(&e));
             return;
         }
@@ -541,7 +548,7 @@ impl Filesystem for ZipfsRw {
         {
             let lock = self.lock_for(ino.0);
             let _guard = lock.lock().unwrap();
-            if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, self.params) {
+            if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
                 warn!("release：封 ino={} 尾块失败：{e}", ino.0);
             }
             if let Err(e) = self.store.flush(ino.0) {

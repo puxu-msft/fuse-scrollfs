@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fuser::MountOption;
 use log::info;
 
-use zipfs::core::codec::Algo;
+use zipfs::core::codec::{train_dict, Algo, SharedDict};
 use zipfs::core::{DEFAULT_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL};
 use zipfs::passthrough::PassthroughFs;
 use zipfs::rwfs::ZipfsRw;
@@ -59,6 +59,12 @@ enum Command {
     /// 用法：`zipfs compact --backend container --backing <redb 文件>`。
     /// 须在容器**未被挂载**时执行（独占打开）。
     Compact(CompactArgs),
+
+    /// 从语料目录训练共享 zstd 字典（T3 研究项），产出字典文件供 `--dict` 挂载使用。
+    ///
+    /// 用法：`zipfs train-dict --input <语料目录> --output <字典文件> [--max-dict 524288] [--chunk-size 65536]`。
+    /// 把语料文件按 `--chunk-size` 切块作训练样本（对齐块独立压缩的粒度），训练上限 `--max-dict`。
+    TrainDict(TrainDictArgs),
 }
 
 /// 挂载所需参数（无子命令时生效）。所有字段 `Option`，便于在 `compact` 子命令下不强制提供。
@@ -84,6 +90,12 @@ struct MountArgs {
     /// 实测：大块/字典叠加等级 19 可把 ~/.claude/projects 压缩比从 6x 推向 16–19x（docs 优化分析）。
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     level: i32,
+
+    /// 共享 zstd 字典文件路径（`zipfs train-dict` 产出）。给定则所有块走字典压缩/解压：
+    /// 在保持小块（append/RMW 友好、免 redb 膨胀）的同时把 boilerplate 长程冗余补回（T3 研究项）。
+    /// **注意**：解压每块都需同一字典——字典文件须与挂载共存、不可丢失（首版由用户保管，未入容器）。
+    #[arg(long)]
+    dict: Option<PathBuf>,
 
     /// 进程退出时自动卸载（AutoUnmount）。
     #[arg(long, default_value_t = false)]
@@ -118,8 +130,130 @@ fn main() -> std::io::Result<()> {
 
     match cli.command {
         Some(Command::Compact(args)) => run_compact(args),
+        Some(Command::TrainDict(args)) => run_train_dict(args),
         None => run_mount(cli.mount),
     }
+}
+
+/// `train-dict` 子命令参数。
+#[derive(clap::Args, Debug)]
+struct TrainDictArgs {
+    /// 语料目录：递归读取其中文件作训练样本（如 `~/.claude/projects` 副本）。
+    #[arg(long)]
+    input: PathBuf,
+
+    /// 输出字典文件路径。
+    #[arg(long)]
+    output: PathBuf,
+
+    /// 字典大小上限（字节），默认 512KiB（实测 512K 优于 110K）。
+    #[arg(long, default_value_t = 512 * 1024)]
+    max_dict: usize,
+
+    /// 把语料文件按此块大小切块作样本（对齐块独立压缩粒度），默认 64KiB。
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE as u32)]
+    chunk_size: u32,
+
+    /// 读取语料的总字节上限（防 OOM / 控时），默认 512MiB。超过即停止采样。
+    #[arg(long, default_value_t = 512 * 1024 * 1024)]
+    max_sample_bytes: u64,
+}
+
+/// 从语料目录训练共享字典并写出。递归读文件 → 按 chunk_size 切样本 → `train_dict` → 落盘。
+fn run_train_dict(args: TrainDictArgs) -> std::io::Result<()> {
+    if !args.input.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("语料目录不存在或非目录：{}", args.input.display()),
+        ));
+    }
+    let chunk = args.chunk_size.max(1) as usize;
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    let mut total: u64 = 0;
+    collect_samples(
+        &args.input,
+        chunk,
+        args.max_sample_bytes,
+        &mut total,
+        &mut samples,
+    )?;
+    if samples.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("语料目录无可读样本：{}", args.input.display()),
+        ));
+    }
+    info!(
+        "训练字典：样本 {} 块（共 {} MiB），上限 {} KiB",
+        samples.len(),
+        total / (1024 * 1024),
+        args.max_dict / 1024
+    );
+    let dict = train_dict(&samples, args.max_dict)?;
+    std::fs::write(&args.output, &dict)?;
+    println!(
+        "train-dict: wrote {} bytes dictionary to {} (from {} samples / {} MiB corpus)",
+        dict.len(),
+        args.output.display(),
+        samples.len(),
+        total / (1024 * 1024)
+    );
+    Ok(())
+}
+
+/// 递归采样：把目录下文件按 `chunk` 切块塞进 `samples`，受 `cap` 总字节上限约束。
+fn collect_samples(
+    dir: &std::path::Path,
+    chunk: usize,
+    cap: u64,
+    total: &mut u64,
+    samples: &mut Vec<Vec<u8>>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if *total >= cap {
+            return Ok(());
+        }
+        if path.is_dir() {
+            collect_samples(&path, chunk, cap, total, samples)?;
+        } else if path.is_file() {
+            let bytes = std::fs::read(&path)?;
+            for piece in bytes.chunks(chunk) {
+                if *total >= cap {
+                    break;
+                }
+                *total += piece.len() as u64;
+                samples.push(piece.to_vec());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 加载 `--dict` 字典文件并用挂载等级预消化为 `SharedDict`。无路径返回 None（不启用字典）。
+fn load_dict(
+    path: Option<&std::path::Path>,
+    level: i32,
+) -> std::io::Result<Option<Arc<SharedDict>>> {
+    let Some(p) = path else {
+        return Ok(None);
+    };
+    let raw = std::fs::read(p).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("无法读取字典文件 {}：{e}", p.display()))
+    })?;
+    let dict = SharedDict::new(raw, level).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("字典文件为空：{}", p.display()),
+        )
+    })?;
+    info!(
+        "已加载共享字典：{}（{} 字节）",
+        p.display(),
+        dict.raw().len()
+    );
+    Ok(Some(dict))
 }
 
 /// 离线 compact：打开 container 容器、调 redb `compact()`、报告前后大小。
@@ -212,6 +346,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
     );
 
     let tail_buffer = !args.no_tail_buffer;
+    // 加载共享字典（若 --dict 给定）：读原始字节 → 用挂载等级预消化 CDict/DDict。
+    let dict = load_dict(args.dict.as_deref(), args.level)?;
     match backend {
         Backend::Passthrough => {
             let backing = canonicalize_dir(&backing)?;
@@ -228,6 +364,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 args.level,
                 args.chunk_size,
                 tail_buffer,
+                dict,
             );
             fuser::mount2(fs, &mountpoint, &cfg)
         }
@@ -242,6 +379,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 args.level,
                 args.chunk_size,
                 tail_buffer,
+                dict,
             );
             fuser::mount2(fs, &mountpoint, &cfg)
         }

@@ -119,7 +119,7 @@ impl TailSessions {
         ino: u64,
         offset: u64,
         data: &[u8],
-        params: CodecParams,
+        params: &CodecParams,
     ) -> io::Result<usize> {
         if !self.enabled {
             return rmw::write_at(store, ino, offset, data, params);
@@ -157,7 +157,7 @@ impl TailSessions {
         data: &[u8],
         chunk_size: u32,
         cur_size: u64,
-        params: CodecParams,
+        params: &CodecParams,
     ) -> io::Result<usize> {
         // 确保缓冲里有「当前尾块」。无缓冲时从 Store 装入未满尾块（或在块边界时建空尾块）。
         self.ensure_tail_loaded(store, ino, chunk_size, cur_size, params)?;
@@ -203,7 +203,7 @@ impl TailSessions {
         ino: u64,
         chunk_size: u32,
         cur_size: u64,
-        params: CodecParams,
+        params: &CodecParams,
     ) -> io::Result<()> {
         if self.tails.lock().unwrap().contains_key(&ino) {
             return Ok(());
@@ -255,7 +255,7 @@ impl TailSessions {
     /// **再**从缓冲移除。期间尾块同时在缓冲与 Store（字节一致，读者优先读缓冲，安全）；绝不出现
     /// 「缓冲已删、Store 未写」的空窗——否则并发读会把有数据的块零填充。调用方持该 inode 写锁，
     /// 故 seal 之间不会相互交错；唯一并发方是无锁读者（`read_tail_block`/`geometry`）。
-    pub fn seal(&self, store: &dyn Store, ino: u64, params: CodecParams) -> io::Result<()> {
+    pub fn seal(&self, store: &dyn Store, ino: u64, params: &CodecParams) -> io::Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -286,7 +286,7 @@ impl TailSessions {
         store: &dyn Store,
         ino: u64,
         new_size: u64,
-        params: CodecParams,
+        params: &CodecParams,
     ) -> io::Result<()> {
         if !self.enabled {
             return rmw::truncate(store, ino, new_size, params);
@@ -301,7 +301,7 @@ impl TailSessions {
         &self,
         store: &dyn Store,
         ino: u64,
-        params: CodecParams,
+        params: &CodecParams,
     ) -> io::Result<()> {
         let Some((size, chunk_size)) = store.block_geometry(ino) else {
             return Ok(());
@@ -346,6 +346,7 @@ mod tests {
         CodecParams {
             algo: Algo::Zstd,
             level: 3,
+            dict: None,
         }
     }
 
@@ -391,7 +392,7 @@ mod tests {
         for i in 0..100u32 {
             let line = format!("L{i:03}"); // 恰 4 字节
             let off = ws.geometry(&store, ino).unwrap().0;
-            ws.write_at(&store, ino, off, line.as_bytes(), params())
+            ws.write_at(&store, ino, off, line.as_bytes(), &params())
                 .unwrap();
             expected.extend_from_slice(line.as_bytes());
         }
@@ -414,14 +415,14 @@ mod tests {
         let store = MemStore::new(16);
         let ino = store.new_file();
         let ws = TailSessions::new(true);
-        ws.write_at(&store, ino, 0, b"hello", params()).unwrap();
+        ws.write_at(&store, ino, 0, b"hello", &params()).unwrap();
         // 未 seal 前 Store 无此块（在缓冲里）。
         assert!(
             store.get_block(ino, 0).unwrap().is_none(),
             "seal 前 Store 不应有尾块"
         );
         // fsync 模拟：seal 落盘。
-        ws.seal(&store, ino, params()).unwrap();
+        ws.seal(&store, ino, &params()).unwrap();
         assert_eq!(read_sealed(&store, ino, 0).as_deref(), Some(&b"hello"[..]));
         assert_eq!(store.block_geometry(ino).unwrap().0, 5, "size 落 Store");
     }
@@ -432,9 +433,9 @@ mod tests {
         let ino = store.new_file();
         let ws = TailSessions::new(true);
         // 先写满块0（封块落 Store），再 append 进块1（缓冲）。
-        ws.write_at(&store, ino, 0, b"AAAAAAAA", params()).unwrap(); // 块0满→封
-        ws.write_at(&store, ino, 8, b"BB", params()).unwrap(); // 块1缓冲
-                                                               // 读块1必须读到缓冲里的 "BB"，而不是 Store（Store 此时无块1）。
+        ws.write_at(&store, ino, 0, b"AAAAAAAA", &params()).unwrap(); // 块0满→封
+        ws.write_at(&store, ino, 8, b"BB", &params()).unwrap(); // 块1缓冲
+                                                                // 读块1必须读到缓冲里的 "BB"，而不是 Store（Store 此时无块1）。
         assert_eq!(ws.read_tail_block(ino, 1).as_deref(), Some(&b"BB"[..]));
         assert!(
             store.get_block(ino, 1).unwrap().is_none(),
@@ -448,13 +449,13 @@ mod tests {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let ws = TailSessions::new(true);
-        ws.write_at(&store, ino, 0, b"abcdefghij", params())
+        ws.write_at(&store, ino, 0, b"abcdefghij", &params())
             .unwrap(); // 10 字节, 块0满+块1("ij")
                        // 随机改写块0中部 [2,5)（非尾块写 → 先 seal 尾块再 RMW）。
-        ws.write_at(&store, ino, 2, b"XYZ", params()).unwrap();
+        ws.write_at(&store, ino, 2, b"XYZ", &params()).unwrap();
         // 再继续 append。
         let off = ws.geometry(&store, ino).unwrap().0;
-        ws.write_at(&store, ino, off, b"KL", params()).unwrap();
+        ws.write_at(&store, ino, off, b"KL", &params()).unwrap();
         assert_eq!(read_all(&ws, &store, ino), b"abXYZfghijKL");
     }
 
@@ -463,9 +464,9 @@ mod tests {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let ws = TailSessions::new(true);
-        ws.write_at(&store, ino, 0, b"ab", params()).unwrap();
+        ws.write_at(&store, ino, 0, b"ab", &params()).unwrap();
         // 越过空洞在 offset 20 写（非 append → seal + RMW 零填充）。
-        ws.write_at(&store, ino, 20, b"Z", params()).unwrap();
+        ws.write_at(&store, ino, 20, b"Z", &params()).unwrap();
         let got = read_all(&ws, &store, ino);
         assert_eq!(got.len(), 21);
         assert_eq!(&got[0..2], b"ab");
@@ -478,13 +479,13 @@ mod tests {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let ws = TailSessions::new(true);
-        ws.write_at(&store, ino, 0, b"0123456789AB", params())
+        ws.write_at(&store, ino, 0, b"0123456789AB", &params())
             .unwrap(); // 12 字节
-        ws.truncate(&store, ino, 5, params()).unwrap();
+        ws.truncate(&store, ino, 5, &params()).unwrap();
         assert_eq!(read_all(&ws, &store, ino), b"01234");
         // 截断后继续 append。
         let off = ws.geometry(&store, ino).unwrap().0;
-        ws.write_at(&store, ino, off, b"xyz", params()).unwrap();
+        ws.write_at(&store, ino, off, b"xyz", &params()).unwrap();
         assert_eq!(read_all(&ws, &store, ino), b"01234xyz");
     }
 
@@ -493,8 +494,8 @@ mod tests {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let ws = TailSessions::new(false);
-        ws.write_at(&store, ino, 0, b"hello", params()).unwrap();
-        ws.write_at(&store, ino, 5, b"world", params()).unwrap();
+        ws.write_at(&store, ino, 0, b"hello", &params()).unwrap();
+        ws.write_at(&store, ino, 5, b"world", &params()).unwrap();
         // 关闭时每次 append 直接落 Store（无缓冲），读 Store 即可。
         assert_eq!(
             read_sealed(&store, ino, 0).as_deref(),
@@ -508,7 +509,7 @@ mod tests {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let ws = TailSessions::new(true);
-        ws.write_at(&store, ino, 0, b"abc", params()).unwrap();
+        ws.write_at(&store, ino, 0, b"abc", &params()).unwrap();
         ws.forget(ino);
         // forget 后缓冲应空；Store 也无块（从未 seal）。
         assert!(ws.read_tail_block(ino, 0).is_none());

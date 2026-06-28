@@ -19,6 +19,7 @@ fn params() -> CodecParams {
     CodecParams {
         algo: Algo::Zstd,
         level: 3,
+        dict: None,
     }
 }
 
@@ -65,16 +66,16 @@ fn run_append_workload(ws: &TailSessions, store: &dyn Store, ino: u64, lines: us
         let mut line = format!("line {i:06} ").into_bytes();
         line.resize(512, b'.');
         let off = ws.geometry(store, ino).unwrap().0;
-        ws.write_at(store, ino, off, &line, params()).unwrap();
+        ws.write_at(store, ino, off, &line, &params()).unwrap();
         expected.extend_from_slice(&line);
         // 每 50 行 fsync 一次（周期持久化 = 封尾块 + Store 提交）。
         if i % 50 == 49 {
-            ws.seal(store, ino, params()).unwrap();
+            ws.seal(store, ino, &params()).unwrap();
             store.fsync(ino).unwrap();
         }
     }
     // 收尾 fsync。
-    ws.seal(store, ino, params()).unwrap();
+    ws.seal(store, ino, &params()).unwrap();
     store.fsync(ino).unwrap();
     expected
 }
@@ -140,7 +141,7 @@ fn 关闭尾块缓冲_每次_append_直接落_store_仍正确() {
         let mut line = format!("row {i}\n").into_bytes();
         line.resize(100, b'x');
         let off = ws.geometry(&store, ino).unwrap().0;
-        ws.write_at(&store, ino, off, &line, params()).unwrap();
+        ws.write_at(&store, ino, off, &line, &params()).unwrap();
         expected.extend_from_slice(&line);
     }
     store.fsync(ino).unwrap();
@@ -201,10 +202,10 @@ fn 并发_读与_seal_无_torn_read() {
         let _g = lock.lock().unwrap();
         let line = vec![line_byte(i); line_len];
         let off = ws.geometry(store.as_ref(), ino).unwrap().0;
-        ws.write_at(store.as_ref(), ino, off, &line, params())
+        ws.write_at(store.as_ref(), ino, off, &line, &params())
             .unwrap();
         if i % 20 == 19 {
-            ws.seal(store.as_ref(), ino, params()).unwrap();
+            ws.seal(store.as_ref(), ino, &params()).unwrap();
             store.fsync(ino).unwrap();
         }
     }
@@ -213,7 +214,7 @@ fn 并发_读与_seal_无_torn_read() {
 
     // 收尾一致性。
     let _g = lock.lock().unwrap();
-    ws.seal(store.as_ref(), ino, params()).unwrap();
+    ws.seal(store.as_ref(), ino, &params()).unwrap();
     store.fsync(ino).unwrap();
     let final_len = read_whole(&ws, store.as_ref(), ino).len();
     assert_eq!(final_len, lines * line_len, "末态长度正确");
@@ -253,14 +254,14 @@ fn shadow_append_run(
     for i in 0..lines {
         let line = semi_line(i, line_size);
         let off = ws.geometry(&store, ino).unwrap().0;
-        ws.write_at(&store, ino, off, &line, params()).unwrap();
+        ws.write_at(&store, ino, off, &line, &params()).unwrap();
         logical += line.len() as u64;
         if fsync_every > 0 && i % fsync_every == fsync_every - 1 {
-            ws.seal(&store, ino, params()).unwrap();
+            ws.seal(&store, ino, &params()).unwrap();
             store.fsync(ino).unwrap();
         }
     }
-    ws.seal(&store, ino, params()).unwrap();
+    ws.seal(&store, ino, &params()).unwrap();
     store.fsync(ino).unwrap();
     let path = dir.path().join("t.jsonl");
     let phys = std::fs::metadata(&path).unwrap().len();
@@ -317,14 +318,14 @@ fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
         for i in 0..800usize {
             let line = semi_line(i, 300);
             let off = ws.geometry(&store, ino).unwrap().0;
-            ws.write_at(&store, ino, off, &line, params()).unwrap();
+            ws.write_at(&store, ino, off, &line, &params()).unwrap();
             expected.extend_from_slice(&line);
             if i % 3 == 2 {
-                ws.seal(&store, ino, params()).unwrap();
+                ws.seal(&store, ino, &params()).unwrap();
                 store.fsync(ino).unwrap();
             }
         }
-        ws.seal(&store, ino, params()).unwrap();
+        ws.seal(&store, ino, &params()).unwrap();
         store.fsync(ino).unwrap();
     }
 
@@ -352,14 +353,14 @@ fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
         for i in 800..1200usize {
             let line = semi_line(i, 300);
             let off = ws.geometry(&store, ino).unwrap().0;
-            ws.write_at(&store, ino, off, &line, params()).unwrap();
+            ws.write_at(&store, ino, off, &line, &params()).unwrap();
             expected.extend_from_slice(&line);
             if i % 7 == 6 {
-                ws.seal(&store, ino, params()).unwrap();
+                ws.seal(&store, ino, &params()).unwrap();
                 store.fsync(ino).unwrap();
             }
         }
-        ws.seal(&store, ino, params()).unwrap();
+        ws.seal(&store, ino, &params()).unwrap();
         store.fsync(ino).unwrap();
         // 经会话读协调读回整文件（尾块走缓冲，其余走 store）。
         assert_eq!(
