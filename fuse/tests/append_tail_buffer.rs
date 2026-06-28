@@ -270,31 +270,18 @@ fn shadow_append_run(
 }
 
 #[test]
-fn shadow_频繁_fsync_不碎片化_物理体积与块数对齐稀疏_fsync() {
-    // 同一负载（5000 行 × 1KB / 64KiB 块），分别在 fsync/5（频繁）与 fsync/100（稀疏）下跑。
-    // 修复前：fsync/5 把渐增尾块逐版本追加成永久空洞，物理膨胀 ~15x、压缩比从 ~76x 崩到 ~5x。
-    // 修复后：尾块重写复用 slot，最终块只剩满块版本 → 两种频率物理体积/块数应几乎一致。
+fn shadow_频繁_fsync_块数一致_append_only() {
+    // §8.3 崩溃安全（append-only + 双 superblock）取代了旧 reuse-tail-slot：每次 fsync 把渐增尾块
+    // append 到 EOF（旧版本成空洞，由压实回收）。故**频繁 fsync 现在会让物理体积增长**——这是
+    // 已知 trade-off（用临时写放大换 durability），§8.4 的 in-archive 尾日志会根治写放大。
+    // 本测验证 append-only 下仍成立的不变量：**块数与 fsync 频率无关（只取决于逻辑数据量）**。
     let lines = 5000usize;
-    let (phys_freq, blocks_freq, logical) = shadow_append_run(lines, 1024, 65536, 5);
-    let (phys_sparse, blocks_sparse, _) = shadow_append_run(lines, 1024, 65536, 100);
+    let (_phys_freq, blocks_freq, _logical) = shadow_append_run(lines, 1024, 65536, 5);
+    let (_phys_sparse, blocks_sparse, _) = shadow_append_run(lines, 1024, 65536, 100);
 
-    // 块数应一致（同样的逻辑数据 → 同样的满块数 + 1 尾块）。
     assert_eq!(
         blocks_freq, blocks_sparse,
         "频繁/稀疏 fsync 最终块数应一致：freq={blocks_freq} sparse={blocks_sparse}"
-    );
-    // 物理体积应接近（容许 5% 误差：不同 fsync 边界处尾块压缩态略有差异）。
-    let ratio = phys_freq as f64 / phys_sparse as f64;
-    assert!(
-        ratio < 1.05,
-        "频繁 fsync 物理体积不应明显大于稀疏：freq={phys_freq} sparse={phys_sparse} ratio={ratio:.3}"
-    );
-    // 压缩比也应接近（直接由物理体积推出，作为可读断言）。
-    let cr_freq = logical as f64 / phys_freq as f64;
-    let cr_sparse = logical as f64 / phys_sparse as f64;
-    assert!(
-        cr_freq > cr_sparse * 0.95,
-        "频繁 fsync 压缩比不应被拖垮：freq={cr_freq:.1}x sparse={cr_sparse:.1}x"
     );
 }
 
