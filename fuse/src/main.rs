@@ -16,7 +16,7 @@ use fuser::MountOption;
 use log::info;
 
 use zipfs::core::codec::Algo;
-use zipfs::core::DEFAULT_CHUNK_SIZE;
+use zipfs::core::{DEFAULT_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL};
 use zipfs::passthrough::PassthroughFs;
 use zipfs::rwfs::ZipfsRw;
 use zipfs::store::container::ContainerStore;
@@ -79,6 +79,11 @@ struct MountArgs {
     /// 逻辑块大小（字节），默认 64KiB（§6.1 裁决：不默认 256KiB）。仅 shadow/container 生效。
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE as u32)]
     chunk_size: u32,
+
+    /// zstd 压缩等级，默认 3。可扫 1/3/9/19（btrfs 上限 15，zstd 库可到 22）。仅 shadow/container 生效。
+    /// 实测：大块/字典叠加等级 19 可把 ~/.claude/projects 压缩比从 6x 推向 16–19x（docs 优化分析）。
+    #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
+    level: i32,
 
     /// 进程退出时自动卸载（AutoUnmount）。
     #[arg(long, default_value_t = false)]
@@ -197,11 +202,12 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
     cfg.mount_options.extend(options);
 
     info!(
-        "挂载 zipfs：backend={:?} backing={} -> mountpoint={} chunk_size={} tail_buffer={}",
+        "挂载 zipfs：backend={:?} backing={} -> mountpoint={} chunk_size={} level={} tail_buffer={}",
         backend,
         backing.display(),
         mountpoint.display(),
         args.chunk_size,
+        args.level,
         !args.no_tail_buffer,
     );
 
@@ -216,7 +222,13 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             let backing = canonicalize_dir(&backing)?;
             let store: Arc<dyn Store> =
                 Arc::new(ShadowStore::open_with_chunk_size(backing, args.chunk_size)?);
-            let fs = ZipfsRw::with_tail_buffer(store, Algo::Zstd, 3, args.chunk_size, tail_buffer);
+            let fs = ZipfsRw::with_tail_buffer(
+                store,
+                Algo::Zstd,
+                args.level,
+                args.chunk_size,
+                tail_buffer,
+            );
             fuser::mount2(fs, &mountpoint, &cfg)
         }
         Backend::Container => {
@@ -224,7 +236,13 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 &backing,
                 args.chunk_size,
             )?);
-            let fs = ZipfsRw::with_tail_buffer(store, Algo::Zstd, 3, args.chunk_size, tail_buffer);
+            let fs = ZipfsRw::with_tail_buffer(
+                store,
+                Algo::Zstd,
+                args.level,
+                args.chunk_size,
+                tail_buffer,
+            );
             fuser::mount2(fs, &mountpoint, &cfg)
         }
     }

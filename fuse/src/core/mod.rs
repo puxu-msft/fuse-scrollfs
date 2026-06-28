@@ -15,3 +15,6 @@ pub mod wsession;
 
 /// 默认逻辑块大小（64KiB）。基准变量取 16 / 64 / 256 KiB，见 §3。
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+
+/// 默认 zstd 压缩等级（3）。`--level` 可覆盖；基准扫 1/3/9/19，见优化分析。
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
