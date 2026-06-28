@@ -26,6 +26,9 @@ docs/        设计与对照文档
 
 - [docs/00-overview.md](docs/00-overview.md) —— 对照实验总纲（条件 / 指标 / 数据集 / 场景适配框架）
 - [docs/01-zipfs-design.md](docs/01-zipfs-design.md) —— 实现设计；**§14 是实现与实测进展日志**
+- [docs/02-layered-chunking.md](docs/02-layered-chunking.md) —— 分层分块 / head 缓存 / 发现读快路径设计
+- [docs/03-target-data-scope.md](docs/03-target-data-scope.md) —— **目标数据范围**（首要 projects/jsonl+log、后续 file-history、排除 plugins/已压缩类）
+- [docs/ROADMAP.md](docs/ROADMAP.md) —— **未来方向路线图**（T0–T4 优先级 + 决策门，单一信息源）
 - [docs/environment-snapshot.md](docs/environment-snapshot.md) —— 实测环境
 
 ## 构建 / 测试
@@ -63,4 +66,4 @@ bash bench/scripts/measure-a-ratio.sh   # 补 btrfs(A) 压缩比（需 sudo comp
 
 ## 状态
 
-设计 + P0 透传 + 布局 S/V 读写 + append 优化 + 五条件基准均已完成、测试全绿。遗留 TODO 见设计文档 §14.4。
+设计 + P0 透传 + 布局 S/V 读写 + append 优化 + 五条件基准均已完成、测试全绿。遗留 TODO 与未来方向见 [docs/ROADMAP.md](docs/ROADMAP.md)。

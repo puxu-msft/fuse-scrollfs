@@ -1,5 +1,7 @@
 # zipfs 首轮真实基准对照（FIRST-RUN）
 
+> ⚠️ **已被取代（SUPERSEDED）**：本轮 BV/BS 数据是 **BS reader 缓存修复前** 的，其中 BS 随机读（1.4 MiB/s）是实现 bug 所致、非布局特性。权威对照见 [../20260628-1212/CONSOLIDATED.md](../20260628-1212/CONSOLIDATED.md)（修复后），修复点见 [FIXES-ADDENDUM.md](./FIXES-ADDENDUM.md)。**本文仅作历史记录，勿据其 BV/BS 数字下结论。**
+>
 > 本轮覆盖四个**无需 sudo** 的条件：**C0**（裸 ext4 目录）、**B0**（FUSE 透传）、**BV**（布局 V 容器 / redb）、**BS**（布局 S 影子树）。
 > 条件 **A**（btrfs + zstd，需 sudo + `modprobe btrfs`）本轮**跳过**，由用户另行测量。
 > 对齐 `docs/00-overview.md` §4（条件/指标/数据集）与 `docs/01-zipfs-design.md` §6.1（默认 64KiB 块）。

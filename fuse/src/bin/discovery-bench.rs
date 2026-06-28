@@ -16,8 +16,8 @@
 //! discovery-bench --input <大 jsonl> [--chunk-size B] [--level L] [--head-bytes B] [--iters K]
 //! ```
 
-use std::os::unix::io::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -28,7 +28,10 @@ use zipfs::core::codec::{compress, decompress, Algo};
 use zipfs::core::DEFAULT_CHUNK_SIZE;
 
 #[derive(Parser, Debug)]
-#[command(name = "discovery-bench", about = "会话发现读 micro-bench：head 缓存收益门控")]
+#[command(
+    name = "discovery-bench",
+    about = "会话发现读 micro-bench：head 缓存收益门控"
+)]
 struct Cli {
     /// 真实大 jsonl 文件（如旗舰 96MB transcript）。
     #[arg(long)]
@@ -85,7 +88,12 @@ fn evict_cache(path: &Path) {
         // SAFETY: fd 有效且在本作用域存活；offset=0,len=0 表示整文件；DONTNEED 仅丢弃干净页，
         // 不影响正确性（数据仍在盘上），只为制造冷缓存。
         unsafe {
-            libc::posix_fadvise(f.as_raw_fd(), 0, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
+            libc::posix_fadvise(
+                f.as_raw_fd(),
+                0,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
         }
     }
 }
@@ -238,7 +246,11 @@ fn main() -> std::io::Result<()> {
                 0.0
             }
         );
-        for n in cli.n_files.split(',').filter_map(|s| s.trim().parse::<usize>().ok()) {
+        for n in cli
+            .n_files
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+        {
             // 发现读首+尾各一次；尾对活跃文件廉价、对封存文件同块 0 成本，这里给「首尾都需解块」的上界。
             let cur = (m_open + m_blk0) * n as f64 / 1000.0;
             let with = (m_open + m_head) * n as f64 / 1000.0;

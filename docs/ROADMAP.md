@@ -1,0 +1,71 @@
+# zipfs 路线图 / Roadmap
+
+> 单一信息源：把散落在 [01-zipfs-design.md](./01-zipfs-design.md) §14.4、各 `bench/results/*/` 报告里的待办收敛于此。
+> 优先级 **T0→T4** 递减；状态 ☐ 未开始 / ◐ 进行中 / ☑ 完成。动机一律落到目标负载（`~/.claude/projects`：追加为主、高冗余、运行时活跃写）或已有实测依据。
+> 日期：2026-06-28。
+
+## T0 · 收尾评估（先让对照结论完整、可信）
+
+当前 CONSOLIDATED 的五条件对照有两个缺口 + 一个口径偏乐观，补齐才算定论。
+
+| 方向 | 为什么 | 工作量/风险 | 状态 |
+|---|---|---|---|
+| **A(btrfs) 压缩比** | 三判据补全 | 极小 | ☑ **2.44x**（`compress=zstd:3` 启发式；btrfs 跳过 212M 不压） |
+| **A 在 `compress-force` 下重测** | 目标负载是 append-only 可压缩 jsonl；btrfs 默认启发式漏压、非最佳。`setup-btrfs.sh` 已默认 `compress-force=zstd:3` | 小 | ☑ **压缩比 6.74x（force）= 第一**，已反转「zipfs 压缩比赢内核」结论；**A 速度列仍是启发式数据、待重测**（次要） |
+| **zipfs 在 1MiB 默认下重测压缩比 vs A 6.74x** | 上面 6.74x 反转是基于 zipfs 旧 64KiB（5.42x）；现默认已退役 64KiB→1MiB，ratio-bench 真实路径 Shadow 13.7x **应再反转回 zipfs 领先**。需在同 CONSOLIDATED 口径复测确认 | 极小（ratio-bench 已就绪） | ☐ **关键：可能再次反转 G1 依据** |
+| **B2（`fuse-zstd` 整文件）消融** | §9 矩阵的「分块 vs 整文件」参照项未跑，缺「分块价值」的外部实证 | 小（装并挂 fuse-zstd 跑一遍） | ☐ |
+| **冷缓存复跑** | 现全热缓存（无免密 sudo drop_caches），读数偏乐观，磁盘真实态未知 | 小（需 root drop_caches） | ☐ |
+| **多轮中位数** | 默认已降为 1 轮省测试量；权威定论需 `ROUNDS=3+` 复跑关键条件 | 小 | ☐ |
+
+**决策门 G1**：T0 补齐后，在 CONSOLIDATED 落「最终布局取向」（V / S / 两者并存按场景），作为后续投入依据。
+
+## T1 · 正确性与可靠性（活跃写负载的前提，丢会话日志不可接受）
+
+| 方向 | 为什么 | 工作量/风险 | 状态 |
+|---|---|---|---|
+| **archive per-block CRC** | 现靠 `set_len+sync` 构造性 fail-closed；每块 CRC 是更稳的根治，杜绝静默错读 | 中 | ☐ |
+| **S 崩溃恢复（双 footer / 扫回最近合法 footer）** | 设计 §10 已承认「完整恢复属后续」；mid-commit 崩溃现在 fail-closed 但不可恢复 | 中 | ☐ |
+| **掉电/崩溃测试 harness** | `kill -9` 守护于写中途，自动验证 fail-closed/恢复，把一致性边界变成可回归测试 | 中 | ☐ |
+| **daemon 健壮 + WSL `[boot]` 自挂载** | 目标负载是 Claude Code 运行时写入，守护必须随 WSL 起、崩溃可重挂 | 中 | ☐ |
+| **hardlink 决策** | 现 `ENOTSUP`（`cp -al`/git 会触发）；决定支持（需 inode-id 命名层）或正式不支持 | 中/低 | ☐ |
+
+## T2 · 性能（FUSE 用户态对内核的差距）
+
+| 方向 | 为什么 | 工作量/风险 | 状态 |
+|---|---|---|---|
+| **FUSE 写尾延迟优化** | CONSOLIDATED 指认：FUSE 三条写 p99 ms 级 vs btrfs 亚毫秒，是对内核**最大结构劣势**。方向：异步/批量 commit、writeback cache、FUSE passthrough/io_uring | 大/中 | ☐ |
+| **BV 写尾抖动定位** | rand-write-64k p99 抖到 28ms，疑 redb commit/MVCC；profile 定位（曾叫停，待需要时再做） | 中 | ☐（搁置） |
+| **读写锁粒度** | append 修复让 `read_range` 持 per-inode 写锁、读写串行；高并发读需改 RwLock/更细粒度 | 中 | ☐ |
+| **mmap（至少只读）** | 与 `direct_io` 互斥，需定写模型后回填；overview 列为 B 核查项 | 中 | ☐ |
+
+## T3 · 空间与压缩（本负载高冗余，空间是核心收益）
+
+| 方向 | 为什么 | 工作量/风险 | 状态 |
+|---|---|---|---|
+| **块大小退役 64KiB → 1MiB** | 两套独立基准（ratio-bench 真实路径 + algo-compare）裁定 64KiB 砍掉长程冗余 | 小 | ☑ **已落地**（`DEFAULT_CHUNK_SIZE=1MiB`，提交 18b2d25；Shadow 真实 5.43x→13.7x、Container 1.89x→8.84x） |
+| **冷文件封存 seal** | 会话写完即冷、读为归档；活跃块 1MiB 随机访问甜点，冷文件大块重压逼近整流 | 中 | ☑ **已落地**（`zipfs seal` + `src/seal.rs`，提交 bb04640；shadow 8MiB/zstd-19→~25-30x，读路径零改动）。container 封存 + 单块>8MiB 的 --long 留后续 |
+| **共享字典压缩** | 用 transcript 语料训练 zstd 字典补回 boilerplate 长程冗余 | 中（研究性） | ☑ **已实现 + 实测：收益次于大块**（提交 96e69a9/df47794；真实路径 64K+字典 10.24x 仍输纯 256K 11.2x；先前 CLI「16x」是单文件过拟合）。保留 opt-in `--dict`/`train-dict`，默认关 |
+| **head 缓存（archive v2，发现读）** | 头尾 64KB 发现读现解压整个 1MiB（16x 放大）；源码实证访问面（[[claude-code-session-io-access-pattern]]） | 中偏高 | ◐ **已设计 + 过 bench 门**（[02-layered-chunking.md](./02-layered-chunking.md)；discovery-bench 测 HOT 砍 82%/COLD 砍 42%）→ **TDD 实现待做**（§7 步骤 1-3：footer v2 → 写 head 缓存 → read_range 快路径） |
+| **algo/chunk 自适应** | 按文件类型/可压缩性选等级/lz4；不可压缩媒体走 verbatim | 中 | ◐ 块大小已据实测定 1MiB + `--level` 可配；lz4 codec 仍 unimplemented、自动选择未做 |
+| **V 全局去重（内容寻址）** | 跨会话巨量重复；去重收益可叠加在压缩之上 | 大 | ☐（G3 门控；注意定长块去重实测 0% 命中，须 CDC） |
+| **BV compact 自动化** | 覆盖写产生 MVCC 膨胀，需卸载时/后台 GC 兜底 | 小/中 | ☐ |
+
+## T4 · 生产化 / 迁移（把它真正用起来）
+
+| 方向 | 为什么 | 工作量/风险 | 状态 |
+|---|---|---|---|
+| **迁移 `~/.claude/projects`（分层）** | 目标范围已分层界定（[03-target-data-scope.md](./03-target-data-scope.md)）：**Tier 1a** projects/*.jsonl(8GB)→**1b** append 日志→**Tier 2** file-history(524MB)；plugins/已压缩类排除。灌入、校验、切换工具，可逆零丢失，活跃会话实时追加压测 | 中 | ☐ |
+| **可观测性** | 守护健康、实时压缩比、append 吞吐的监控，便于长期运行排障 | 中 | ☐ |
+| **物理空间回收** | 压缩省的是逻辑量；WSL `ext4.vhdx` 物理回收需 `wsl --shutdown` + `Optimize-VHD`，需文档化/脚本化 | 小 | ☐ |
+
+## 决策门汇总
+
+- **G1（布局取向）**：T0 完成后定 V/S/并存。
+- **G2（自写数据区）**：仅当 redb 在真实规模下空间/性能不达标（microbench 已给 256KiB 红线），才评估自写 extent 数据区——默认不做。
+- **G3（去重投入）**：G1 选了 V（或并存含 V）后，再决定 T3 去重是否进主线。
+
+## Stretch / 研究
+
+- bcachefs / ZFS 透明压缩横向对照（内核态另一参照）。
+- 静态加密层叠加（compression-then-encryption 顺序与安全）。
+- `/mnt/c`（Windows 侧）用例——当前明确不在范围，未来若需另开。

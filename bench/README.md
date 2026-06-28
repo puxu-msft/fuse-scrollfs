@@ -45,7 +45,10 @@ bash bench/scripts/probe-env.sh
 | 文件 | 作用 | 是否改系统 |
 |---|---|---|
 | `scripts/probe-env.sh` | 探测内核/btrfs/fuse/fio/工具链/CPU/内存，输出报告 | 否（只读、幂等） |
-| `scripts/setup-btrfs.sh` | 建稀疏 loop image → `mkfs.btrfs` → `mount -o loop,compress=zstd:N` | 是（需 root） |
+| `scripts/setup-btrfs.sh` | 建稀疏 loop image → `mkfs.btrfs` → `mount -o loop,compress-force=zstd:N`（默认 `FORCE=1` 强制压；`FORCE=0` 退回 btrfs 默认启发式对照） | 是（需 root） |
+| `scripts/mount-bv.sh` / `mount-bs.sh` | 把 backing 挂成 BV(容器/redb) / BS(影子树) 读写挂载点 | 否（用户 FUSE，无需 root） |
+| `scripts/umount-bv.sh` / `umount-bs.sh` | 卸载 BV / BS | 否 |
+| `scripts/measure-a-ratio.sh` | 测 A(btrfs) 真实压缩比：写数据集进探针 → `sudo compsize` → 算比值 → 清理 | 部分（compsize 需 sudo） |
 | `scripts/mount-b0.sh` | 用 `fuse/` 透传二进制把 backing 目录挂成 B0 挂载点 | 否（普通用户 FUSE，无需 root） |
 | `scripts/umount-b0.sh` | 卸载 B0（`fusermount3 -u` + 收尾守护进程） | 否（无需 root） |
 | `scripts/teardown.sh` | 安全卸载 btrfs（A），可选删 image（重重设防，绝不通配符 rm） | 是（需 root） |
@@ -116,12 +119,15 @@ python3 bench/scripts/collect.py results/<那个时间戳目录>
 
 ### 5. 压缩比（条件 A）
 
-吞吐之外，压缩比单独量：
+吞吐之外，压缩比单独量。**A 用 `measure-a-ratio.sh`**（写数据集进探针 → `sudo compsize` → 算逻辑/物理比 → 清理探针）：
 
 ```bash
-compsize /mnt/zipfs-btrfs        # btrfs 真实物理 vs 逻辑
-# B 路线（B0 透传不压缩，用后端 backing 目录 du 对比逻辑大小即可）
+bash bench/scripts/measure-a-ratio.sh                       # compsize 那步要 sudo
+DATASET=~/.claude/projects bash bench/scripts/measure-a-ratio.sh   # 测完整目标负载
 ```
+
+> **必须用 `compress-force`**：目标负载是 append-only 可压缩 jsonl，btrfs 默认启发式 `compress` 会误判跳过大量可压数据（实测 676M 子集漏压 212M，仅 2.44x）；`compress-force=zstd:3` 下同一数据 **6.74x**。`setup-btrfs.sh` 已默认 force；若挂载是旧的启发式，先 `sudo mount -o remount,compress-force=zstd:3 /mnt/zipfs-btrfs` 再测。
+> BV/BS 压缩比：卸载后对 backing（`bench/.bv-backing` 容器文件 / `bench/.bs-backing` 影子树）`du` 对比逻辑大小；BV 的 redb 是稀疏文件，用 `du -sh`（实际磁盘块）而非 `du -sb`（apparent）。
 
 ### 6. 收尾
 
@@ -183,6 +189,14 @@ fuse/target/release/append-bench --chunk-size 4096 --line-size 512 # 小块场�
 ```
 
 **默认单次短跑**（约 1-5 分钟内完成两后端 × on/off 四次），输出 before/after 对照表。结果与分析见 [`results/append-opt/REPORT.md`](results/append-opt/REPORT.md)。`--no-tail-buffer`（挂载 CLI）或 bench 的 OFF 段走旧路径（每次 append 重压尾块）。
+
+## 常见坑 / Troubleshooting
+
+- **`teardown.sh` 报 `MNT 为空`**：teardown 要的是 **`MNT`（挂载点）**，不是 `IMG`，且 umount 需 root。正确：`sudo MNT=/mnt/zipfs-btrfs bash bench/scripts/teardown.sh`。删镜像再加 `IMG=...img DELETE_IMG=1`。
+- **`setup-btrfs.sh` 报 `已是挂载点`**：该挂载点已挂着 btrfs；要重建先 teardown 卸载。若只是想换压缩模式，**不必重建**——`sudo mount -o remount,compress-force=zstd:3 <挂载点>` 即可（对后续写入生效）。
+- **A 压缩比偏低（~2.44x）**：多半是 btrfs 用了**默认启发式** `compress`（漏压）。改 `compress-force`（`setup-btrfs.sh` 已默认；旧挂载用上面的 remount），同数据应到 ~6.74x。
+- **compsize 报 `SEARCH_V2: Operation not permitted`**：compsize 需 root，用 `sudo compsize ...`（`measure-a-ratio.sh` 已内置 sudo）。
+- **WSL 重启后 btrfs 挂不上**：`sudo modprobe btrfs`（每次 `wsl --shutdown` 后都要；脚本不擅自 modprobe）。
 
 ## 当前待办 / 风险
 

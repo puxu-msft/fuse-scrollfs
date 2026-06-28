@@ -16,7 +16,7 @@ Rust 无成熟读写透明压缩 FUSE 成品（见 overview §6），故**自研
 
 ### 1.1 目标工作负载（驱动设计，实测 2026-06-27）
 
-最终目标之一：用 zipfs 承载 **`~/.claude/projects`** 等 Claude 记录大目录（另含 `file-history` 523M、`plugins` 1.8G 等候选）。实测画像：
+最终目标之一：用 zipfs 承载 **`~/.claude/projects`** 的会话 transcript。**目标数据范围已正式分层界定**（见 [03-target-data-scope.md](./03-target-data-scope.md)）：**首要 = `projects/*.jsonl` + append 日志**（8 GB 的 append-only 可压缩核心）；**后续 = `file-history`**（524 MB）；**排除 = plugins（1.8 GB 可重装代码）与已压缩媒体（`.pack/.png/.pdf`）**。实测画像（针对首要目标）：
 
 | 维度 | 实测 | 对设计的影响 |
 |---|---|---|
@@ -285,6 +285,8 @@ fuse/src/
 - **早期对照与修复**：`bench/results/20260627-1641/{FIRST-RUN,FIXES-ADDENDUM}.md`。
 
 ### 14.4 遗留 TODO
+
+> **完整路线图（含优先级 T0–T4 与决策门）见 [ROADMAP.md](./ROADMAP.md)——单一信息源。** 下列为摘要。
 
 1. **A(btrfs) 压缩比待补**：compsize 需 root，本轮失败；用 `bench/scripts/measure-a-ratio.sh`（含 sudo）补齐。
 2. **B2（`fuse-zstd` 整文件对照）未跑**：§9 矩阵里的消融项尚缺。

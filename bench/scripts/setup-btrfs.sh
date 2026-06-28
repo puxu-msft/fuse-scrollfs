@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # setup-btrfs.sh — 参数化创建并挂载一个 btrfs loop image（路线 A 的载体）。
 #
-# 用稀疏镜像 + mkfs.btrfs + mount -o loop,compress=zstd:LEVEL。
+# 用稀疏镜像 + mkfs.btrfs + mount -o loop,compress-force=zstd:LEVEL。
 # 挂载与 mkfs 需要 root（loop 设备 / mount），脚本会显式要求。
+#
+# 为什么 compress-FORCE 而非 compress（针对本项目目标负载的最佳配置）:
+#   目标负载是 ~/.claude/projects 这类 append-only 可压缩 jsonl。btrfs 默认的
+#   `compress=zstd` 用采样启发式，会误判跳过大量本可压缩的数据——实测对 676M 子集
+#   漏压 212M、整体仅 2.44x。`compress-force` 强制压每个 extent，对此场景才是最佳，
+#   也才与 zipfs「逐块强制压缩」apples-to-apples（用 FORCE=0 可退回默认启发式对照）。
 #
 # 用法（环境变量参数化）:
 #   IMG=/path/to/btrfs.img SIZE=20G MNT=/mnt/zipfs-btrfs ZSTD_LEVEL=3 \
@@ -25,6 +31,7 @@ IMG="${IMG:-./bench/results/btrfs.img}"
 SIZE="${SIZE:-20G}"
 MNT="${MNT:-/mnt/zipfs-btrfs}"
 ZSTD_LEVEL="${ZSTD_LEVEL:-3}"
+FORCE="${FORCE:-1}"   # 1=compress-force（默认，本负载最佳）；0=compress（btrfs 默认启发式，仅作对照）
 
 log()  { printf '[setup-btrfs] %s\n' "$*"; }
 die()  { printf '[setup-btrfs] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -79,8 +86,15 @@ mkfs.btrfs -f "$IMG" >/dev/null
 log "创建挂载点: $MNT"
 mkdir -p "$MNT"
 
-log "挂载: $IMG -> $MNT  (loop, compress=zstd:$ZSTD_LEVEL)"
-mount -o loop,compress=zstd:"$ZSTD_LEVEL" "$IMG" "$MNT"
+if [ "$FORCE" = "1" ]; then
+  COMPRESS_OPT="compress-force=zstd:$ZSTD_LEVEL"
+else
+  COMPRESS_OPT="compress=zstd:$ZSTD_LEVEL"
+  log "注意: FORCE=0，用 btrfs 默认启发式 compress（会跳过判为不可压的 extent），仅作对照"
+fi
+
+log "挂载: $IMG -> $MNT  (loop, $COMPRESS_OPT)"
+mount -o loop,"$COMPRESS_OPT" "$IMG" "$MNT"
 
 # ── 确认结果 ───────────────────────────────────────────────────
 if mountpoint -q "$MNT"; then
