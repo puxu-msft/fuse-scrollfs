@@ -65,6 +65,13 @@ enum Command {
     /// 用法：`zipfs train-dict --input <语料目录> --output <字典文件> [--max-dict 524288] [--chunk-size 65536]`。
     /// 把语料文件按 `--chunk-size` 切块作训练样本（对齐块独立压缩的粒度），训练上限 `--max-dict`。
     TrainDict(TrainDictArgs),
+
+    /// 冷文件封存：把 shadow archive 树里的文件用更大块 + 高等级离线重编码（algo-compare 结论 #4）。
+    ///
+    /// 用法：`zipfs seal --backing <shadow 目录> [--seal-chunk 8388608] [--level 19]`。
+    /// 须在 backing **未挂载**时跑（每文件临时文件 + 原子 rename）。活跃块 1MiB 换冷归档大块，
+    /// 把比值从 ~16x 推向 ~25–30x。读路径无需改（按每文件 footer chunk_size 解块）。
+    Seal(SealArgs),
 }
 
 /// 挂载所需参数（无子命令时生效）。所有字段 `Option`，便于在 `compact` 子命令下不强制提供。
@@ -132,8 +139,64 @@ fn main() -> std::io::Result<()> {
     match cli.command {
         Some(Command::Compact(args)) => run_compact(args),
         Some(Command::TrainDict(args)) => run_train_dict(args),
+        Some(Command::Seal(args)) => run_seal(args),
         None => run_mount(cli.mount),
     }
+}
+
+/// `seal` 子命令参数。
+#[derive(clap::Args, Debug)]
+struct SealArgs {
+    /// 要封存的 shadow archive 树根目录（须未挂载）。
+    #[arg(long)]
+    backing: PathBuf,
+
+    /// 封存目标块大小（字节），默认 8MiB（落在 zstd-19 默认窗口内）。
+    #[arg(long, default_value_t = zipfs::seal::DEFAULT_SEAL_CHUNK)]
+    seal_chunk: u32,
+
+    /// 封存压缩等级，默认 19（冷数据一次性付 CPU 换高比值）。
+    #[arg(long, default_value_t = zipfs::seal::DEFAULT_SEAL_LEVEL)]
+    level: i32,
+}
+
+/// 离线封存 shadow 树：重编码冷文件为大块 + 高等级，报告前后大小。
+fn run_seal(args: SealArgs) -> std::io::Result<()> {
+    if !args.backing.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("seal backing 不是目录：{}", args.backing.display()),
+        ));
+    }
+    info!(
+        "封存 shadow 树：backing={} seal_chunk={}KiB level={}",
+        args.backing.display(),
+        args.seal_chunk / 1024,
+        args.level
+    );
+    let stats = zipfs::seal::seal_shadow_tree(&args.backing, args.seal_chunk, args.level)?;
+    for (path, err) in &stats.errors {
+        log::warn!("封存失败（跳过）：{} — {err}", path.display());
+    }
+    info!(
+        "封存完成：sealed={} skipped={} errors={} 物理 {} → {} 字节（{:.2}x）",
+        stats.sealed,
+        stats.skipped,
+        stats.errors.len(),
+        stats.bytes_before,
+        stats.bytes_after,
+        stats.ratio()
+    );
+    println!(
+        "seal: sealed={} skipped={} errors={} bytes {} -> {} ({:.2}x smaller on sealed files)",
+        stats.sealed,
+        stats.skipped,
+        stats.errors.len(),
+        stats.bytes_before,
+        stats.bytes_after,
+        stats.ratio()
+    );
+    Ok(())
 }
 
 /// `train-dict` 子命令参数。

@@ -9,4 +9,5 @@ pub mod core;
 pub mod fixture;
 pub mod passthrough;
 pub mod rwfs;
+pub mod seal;
 pub mod store;
