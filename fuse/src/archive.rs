@@ -330,11 +330,13 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 // ArchiveReader：open → 读 footer/index；read_block(idx) → 压缩字节 + flags
 // ===========================================================================
 
-/// 只读 archive：打开即解析尾部 footer 与索引，后续 `read_block` O(1) 定位。
+/// 只读 archive：打开即读双 superblock 选活跃 + 索引，后续 `read_block` O(1) 定位。
 pub struct ArchiveReader {
     file: File,
     footer: Footer,
     index: Vec<ChunkEntry>,
+    /// 未封尾块的尾日志区 `(offset, len)`（无则 None）。`read_tail` 重放它（docs/04 §8.4）。
+    tail_journal: Option<(u64, u64)>,
 }
 
 impl ArchiveReader {
@@ -362,11 +364,28 @@ impl ArchiveReader {
             return Err(corrupt(&format!("不支持的 archive 版本：{version}")));
         }
         let (sb, _active_off, index) = load_active(&file, total_len)?;
+        let tail_journal = if sb.tail_journal_len > 0 {
+            Some((sb.tail_journal_offset, sb.tail_journal_len))
+        } else {
+            None
+        };
         Ok(Self {
             file,
             footer: footer_from_sb(&sb),
             index,
+            tail_journal,
         })
+    }
+
+    /// 重放尾日志，返回未封尾块的**原始字节**（无未封尾则 None）。区间已在 `load_active` 校验 bounds，
+    /// 故可信。上层把它当作「块 chunk_count」的 verbatim 尾块（docs/04 §8.4）。
+    pub fn read_tail(&self) -> io::Result<Option<Vec<u8>>> {
+        let Some((off, len)) = self.tail_journal else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; len as usize];
+        read_exact_at(&self.file, &mut buf, off)?;
+        Ok(Some(replay_journal(&buf)))
     }
 
     /// footer 视图（含 uncompressed_size / chunk_size，供 getattr 复用）。
@@ -498,6 +517,16 @@ fn validate_and_load_index(
             None => return Ok(None),
         };
         if e.offset < DATA_START || end > data_end {
+            return Ok(None);
+        }
+    }
+    // 尾日志区 bounds（docs/04 §8.4）：在 [DATA_START, total_len] 内，使 read_tail 可信。
+    if sb.tail_journal_len > 0 {
+        let jend = match sb.tail_journal_offset.checked_add(sb.tail_journal_len) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if sb.tail_journal_offset < DATA_START || jend > total_len {
             return Ok(None);
         }
     }
@@ -705,6 +734,15 @@ pub struct ArchiveUpdater {
     active_seq: u64,
     /// 下次 commit 要写的（非活跃）superblock 槽偏移（A/B 交替）。
     inactive_off: u64,
+    /// 上次 full commit 落盘的 index 描述符 `(offset, len, crc)`。`commit_journal` 复用它（块集未变时
+    /// index 稳定），使尾日志记录保持连续。`commit` 写新 index 后更新它。
+    committed_index: (u64, u64, u32),
+    /// 上次 commit 落盘的 head 缓存描述符（`commit_journal` 复用，不重写）。
+    committed_head_cache: Option<HeadCache>,
+    /// 尾日志（未封尾块的原始字节增量，docs/04 §8.4）：本封块周期内首条记录的偏移（None=无未封尾）。
+    journal_offset: Option<u64>,
+    /// 尾日志区累计字节长度（含记录头）。commit 写入 SB 的 `tail_journal_len`。
+    journal_len: u64,
 }
 
 impl ArchiveUpdater {
@@ -744,7 +782,73 @@ impl ArchiveUpdater {
             head_cache,
             active_seq: sb.seq,
             inactive_off,
+            committed_index: (sb.index_offset, sb.index_len, sb.index_crc),
+            committed_head_cache: sb.head_cache,
+            journal_offset: if sb.tail_journal_len > 0 {
+                Some(sb.tail_journal_offset)
+            } else {
+                None
+            },
+            journal_len: sb.tail_journal_len,
         })
+    }
+
+    /// 翻转活跃槽（commit / commit_journal 收尾共用）。
+    fn flip_active(&mut self, new_seq: u64) {
+        self.active_seq = new_seq;
+        self.inactive_off = if self.inactive_off == SB_A_OFFSET {
+            SB_B_OFFSET
+        } else {
+            SB_A_OFFSET
+        };
+    }
+
+    /// 仅提交尾日志（fsync 路径，docs/04 §8.4）：**不重写 index**（块集未变 → index 稳定，
+    /// 复用上次 full commit 的 index_offset，使 journal 记录保持连续），只更新 SB 的尾日志指针。
+    /// 调用前应已 `append_journal`。双段 barrier 同 `commit`。**契约**：自上次 full commit 起未发生
+    /// `set_block`/`truncate`（否则 index 已变、必须走 `commit`）。
+    pub fn commit_journal(&mut self) -> io::Result<()> {
+        // barrier 1：journal 记录已落盘（append_journal 已写，这里确保 durable）。
+        self.file.sync_all()?;
+        let (index_offset, index_len, index_crc) = self.committed_index;
+        let new_seq = self.active_seq + 1;
+        let sb = SuperBlock {
+            seq: new_seq,
+            chunk_size: self.chunk_size,
+            uncompressed_size: self.uncompressed_size,
+            chunk_count: self.index.len() as u64,
+            index_offset,
+            index_len,
+            index_crc,
+            tail_journal_offset: self.journal_offset.unwrap_or(0),
+            tail_journal_len: self.journal_len,
+            head_cache: self.committed_head_cache,
+        };
+        write_superblock_slot(&mut self.file, self.inactive_off, &sb)?;
+        self.file.sync_all()?; // barrier 2
+        self.flip_active(new_seq);
+        Ok(())
+    }
+
+    /// 追加一条尾日志记录（未封尾块的原始字节增量，docs/04 §8.4）。**不压缩、不动 index**——
+    /// fsync 路径调用，成本 O(delta)。首条记录确立 journal 区起点。commit 时写入 SB 的尾日志指针。
+    pub fn append_journal(&mut self, raw_delta: &[u8]) -> io::Result<()> {
+        let rec = serialize_journal_record(raw_delta);
+        if self.journal_offset.is_none() {
+            self.journal_offset = Some(self.write_cursor);
+        }
+        self.file.seek(SeekFrom::Start(self.write_cursor))?;
+        self.file.write_all(&rec)?;
+        self.write_cursor += rec.len() as u64;
+        self.journal_len += rec.len() as u64;
+        Ok(())
+    }
+
+    /// 重置尾日志（封块时调用）：新 SB 的 `tail_journal_len=0`，旧 journal 记录成空洞（压实回收，
+    /// **不物理清零** H2）。调用顺序：先 `set_block` 把封块写入，再 `reset_journal`，再 `commit`。
+    pub fn reset_journal(&mut self) {
+        self.journal_offset = None;
+        self.journal_len = 0;
     }
 
     /// 设置 / 更新 head 缓存（块 0 首次封存或头区 RMW 后由上层调用，docs/02 §4.3）。
@@ -862,21 +966,18 @@ impl ArchiveUpdater {
             index_offset,
             index_len: index_bytes.len() as u64,
             index_crc,
-            tail_journal_offset: 0,
-            tail_journal_len: 0,
+            tail_journal_offset: self.journal_offset.unwrap_or(0),
+            tail_journal_len: self.journal_len,
             head_cache,
         };
         write_superblock_slot(&mut self.file, self.inactive_off, &sb)?;
         // barrier 2：superblock 落盘 → 新版本原子生效。
         self.file.sync_all()?;
 
-        // 翻转活跃槽。
-        self.active_seq = new_seq;
-        self.inactive_off = if self.inactive_off == SB_A_OFFSET {
-            SB_B_OFFSET
-        } else {
-            SB_A_OFFSET
-        };
+        // 更新已提交 index / head 缓存描述符（供后续 commit_journal 复用），翻转活跃槽。
+        self.committed_index = (index_offset, index_bytes.len() as u64, index_crc);
+        self.committed_head_cache = head_cache;
+        self.flip_active(new_seq);
         Ok(())
     }
 
@@ -1156,9 +1257,22 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// 读活跃槽（A）的 SuperBlock（测试辅助）。
+    /// 读活跃槽（seq 较大者）的 SuperBlock（测试辅助）。
     fn active_sb(buf: &[u8]) -> SuperBlock {
-        parse_superblock(&buf[SB_A_OFFSET as usize..]).unwrap()
+        let a = parse_superblock(&buf[SB_A_OFFSET as usize..]);
+        let b = parse_superblock(&buf[SB_B_OFFSET as usize..]);
+        match (a, b) {
+            (Some(x), Some(y)) => {
+                if y.seq > x.seq {
+                    y
+                } else {
+                    x
+                }
+            }
+            (Some(x), None) => x,
+            (None, Some(y)) => y,
+            (None, None) => panic!("两槽皆不可解析"),
+        }
     }
     /// 用闭包改 SuperBlock 后，重新序列化写回 A、B 两槽（保持 sb_crc 自洽，测试辅助）。
     fn patch_both_sb(buf: &mut [u8], f: impl Fn(&mut SuperBlock)) {
@@ -1538,6 +1652,114 @@ mod tests {
         assert!(
             r.read_head_cache().unwrap().is_none(),
             "未提交的 head 缓存不应可见"
+        );
+    }
+
+    // ----- 尾日志接线（docs/04 §8.4，TDD）-----
+
+    #[test]
+    fn journal_append_commit_重开_重放尾块() {
+        // 0 块 archive（空文件）。逐次 append_journal（原始增量）+ commit_journal（不动 index）→
+        // 重开 read_tail 应重放出全部原始字节。模拟 fsync 路径：不压缩、只追加 delta。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.archive");
+        {
+            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        {
+            let mut up = ArchiveUpdater::open(&path).unwrap();
+            for line in [b"line1\n".as_ref(), b"line2\n", b"line3\n"] {
+                up.append_journal(line).unwrap();
+                up.commit_journal().unwrap(); // 每次 fsync 一提交
+            }
+        }
+        let r = ArchiveReader::open(&path).unwrap();
+        assert_eq!(r.chunk_count(), 0, "尾日志不增加封块数");
+        assert_eq!(
+            r.read_tail().unwrap().as_deref(),
+            Some(b"line1\nline2\nline3\n".as_ref()),
+            "重开应重放出全部尾日志原始字节"
+        );
+    }
+
+    #[test]
+    fn journal_未提交即崩溃_丢未提交delta_保住已提交() {
+        // append_journal 两条都 commit_journal（durable），第三条 append 后不 commit（drop=崩溃）。
+        // 重开应只见前两条（已提交），第三条未提交被忽略——崩溃安全的尾日志。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.archive");
+        {
+            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        {
+            let mut up = ArchiveUpdater::open(&path).unwrap();
+            up.append_journal(b"committed-A").unwrap();
+            up.commit_journal().unwrap();
+            up.append_journal(b"committed-B").unwrap();
+            up.commit_journal().unwrap();
+            up.append_journal(b"UNCOMMITTED").unwrap(); // 不 commit
+            drop(up);
+        }
+        let r = ArchiveReader::open(&path).unwrap();
+        assert_eq!(
+            r.read_tail().unwrap().as_deref(),
+            Some(b"committed-Acommitted-B".as_ref()),
+            "未提交的第三条 delta 应被忽略，已提交的保住"
+        );
+    }
+
+    #[test]
+    fn journal_封块后重置_尾块迁入压缩块() {
+        // 攒了尾日志后「封块」：set_block 写压缩块（这里 verbatim 模拟）+ reset_journal + commit。
+        // 重开：read_tail 应为 None（journal 已重置），内容改由块 0 承载。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.archive");
+        {
+            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        {
+            let mut up = ArchiveUpdater::open(&path).unwrap();
+            up.append_journal(b"AAAA").unwrap();
+            up.commit_journal().unwrap();
+            up.append_journal(b"BBBB").unwrap();
+            up.commit_journal().unwrap();
+            // 封块：把累积的 "AAAABBBB" 作为块0（verbatim 模拟压缩）写入，重置 journal。
+            up.set_block(0, b"AAAABBBB", true, 8).unwrap();
+            up.reset_journal();
+            up.commit().unwrap();
+        }
+        let r = ArchiveReader::open(&path).unwrap();
+        assert_eq!(r.chunk_count(), 1, "封块后应有 1 个块");
+        assert!(r.read_tail().unwrap().is_none(), "封块后尾日志应已重置为空");
+        assert_eq!(r.read_block(0).unwrap().unwrap().0, b"AAAABBBB");
+    }
+
+    #[test]
+    fn journal_越界_load_active拒绝该槽() {
+        // SB 的 tail_journal 区越界 → 该槽不可用（级联校验拒绝）。两槽都坏则报损坏。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.archive");
+        {
+            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        {
+            let mut up = ArchiveUpdater::open(&path).unwrap();
+            up.append_journal(b"data").unwrap();
+            up.commit_journal().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        // 把两槽的 tail_journal_offset 改成越界巨值（保持 sb_crc 自洽）。
+        patch_both_sb(&mut bytes, |s| s.tail_journal_offset = u64::MAX - 100);
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&bytes).unwrap();
+        tmp.flush().unwrap();
+        assert!(
+            ArchiveReader::open(tmp.path()).is_err(),
+            "尾日志越界的槽应被级联校验拒绝；两槽皆坏 → 报损坏"
         );
     }
 }
