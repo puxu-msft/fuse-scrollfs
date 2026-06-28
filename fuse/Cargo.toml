@@ -34,6 +34,12 @@ path = "src/bin/append-bench.rs"
 name = "ratio-bench"
 path = "src/bin/ratio-bench.rs"
 
+# 会话发现读 micro-bench（docs/02 §6.1，head 缓存门控）：量「open 解析 + 块 0 解压」vs
+# 「open 解析 + 独立 head 流解压」的发现读成本差，零格式改动。决定是否值得落 archive v2。
+[[bin]]
+name = "discovery-bench"
+path = "src/bin/discovery-bench.rs"
+
 [dependencies]
 # default-features = false 关闭 libfuse 链接：本机未装 libfuse3-dev（无 fuse3.pc），
 # 改用 fusermount3 二进制挂载，避免 build 依赖 pkg-config 找不到 fuse3 而失败。
