@@ -28,6 +28,12 @@ path = "src/bin/mkfixture.rs"
 name = "append-bench"
 path = "src/bin/append-bench.rs"
 
+# 压缩比矩阵基准（T3）：把真实语料经实际 Store+Core 路径写入，量「块大小×等级×字典」组合的
+# 物理压缩比。回答「字典能否在真实数据 + 真实代码路径上交付 16x」（docs 优化分析）。
+[[bin]]
+name = "ratio-bench"
+path = "src/bin/ratio-bench.rs"
+
 [dependencies]
 # default-features = false 关闭 libfuse 链接：本机未装 libfuse3-dev（无 fuse3.pc），
 # 改用 fusermount3 二进制挂载，避免 build 依赖 pkg-config 找不到 fuse3 而失败。
