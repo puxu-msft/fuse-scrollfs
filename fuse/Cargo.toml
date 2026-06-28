@@ -22,6 +22,12 @@ path = "src/main.rs"
 name = "mkfixture"
 path = "src/bin/mkfixture.rs"
 
+# append 优化微基准（§1.1）：逐行 append 小记录 + 周期 fsync，量 before/after（尾块缓冲 on/off）
+# 的吞吐 / 封块（重压）次数 / 压缩比。直接驱动 Core+Store，免 FUSE 挂载噪声。
+[[bin]]
+name = "append-bench"
+path = "src/bin/append-bench.rs"
+
 [dependencies]
 # default-features = false 关闭 libfuse 链接：本机未装 libfuse3-dev（无 fuse3.pc），
 # 改用 fusermount3 二进制挂载，避免 build 依赖 pkg-config 找不到 fuse3 而失败。
@@ -33,8 +39,11 @@ log = "0.4"
 env_logger = "0.11"
 # P1：每块独立 zstd 压缩（布局 S archive 用），见 §3。lz4 留作后续对照（codec::Algo::Lz4）。
 zstd = "0.13"
+# P2/P3：布局 V 容器后端。redb 全包（表 inodes/dirents/blocks），复用其 ACID B-tree
+# 作变长 blob 分配器 + 事务，见 §6.1。写批处理一次 write 多块合并一事务（microbench 8-18x）。
+redb = "4"
 
 [dev-dependencies]
 tempfile = "3"
 
-# P1 引入 zstd；lz4_flex / redb / rusqlite 仍留待 P2+（写路径 / 容器布局 V）。
+# P2/P3 引入 redb；lz4_flex / rusqlite 仍留待后续（codec lz4 对照 / 空间敏感备选）。

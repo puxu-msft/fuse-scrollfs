@@ -8,5 +8,5 @@ pub mod archive;
 pub mod core;
 pub mod fixture;
 pub mod passthrough;
-pub mod shadow_fs;
+pub mod rwfs;
 pub mod store;

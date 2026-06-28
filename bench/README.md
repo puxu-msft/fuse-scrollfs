@@ -103,6 +103,8 @@ CONDITIONS="C0=/home/xp/src/zipfs/bench/.mnt/c0 A=/mnt/zipfs-btrfs B0=/home/xp/s
 
 未列出的、或挂载点不存在的条件会被显式跳过。结果落 `results/<UTC时间戳>/<条件>/<job>.json`。
 
+> **默认 1 轮（用户要求减少测试量）**：`run-suite.sh` 默认 `ROUNDS=1`，单项目标 ~1-5 分钟。需要稳定性统计再加轮数：`ROUNDS=3 bash bench/scripts/run-suite.sh`，多轮时每轮落 `<时间戳>/r<N>/<条件>/` 子目录（单轮不加 `r<N>/`，向后兼容）。
+
 > **冷缓存**：`run-suite.sh` 每个 job 前尝试 `sync + drop_caches`（需 root / 免密 sudo）。无权限时**降级为热缓存并打印告警**，不会静默。需要严格冷缓存对比时，以 root 运行整个 suite。
 
 ### 4. 汇总成 CSV
@@ -168,6 +170,19 @@ bash bench/datasets/fetch-claude-projects.sh --size-cap 3G
 - 写负载用 `buffer_compress_percentage=50`，让数据约一半可压缩，贴近「混合树」数据集；否则 fio 默认全随机数据会让 A/B2 的压缩路径失真为「不可压缩」。
 - `size=1G`、`numjobs=1`。并发对照（总纲 §4.5 的 `numjobs` 1 vs N）后续可通过复制 job 或加参数扩展。
 - 输出 JSON（`--output-format=json`），供 `collect.py` 解析。
+
+## append 优化微基准（开放尾块缓冲，§1.1）
+
+针对目标负载「逐行 append 小记录到增长文件 + 周期 fsync」的专项微基准，量化**未压缩开放尾块缓冲**优化前后的差异（吞吐 / 尾块重压次数 / 压缩比）。直接驱动 Core+Store（免 FUSE 挂载噪声），跑在 BS（影子树）与 BV（容器）上：
+
+```bash
+( cd fuse && cargo build --release --bin append-bench )
+fuse/target/release/append-bench                                   # 默认 64KiB 块 / 1KB 行 / 20000 行，两后端各跑 on/off
+fuse/target/release/append-bench --chunk-size 4096 --line-size 512 # 小块场景
+# 可调：--lines --line-size --chunk-size --fsync-every --level --backend {shadow|container|both}
+```
+
+**默认单次短跑**（约 1-5 分钟内完成两后端 × on/off 四次），输出 before/after 对照表。结果与分析见 [`results/append-opt/REPORT.md`](results/append-opt/REPORT.md)。`--no-tail-buffer`（挂载 CLI）或 bench 的 OFF 段走旧路径（每次 append 重压尾块）。
 
 ## 当前待办 / 风险
 

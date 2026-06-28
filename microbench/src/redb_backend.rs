@@ -6,7 +6,7 @@
 //!   暴露「每块一事务」陷阱的真实代价（用 `Durability::None` 会把陷阱测没了）。
 //! - 批量策略 = 一个 write txn 内塞 K 块再 commit，对照单块 commit。
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 
 use crate::backend::{Backend, CommitPolicy};
 

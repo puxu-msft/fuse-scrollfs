@@ -221,8 +221,9 @@ fn run_combo(kind: BackendKind, prof: ChunkProfile, cli: &Cli) {
 
     // --- 场景 3b：PerBlock 对照（陷阱量化）---
     // 为省时间，PerBlock 的插入只用一个子集（陷阱在「每块一 fsync」，子集足以量化每块成本）。
-    let subset_n = (total_blocks / 20).clamp(500, 5_000) as usize;
-    let subset: Vec<_> = blocks.iter().take(subset_n).cloned().collect();
+    let subset_target = (total_blocks / 20).clamp(500, 5_000) as usize;
+    let subset: Vec<_> = blocks.iter().take(subset_target).cloned().collect();
+    let subset_n = subset.len();
     let dir_perblk = TempDir::new().expect("创建临时目录失败");
     let mut be2 = make_backend(kind, dir_perblk.path());
     let s_ins_perblk = scenario_bulk_insert(be2.as_mut(), &subset, CommitPolicy::PerBlock);

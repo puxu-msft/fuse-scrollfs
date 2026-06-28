@@ -62,7 +62,7 @@ flowchart TD
 
 ## 3. 共享内核：分块 + 压缩 + 索引
 
-- 逻辑文件 = 定长**逻辑块**序列，`CHUNK_SIZE`（默认 64KiB，**基准变量**：16/64/256KiB）。
+- 逻辑文件 = 定长**逻辑块**序列，`CHUNK_SIZE`（**默认 64KiB**——microbench 实测 256KiB 会让 redb 容器膨胀 2.75x，见 §6.1；基准仍扫 16/64/256KiB，但 256KiB 档须配非-redb 数据区或接受膨胀）。
 - 每块**独立压缩**（zstd 等级 / lz4 可选），记录压缩后长度。
 - **随机读** `[off, off+len)`：定位覆盖的块 → 解压 → 切片返回。
 - **随机写** `[off, ...)`：命中块**读改写（RMW）**——解压整块 → 打补丁 → 重压 → 写回 → 更新索引与文件大小。部分块（首尾）按 RMW 处理，整块覆盖可跳过读。
@@ -140,6 +140,12 @@ V 的定义性特征是「整棵树落到一个后端对象」，这把三件事
 | `rusqlite`（备选） | SQLite 表 | BLOB | 想直接对标 `sqlitefs`；大 BLOB 溢出页有开销 |
 
 > **「专门虚拟盘」的隐患**：手写 superblock + bitmap/extent + inode 表 = 写迷你文件系统，控制力最强但易滑向「一个更差的 btrfs」（重造其变长 extent 分配却不如它成熟）。**默认不先做**，以 §6.1 末「大 BLOB 随机更新 microbench」为闸门。
+
+> **闸门已跑（microbench 实测 2026-06-27，redb 4.1 vs sqlite，详见 `microbench/REPORT.md`）**：
+> - **吞吐够用**：redb 批量事务比每块一事务快 **8–18x**；首版选 **redb 全包**，无需为性能自写数据区。
+> - **写批处理是必备项**（非优化）：一次 `write` 回调内多块合并一事务、`fsync`/`flush` 才 commit——否则重蹈 `sqlitefs`「每写 COW sync」覆辙。
+> - **空间是红灯且与块大小强相关**：redb 大 BLOB 膨胀——**256KiB 块 → 稳态 2.75x / compact 后 1.48x**；**64KiB 块 → compact 后 1.34x**。sqlite 几乎零浪费(1.01x) 但吞吐低一截。
+> - **裁决**：redb 全包 + **默认 64KiB 块** + 写批处理。**不要默认 256KiB**——它触发第二档（redb 元数据 + sqlite/自写数据区）评估，不应死守 redb 全包。sqlite 作为「空间敏感」备选保留。
 
 - **优点**：小文件天然打包（省 inode/最小块浪费）；易做**全局去重**（块按内容哈希做 key）；事务化。
 - **缺点**：单点损坏波及全盘；并发受容器实现上限约束；KV/SQL 存大 BLOB 有额外开销；底层 FS 看到的是不透明 blob，无法绕过挂载直接访问文件。
@@ -244,6 +250,45 @@ fuse/
 
 **仍开放**：
 
-1. 容器后端 V 选 `redb` 还是 `rusqlite`？**首版默认 redb 全包**（元数据 + 数据块都进 redb）；自写「专门虚拟盘」数据区 gated on 大 BLOB microbench，不先做（见 §6）。
+1. ~~容器后端 redb vs rusqlite~~ **已定（microbench）**：首版 **redb 全包 + 64KiB 块 + 写批处理**；sqlite 作空间敏感备选；自写数据区仅 256KiB 大块档触发评估，不先做。
 2. mmap 写支持优先级（默认后置）。
 3. 全局去重：**保留可能性，不急做**（设计上为 V 预留内容寻址的位置，但首版不实现）；日后开启时跑分单列「V+dedup」。
+
+## 14. 实现与实测进展（2026-06-28）
+
+> 本节是「实际建成 + 实测」的进展日志；上文 §1–§13 保留为 2026-06-27 的**设计快照**，不回改。
+
+### 14.1 实际模块布局（与 §11 计划略有出入）
+
+```text
+fuse/src/
+├── main.rs            # 挂载 + `compact` 子命令；--backend {passthrough|shadow|container} --chunk-size
+├── passthrough.rs     # P0 透传（B0）
+├── rwfs.rs            # 读写 FUSE 层（对应 §11 计划的 fuse_fs.rs），持 TailSessions
+├── archive.rs         # 布局 S 每文件分块压缩包（footer 索引 + 尾块 slot 复用）
+├── core/{mod,rmw,codec,chunk,inode,wsession}.rs
+└── store/{mod,shadow,container,tests_support}.rs
+```
+
+### 14.2 计划外/超出计划的关键实现
+
+- **open-tail buffer（`core/wsession.rs::TailSessions`）**：append 路径的「未压缩开放尾块缓冲」，落在 Core 写会话（per-inode），两布局共享。把尾块重压从「每次 append」降到「每满块/每 fsync」一次。
+- **fsync 抗碎片（`archive.rs` 尾块 slot 原地复用）**：fsync 封部分尾块后续写**同一逻辑块**，不另起新块——块数/压缩比不随 fsync 频率劣化。配套**崩溃 fail-closed**：复用覆盖前先 `set_len+sync_data` 铲除旧 footer，杜绝崩溃后读出「新前缀+旧残尾」的 Frankenstein 块（archive 无 per-block 校验，故构造性 fail-closed）。
+- **BS reader 缓存（`store/shadow.rs`）**：per-inode `ArchiveReader` 缓存 + epoch 失效，修复「每次 read 重开 reader 重解析全量 footer 索引」导致的随机读病态（1.4→37 MiB/s）。
+- **BV `compact` 子命令**：`zipfs compact --backend container --backing <redb>`，调 redb compact 回收 MVCC 未引用页。
+
+### 14.3 实测结论（指针，勿在此重复数字）
+
+- **选型**：`microbench/REPORT.md` —— redb 全包 + **64KiB 块** + 批事务；256KiB 触发膨胀红线。
+- **五条件大对照**：`bench/results/20260628-1212/CONSOLIDATED.md` —— BS 读修复后**与内核 btrfs 同档**、压缩比最高（5.42x）；BV 干净写 3.84x（compact 仅对「随机覆盖写的 MVCC 膨胀」有意义，对追加/干净写无关）；**写尾延迟是 FUSE 对内核的结构性劣势**（FUSE 三条 ms 级 vs btrfs 亚毫秒）。
+- **append 优化**：`bench/results/append-opt/REPORT.md` —— 尾块缓冲重压 40x↓、吞吐 BV +2.5x；fsync 抗碎片后块数/压缩比/物理体积**与 fsync 频率无关**。
+- **早期对照与修复**：`bench/results/20260627-1641/{FIRST-RUN,FIXES-ADDENDUM}.md`。
+
+### 14.4 遗留 TODO
+
+1. **A(btrfs) 压缩比待补**：compsize 需 root，本轮失败；用 `bench/scripts/measure-a-ratio.sh`（含 sudo）补齐。
+2. **B2（`fuse-zstd` 整文件对照）未跑**：§9 矩阵里的消融项尚缺。
+3. **冷缓存复跑**：当前全热缓存（无免密 sudo drop_caches），偏乐观。
+4. **archive per-block 校验**：当前靠 `set_len+sync` 构造性 fail-closed；更彻底是每块加 CRC。
+5. **FUSE 写尾延迟优化**：BV/BS 对 btrfs 的最大劣势（异步/批量 commit 等方向待探）。
+6. **去重 / mmap 写 / WSL 启动自挂载**：按需推进。

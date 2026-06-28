@@ -10,6 +10,8 @@
 pub mod chunk;
 pub mod codec;
 pub mod inode;
+pub mod rmw;
+pub mod wsession;
 
 /// 默认逻辑块大小（64KiB）。基准变量取 16 / 64 / 256 KiB，见 §3。
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;

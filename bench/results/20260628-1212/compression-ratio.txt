@@ -1,0 +1,16 @@
+dataset=/home/xp/src/zipfs/bench/datasets/claude-projects
+logical_bytes=709122748  (678M)
+--- A (btrfs zstd:3) compsize ---
+/mnt/zipfs-btrfs/dataset/-home-xp-src-ghc2api-go/e01b8424-c452-4f4e-8584-5d2a85c6da2d/subagents/agent-ad0cda6e2891509e9.meta.json: SEARCH_V2: Operation not permitted
+compsize 失败
+--- BS (shadow) ---
+BS_physical_bytes=129202355  (125M)
+--- BV (container/redb) ---
+BV_pre_compact_bytes=306188288  (177M)
+-- compact --
+[2026-06-28T04:58:17Z INFO  zipfs] compact container：backing=/home/xp/src/zipfs/bench/.bv-backing/zipfs.redb，压实前 306188288 字节
+[2026-06-28T04:58:18Z INFO  zipfs] compact 完成：/home/xp/src/zipfs/bench/.bv-backing/zipfs.redb（306188288 → 369201152 字节，收缩 0.83x，compacted=true）
+compact: 306188288 -> 369201152 bytes (0.83x smaller, compacted=true)
+BV_post_compact_bytes=369201152  (177M)
+--- zstd -3 single-stream upper bound ---
+zstd3_bytes=39400422

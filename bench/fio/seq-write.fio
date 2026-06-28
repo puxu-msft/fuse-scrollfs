@@ -16,7 +16,6 @@ direct=0
 group_reporting=1
 runtime=0
 buffer_compress_percentage=50
-buffer_pattern=
 refill_buffers=1
 fsync=64
 end_fsync=1
