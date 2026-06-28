@@ -82,7 +82,8 @@ struct MountArgs {
     #[arg(long)]
     mountpoint: Option<PathBuf>,
 
-    /// 逻辑块大小（字节），默认 64KiB（§6.1 裁决：不默认 256KiB）。仅 shadow/container 生效。
+    /// 逻辑块大小（字节），默认 **1MiB**（实测裁决：64KiB 砍掉长程冗余，1MiB 是甜点；
+    /// 见 bench/results/dict-chunk-ratio + algo-compare）。仅 shadow/container 生效。
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE as u32)]
     chunk_size: u32,
 
