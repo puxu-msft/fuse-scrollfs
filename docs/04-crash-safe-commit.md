@@ -141,3 +141,37 @@ head 缓存（发现读快路径，字段并入 superblock）是**可丢弃的�
 - 其压缩字节**无独立 CRC**（仅指针受 `sb_crc` 保护）。读时若解压失败 / 越界 → **静默回退逐块路径**（`read_range` 既有路径），**绝不** fail-closed 整个文件。
 - 块 0 改写时随 commit 重建（docs/02 §4.3）。一个可重建的读优化缓存损坏，绝不能拖垮文件可打开性。
 - 可选增强：给 head 缓存也加一个 crc 字段进 superblock，命中校验失败即回退——首版可不做。
+
+## 12. §8.3 实现细则（关键简化：write_cursor = 物理 EOF）
+
+把抽象协议落到 `archive.rs` 的具体改写。**核心简化**（实现前勘码得出）：**写游标恒取物理文件末尾（EOF），新数据/index/journal/head 缓存一律 append 到 EOF**。这一条**由构造满足 §1 的 C2 不变量**（append 到 EOF 绝不可能覆写任何 superblock 可达区间），从而**整段删除** `reuse_tail_slot` + `live_data_end` + `set_len`（原 bug 的发源地）。代价：旧空洞只由压实回收（§6 已接受）。
+
+### 12.1 磁盘布局与常量
+```
+HEADER_LEN=12  SB_A_OFFSET=12  SB_B_OFFSET=12+128=140  DATA_START=12+256=268
+VERSION: 1 → 2
+```
+删除 `FOOTER_LEN` / `serialize_footer` / `read_footer` / `live_data_end`。`Footer` 结构**保留**，但降级为「从活跃 SuperBlock 派生的内存视图」（`chunk_size/uncompressed_size/chunk_count/index_offset/crc=index_crc/head_cache`），使 `reader.footer()` 与 shadow.rs 调用面不变。
+
+### 12.2 函数级改写
+- **新 helper**：`read_sb_slot(file, off) -> io::Result<Option<SuperBlock>>`（读 128B、`parse_superblock`）；`load_active(file, total_len) -> io::Result<(SuperBlock, u64 active_slot_off, Vec<ChunkEntry>)>`：读两槽 → 候选按 seq 降序 → 逐个**级联校验**（index 区 bounds + `index_crc` + 块 bounds）→ 取首个通过者；皆不通过报 corrupt（M4）。
+- **ArchiveReader::open**：header（version==2）→ `load_active` → 派生 `Footer` + 持 index。`read_block`/`read_head_cache`/bounds 校验逻辑复用（数据区改为 `[DATA_START, index_offset)`）。
+- **ArchiveWriter::new**：写 header + **两个 128B 零槽占位**，`cursor=DATA_START`。**finish**：写 head 缓存 + index → 建 `SuperBlock{seq:0, …, tail_journal_*:0}` → **写到 A、B 两槽**（皆 seq=0）→ flush。
+- **ArchiveUpdater::open**：`load_active` 取活跃 SB + 活跃槽 + index；**`write_cursor = total_len`（EOF）**；记 `active_seq` 与**非活跃槽偏移**。
+- **set_block**：恒 append 到 `write_cursor`（删除 reuse/`set_len` 整段）；`idx==count` push、`idx<count` 改 entry（旧块成空洞）、`idx>count` 在 cursor 补零块。
+- **truncate**：仅改内存 index + `uncompressed_size`（旧块成空洞，物理不动）。
+- **commit**：append head 缓存 + index 到 EOF → **barrier 1 `sync_all()`（检查返回值，失败不推进）** → 建 `SuperBlock{seq:active_seq+1,…}` 写**非活跃槽**（原地，安全因双槽）→ **barrier 2 `sync_all()`** → 翻转 active 槽 / `active_seq+=1`。
+- **sync**：`sync_all()`（commit 已含 barrier，保留兼容）。
+
+### 12.3 §8.3 暂不接 journal（与 §8.4 解耦）
+本步 `tail_journal_len` 恒 0：尾块仍由 shadow/wsession **压缩后经 set_block(0) 写**（现状），但走 append-only + 双 SB → **durability bug 结构性消除**（harness 可验，活跃写用小 `--chunk-size` 控文件增长）。**写放大（每 fsync 重压重写块 0）留 §8.4 用 journal 根治**——届时 set_block(0) 改为 append raw 增量到尾日志、`tail_journal_len>0`、reader 把 journal 重放为「块 count 的 verbatim 尾块」。
+
+### 12.4 测试迁移（与代码同一原子单元）
+- `build_archive`/round-trip：适配新布局（数据从 DATA_START 起）。
+- **删** `updater_reuse_尾块原地覆盖中崩溃_*`（该路径已删除）。
+- **改写** `updater_未提交即崩溃_*`：双 SB 下「写新槽半截崩溃」应**恢复旧槽**（非报 corrupt）→ 断言读回旧一致版本。
+- **新增**构造性崩溃单测：barrier 1/2 各点截断 → open 取上一致版本，**绝无 set_len 丢数据**。
+- `索引_crc_损坏被检出` → 改为 superblock/index_crc 双坏才 corrupt、单坏回落另一槽。
+- 验收：`crash-test.sh`（小 chunk）多次 **0% 丢数据**。
+
+> §8.1（superblock 编解码 + pick_active）、§8.2（journal 记录编解码 + replay）已实现并提交（4598bd3 / a1e1153），是本步地基。§8.3 是上述「代码 + 测试」的单一原子提交——共享 worktree 下不留半成品破坏树。
