@@ -203,6 +203,10 @@ impl ShadowStore {
             perm: (meta.mode() & 0o7777) as u16,
             uid: meta.uid(),
             gid: meta.gid(),
+            // 由底层文件真实时间填充（修复挂载点全 1970 的根因：旧实现丢弃 meta 时间）。
+            mtime: crate::core::system_time_from(meta.mtime(), meta.mtime_nsec()),
+            atime: crate::core::system_time_from(meta.atime(), meta.atime_nsec()),
+            ctime: crate::core::system_time_from(meta.ctime(), meta.ctime_nsec()),
             chunk_size,
         }
     }
@@ -359,6 +363,42 @@ fn read_footer_geometry(abs: &Path) -> Option<(u64, u32)> {
     ArchiveReader::open(abs)
         .ok()
         .map(|r| (r.footer().uncompressed_size, r.footer().chunk_size))
+}
+
+/// 把 atime/mtime 落到底层文件（`utimensat`，不跟随符号链接，对齐 symlink_metadata 语义）。
+/// epoch 之前的时间 clamp 到 0。ctime 不可由用户态直接设定，故不处理。
+fn set_file_times(
+    abs: &Path,
+    atime: std::time::SystemTime,
+    mtime: std::time::SystemTime,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    fn to_timespec(t: std::time::SystemTime) -> libc::timespec {
+        let (secs, nsec) = match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as libc::time_t, d.subsec_nanos() as i64),
+            Err(_) => (0, 0),
+        };
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: nsec as _,
+        }
+    }
+    let times = [to_timespec(atime), to_timespec(mtime)];
+    let c_path = std::ffi::CString::new(abs.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "路径含 NUL"))?;
+    // SAFETY: c_path 是有效的 NUL 结尾 C 字符串；times 指向本栈上长度为 2 的合法数组。
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn filetype_from_meta(meta: &fs::Metadata) -> fuser::FileType {
@@ -524,6 +564,10 @@ impl Store for ShadowStore {
         // perm 落到底层文件（mode）。uid/gid/size 的截断由 Core::truncate 走 truncate_blocks，
         // 这里只处理元数据 perm（size 由分块路径维护，不在 setattr 直接改物理大小）。
         fs::set_permissions(&abs, fs::Permissions::from_mode(attr.perm as u32))?;
+        // atime/mtime 落到底层文件（utimensat）。前端已把 TimeOrNow 解析为绝对时间，attr 始终
+        // 携带有效时间（未改的字段为 getattr 读到的现值），故无条件回写。ctime 在 Linux 无法
+        // 直接设定——元数据变更即由内核置「now」，跳过。
+        set_file_times(&abs, attr.atime, attr.mtime)?;
         Ok(())
     }
 
@@ -781,6 +825,9 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
             chunk_size,
         };
         let ino = store.create(ROOT_INO, "f.bin", attr).unwrap();
@@ -920,6 +967,9 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
             chunk_size: cs,
         };
         let dst_ino = store.create(ROOT_INO, "dst.bin", dst_attr).unwrap();
@@ -1135,5 +1185,55 @@ mod tests {
         );
         let plain = decompress(&after.0, Algo::Zstd, after.1).unwrap();
         assert_eq!(&plain[..], &data[..HEAD_CACHE_BYTES as usize]);
+    }
+
+    // ----- 时间戳：读路径透传底层真实 mtime + setattr 写回（修复挂载点全 1970） -----
+
+    /// 一个非 epoch 的确定性参照时间（2026-06-24 04:47:00 UTC 附近）。
+    fn ref_time() -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_750_740_420, 123_456_789)
+    }
+
+    #[test]
+    fn getattr_propagates_backing_mtime_not_epoch() {
+        let (store, _dir, ino) = store_with_file(64 * 1024);
+        let abs = store.abs_of_ino(ino).unwrap();
+        // 直接给底层文件盖一个已知 mtime（atime 同步设），模拟真实会话文件。
+        set_file_times(&abs, ref_time(), ref_time()).unwrap();
+
+        let a = store.getattr_ino(ino).unwrap();
+        assert_ne!(
+            a.mtime,
+            std::time::SystemTime::UNIX_EPOCH,
+            "mtime 不应退化为 1970"
+        );
+        // 允许文件系统纳秒精度差异，按秒比较。
+        let got = a
+            .mtime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(got.as_secs(), 1_750_740_420);
+    }
+
+    #[test]
+    fn setattr_writes_mtime_back_to_backing() {
+        let (store, _dir, ino) = store_with_file(64 * 1024);
+        let mut a = store.getattr_ino(ino).unwrap();
+        a.mtime = ref_time();
+        a.atime = ref_time();
+        store.setattr(ino, a).unwrap();
+
+        // 重新 getattr：mtime 应反映写回值（往返一致）。
+        let a2 = store.getattr_ino(ino).unwrap();
+        let secs = a2
+            .mtime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(secs, 1_750_740_420, "setattr 写回的 mtime 应被持久化");
+        // 底层文件本身也应同步（不止内存视图）。
+        let abs = store.abs_of_ino(ino).unwrap();
+        let backing_secs = fs::metadata(&abs).unwrap().mtime();
+        assert_eq!(backing_secs, 1_750_740_420);
     }
 }

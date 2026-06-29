@@ -29,3 +29,42 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 /// 保持 3 而非 19：活跃写负载下 19 的 CPU 代价 25–100x，比值仅 +13~16%（1MiB/L3=13.7x→L19=15.9x），
 /// 写延迟优先。要更高比值用 `--level 19` 或冷封存（zstd-19 --long，35x，见 algo-compare 结论 #4）。
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
+/// 由 unix 时间戳（秒 + 纳秒）构造 `SystemTime`，负秒按 epoch 处理（罕见）。
+/// 读路径共享：passthrough / shadow attr_from_meta / container 行解码都用它把底层
+/// `meta.mtime()` 等转 FUSE 时间，避免各处重复实现（文件日期不再退化为 1970）。
+///
+/// 用 `checked_add` 防溢出 panic：container `decode` 把**持久化的任意 8 字节**喂进来，
+/// 损坏/极端 secs 不应让 `decode`（返 io::Result）变进程崩溃——溢出回退 epoch。
+pub fn system_time_from(secs: i64, nsec: i64) -> std::time::SystemTime {
+    use std::time::{Duration, SystemTime};
+    if secs < 0 {
+        return SystemTime::UNIX_EPOCH;
+    }
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(
+            secs as u64,
+            nsec.clamp(0, 999_999_999) as u32,
+        ))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::system_time_from;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn system_time_from_maps_valid_and_clamps_extremes() {
+        assert_eq!(
+            system_time_from(100, 500),
+            SystemTime::UNIX_EPOCH + Duration::new(100, 500)
+        );
+        // 负秒 → epoch。
+        assert_eq!(system_time_from(-5, 0), SystemTime::UNIX_EPOCH);
+        // 极端大秒（损坏的容器字节）不得 panic——平台溢出时回退 epoch，否则返某有效时间。
+        let _ = system_time_from(i64::MAX, 0);
+        // 越界 nsec 被 clamp，不 panic（Duration::new 对 >1e9 纳秒会 panic，故须 clamp）。
+        let _ = system_time_from(0, i64::MAX);
+    }
+}

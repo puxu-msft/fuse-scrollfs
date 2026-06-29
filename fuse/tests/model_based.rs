@@ -62,6 +62,9 @@ fn new_attr(perm: u16) -> Attr {
         perm,
         uid: 0,
         gid: 0,
+        mtime: std::time::SystemTime::UNIX_EPOCH,
+        atime: std::time::SystemTime::UNIX_EPOCH,
+        ctime: std::time::SystemTime::UNIX_EPOCH,
         chunk_size: CHUNK_SIZE,
     }
 }

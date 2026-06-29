@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use crate::core::system_time_from;
+
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, KernelConfig,
     OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
@@ -250,15 +252,6 @@ fn metadata_to_attr(ino: u64, meta: &fs::Metadata) -> FileAttr {
         rdev: meta.rdev() as u32,
         flags: 0,
         blksize: meta.blksize() as u32,
-    }
-}
-
-/// 由 unix 时间戳（秒 + 纳秒）构造 `SystemTime`，负秒按 epoch 处理（透传少见）。
-fn system_time_from(secs: i64, nsec: i64) -> SystemTime {
-    if secs >= 0 {
-        SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nsec as u32)
-    } else {
-        SystemTime::UNIX_EPOCH
     }
 }
 

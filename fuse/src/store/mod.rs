@@ -38,6 +38,12 @@ pub struct Attr {
     pub perm: u16,
     pub uid: u32,
     pub gid: u32,
+    /// 修改时间 / 访问时间 / 状态变更时间。getattr 经 `to_file_attr` 直接呈现给内核——
+    /// shadow 后端由底层文件 `meta` 取真值，container 由 InodeRow 存取。缺失退化为 UNIX_EPOCH。
+    /// 历史 bug：本结构曾无时间字段，前端把四时间写死 1970。
+    pub mtime: std::time::SystemTime,
+    pub atime: std::time::SystemTime,
+    pub ctime: std::time::SystemTime,
     /// 该普通文件的逻辑块大小（目录可填默认值，不参与分块）。create 时由前端给定，
     /// 后续 get/put_block 与 Core 分块数学都以它为准。
     pub chunk_size: u32,

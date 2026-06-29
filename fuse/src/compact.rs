@@ -178,6 +178,9 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
             chunk_size: cs,
         };
         let ino = store.create(1, "t.jsonl", attr).unwrap();

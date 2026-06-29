@@ -149,9 +149,11 @@ impl ZipfsRw {
             ino: INodeNo(a.ino),
             size: a.size,
             blocks: a.size.div_ceil(512),
-            atime: SystemTime::UNIX_EPOCH,
-            mtime: SystemTime::UNIX_EPOCH,
-            ctime: SystemTime::UNIX_EPOCH,
+            atime: a.atime,
+            mtime: a.mtime,
+            ctime: a.ctime,
+            // 无真实 btime 来源（两后端都不存创建时间）；置 epoch（同 passthrough），
+            // 避免 crtime=ctime 在 chmod 后误随 ctime 前跳（review M3）。
             crtime: SystemTime::UNIX_EPOCH,
             kind: a.kind,
             perm: a.perm,
@@ -287,6 +289,15 @@ impl ZipfsRw {
 /// io::Error → Errno，无 raw_os_error 时回退 EIO。
 pub fn io_to_errno(e: &std::io::Error) -> Errno {
     Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+/// 把 FUSE `setattr` 的 `TimeOrNow` 解析为绝对 `SystemTime`：`Now` → 当前时钟，
+/// `SpecificTime(t)` → t。供 atime/mtime 写回（utimensat 的 UTIME_NOW 语义在前端折叠）。
+fn resolve_time_or_now(t: TimeOrNow) -> SystemTime {
+    match t {
+        TimeOrNow::Now => SystemTime::now(),
+        TimeOrNow::SpecificTime(t) => t,
+    }
 }
 
 impl Filesystem for ZipfsRw {
@@ -430,6 +441,7 @@ impl Filesystem for ZipfsRw {
             reply.error(Errno::EINVAL);
             return;
         };
+        let now = SystemTime::now();
         let attr = Attr {
             ino: 0,
             size: 0,
@@ -437,6 +449,9 @@ impl Filesystem for ZipfsRw {
             perm: ((mode & !umask) & 0o7777) as u16,
             uid: req.uid(),
             gid: req.gid(),
+            mtime: now,
+            atime: now,
+            ctime: now,
             chunk_size: self.default_chunk_size,
         };
         match self.store.create(parent.0, name, attr) {
@@ -472,6 +487,7 @@ impl Filesystem for ZipfsRw {
             reply.error(Errno::EINVAL);
             return;
         };
+        let now = SystemTime::now();
         let attr = Attr {
             ino: 0,
             size: 0,
@@ -479,6 +495,9 @@ impl Filesystem for ZipfsRw {
             perm: ((mode & !umask) & 0o7777) as u16,
             uid: req.uid(),
             gid: req.gid(),
+            mtime: now,
+            atime: now,
+            ctime: now,
             chunk_size: self.default_chunk_size,
         };
         match self.store.mkdir(parent.0, name, attr) {
@@ -572,9 +591,9 @@ impl Filesystem for ZipfsRw {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
@@ -598,8 +617,10 @@ impl Filesystem for ZipfsRw {
                 return;
             }
         }
-        // 元数据更新（perm/uid/gid）。
-        if mode.is_some() || uid.is_some() || gid.is_some() {
+        // 元数据更新（perm/uid/gid + atime/mtime/ctime）。时间把 `TimeOrNow` 解析为绝对
+        // `SystemTime`（Now → 当前时钟），写回 store；shadow 落到底层文件，container 存进行。
+        let has_time = atime.is_some() || mtime.is_some() || ctime.is_some();
+        if mode.is_some() || uid.is_some() || gid.is_some() || has_time {
             if let Some(m) = mode {
                 a.perm = (m & 0o7777) as u16;
             }
@@ -608,6 +629,15 @@ impl Filesystem for ZipfsRw {
             }
             if let Some(g) = gid {
                 a.gid = g;
+            }
+            if let Some(t) = atime {
+                a.atime = resolve_time_or_now(t);
+            }
+            if let Some(t) = mtime {
+                a.mtime = resolve_time_or_now(t);
+            }
+            if let Some(t) = ctime {
+                a.ctime = t;
             }
             if let Err(e) = self.store.setattr(ino.0, a) {
                 reply.error(io_to_errno(&e));
@@ -740,6 +770,15 @@ mod tests {
     use crate::store::shadow::ShadowStore;
     use crate::store::Attr;
 
+    #[test]
+    fn resolve_time_or_now_maps_specific_and_now() {
+        let t = SystemTime::UNIX_EPOCH + Duration::new(1_750_740_420, 5);
+        assert_eq!(resolve_time_or_now(TimeOrNow::SpecificTime(t)), t);
+        // Now → 当前时钟（晚于 epoch，且非固定值）。
+        let now = resolve_time_or_now(TimeOrNow::Now);
+        assert!(now > SystemTime::UNIX_EPOCH);
+    }
+
     const ROOT: u64 = 1;
 
     /// 建 shadow ZipfsRw + 一个 200KiB 文件（128KiB 块 → 块0 满封建 head 缓存），返回 (fs, 内容, ino)。
@@ -755,6 +794,9 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            mtime: SystemTime::UNIX_EPOCH,
+            atime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
             chunk_size: cs,
         };
         let ino = store.create(ROOT, "f.bin", attr).unwrap();

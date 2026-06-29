@@ -124,6 +124,7 @@ impl RunResult {
 }
 
 fn new_attr(chunk_size: u32) -> Attr {
+    let now = std::time::SystemTime::now();
     Attr {
         ino: 0,
         size: 0,
@@ -131,6 +132,9 @@ fn new_attr(chunk_size: u32) -> Attr {
         perm: 0o644,
         uid: 0,
         gid: 0,
+        mtime: now,
+        atime: now,
+        ctime: now,
         chunk_size,
     }
 }

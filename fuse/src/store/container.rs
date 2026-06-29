@@ -41,9 +41,24 @@ struct InodeRow {
     uid: u32,
     gid: u32,
     chunk_size: u32,
+    /// 修改 / 访问 / 状态变更时间。V 布局自身持久化（无底层文件可问），create/setattr 维护。
+    mtime: std::time::SystemTime,
+    atime: std::time::SystemTime,
+    ctime: std::time::SystemTime,
 }
 
-const INODE_ROW_LEN: usize = 1 + 8 + 2 + 4 + 4 + 4; // 23
+/// 旧布局长度（无时间字段）：kind(1)+size(8)+perm(2)+uid(4)+gid(4)+chunk_size(4)。
+const INODE_ROW_LEN_V1: usize = 1 + 8 + 2 + 4 + 4 + 4; // 23
+/// 当前布局：在 V1 基础上追加 mtime/atime/ctime，各 i64 秒 + u32 纳秒（12B×3）。
+const INODE_ROW_LEN: usize = INODE_ROW_LEN_V1 + 12 * 3; // 59
+
+/// SystemTime → (秒 i64, 纳秒 u32)。epoch 之前（罕见）clamp 到 0，与 `system_time_from` 对称。
+fn time_to_parts(t: std::time::SystemTime) -> (i64, u32) {
+    match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(_) => (0, 0),
+    }
+}
 
 impl InodeRow {
     fn encode(&self) -> [u8; INODE_ROW_LEN] {
@@ -54,16 +69,34 @@ impl InodeRow {
         b[11..15].copy_from_slice(&self.uid.to_le_bytes());
         b[15..19].copy_from_slice(&self.gid.to_le_bytes());
         b[19..23].copy_from_slice(&self.chunk_size.to_le_bytes());
+        // 时间三元组，各 (secs i64, nsec u32)。
+        for (off, t) in [(23usize, self.mtime), (35, self.atime), (47, self.ctime)] {
+            let (secs, nsec) = time_to_parts(t);
+            b[off..off + 8].copy_from_slice(&secs.to_le_bytes());
+            b[off + 8..off + 12].copy_from_slice(&nsec.to_le_bytes());
+        }
         b
     }
 
     fn decode(b: &[u8]) -> io::Result<Self> {
-        if b.len() != INODE_ROW_LEN {
+        // 长度容忍：V1(23B) 旧档时间退化为 UNIX_EPOCH；当前布局(59B) 解出真实时间。
+        if b.len() != INODE_ROW_LEN && b.len() != INODE_ROW_LEN_V1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("inode 行长度异常：{}", b.len()),
             ));
         }
+        let read_time = |off: usize| -> std::time::SystemTime {
+            let secs = i64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+            let nsec = u32::from_le_bytes(b[off + 8..off + 12].try_into().unwrap());
+            crate::core::system_time_from(secs, nsec as i64)
+        };
+        let (mtime, atime, ctime) = if b.len() == INODE_ROW_LEN {
+            (read_time(23), read_time(35), read_time(47))
+        } else {
+            let e = std::time::SystemTime::UNIX_EPOCH;
+            (e, e, e)
+        };
         Ok(Self {
             kind: b[0],
             size: u64::from_le_bytes(b[1..9].try_into().unwrap()),
@@ -71,6 +104,9 @@ impl InodeRow {
             uid: u32::from_le_bytes(b[11..15].try_into().unwrap()),
             gid: u32::from_le_bytes(b[15..19].try_into().unwrap()),
             chunk_size: u32::from_le_bytes(b[19..23].try_into().unwrap()),
+            mtime,
+            atime,
+            ctime,
         })
     }
 
@@ -157,6 +193,7 @@ impl ContainerStore {
                     .map_err(|e| db_err("get root", e))?
                     .is_none()
                 {
+                    let now = std::time::SystemTime::now();
                     let root = InodeRow {
                         kind: 1,
                         size: 0,
@@ -164,6 +201,9 @@ impl ContainerStore {
                         uid: 0,
                         gid: 0,
                         chunk_size: default_chunk_size,
+                        mtime: now,
+                        atime: now,
+                        ctime: now,
                     };
                     inodes
                         .insert(ROOT_INO, &root.encode()[..])
@@ -231,6 +271,9 @@ impl ContainerStore {
             perm: row.perm,
             uid: row.uid,
             gid: row.gid,
+            mtime: row.mtime,
+            atime: row.atime,
+            ctime: row.ctime,
             chunk_size: row.chunk_size,
         }
     }
@@ -276,6 +319,9 @@ impl Store for ContainerStore {
             uid: attr.uid,
             gid: attr.gid,
             chunk_size,
+            mtime: attr.mtime,
+            atime: attr.atime,
+            ctime: attr.ctime,
         };
         let txn = self
             .db
@@ -471,6 +517,10 @@ impl Store for ContainerStore {
             row.uid = attr.uid;
             row.gid = attr.gid;
             row.size = attr.size;
+            // 时间写回（V 布局自持久化，无底层文件可问）。前端已解析 TimeOrNow 后填入 attr。
+            row.mtime = attr.mtime;
+            row.atime = attr.atime;
+            row.ctime = attr.ctime;
             inodes
                 .insert(ino, &row.encode()[..])
                 .map_err(|e| db_err("insert inode", e))?;
@@ -593,6 +643,7 @@ impl ContainerStore {
                     .map_err(|e| db_err("insert block", e))?;
             }
             // 写挂起 size。
+            let now = std::time::SystemTime::now();
             for (&ino, &size) in &pending.sizes {
                 let row = {
                     let Some(existing) = inodes.get(ino).map_err(|e| db_err("get inode", e))?
@@ -603,6 +654,9 @@ impl ContainerStore {
                 };
                 let mut row = row;
                 row.size = size;
+                // 内容已变 → 更新 mtime/ctime（shadow 由底层 fs 自动获得，V 布局须显式维护）。
+                row.mtime = now;
+                row.ctime = now;
                 inodes
                     .insert(ino, &row.encode()[..])
                     .map_err(|e| db_err("insert inode", e))?;
@@ -634,6 +688,9 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
             chunk_size: cs,
         };
         store.create(ROOT_INO, name, attr).unwrap()
@@ -713,5 +770,64 @@ mod tests {
         let mut store = ContainerStore::open(&path).unwrap();
         // 不 panic 即可（返回 true/false 取决于是否有可回收页）。
         let _ = store.compact().unwrap();
+    }
+
+    // ----- 时间戳：InodeRow 编解码往返 + 旧档兼容 + setattr 跨 reopen 持久 -----
+
+    #[test]
+    fn inode_row_encode_decode_round_trips_times() {
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_750_740_420, 999);
+        let row = InodeRow {
+            kind: 2,
+            size: 4096,
+            perm: 0o644,
+            uid: 7,
+            gid: 9,
+            chunk_size: 65536,
+            mtime: t,
+            atime: t,
+            ctime: t,
+        };
+        let bytes = row.encode();
+        assert_eq!(bytes.len(), INODE_ROW_LEN);
+        let back = InodeRow::decode(&bytes).unwrap();
+        assert_eq!(back.size, 4096);
+        assert_eq!(back.mtime, t);
+        assert_eq!(back.atime, t);
+        assert_eq!(back.ctime, t);
+    }
+
+    #[test]
+    fn decode_legacy_v1_row_yields_epoch_times() {
+        // 模拟旧版本写出的 23 字节行（无时间字段）：decode 应成功且时间退化为 epoch。
+        let mut v1 = [0u8; INODE_ROW_LEN_V1];
+        v1[0] = 2; // 普通文件
+        v1[1..9].copy_from_slice(&123u64.to_le_bytes());
+        v1[9..11].copy_from_slice(&0o600u16.to_le_bytes());
+        v1[19..23].copy_from_slice(&65536u32.to_le_bytes());
+        let back = InodeRow::decode(&v1).unwrap();
+        assert_eq!(back.size, 123);
+        assert_eq!(back.mtime, std::time::SystemTime::UNIX_EPOCH);
+        assert_eq!(back.ctime, std::time::SystemTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn setattr_mtime_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.zipfs");
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_750_740_420, 0);
+        let ino = {
+            let store = ContainerStore::open(&path).unwrap();
+            let ino = new_file(&store, "f.bin", 65536);
+            let mut a = store.getattr_ino(ino).unwrap();
+            a.mtime = t;
+            store.setattr(ino, a).unwrap();
+            store.sync_all().unwrap();
+            ino
+        };
+        // 重新打开数据库，mtime 应仍是写入值（持久化到 redb）。
+        let store2 = ContainerStore::open(&path).unwrap();
+        let a2 = store2.getattr_ino(ino).unwrap();
+        assert_eq!(a2.mtime, t, "container setattr 的 mtime 应跨 reopen 持久");
     }
 }

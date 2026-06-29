@@ -45,6 +45,9 @@ impl MemStore {
                     perm: 0o755,
                     uid: 0,
                     gid: 0,
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                    atime: std::time::SystemTime::UNIX_EPOCH,
+                    ctime: std::time::SystemTime::UNIX_EPOCH,
                     chunk_size,
                 }),
                 ..Default::default()
@@ -72,6 +75,9 @@ impl MemStore {
                     perm: 0o644,
                     uid: 0,
                     gid: 0,
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                    atime: std::time::SystemTime::UNIX_EPOCH,
+                    ctime: std::time::SystemTime::UNIX_EPOCH,
                     chunk_size: cs,
                 }),
                 ..Default::default()

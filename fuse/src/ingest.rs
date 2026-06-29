@@ -209,6 +209,9 @@ fn dir_attr(meta: &fs::Metadata) -> Attr {
         perm: (meta.mode() & 0o7777) as u16,
         uid: meta.uid(),
         gid: meta.gid(),
+        mtime: crate::core::system_time_from(meta.mtime(), meta.mtime_nsec()),
+        atime: crate::core::system_time_from(meta.atime(), meta.atime_nsec()),
+        ctime: crate::core::system_time_from(meta.ctime(), meta.ctime_nsec()),
         chunk_size: 0,
     }
 }
@@ -222,6 +225,9 @@ fn file_attr(meta: &fs::Metadata, chunk_size: u32) -> Attr {
         perm: (meta.mode() & 0o7777) as u16,
         uid: meta.uid(),
         gid: meta.gid(),
+        mtime: crate::core::system_time_from(meta.mtime(), meta.mtime_nsec()),
+        atime: crate::core::system_time_from(meta.atime(), meta.atime_nsec()),
+        ctime: crate::core::system_time_from(meta.ctime(), meta.ctime_nsec()),
         chunk_size,
     }
 }

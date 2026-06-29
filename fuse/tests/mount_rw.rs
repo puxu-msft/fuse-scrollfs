@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn zipfs_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zipfs"))
@@ -200,6 +200,49 @@ fn rw_assertions(mountpoint: &Path) {
     );
     fs::remove_file(mountpoint.join("renamed.txt")).expect("unlink");
     assert!(!mountpoint.join("renamed.txt").exists());
+
+    // 7) 时间戳读路径：新写文件 mtime 应为「近期」，绝不是 1970 epoch（修复回归守卫）。
+    {
+        let ts_file = mountpoint.join("ts.txt");
+        fs::write(&ts_file, b"now\n").expect("写时间戳文件");
+        let mtime = fs::metadata(&ts_file).unwrap().modified().unwrap();
+        assert!(
+            mtime > UNIX_EPOCH + Duration::from_secs(1_000_000_000),
+            "新写文件 mtime 不应退化为 1970 epoch（得到 {mtime:?}）"
+        );
+        let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
+        assert!(
+            age < Duration::from_secs(3600),
+            "新写文件 mtime 应为近期（age={age:?}）"
+        );
+    }
+
+    // 8) 时间戳写回：touch -d 设定固定 mtime → 经挂载点 stat 取回应被持久化（非 epoch）。
+    {
+        let touched = mountpoint.join("touched.txt");
+        fs::write(&touched, b"x").expect("写 touch 文件");
+        let st = Command::new("touch")
+            .arg("-d")
+            .arg("2025-01-02 03:04:05")
+            .arg(&touched)
+            .status();
+        if let Ok(s) = st {
+            if s.success() {
+                let secs = fs::metadata(&touched)
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                // 2025-01-02 ≈ 1.735e9（时区无关地远离 epoch）。
+                assert!(
+                    secs > 1_700_000_000 && secs < 1_800_000_000,
+                    "touch -d 设的 mtime 应被写回，得到 secs={secs}"
+                );
+            }
+        }
+    }
 
     eprintln!("[OK] 读写 round-trip 全部断言通过（真实挂载）");
 }
