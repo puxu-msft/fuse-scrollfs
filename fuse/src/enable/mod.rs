@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod lifecycle;
 pub mod model;
+pub mod systemd;
 pub mod tui;
 
 use std::path::PathBuf;
