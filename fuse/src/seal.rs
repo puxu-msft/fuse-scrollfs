@@ -157,6 +157,13 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    // rename 持久化需父目录项落盘（docs/04 §6：崩溃后看到新文件而非旧）。
+    // 与 compact.rs 一致；缺此步则崩溃后 seal 的 rename 可能丢失。
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
     let size_after = std::fs::metadata(path)?.len();
     Ok(Some((size_before, size_after)))
 }

@@ -29,6 +29,8 @@
 | **fsync 写放大根治（in-archive 尾日志）** | append 微行 + fsync 每次重压整块 → §8.4 尾日志只追原始增量 + remount 重放重建 | 中 | ✅ §8.4 |
 | **daemon 健壮 + WSL `[boot]` 自挂载** | 目标负载是 Claude Code 运行时写入，守护必须随 WSL 起、崩溃可重挂 | 中 | ✅ --pid-file + zipfs-mount.sh（幂等/stale 清理）+ systemd unit + wsl.conf 片段；fork 守护化未做 |
 | **hardlink 决策** | 现 `ENOTSUP`（`cp -al`/git 会触发）；决定支持（需 inode-id 命名层）或正式不支持 | 中/低 | ✅ 定调：正式**不支持**（保持 ENOTSUP，布局 S 一文件=一 archive，无 inode-id 命名层） |
+| **故障注入测试（两层）** | `kill -9` + tmpfs 测不到「fsync 后丢失 / EIO / 撕裂 / 重排」；进程内 `BlockIo` seam 穷举崩溃点 + dm-log-writes 真实块层门，把崩溃安全协议变可回归 | 中/大 | ☑ 已实施（[05-fault-injection-testing.md](./05-fault-injection-testing.md)）：`BlockIo` 接缝 + `FaultIo` 确定性崩溃模拟器（EIO/撕裂/掉电/乱序 × barrier 软化交叉 + 双 SB 非互污）+ shadow `up.sync()` 失败失效专项；Tier 2 dm-flakey / dm-log-writes / container 三脚本（root 门控） |
+| **seal.rs 缺父目录 fsync** | seal temp+rename 后未 fsync 父目录（compact.rs 有，不一致）；崩溃后 seal 的 rename 可能丢失 | 小 | ✅ 已修：rename 后 fsync 父目录，与 compact.rs 一致 |
 
 ## T2 · 性能（FUSE 用户态对内核的差距）
 

@@ -18,6 +18,7 @@
 
 use super::{Attr, DirEntry, Store, StoredBlock};
 use crate::archive::{ArchiveReader, ArchiveUpdater, ArchiveWriter};
+use crate::blockio::BlockIo;
 use crate::core::inode::Ino;
 
 use std::collections::HashMap;
@@ -129,6 +130,11 @@ pub struct ShadowStore {
     reader_epoch: AtomicU64,
     /// 新建文件采用的默认 chunk_size。
     default_chunk_size: u32,
+    /// 故障注入（docs/05 §4 / 任务 2.6，仅 test/feature）：置位则下次 `commit_session` 走 `FaultIo`
+    /// 并令末尾 `up.sync()` 返 EIO，验证「`invalidate_reader` 先于 `up.sync()`」不变量在 sync 失败时
+    /// 仍成立。
+    #[cfg(any(test, feature = "fault-injection"))]
+    fault_commit_sync: std::sync::atomic::AtomicBool,
 }
 
 impl ShadowStore {
@@ -159,6 +165,8 @@ impl ShadowStore {
             readers: Mutex::new(HashMap::new()),
             reader_epoch: AtomicU64::new(0),
             default_chunk_size,
+            #[cfg(any(test, feature = "fault-injection"))]
+            fault_commit_sync: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -269,6 +277,10 @@ impl ShadowStore {
         let session = self.sessions.lock().unwrap().remove(&ino);
         let Some(session) = session else {
             // 无脏数据：仍对底层文件 fsync（POSIX fsync 语义）。
+            // 注意：这条 `fs::File::open + sync_all` 是一条**独立的 durable 写点**，**有意留在
+            // `BlockIo` 接缝之外**（不经 `ArchiveUpdater`）——它不参与 archive 字节流提交协议，
+            // 故障注入归 crash-test.sh / Tier 2 覆盖，勿误以为 shadow 全部 durable 写已收口 BlockIo
+            // （docs/05 §9 / 任务 1.3）。
             if let Some(abs) = self.abs_of_ino(ino) {
                 if let Ok(f) = fs::File::open(&abs) {
                     f.sync_all()?;
@@ -280,7 +292,35 @@ impl ShadowStore {
             .abs_of_ino(ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
 
+        // 故障注入钩子（docs/05 §4 / 任务 2.6，仅 test/feature）：用 FaultIo 重放 commit 并令末尾
+        // `up.sync()` 返 EIO，验证「invalidate_reader 先于 up.sync()」不变量在 sync 失败时仍成立。
+        // FaultIo 为内存盘面（不落真实 archive），仅检验缓存失效时序，故此分支不更新真实文件内容。
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self
+            .fault_commit_sync
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            let bytes = fs::read(&abs)?;
+            let fio = crate::blockio::FaultIo::from_bytes(bytes);
+            fio.fail_sync_in(3); // commit 内 barrier1/2（sync #1/#2）+ 末尾 up.sync()（#3）失败
+            let mut up = ArchiveUpdater::from_io(fio)?;
+            return self.commit_with_updater(ino, session, &mut up);
+        }
+
         let mut up = ArchiveUpdater::open(&abs)?;
+        self.commit_with_updater(ino, session, &mut up)
+    }
+
+    /// 把脏会话应用到 updater 并提交：截断 → 升序应用脏块 → head 缓存 → `commit` → **失效 reader
+    /// 缓存** → `up.sync()`。泛型于 `BlockIo`（生产为 `File`，任务 2.6 故障注入为 `FaultIo`）。
+    /// **失效点必须在 `up.sync()` 之前**：即便 sync 失败提前返回，盘上已是新版本（commit 内部 barrier
+    /// 已落），缓存也不残留旧 reader（rust-review L3）。
+    fn commit_with_updater<W: BlockIo>(
+        &self,
+        ino: Ino,
+        session: WriteSession,
+        up: &mut ArchiveUpdater<W>,
+    ) -> io::Result<()> {
         // 先截断（若有）。
         if let Some(keep_from) = session.truncate_to {
             up.truncate(keep_from, session.size);
@@ -298,12 +338,19 @@ impl ShadowStore {
             up.set_head_cache(bytes, verbatim, rawlen);
         }
         up.commit()?;
-        // 底层 archive 已变更（commit 内部已 sync_data 落新 footer/index）。在 up.sync() 之前就
-        // 失效缓存：即便随后的 sync() 失败提前返回，盘上已是新版本，缓存也不会残留旧 reader
-        // （rust-review L3）。
+        // 底层 archive 已变更（commit 内部已 sync 落新 footer/index）。在 up.sync() 之前就失效缓存：
+        // 即便随后的 sync() 失败提前返回，盘上已是新版本，缓存也不会残留旧 reader（rust-review L3）。
         self.invalidate_reader(ino);
         up.sync()?;
         Ok(())
+    }
+
+    /// 故障注入（任务 2.6，仅 test/feature）：令下一次 `commit_session` 走 FaultIo 并使末尾
+    /// `up.sync()` 返 EIO。`pub` 以便 feature 构建下集成测试亦可调用（与导出的 `FaultIo` 一致）。
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn fault_next_commit_sync(&self) {
+        self.fault_commit_sync
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -863,8 +910,44 @@ mod tests {
         );
     }
 
-    // ----- head 缓存端到端：Core(rmw) 封块时建 → Store 读快路径（docs/02）-----
+    // ----- 故障注入：commit_session 的 up.sync() 失败后 reader 缓存仍失效（docs/05 §4 / 任务 2.6）-----
 
+    #[test]
+    fn commit_session_sync失败_仍失效reader缓存_不读陈旧() {
+        // 历史 reuse-tail-slot durability 洞高发区：commit_session 把 invalidate_reader 放在
+        // up.sync() **之前**，故即便 sync 失败提前返回，缓存也已失效。三层中只有 FaultIo 能在
+        // 进程内令 up.sync() 返 EIO（docs/05 §8）。
+        let cs = 8u32;
+        let (store, _d, ino) = store_with_file(cs);
+        // 写 + 提交 + 读，填充 reader 缓存。
+        store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
+        store.fsync(ino).unwrap();
+        assert_eq!(
+            read_plain(&store, ino, 0).as_deref(),
+            Some(&b"AAAAAAAA"[..])
+        );
+        assert!(
+            store.readers.lock().unwrap().contains_key(&ino),
+            "读后应缓存 reader"
+        );
+
+        // 再写块0，武装「下次 commit_session 的 up.sync() 返 EIO」。
+        store.put_block(ino, 0, mk_block(b"ZZZZZZZZ"), 8).unwrap();
+        store.fault_next_commit_sync();
+        let res = store.fsync(ino); // commit ok → invalidate_reader → up.sync() EIO → Err
+        assert!(
+            res.is_err(),
+            "注入 sync 失败应使 fsync 返回 Err（非静默吞）"
+        );
+
+        // 不变量：sync 失败提前返回，但 reader 缓存已在 sync 前失效，后续读不命中陈旧 footer。
+        assert!(
+            !store.readers.lock().unwrap().contains_key(&ino),
+            "sync 失败后旧 reader 缓存必已失效（invalidate 先于 up.sync）"
+        );
+    }
+
+    // ----- head 缓存端到端：Core(rmw) 封块时建 → Store 读快路径（docs/02）-----
     use crate::archive::HEAD_CACHE_BYTES;
     use crate::core::rmw::{self, CodecParams};
 

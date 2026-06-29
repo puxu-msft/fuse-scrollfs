@@ -25,8 +25,9 @@
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
+
+use crate::blockio::BlockIo;
 
 /// 文件头魔数，标识 zipfs 布局 S 的 archive。取 "ZIPFSAR1" 的字节。
 pub const MAGIC: [u8; 8] = *b"ZIPFSAR\x01";
@@ -37,11 +38,13 @@ pub const VERSION: u32 = 2;
 /// 文件头大小：magic(8) + version(4)。
 const HEADER_LEN: u64 = 12;
 
-/// 双 superblock 槽在文件头部的固定偏移（commit 点，docs/04 §2）。
-const SB_A_OFFSET: u64 = HEADER_LEN;
-const SB_B_OFFSET: u64 = HEADER_LEN + SB_LEN;
+/// 双 superblock 槽在文件头部的固定偏移（commit 点，docs/04 §2）。`pub`：故障注入测试按
+/// 语义 offset 区间调度（docs/05 §4），SB 槽区间是稳定的格式契约。
+pub const SB_A_OFFSET: u64 = HEADER_LEN;
+pub const SB_B_OFFSET: u64 = HEADER_LEN + SB_LEN;
 /// 数据区起点：header + 两个 superblock 槽。块/index/journal/head 缓存一律 append 到此后。
-const DATA_START: u64 = HEADER_LEN + 2 * SB_LEN;
+/// `pub`：故障注入测试用它界定「数据区写」注入区间（docs/05 §4）。
+pub const DATA_START: u64 = HEADER_LEN + 2 * SB_LEN;
 
 /// 单个块索引项的序列化大小：offset(8) + clen(8) + flags(4) + block_crc(4) = 24 字节。
 const INDEX_ENTRY_LEN: u64 = 24;
@@ -325,8 +328,11 @@ pub fn replay_journal(buf: &[u8]) -> Vec<u8> {
 /// 定位读（pread）：用绝对偏移读，**不移动文件游标**。这让同一只读 `File`（如缓存的
 /// `ArchiveReader`）可被多线程并发 `read_block` 而不发生 seek 竞争（fuser 多线程派发，
 /// reader 缓存按 `Arc` 共享，见 store::shadow 的 per-fh reader 缓存）。
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    file.read_exact_at(buf, offset)
+///
+/// 经 `BlockIo` 接缝（生产为 `impl BlockIo for File`，注入为 `FaultIo`），使「打开/恢复阶段
+/// 读失败」可被故障注入覆盖（docs/05 §3）。
+fn read_exact_at(io: &impl BlockIo, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    io.read_at(offset, buf)
 }
 
 // ===========================================================================
@@ -459,25 +465,28 @@ fn footer_from_sb(sb: &SuperBlock) -> Footer {
 }
 
 /// 读一个 superblock 槽并解析；magic/crc 不符（未初始化/半截写/损坏）→ None。
-fn read_sb_slot(file: &File, off: u64) -> io::Result<Option<SuperBlock>> {
+fn read_sb_slot(io: &impl BlockIo, off: u64) -> io::Result<Option<SuperBlock>> {
     let mut buf = [0u8; SB_LEN as usize];
-    read_exact_at(file, &mut buf, off)?;
+    read_exact_at(io, &mut buf, off)?;
     Ok(parse_superblock(&buf))
 }
 
 /// 级联校验并加载活跃 superblock：读两槽 → 候选按 seq 降序 → 逐个验证 index（bounds + index_crc +
 /// 块 bounds）→ 取首个通过者，返回 `(活跃 SB, 活跃槽偏移, index)`；两槽皆不可用 → corrupt（M4）。
-fn load_active(file: &File, total_len: u64) -> io::Result<(SuperBlock, u64, Vec<ChunkEntry>)> {
+fn load_active(
+    io: &impl BlockIo,
+    total_len: u64,
+) -> io::Result<(SuperBlock, u64, Vec<ChunkEntry>)> {
     let mut cands: Vec<(SuperBlock, u64)> = Vec::with_capacity(2);
-    if let Some(sb) = read_sb_slot(file, SB_A_OFFSET)? {
+    if let Some(sb) = read_sb_slot(io, SB_A_OFFSET)? {
         cands.push((sb, SB_A_OFFSET));
     }
-    if let Some(sb) = read_sb_slot(file, SB_B_OFFSET)? {
+    if let Some(sb) = read_sb_slot(io, SB_B_OFFSET)? {
         cands.push((sb, SB_B_OFFSET));
     }
     cands.sort_by_key(|c| std::cmp::Reverse(c.0.seq)); // seq 降序
     for (sb, off) in cands {
-        if let Some(index) = validate_and_load_index(file, &sb, total_len)? {
+        if let Some(index) = validate_and_load_index(io, &sb, total_len)? {
             return Ok((sb, off, index));
         }
     }
@@ -489,7 +498,7 @@ fn load_active(file: &File, total_len: u64) -> io::Result<(SuperBlock, u64, Vec<
 /// 校验并加载某 superblock 的 index 区；任一校验失败 → Ok(None)（让 load_active 回落另一槽）。
 /// io 错误 → Err。校验：chunk_size!=0、index 区 bounds、index_crc、每块在数据区内。
 fn validate_and_load_index(
-    file: &File,
+    io: &impl BlockIo,
     sb: &SuperBlock,
     total_len: u64,
 ) -> io::Result<Option<Vec<ChunkEntry>>> {
@@ -512,7 +521,7 @@ fn validate_and_load_index(
         return Ok(None);
     }
     let mut index_bytes = vec![0u8; sb.index_len as usize];
-    read_exact_at(file, &mut index_bytes, sb.index_offset)?;
+    read_exact_at(io, &mut index_bytes, sb.index_offset)?;
     if crc32(&index_bytes) != sb.index_crc {
         return Ok(None);
     }
@@ -542,13 +551,13 @@ fn validate_and_load_index(
 }
 
 /// 读 head 缓存压缩字节，越界/溢出 → None（可丢弃派生数据，M2）。`footer` 提供 index_offset 上界。
-fn read_head_cache_bytes(file: &File, footer: &Footer, hc: HeadCache) -> Option<Vec<u8>> {
+fn read_head_cache_bytes(io: &impl BlockIo, footer: &Footer, hc: HeadCache) -> Option<Vec<u8>> {
     let end = hc.offset.checked_add(hc.clen)?;
     if hc.offset < DATA_START || end > footer.index_offset {
         return None; // 越界 → 当作无缓存（优雅回退）。
     }
     let mut buf = vec![0u8; hc.clen as usize];
-    read_exact_at(file, &mut buf, hc.offset).ok()?;
+    read_exact_at(io, &mut buf, hc.offset).ok()?;
     Some(buf)
 }
 
@@ -733,8 +742,13 @@ fn corrupt(msg: &str) -> io::Error {
 
 /// 在已存在 archive 上 append-only 更新。`set_block`/`truncate` 改内存 index 并把新块写到 EOF，
 /// `commit` append 新 index + 写非活跃 superblock 槽（双段 barrier）。
-pub struct ArchiveUpdater {
-    file: File,
+///
+/// 泛型 `W: BlockIo` 是故障注入接缝（docs/05 §3）：生产为 `ArchiveUpdater<File>`（经
+/// `impl BlockIo for File`，与改造前逐字节等价），测试经 `from_io(FaultIo)` 注入确定性崩溃。
+/// 写路径全部经 `self.io.write_at`（绝对偏移 pwrite，与旧 `seek+write_all` 严格等价）+
+/// `self.io.sync`（唯一 barrier）。
+pub struct ArchiveUpdater<W: BlockIo> {
+    io: W,
     chunk_size: u32,
     index: Vec<ChunkEntry>,
     uncompressed_size: u64,
@@ -757,28 +771,38 @@ pub struct ArchiveUpdater {
     journal_len: u64,
 }
 
-impl ArchiveUpdater {
+impl ArchiveUpdater<File> {
     /// 打开已存在的 archive 供更新（读写）。空/缺文件请先用 `ArchiveWriter` 建一个 0 块 archive。
+    /// 生产入口：内部 `OpenOptions` 开 `File` → `from_io`（经 `impl BlockIo for File`）。
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)?;
-        let total_len = file.metadata()?.len();
+        Self::from_io(file)
+    }
+}
+
+impl<W: BlockIo> ArchiveUpdater<W> {
+    /// 从注入的 `BlockIo` 构造 updater（生产为 `File`，故障注入测试为 `FaultIo`，docs/05 §3）。
+    /// 读 header（经 BlockIo）→ `load_active`（读双 SB + index + bounds）→ 载入既有 head 缓存。
+    /// 这条**打开/恢复读链**正是双 SB 崩溃安全最该测的路径，故必须经 `BlockIo` 可注入。
+    pub fn from_io(io: W) -> io::Result<Self> {
+        let total_len = io.len()?;
         if total_len < DATA_START {
             return Err(corrupt("文件太小，不足 header + 双 superblock"));
         }
         let mut header = [0u8; HEADER_LEN as usize];
-        read_exact_at(&file, &mut header, 0)?;
+        read_exact_at(&io, &mut header, 0)?;
         if header[..8] != MAGIC || u32::from_le_bytes(header[8..12].try_into().unwrap()) != VERSION
         {
             return Err(corrupt("非 v2 archive"));
         }
-        let (sb, active_off, index) = load_active(&file, total_len)?;
+        let (sb, active_off, index) = load_active(&io, total_len)?;
         let footer = footer_from_sb(&sb);
         // 载入既有 head 缓存字节（越界 → None，可丢弃派生数据 M2）。
         let head_cache = sb.head_cache.and_then(|hc| {
-            read_head_cache_bytes(&file, &footer, hc).map(|b| (b, hc.verbatim, hc.rawlen))
+            read_head_cache_bytes(&io, &footer, hc).map(|b| (b, hc.verbatim, hc.rawlen))
         });
         let inactive_off = if active_off == SB_A_OFFSET {
             SB_B_OFFSET
@@ -786,7 +810,7 @@ impl ArchiveUpdater {
             SB_A_OFFSET
         };
         Ok(Self {
-            file,
+            io,
             chunk_size: sb.chunk_size,
             index,
             uncompressed_size: sb.uncompressed_size,
@@ -821,7 +845,7 @@ impl ArchiveUpdater {
     /// `set_block`/`truncate`（否则 index 已变、必须走 `commit`）。
     pub fn commit_journal(&mut self) -> io::Result<()> {
         // barrier 1：journal 记录已落盘（append_journal 已写，这里确保 durable）。
-        self.file.sync_all()?;
+        self.io.sync()?;
         let (index_offset, index_len, index_crc) = self.committed_index;
         let new_seq = self.active_seq + 1;
         let sb = SuperBlock {
@@ -836,8 +860,9 @@ impl ArchiveUpdater {
             tail_journal_len: self.journal_len,
             head_cache: self.committed_head_cache,
         };
-        write_superblock_slot(&mut self.file, self.inactive_off, &sb)?;
-        self.file.sync_all()?; // barrier 2
+        self.io
+            .write_at(self.inactive_off, &serialize_superblock(&sb))?;
+        self.io.sync()?; // barrier 2
         self.flip_active(new_seq);
         Ok(())
     }
@@ -849,8 +874,7 @@ impl ArchiveUpdater {
         if self.journal_offset.is_none() {
             self.journal_offset = Some(self.write_cursor);
         }
-        self.file.seek(SeekFrom::Start(self.write_cursor))?;
-        self.file.write_all(&rec)?;
+        self.io.write_at(self.write_cursor, &rec)?;
         self.write_cursor += rec.len() as u64;
         self.journal_len += rec.len() as u64;
         Ok(())
@@ -909,8 +933,7 @@ impl ArchiveUpdater {
             let zeros_crc = crc32(&zeros);
             while (self.index.len() as u64) < idx {
                 let offset = self.write_cursor;
-                self.file.seek(SeekFrom::Start(offset))?;
-                self.file.write_all(&zeros)?;
+                self.io.write_at(offset, &zeros)?;
                 self.write_cursor += zeros.len() as u64;
                 self.index.push(ChunkEntry {
                     offset,
@@ -922,8 +945,7 @@ impl ArchiveUpdater {
         }
         // 恒 append 到 EOF（append-only，C2：绝不覆写任何 SB 可达区间，删除 reuse/set_len）。
         let offset = self.write_cursor;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(stored_bytes)?;
+        self.io.write_at(offset, stored_bytes)?;
         self.write_cursor = offset + stored_bytes.len() as u64;
         let entry = ChunkEntry {
             offset,
@@ -953,11 +975,10 @@ impl ArchiveUpdater {
     /// 写非活跃 superblock 槽（seq+1）→ **barrier 2 fsync（原子提交点）** → 翻转活跃槽。
     pub fn commit(&mut self) -> io::Result<()> {
         // 1) append head 缓存（若有）+ 新 index 到 EOF。
-        self.file.seek(SeekFrom::Start(self.write_cursor))?;
         let head_cache = match &self.head_cache {
             Some((bytes, verbatim, raw_len)) => {
                 let offset = self.write_cursor;
-                self.file.write_all(bytes)?;
+                self.io.write_at(offset, bytes)?;
                 self.write_cursor += bytes.len() as u64;
                 Some(HeadCache {
                     offset,
@@ -971,11 +992,10 @@ impl ArchiveUpdater {
         let index_offset = self.write_cursor;
         let index_bytes = serialize_index(&self.index);
         let index_crc = crc32(&index_bytes);
-        self.file.seek(SeekFrom::Start(index_offset))?;
-        self.file.write_all(&index_bytes)?;
+        self.io.write_at(index_offset, &index_bytes)?;
         self.write_cursor += index_bytes.len() as u64;
         // barrier 1：数据 + index 落盘（检查返回值；失败则不写/不推进 superblock，旧活跃槽不受损）。
-        self.file.sync_all()?;
+        self.io.sync()?;
 
         // 2) 写非活跃 superblock 槽（seq+1）= 原子提交点。
         let new_seq = self.active_seq + 1;
@@ -991,9 +1011,10 @@ impl ArchiveUpdater {
             tail_journal_len: self.journal_len,
             head_cache,
         };
-        write_superblock_slot(&mut self.file, self.inactive_off, &sb)?;
+        self.io
+            .write_at(self.inactive_off, &serialize_superblock(&sb))?;
         // barrier 2：superblock 落盘 → 新版本原子生效。
-        self.file.sync_all()?;
+        self.io.sync()?;
 
         // 更新已提交 index / head 缓存描述符（供后续 commit_journal 复用），翻转活跃槽。
         self.committed_index = (index_offset, index_bytes.len() as u64, index_crc);
@@ -1004,7 +1025,7 @@ impl ArchiveUpdater {
 
     /// fsync 后端文件（commit 已含 barrier，保留兼容 shadow 的 commit→sync 调用序）。
     pub fn sync(&self) -> io::Result<()> {
-        self.file.sync_all()
+        self.io.sync()
     }
 }
 
@@ -1799,5 +1820,118 @@ mod tests {
             ArchiveReader::open(tmp.path()).is_err(),
             "尾日志越界的槽应被级联校验拒绝；两槽皆坏 → 报损坏"
         );
+    }
+
+    // ----- 字节等价回归网（spy IO，docs/05 任务 1.2c）-----
+    //
+    // 现有 updater 测试只经 reader 间接验最终字节正确，offset 错位可能因 CRC 自洽蒙混。本网用
+    // in-memory BlockIo 镜像与真实 File 路径逐字节比对：钉死「FaultIo 盘面模型字节级保真」——
+    // Tier 1「crash() 镜像 → ArchiveReader::from_file」全建在这条保真之上。
+
+    /// 记录所有 `write_at` 的 spy `BlockIo`：内部 `Vec<u8>` 模拟盘面（绝对偏移写、越界零填充扩展，
+    /// 仿 `File` 语义），`Clone` 共享内部状态，使 updater 消费后仍能取出镜像与写记录。
+    #[derive(Clone)]
+    struct RecordingIo {
+        inner: std::sync::Arc<std::sync::Mutex<RecState>>,
+    }
+    struct RecState {
+        data: Vec<u8>,
+        writes: Vec<(u64, usize)>,
+    }
+    impl RecordingIo {
+        fn new(initial: Vec<u8>) -> Self {
+            Self {
+                inner: std::sync::Arc::new(std::sync::Mutex::new(RecState {
+                    data: initial,
+                    writes: Vec::new(),
+                })),
+            }
+        }
+        fn image(&self) -> Vec<u8> {
+            self.inner.lock().unwrap().data.clone()
+        }
+        fn writes(&self) -> Vec<(u64, usize)> {
+            self.inner.lock().unwrap().writes.clone()
+        }
+    }
+    impl BlockIo for RecordingIo {
+        fn write_at(&self, off: u64, buf: &[u8]) -> io::Result<()> {
+            let mut st = self.inner.lock().unwrap();
+            let end = off as usize + buf.len();
+            if st.data.len() < end {
+                st.data.resize(end, 0); // 越界写自动零填充扩展，仿 File 语义。
+            }
+            st.data[off as usize..end].copy_from_slice(buf);
+            st.writes.push((off, buf.len()));
+            Ok(())
+        }
+        fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+            let st = self.inner.lock().unwrap();
+            let end = off as usize + buf.len();
+            if end > st.data.len() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read 越界"));
+            }
+            buf.copy_from_slice(&st.data[off as usize..end]);
+            Ok(())
+        }
+        fn sync(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.inner.lock().unwrap().data.len() as u64)
+        }
+        fn set_len(&self, len: u64) -> io::Result<()> {
+            self.inner.lock().unwrap().data.resize(len as usize, 0);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn updater_spy_io_字节镜像与_file_路径逐字节等价() {
+        // 基线档 1 块；两条路径从同一初始字节出发跑同一工作负载（两次 set_block + commit），
+        // 比对最终盘面逐字节相等——证 in-memory 基底与真实 File 字节级保真。
+        let base = build_archive(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);
+
+        // golden = File 路径（生产，经 impl BlockIo for File；已被全套 reader 测试 + crash-test.sh 验证）。
+        let golden = {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(&base).unwrap();
+            tmp.flush().unwrap();
+            let mut up = ArchiveUpdater::open(tmp.path()).unwrap();
+            up.set_block(1, b"BBBB", false, 12).unwrap();
+            up.set_block(0, b"XXXXXXXX", false, 16).unwrap();
+            up.commit().unwrap();
+            std::fs::read(tmp.path()).unwrap()
+        };
+
+        // mirror = spy 路径（in-memory Vec 基底，记录 write）。
+        let spy = RecordingIo::new(base.clone());
+        let probe = spy.clone();
+        let mut up = ArchiveUpdater::from_io(spy).unwrap();
+        up.set_block(1, b"BBBB", false, 12).unwrap();
+        up.set_block(0, b"XXXXXXXX", false, 16).unwrap();
+        up.commit().unwrap();
+        let mirror = probe.image();
+
+        assert_eq!(
+            mirror, golden,
+            "spy in-memory 盘面应与 File 路径逐字节等价（offset 错位会在此暴露）"
+        );
+
+        // 独立结构校验：活跃 SB 的 index 区由测试侧定位，断言镜像该处字节自洽，且 index append 在
+        // 基线档之后（不靠 reader 自证；堵「写错 offset 但 SB 指向别处仍 CRC 自洽」）。
+        let sb = active_sb(&mirror);
+        assert!(
+            sb.index_offset as usize >= base.len(),
+            "index 应 append 在基线档之后"
+        );
+        let idx = &mirror[sb.index_offset as usize..(sb.index_offset + sb.index_len) as usize];
+        assert_eq!(
+            crc32(idx),
+            sb.index_crc,
+            "镜像 index 区应与活跃 SB 的 index_crc 自洽"
+        );
+        // spy 确实记录了写（commit 至少写了 index + 一个 SB 槽）。
+        assert!(probe.writes().len() >= 2, "spy 应记录 commit 期间的写");
     }
 }
