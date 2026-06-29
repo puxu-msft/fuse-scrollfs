@@ -240,7 +240,7 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
     zipfs::enable::model::validate_name(&name)?;
-    zipfs::enable::daemon::RealMounter.unmount(&paths.mountpoint(&name))
+    zipfs::enable::daemon::RealMounter.unmount(&name, &paths.mountpoint(&name))
 }
 
 /// 由 `MountSpec` 构造等价的 `MountArgs`，让 managed 挂载复用 `run_mount` 全部 FUSE 装配逻辑。

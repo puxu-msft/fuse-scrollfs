@@ -162,7 +162,7 @@ pub fn apply(
     // 状态为 STOPPED（orig 在、未挂载、committed），用户 `enable remount` 直接复用，无需重灌。
     let spec = mount_spec(paths, name, &opts);
     if let Err(e) = mounter.spawn(&spec) {
-        let _ = mounter.unmount(&mp); // 清理可能残留的半挂载 endpoint
+        let _ = mounter.unmount(name, &mp); // 清理可能残留的半挂载 endpoint
         return Err(err(format!(
             "挂载失败：{e}；backing 已提交、数据完好（未删除），状态置为 STOPPED。\
              运行 `enable remount {name}` 重挂，或 `enable restore {name}` 回到 Plain"
@@ -183,7 +183,7 @@ pub fn restore(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
     if !orig.exists() {
         return Err(err(format!("无备份 {}，无法还原", orig.display())));
     }
-    mounter.unmount(&mp)?;
+    mounter.unmount(name, &mp)?;
     // 删空挂载点目录（apply 时建的空 dir；仍非空 = 仍挂载）。崩溃后已删则跳过（幂等续做）。
     match fs::remove_dir(&mp) {
         Ok(()) => {}
@@ -211,7 +211,7 @@ pub fn remount(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
         return Ok(()); // 幂等。
     }
     if !discovery::endpoint_ok(&mp) {
-        let _ = mounter.unmount(&mp); // 清 stale endpoint。
+        let _ = mounter.unmount(name, &mp); // 清 stale endpoint。
     }
     let meta = discovery::read_meta(&paths.meta_path(name))?
         .filter(|m| m.committed)
@@ -313,7 +313,7 @@ fn maintain(
     let mp = paths.mountpoint(name);
     let was_mounted = mounter.is_mounted(&mp);
     if was_mounted {
-        mounter.unmount(&mp)?;
+        mounter.unmount(name, &mp)?;
         let exited = wait_daemon_exit(paths, name);
         // container 的 redb 排他锁须等旧守护退出才释放；未确认退出则不动手，重挂回去（H2）。
         if meta.backend == Backend::Container && !exited {
@@ -714,7 +714,7 @@ mod tests {
         apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
 
         // 模拟守护死：从 FakeMounter 移除挂载，状态变 STOPPED（备份在 + 已提交）。
-        m.unmount(&paths.mountpoint("demo")).unwrap();
+        m.unmount("demo", &paths.mountpoint("demo")).unwrap();
         assert_eq!(
             discovery::probe(&paths, "demo").status,
             ProjectStatus::Stopped

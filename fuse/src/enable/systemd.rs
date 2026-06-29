@@ -8,6 +8,8 @@
 //! 模板 unit body、环境探测。真正的 `SystemdMounter`（实现 `Mounter`）也在此，但其行为靠
 //! 集成测试（需 systemd + /dev/fuse）覆盖。
 
+use crate::enable::discovery;
+
 /// systemd 实例名允许**不转义**的字符：数字 / 字母 / `:` `_` `.`（对齐 systemd `VALID_CHARS`
 /// 去掉 `-` `\`——这两者 systemd 总是转义）。
 fn is_plain(b: u8) -> bool {
@@ -95,6 +97,67 @@ pub fn resolve_managed_spec(
     ))
 }
 
+/// 构造 `systemctl --user <verb> zipfs@<esc>.service` 的 argv（不含 `systemctl` 本身），
+/// 实例名经 `systemd_escape`。纯函数，便于单测命令构造正确性（仿 daemon 的 mount_argv 模式）。
+pub fn systemctl_args(verb: &str, name: &str) -> Vec<String> {
+    vec![
+        "--user".to_string(),
+        verb.to_string(),
+        format!("zipfs@{}.service", systemd_escape(name)),
+    ]
+}
+
+/// 跑一条 `systemctl --user …`，非零退出 → Err（带 argv 上下文）。
+fn run_systemctl(args: &[String]) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let status = Command::new("systemctl")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "systemctl {} 失败（{status}）",
+            args.join(" ")
+        )))
+    }
+}
+
+/// systemd user 托管挂载器：per-project 模板实例 `zipfs@<esc>.service`（单实例 + 自动重启 +
+/// 监管）。`spawn`/`unmount` 走 `systemctl --user start/stop`；`is_mounted` 查 /proc 地面真值
+/// （非 unit active 状态，避免 unit 报 active 但挂载实际已 stale）。
+pub struct SystemdMounter;
+
+impl crate::enable::daemon::Mounter for SystemdMounter {
+    fn spawn(&self, spec: &crate::enable::daemon::MountSpec) -> std::io::Result<()> {
+        // 先 reset-failed 清掉上次失败计数，否则触发 start-limit 时 start 直接被拒（评审建议）。
+        let _ = run_systemctl(&systemctl_args("reset-failed", &spec.name));
+        // Type=notify：start 阻塞到 main.rs sd_notify READY，比轮询更可靠。
+        run_systemctl(&systemctl_args("start", &spec.name))?;
+        // 再校验地面真值（/proc mountinfo）：unit active 不等于挂载就绪。
+        if discovery::is_mounted(&spec.mountpoint) && discovery::endpoint_ok(&spec.mountpoint) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "systemd start 后挂载点未就绪：{}",
+                spec.mountpoint.display()
+            )))
+        }
+    }
+
+    fn unmount(&self, name: &str, _mountpoint: &std::path::Path) -> std::io::Result<()> {
+        // 必须 systemctl stop（而非直接 fusermount -u），否则 Restart=on-failure 会与卸载抢挂。
+        run_systemctl(&systemctl_args("stop", name))
+    }
+
+    fn is_mounted(&self, mountpoint: &std::path::Path) -> bool {
+        discovery::is_mounted(mountpoint)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +196,22 @@ mod tests {
         assert_eq!(
             systemd_unescape("\\x2dhome\\x2dxp\\x2dsrc\\x2dneighbors"),
             "-home-xp-src-neighbors"
+        );
+    }
+
+    #[test]
+    fn systemctl_args_builds_escaped_instance_unit() {
+        assert_eq!(
+            systemctl_args("start", "-home-xp-src-neighbors"),
+            vec![
+                "--user",
+                "start",
+                "zipfs@\\x2dhome\\x2dxp\\x2dsrc\\x2dneighbors.service",
+            ]
+        );
+        assert_eq!(
+            systemctl_args("stop", "plain"),
+            vec!["--user", "stop", "zipfs@plain.service"]
         );
     }
 

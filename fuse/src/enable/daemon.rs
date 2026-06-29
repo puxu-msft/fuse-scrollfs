@@ -36,8 +36,9 @@ pub struct MountSpec {
 pub trait Mounter {
     /// 启动 detached 守护并等待挂载就绪；超时/早死 → Err（不留半挂状态）。
     fn spawn(&self, spec: &MountSpec) -> std::io::Result<()>;
-    /// 卸载挂载点（轮询直至卸载完成或超时）。
-    fn unmount(&self, mountpoint: &Path) -> std::io::Result<()>;
+    /// 卸载挂载点（轮询直至卸载完成或超时）。`name` 供 systemd 实现 `systemctl stop` 用，
+    /// `RealMounter`/`FakeMounter` 忽略（直接卸 mountpoint）。
+    fn unmount(&self, name: &str, mountpoint: &Path) -> std::io::Result<()>;
     /// 是否为活的 zipfs 挂载点。
     fn is_mounted(&self, mountpoint: &Path) -> bool;
 }
@@ -100,7 +101,7 @@ impl Mounter for RealMounter {
         ))
     }
 
-    fn unmount(&self, mountpoint: &Path) -> std::io::Result<()> {
+    fn unmount(&self, _name: &str, mountpoint: &Path) -> std::io::Result<()> {
         unmount_path(mountpoint)?;
         for _ in 0..POLL_MAX {
             if !discovery::is_mounted(mountpoint) {
@@ -219,7 +220,7 @@ pub(crate) mod fake {
             self.mounted.lock().unwrap().insert(spec.mountpoint.clone());
             Ok(())
         }
-        fn unmount(&self, mountpoint: &Path) -> std::io::Result<()> {
+        fn unmount(&self, _name: &str, mountpoint: &Path) -> std::io::Result<()> {
             self.mounted.lock().unwrap().remove(mountpoint);
             Ok(())
         }
