@@ -414,6 +414,7 @@ pub fn purge_backing(paths: &Paths, name: &str, yes: bool) -> io::Result<()> {
 /// 组装挂载守护参数（apply / remount 共用，DRY）。
 fn mount_spec(paths: &Paths, name: &str, opts: &ApplyOptions) -> MountSpec {
     MountSpec {
+        name: name.to_string(),
         backend: opts.backend,
         backing: paths.backing(name, opts.backend),
         mountpoint: paths.mountpoint(name),

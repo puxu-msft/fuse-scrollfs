@@ -13,6 +13,9 @@ use crate::enable::discovery;
 /// 挂载一个守护所需参数。
 #[derive(Debug, Clone)]
 pub struct MountSpec {
+    /// project 原始名（如 `-home-xp-src-neighbors`）。`SystemdMounter` 据此拼实例名；
+    /// `RealMounter` 忽略（其 argv 不含 name，靠 backing/mountpoint 即可）。
+    pub name: String,
     pub backend: crate::enable::model::Backend,
     pub backing: PathBuf,
     pub mountpoint: PathBuf,
@@ -233,6 +236,7 @@ mod tests {
     #[test]
     fn mount_argv_uses_shadow_and_all_flags() {
         let spec = MountSpec {
+            name: "demo".to_string(),
             backend: crate::enable::model::Backend::Shadow,
             backing: PathBuf::from("/b"),
             mountpoint: PathBuf::from("/m"),
@@ -274,6 +278,7 @@ mod tests {
     #[test]
     fn mount_argv_container_and_optional_flags() {
         let spec = MountSpec {
+            name: "demo".to_string(),
             backend: crate::enable::model::Backend::Container,
             backing: PathBuf::from("/b.redb"),
             mountpoint: PathBuf::from("/m"),
