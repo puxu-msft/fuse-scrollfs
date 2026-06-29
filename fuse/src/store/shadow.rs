@@ -498,6 +498,25 @@ impl Store for ShadowStore {
         out
     }
 
+    fn readlink(&self, ino: Ino) -> io::Result<PathBuf> {
+        let abs = self
+            .abs_of_ino(ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
+        fs::read_link(&abs)
+    }
+
+    fn symlink(&self, parent: Ino, name: &str, target: &Path) -> io::Result<Attr> {
+        let parent_rel = self
+            .rel_of(parent)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
+        let child_rel = parent_rel.join(name);
+        let abs = self.abs_of(&child_rel);
+        std::os::unix::fs::symlink(target, &abs)?;
+        let meta = fs::symlink_metadata(&abs)?;
+        let ino = self.inodes.lock().unwrap().intern(child_rel);
+        Ok(self.attr_from_meta(ino, &meta, &abs))
+    }
+
     fn setattr(&self, ino: Ino, attr: Attr) -> io::Result<()> {
         let abs = self
             .abs_of_ino(ino)
@@ -766,6 +785,34 @@ mod tests {
         };
         let ino = store.create(ROOT_INO, "f.bin", attr).unwrap();
         (store, dir, ino)
+    }
+
+    #[test]
+    fn symlink_creates_with_symlink_kind_and_readlink_round_trips() {
+        let (store, _dir, _file_ino) = store_with_file(4096);
+        // 指向 mount 外的软链（Claude `memory` 外链即此类）：target 原样存取。
+        let target = Path::new("/some/external/memory");
+        let a = store.symlink(ROOT_INO, "memory", target).unwrap();
+        assert_eq!(
+            a.kind,
+            fuser::FileType::Symlink,
+            "新条目类型应为 Symlink（否则内核不会发 readlink）"
+        );
+        // readlink 原样返回 target，不暴露 backing 绝对路径。
+        assert_eq!(store.readlink(a.ino).unwrap(), target);
+        // 经 lookup 再取也应是 Symlink（symlink_metadata 不跟随）。
+        assert_eq!(
+            store.lookup(ROOT_INO, "memory").unwrap().kind,
+            fuser::FileType::Symlink
+        );
+    }
+
+    #[test]
+    fn readlink_on_regular_file_is_einval() {
+        let (store, _dir, file_ino) = store_with_file(4096);
+        let e = store.readlink(file_ino).unwrap_err();
+        // readlink(2) 对非链接返回 EINVAL → std 映射 InvalidInput。
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "对普通文件应 EINVAL");
     }
 
     #[test]

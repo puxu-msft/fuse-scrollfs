@@ -67,6 +67,17 @@ pub trait Store: Send + Sync {
     fn rmdir(&self, parent: Ino, name: &str) -> io::Result<()>;
     fn rename(&self, old: (Ino, &str), new: (Ino, &str)) -> io::Result<()>;
     fn readdir(&self, dir: Ino) -> Vec<DirEntry>;
+
+    /// 读取符号链接目标。默认不支持（ENOSYS）；shadow 路径镜像后端实现（serve Claude `memory` 外链）。
+    fn readlink(&self, _ino: Ino) -> io::Result<std::path::PathBuf> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
+    /// 创建符号链接，返回新条目属性。默认不支持（ENOSYS）；shadow 后端实现。
+    fn symlink(&self, _parent: Ino, _name: &str, _target: &std::path::Path) -> io::Result<Attr> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+
     /// 更新属性。`size`/`perm`/`uid`/`gid` 取自 `attr`；`chunk_size` 不可变更（建文件时定）。
     fn setattr(&self, ino: Ino, attr: Attr) -> io::Result<()>;
 

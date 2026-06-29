@@ -8,6 +8,7 @@ pub mod archive;
 pub mod blockio;
 pub mod compact;
 pub mod core;
+pub mod enable;
 pub mod fixture;
 pub mod ingest;
 pub mod passthrough;

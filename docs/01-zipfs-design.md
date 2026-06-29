@@ -168,6 +168,10 @@ V 的定义性特征是「整棵树落到一个后端对象」，这把三件事
 - **目录** = 底层真实目录。**属性来源**：mode/uid/gid/mtime **直接复用底层 inode 的 stat**，仅 `uncompressed_size` 与 `chunk_size` 放 **xattr（`user.zipfs.*`）或包头**。避免「为读属性而 open+解析每个 header」——否则 `ls -l`/`find` 在海量小文件下退化成 N 次 open，会让 BS 的元数据跑分不必要地难看（注意 ext4 xattr 大小限制，且 WSL 需确认 user xattr 已启用）。
 - **名字映射**：逻辑 `/a/b.txt` ↔ 后端 `BACKING/a/b.txt`（1:1）。须定义：超过 ext4 255 字节文件名、含特殊字节的逻辑名如何编码（建议对非法/超长名做可逆编码）。
 - **hardlink**：「逻辑路径=后端路径」模型天然无法表达「一份数据两个名字」。**首版 `link` 返回 `ENOTSUP`** 并在 P4 文档化（`cp -al`/git 会触发）；若日后要支持需引入 inode-id 命名 + 目录项表，会让 S 退化成「半个 V」，权衡后再定。
+- **特殊条目三分决策**（`enable` 迁移落地后定，shadow 布局）：
+  - **symlink → 重建支持**。backing 是真实目录树，ingest 照原样 `read_link`+`symlink` 重建（target 字节原样，可指向 mount 外）；运行时由 shadow store + rwfs 的 `readlink`/`symlink` op 透明服务，内核在挂载点命名空间内解析。Claude projects 的 `memory` 外链即依赖此路径。target 不做校验——与任何真实 FS 的 symlink 语义一致，非越权面。
+  - **hardlink → 正式不支持**（`ENOTSUP`，见上）。
+  - **FIFO/socket/设备 → 拒绝切换**。shadow 无法表示，ingest 计入 `skipped`，`apply` 据此回滚到 Plain（避免静默丢失）。Claude projects 实测无此类。
 - **sparse/空洞**：定义空洞在 archive 中的表示（跳过该块索引 vs 存零块）。这直接影响**压缩比指标口径**——见 §10 末「物理占用口径」。
 - **RMW（中间块覆盖，本负载下罕见）**：读 footer 索引 → 解压目标块 → 改 → 重压。因压缩长度变，被覆盖块可能放不回原位：首版**在末尾追加新版本块 + footer 索引指向新位置**（旧位置成包内空洞，留待后续 GC/压实），避免全量重写；崩溃安全用 footer 的原子更新（写新 footer + crc，旧 footer 失效）保证。仅当空洞过多再触发离线压实（temp+rename 整理）。
 - **优点**：损坏**局部化**（只伤单个文件）；**天然并行**（不同文件 = 不同后端文件）；复用底层 FS 的命名/权限/空间/一致性；可逐文件备份/同步/排查；无全局 GC。

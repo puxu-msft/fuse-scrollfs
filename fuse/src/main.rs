@@ -77,6 +77,18 @@ enum Command {
     /// 用法：`zipfs ingest --src <目录> --backing <dst 树> [--verify] [--chunk-size --level]`。
     /// 源只读、流式（单文件内存 ~chunk），适合大 jsonl；`--verify` 灌后逐字节比对。
     Ingest(IngestArgs),
+
+    /// Claude projects 透明压缩启用器：可逆切换/还原/重挂 + 状态总览 + 自挂载（TUI / 子动作）。
+    ///
+    /// 用法：`zipfs enable`（TUI）或 `zipfs enable list|apply|restore|remount|status|purge|autostart`。
+    Enable(EnableArgs),
+}
+
+/// `enable` 子命令参数：无子动作 → TUI。
+#[derive(clap::Args, Debug)]
+struct EnableArgs {
+    #[command(subcommand)]
+    action: Option<zipfs::enable::EnableAction>,
 }
 
 /// 挂载所需参数（无子命令时生效）。所有字段 `Option`，便于在 `compact` 子命令下不强制提供。
@@ -171,6 +183,17 @@ fn main() -> std::io::Result<()> {
         Some(Command::TrainDict(args)) => run_train_dict(args),
         Some(Command::Seal(args)) => run_seal(args),
         Some(Command::Ingest(args)) => run_ingest(args),
+        Some(Command::Enable(args)) => {
+            // HOME 缺失时不猜测 /root：enable 操作真实用户数据，错树即误操作（fail-closed）。
+            // 需要非默认根时显式用 env CLAUDE_PROJECTS / ZIPFS_HOME 覆盖。
+            let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "未设置 HOME，拒绝猜测路径；请设 HOME，或用 CLAUDE_PROJECTS / ZIPFS_HOME 显式指定",
+                )
+            })?;
+            zipfs::enable::run(args.action, home)
+        }
         None => run_mount(cli.mount),
     }
 }
@@ -261,9 +284,11 @@ fn run_ingest(args: IngestArgs) -> std::io::Result<()> {
         log::warn!("灌入失败（跳过）：{} — {e}", p.display());
     }
     println!(
-        "ingest: files={} verified={} errors={} bytes {} -> {} ({:.2}x)",
+        "ingest: files={} verified={} symlinks={} skipped={} errors={} bytes {} -> {} ({:.2}x)",
         s.files,
         s.verified,
+        s.symlinks,
+        s.skipped,
         s.errors.len(),
         s.bytes_src,
         s.bytes_archive,

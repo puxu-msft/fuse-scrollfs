@@ -50,6 +50,37 @@ fuse/target/release/zipfs --backend container --backing <redb文件> --mountpoin
 fuse/target/release/zipfs compact --backend container --backing <redb文件>
 ```
 
+## 启用到 Claude projects（`zipfs enable`，TUI / 子命令）
+
+把 `~/.claude/projects/*` 目录**可逆**切换到透明压缩挂载：`mv 备份 → ingest --verify → 挂载`，
+失败回滚、零丢失；backing 内 `.zipfs.meta` 提交标记使半灌可检测、绝不当权威挂出。
+
+```bash
+fuse/target/release/zipfs enable                 # 交互式 TUI（列表/状态/切换/还原/重挂/选项/批量）
+fuse/target/release/zipfs enable list            # 状态总览（PLAIN/ZIPFS/STOPPED/BROKEN + 压缩比）
+fuse/target/release/zipfs enable apply  <name>   # 切换（活跃会话默认拦截，需 --force）
+fuse/target/release/zipfs enable restore <name>  # 还原（backing 保留，可 `enable purge` 清理）
+fuse/target/release/zipfs enable remount --all   # 守护崩溃/重启后重挂所有 STOPPED
+fuse/target/release/zipfs enable autostart install   # systemd user 登录自挂载（WSL 用 `autostart print`）
+```
+
+apply 选项（全部持久化到 backing sidecar，remount 原样复用；TUI 内 `o` 调 backend/chunk/level/threads/writeback）：
+
+```bash
+zipfs enable apply <name> --backend shadow|container \
+  --chunk 1048576 --level 19 --dict shared.dict --threads 4 --writeback \
+  --max-write 4194304 --no-tail-buffer --allow-other --auto-unmount --metrics-file z.prom
+```
+
+- **两种后端可选**：`shadow`（默认；真实目录树，支持 symlink，append 友好）/ `container`（redb 单文件，便于搬运；不支持 symlink）。
+- **持久化默认**：`zipfs enable config set level 19` / `config show` —— 免去每次重复敲选项。
+- **维护**：`zipfs enable compact <name>`（回收空间，两后端）、`zipfs enable seal <name>`（仅 shadow，冷文件大块重压）—— 自动卸载→操作→重挂。
+- 透明支持 Claude 的 `memory` 外部软链（shadow：ingest 照原样重建、运行时经 readlink 服务）；真正特殊文件（FIFO/socket/设备）会被拒绝并回滚，避免静默丢失。
+
+> 路径可经 env `CLAUDE_PROJECTS` / `ZIPFS_HOME` 覆盖（默认 `~/.claude/projects`、`~/.claude-zip`）。
+> 取代了早期 `bench/scripts/zipfs-{cutover,rollback,mount}.sh`（保留作手动/参考）。
+
+
 ## 基准
 
 ```bash

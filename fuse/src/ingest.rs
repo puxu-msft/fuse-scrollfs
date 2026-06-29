@@ -6,10 +6,14 @@
 
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::archive::{ArchiveReader, ArchiveWriter};
 use crate::core::codec::{compress, decompress_block, Algo};
+use crate::core::inode::Ino;
+use crate::store::container::ContainerStore;
+use crate::store::{Attr, Store, StoredBlock};
 
 /// 灌入汇总。
 #[derive(Debug, Default, Clone)]
@@ -18,6 +22,10 @@ pub struct IngestStats {
     pub bytes_src: u64,
     pub bytes_archive: u64,
     pub verified: u64,
+    /// 重建的符号链接数（shadow backing 是真实目录树，照原样重建，运行时经 readlink 透明服务）。
+    pub symlinks: u64,
+    /// 跳过的真正特殊条目数（FIFO / socket / 设备）。shadow 无法表示，调用方据此判完整性。
+    pub skipped: u64,
     pub errors: Vec<(PathBuf, String)>,
 }
 
@@ -50,6 +58,174 @@ pub fn ingest_tree(
     Ok(stats)
 }
 
+/// 把 `src` 目录灌入 **container（布局 V，redb 文件）**。经 Store API 建树 + 逐块压缩写入，
+/// `verify` 开则逐文件 read-back 比对。container 无法表示符号链接/特殊文件 → 计入 `skipped`，
+/// 调用方据此拒绝（避免静默丢失），与 shadow 的 special 处理一致。
+pub fn ingest_tree_to_container(
+    src: &Path,
+    redb: &Path,
+    chunk_size: u32,
+    level: i32,
+    verify: bool,
+) -> io::Result<IngestStats> {
+    if chunk_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk_size 不能为 0",
+        ));
+    }
+    let store = ContainerStore::open_with_chunk_size(redb, chunk_size)?;
+    let mut stats = IngestStats::default();
+    // 根 ino 约定为 1（与 ShadowStore/容器一致）。
+    ingest_dir_into_store(&store, src, 1, chunk_size, level, verify, &mut stats)?;
+    store.sync_all()?;
+    Ok(stats)
+}
+
+/// 递归把 `src` 目录灌入已打开的 `store`（parent ino 已建）。
+fn ingest_dir_into_store(
+    store: &ContainerStore,
+    src: &Path,
+    parent_ino: Ino,
+    chunk_size: u32,
+    level: i32,
+    verify: bool,
+    stats: &mut IngestStats,
+) -> io::Result<()> {
+    for dent in fs::read_dir(src)? {
+        let dent = dent?;
+        let ft = dent.file_type()?;
+        let name = dent.file_name();
+        let Some(name_str) = name.to_str() else {
+            stats.skipped += 1; // 非 UTF-8 名跳过（避免静默：计入 skipped）。
+            continue;
+        };
+        let s = src.join(&name);
+        if ft.is_dir() {
+            let meta = fs::symlink_metadata(&s)?;
+            let attr = dir_attr(&meta);
+            let child = store.mkdir(parent_ino, name_str, attr)?;
+            ingest_dir_into_store(store, &s, child, chunk_size, level, verify, stats)?;
+        } else if ft.is_file() {
+            match ingest_file_into_store(store, &s, parent_ino, name_str, chunk_size, level, verify)
+            {
+                Ok((src_b, arch_b, ok)) => {
+                    stats.files += 1;
+                    stats.bytes_src += src_b;
+                    stats.bytes_archive += arch_b;
+                    stats.verified += u64::from(ok);
+                }
+                Err(e) => stats.errors.push((s, e.to_string())),
+            }
+        } else {
+            // 符号链接/特殊文件：container 无法表示 → 计入 skipped（调用方拒绝，避免静默丢失）。
+            stats.skipped += 1;
+        }
+    }
+    Ok(())
+}
+
+/// 灌一个文件进 container：create → 逐 chunk 压缩 put_block → fsync；verify 则 read-back 比对。
+/// 返回 (源字节, 压缩字节, 是否校验通过)。
+fn ingest_file_into_store(
+    store: &ContainerStore,
+    src: &Path,
+    parent_ino: Ino,
+    name: &str,
+    chunk_size: u32,
+    level: i32,
+    verify: bool,
+) -> io::Result<(u64, u64, bool)> {
+    let meta = fs::symlink_metadata(src)?;
+    let attr = file_attr(&meta, chunk_size);
+    let ino = store.create(parent_ino, name, attr)?;
+    let mut f = fs::File::open(src)?;
+    let mut buf = vec![0u8; chunk_size as usize];
+    let mut idx = 0u64;
+    let mut written = 0u64;
+    let mut archive = 0u64;
+    loop {
+        let n = read_full(&mut f, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let (bytes, stored_verbatim) = compress(&buf[..n], Algo::Zstd, level)?;
+        archive += bytes.len() as u64;
+        written += n as u64;
+        store.put_block(
+            ino,
+            idx,
+            StoredBlock {
+                bytes,
+                stored_verbatim,
+            },
+            written,
+        )?;
+        idx += 1;
+    }
+    store.fsync(ino)?;
+    let ok = if verify {
+        verify_file_in_store(store, src, ino)?
+    } else {
+        true
+    };
+    Ok((written, archive, ok))
+}
+
+/// 逐字节校验 container 内某 ino 与源文件一致（流式，内存 ~chunk）。
+fn verify_file_in_store(store: &ContainerStore, src: &Path, ino: Ino) -> io::Result<bool> {
+    let Some((_size, cs)) = store.block_geometry(ino) else {
+        return Ok(false);
+    };
+    let mut f = fs::File::open(src)?;
+    let mut buf = vec![0u8; cs as usize];
+    let mut idx = 0u64;
+    loop {
+        let n = read_full(&mut f, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let blk = store
+            .get_block(ino, idx)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("校验缺块 {idx}")))?;
+        let plain = decompress_block(&blk.bytes, Algo::Zstd, blk.stored_verbatim, None)?;
+        if plain != buf[..n] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("校验失败：{} 块 {idx} 不一致", src.display()),
+            ));
+        }
+        idx += 1;
+    }
+    Ok(true)
+}
+
+/// 由源 metadata 构造目录 Attr。
+fn dir_attr(meta: &fs::Metadata) -> Attr {
+    Attr {
+        ino: 0,
+        size: 0,
+        kind: fuser::FileType::Directory,
+        perm: (meta.mode() & 0o7777) as u16,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        chunk_size: 0,
+    }
+}
+
+/// 由源 metadata 构造普通文件 Attr。
+fn file_attr(meta: &fs::Metadata, chunk_size: u32) -> Attr {
+    Attr {
+        ino: 0,
+        size: 0,
+        kind: fuser::FileType::RegularFile,
+        perm: (meta.mode() & 0o7777) as u16,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        chunk_size,
+    }
+}
+
 fn ingest_dir(
     src: &Path,
     dst: &Path,
@@ -77,8 +253,18 @@ fn ingest_dir(
                 }
                 Err(e) => stats.errors.push((s, e.to_string())),
             }
+        } else if ft.is_symlink() {
+            // 符号链接：照原样在 backing 真实目录树里重建（target 可指向 mount 外，内核自行解析）。
+            // 运行时由 shadow store + rwfs readlink 透明服务（Claude 的 `memory` 外链即此类）。
+            match fs::read_link(&s).and_then(|target| std::os::unix::fs::symlink(target, &d)) {
+                Ok(()) => stats.symlinks += 1,
+                Err(e) => stats.errors.push((s, e.to_string())),
+            }
+        } else {
+            // 真正特殊文件（FIFO/socket/设备）：shadow 无法表示，计入 skipped（调用方据此拒绝，
+            // 避免静默丢失）。Claude projects 实测无此类。
+            stats.skipped += 1;
         }
-        // symlink / 特殊文件跳过（同 fixture P1）。
     }
     Ok(())
 }
@@ -170,5 +356,50 @@ mod tests {
             );
         }
         assert_eq!(got, big);
+    }
+
+    #[test]
+    fn ingest_container_round_trip_verify() {
+        let src = tempfile::tempdir().unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let redb = cdir.path().join("c.redb");
+        let big: Vec<u8> = (0..200_000).map(|i| b"jsonl line \n"[i % 12]).collect();
+        fs::write(src.path().join("a.jsonl"), &big).unwrap();
+        fs::create_dir(src.path().join("sub")).unwrap();
+        fs::write(src.path().join("sub/b.txt"), b"hello container").unwrap();
+
+        let s = ingest_tree_to_container(src.path(), &redb, 65536, 3, true).unwrap();
+        assert_eq!(s.files, 2, "两个常规文件");
+        assert_eq!(s.verified, 2, "verify 全通过");
+        assert!(s.errors.is_empty());
+        assert_eq!(s.skipped, 0);
+        assert!(s.ratio() > 1.0);
+
+        // 重开容器逐字节读回 a.jsonl 验证持久化。
+        let store = ContainerStore::open_with_chunk_size(&redb, 65536).unwrap();
+        let root = store.lookup(1, "a.jsonl").unwrap();
+        let (size, cs) = store.block_geometry(root.ino).unwrap();
+        assert_eq!(size, big.len() as u64);
+        let mut got = Vec::new();
+        let nblk = size.div_ceil(cs as u64);
+        for i in 0..nblk {
+            let blk = store.get_block(root.ino, i).unwrap().unwrap();
+            got.extend_from_slice(
+                &decompress_block(&blk.bytes, Algo::Zstd, blk.stored_verbatim, None).unwrap(),
+            );
+        }
+        assert_eq!(got, big);
+    }
+
+    #[test]
+    fn ingest_container_counts_symlink_as_skipped() {
+        let src = tempfile::tempdir().unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let redb = cdir.path().join("c.redb");
+        fs::write(src.path().join("a.jsonl"), b"hi").unwrap();
+        std::os::unix::fs::symlink("/ext", src.path().join("memory")).unwrap();
+        let s = ingest_tree_to_container(src.path(), &redb, 65536, 3, false).unwrap();
+        assert_eq!(s.files, 1);
+        assert_eq!(s.skipped, 1, "container 无法表示 symlink → 计入 skipped");
     }
 }

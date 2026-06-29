@@ -58,7 +58,7 @@
 
 | 方向 | 为什么 | 工作量/风险 | 状态 |
 |---|---|---|---|
-| **迁移 `~/.claude/projects`（分层）** | 目标范围已分层界定（[03-target-data-scope.md](./03-target-data-scope.md)）：**Tier 1a** projects/*.jsonl(8GB)→**1b** append 日志→**Tier 2** file-history(524MB)；plugins/已压缩类排除。灌入、校验、切换工具，可逆零丢失，活跃会话实时追加压测 | 中 | ◐ `zipfs ingest --src --backing --verify`（流式灌入+逐字节校验）；切换/活跃压测待做 |
+| **迁移 `~/.claude/projects`（分层）** | 目标范围已分层界定（[03-target-data-scope.md](./03-target-data-scope.md)）：**Tier 1a** projects/*.jsonl(8GB)→**1b** append 日志→**Tier 2** file-history(524MB)；plugins/已压缩类排除。灌入、校验、切换工具，可逆零丢失，活跃会话实时追加压测 | 中 | ☑ **切换工具落地** `zipfs enable`（TUI + list/apply/restore/remount/status/purge/autostart 子命令；`ingest --verify` + sidecar 提交标记使半灌可检测 + 活跃会话默认拦截 + 失败回滚到 Plain；`src/enable/`，取代旧 `bench/scripts/zipfs-*.sh`）；分层批量灌入策略与活跃会话长压测待续 |
 | **可观测性** | 守护健康、实时压缩比、append 吞吐的监控，便于长期运行排障 | 中 | ◐ statfs 显压缩比（df）+ sd-notify 健康；吞吐/比值监控待扩 |
 | **物理空间回收** | 压缩省的是逻辑量；WSL `ext4.vhdx` 物理回收需 `wsl --shutdown` + `Optimize-VHD`，需文档化/脚本化 | 小 | ☐ |
 

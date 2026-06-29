@@ -214,6 +214,52 @@ fn shadow_rw_mount_or_skip() {
     with_mount("shadow", backing.path(), rw_assertions);
 }
 
+/// 符号链接 round-trip（仅 shadow：container/redb 无真实目录树，readlink/symlink 为 ENOSYS）。
+/// 验证 README 宣称的「运行时经 readlink 透明服务」：经挂载点建软链 → readlink 原样取回 target，
+/// 且类型为 symlink。Claude 的 `memory` 外链即依赖此路径。
+fn symlink_assertions(mountpoint: &Path) {
+    use std::os::unix::fs::symlink;
+    let link = mountpoint.join("memory");
+    let target = Path::new("/some/external/memory"); // mount 外、绝对 target
+
+    symlink(target, &link).expect("经挂载点建软链（rwfs symlink 回调）");
+    // readlink 原样返回 target（rwfs readlink 回调）。
+    assert_eq!(
+        fs::read_link(&link).expect("readlink"),
+        target,
+        "readlink 应原样返回 target"
+    );
+    // 类型应为 symlink（symlink_metadata 不跟随）。
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "条目应为 symlink 类型"
+    );
+    // readdir 也应能看到它。
+    let names: Vec<String> = fs::read_dir(mountpoint)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.contains(&"memory".to_string()),
+        "readdir 应含软链：{names:?}"
+    );
+    eprintln!("[OK] 符号链接 round-trip 通过（真实挂载）");
+}
+
+#[test]
+fn shadow_symlink_mount_or_skip() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("[SKIP] shadow_symlink_mount：{reason}");
+        return;
+    }
+    let backing = tempfile::tempdir().unwrap();
+    with_mount("shadow", backing.path(), symlink_assertions);
+}
+
 #[test]
 fn container_rw_mount_or_skip() {
     if let Some(reason) = skip_reason() {

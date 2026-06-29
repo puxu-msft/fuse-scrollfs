@@ -333,6 +333,32 @@ impl Filesystem for ZipfsRw {
         }
     }
 
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        use std::os::unix::ffi::OsStrExt;
+        match self.store.readlink(ino.0) {
+            Ok(target) => reply.data(target.as_os_str().as_bytes()),
+            Err(e) => reply.error(io_to_errno(&e)),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let Some(name) = link_name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.store.symlink(parent.0, name, target) {
+            Ok(a) => reply.entry(&TTL, &self.to_file_attr(&a), Generation(0)),
+            Err(e) => reply.error(io_to_errno(&e)),
+        }
+    }
+
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if self.store.getattr_ino(ino.0).is_some() {
             // 只读 open：用 page cache（FOPEN_KEEP_CACHE）→ 支持只读 mmap（T2）；read 仍精确切片。
