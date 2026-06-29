@@ -5,6 +5,7 @@
 //! 避免跨 bin 复制粘贴。见 docs/01-zipfs-design.md §11 模块布局。
 
 pub mod archive;
+pub mod compact;
 pub mod core;
 pub mod fixture;
 pub mod ingest;

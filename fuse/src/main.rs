@@ -54,10 +54,9 @@ struct Cli {
 /// 子命令集合。挂载是默认（无子命令）路径，故此处只放非挂载操作。
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// 离线压实 container（布局 V / redb）容器文件，回收 MVCC 未引用页，收缩物理占用。
+    /// 离线压实：container 回收 redb MVCC 未引用页；shadow 回收 append-only 空洞（temp+rename）。
     ///
-    /// 用法：`zipfs compact --backend container --backing <redb 文件>`。
-    /// 须在容器**未被挂载**时执行（独占打开）。
+    /// 用法：`zipfs compact --backend {container|shadow} --backing <文件或目录>`。须**未挂载**。
     Compact(CompactArgs),
 
     /// 从语料目录训练共享 zstd 字典（T3 研究项），产出字典文件供 `--dict` 挂载使用。
@@ -143,11 +142,11 @@ struct MountArgs {
 /// `compact` 子命令参数。
 #[derive(clap::Args, Debug)]
 struct CompactArgs {
-    /// 后端布局：当前仅 `container` 支持 compact（shadow 是每文件 archive，无全局容器可压实）。
+    /// 后端布局：container（redb 全包，回收 MVCC）或 shadow（每文件 archive，回收 append-only 空洞）。
     #[arg(long, value_enum, default_value_t = Backend::Container)]
     backend: Backend,
 
-    /// 要压实的 container 容器文件路径（redb 文件，须已存在）。
+    /// 要压实的对象：container 是 redb 文件，shadow 是 backing 目录树（须未挂载）。
     #[arg(long)]
     backing: PathBuf,
 }
@@ -386,11 +385,42 @@ fn load_dict(
 
 /// 离线 compact：打开 container 容器、调 redb `compact()`、报告前后大小。
 fn run_compact(args: CompactArgs) -> std::io::Result<()> {
+    if args.backend == Backend::Shadow {
+        // 布局 S：递归压实 backing 目录树（temp+rename，回收 append-only 空洞）。须未挂载。
+        if !args.backing.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("shadow 压实 backing 须为目录：{}", args.backing.display()),
+            ));
+        }
+        let s = zipfs::compact::compact_shadow_tree(&args.backing, DEFAULT_ZSTD_LEVEL)?;
+        for (p, e) in &s.errors {
+            log::warn!("压实失败（跳过）：{} — {e}", p.display());
+        }
+        info!(
+            "compact shadow：compacted={} skipped={} errors={} 物理 {} → {} 字节（{:.2}x）",
+            s.compacted,
+            s.skipped,
+            s.errors.len(),
+            s.bytes_before,
+            s.bytes_after,
+            s.ratio()
+        );
+        println!(
+            "compact shadow: compacted={} skipped={} bytes {} -> {} ({:.2}x)",
+            s.compacted,
+            s.skipped,
+            s.bytes_before,
+            s.bytes_after,
+            s.ratio()
+        );
+        return Ok(());
+    }
     if args.backend != Backend::Container {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "compact 仅支持 --backend container（布局 V）；shadow/passthrough 无全局容器可压实，收到 {:?}",
+                "compact 支持 --backend container（布局 V）或 shadow（布局 S 目录树），收到 {:?}",
                 args.backend
             ),
         ));

@@ -1,0 +1,214 @@
+//! 布局 S 压实（compact）：append-only archive 把被取代旧块/旧 index/旧尾日志 raw 留成空洞，
+//! 文件单调增长（docs/04 §6/§12）。压实=离线 temp+rename 整文件重写，只保活块 + 当前尾块，
+//! 丢空洞 → 物理回收，频繁 fsync 的写放大（<5x）压回 ≈稀疏。
+//!
+//! 与 seal 的区别：seal 换**大块 + 高等级**（冷归档）；compact 保**原 chunk_size + 原等级**，只
+//! 去碎片。未封尾块（尾日志 raw）折叠为末尾封块——逻辑内容不变，读路径照常。须 backing 未挂载。
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::archive::{ArchiveReader, ArchiveWriter};
+use crate::core::codec::{compress, Algo};
+
+/// 一次压实汇总。
+#[derive(Debug, Default, Clone)]
+pub struct CompactStats {
+    pub compacted: u64,
+    pub skipped: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub errors: Vec<(PathBuf, String)>,
+}
+
+impl CompactStats {
+    pub fn ratio(&self) -> f64 {
+        if self.bytes_after == 0 {
+            0.0
+        } else {
+            self.bytes_before as f64 / self.bytes_after as f64
+        }
+    }
+}
+
+/// 递归压实 `backing` 下所有 archive。`level` 重压等级（保活跃默认 3）。只回收空洞，不改 chunk_size。
+pub fn compact_shadow_tree(backing: &Path, level: i32) -> io::Result<CompactStats> {
+    if !backing.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("压实 backing 不是目录：{}", backing.display()),
+        ));
+    }
+    let mut stats = CompactStats::default();
+    compact_dir(backing, level, &mut stats)?;
+    Ok(stats)
+}
+
+fn compact_dir(dir: &Path, level: i32, stats: &mut CompactStats) -> io::Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
+        let path = entry.path();
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                stats.errors.push((path, e.to_string()));
+                continue;
+            }
+        };
+        if ft.is_dir() {
+            if let Err(e) = compact_dir(&path, level, stats) {
+                stats.errors.push((path, e.to_string())); // 子目录 IO 错也续跑
+            }
+        } else if ft.is_file() {
+            match compact_file(&path, level) {
+                Ok(Some((before, after))) => {
+                    stats.compacted += 1;
+                    stats.bytes_before += before;
+                    stats.bytes_after += after;
+                }
+                Ok(None) => stats.skipped += 1,
+                Err(e) => stats.errors.push((path.clone(), e.to_string())),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 压实单文件：读活块 round-trip + 折叠尾日志为末块（同 chunk_size 重压）→ temp → rename → fsync 父目录。
+/// 物理无空洞者跳过（after 不小于 before）。错误清理 temp，不破坏原文件。
+fn compact_file(path: &Path, level: i32) -> io::Result<Option<(u64, u64)>> {
+    let reader = match ArchiveReader::open(path) {
+        Ok(r) => r,
+        Err(_) => return Ok(None), // 非 archive / 损坏 → 跳过
+    };
+    let chunk_size = reader.footer().chunk_size;
+    let size_before = std::fs::metadata(path)?.len();
+    let tmp = tmp_sibling(path);
+    {
+        let mut writer = ArchiveWriter::create(&tmp, chunk_size)?;
+        // 活块原样重写（按当前 index，自然丢被取代旧块空洞）。
+        for idx in 0..reader.chunk_count() {
+            if let Some((bytes, entry)) = reader.read_block(idx)? {
+                writer.append_block(
+                    &bytes,
+                    entry.is_verbatim(),
+                    block_rawlen(&reader, idx, chunk_size),
+                )?;
+            }
+        }
+        // 未封尾块（尾日志 raw）折叠为末尾封块：逻辑内容不变，去掉 journal 碎片。
+        if let Some(tail) = reader.read_tail()? {
+            if !tail.is_empty() {
+                let (stored, verbatim) = compress(&tail, Algo::Zstd, level)?;
+                writer.append_block(&stored, verbatim, tail.len() as u64)?;
+            }
+        }
+        let file = writer.finish()?;
+        file.sync_all()?;
+    }
+    drop(reader);
+    let size_after_tmp = std::fs::metadata(&tmp)?.len();
+    // 无收益（无空洞）→ 丢弃 temp，跳过。
+    if size_after_tmp >= size_before {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(None);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // rename 持久化需父目录项落盘（§6：崩溃后看到新文件而非旧）。
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(Some((size_before, std::fs::metadata(path)?.len())))
+}
+
+/// 第 idx 块解压后逻辑长度：末块可不足 chunk_size，用 footer uncompressed_size 推。
+fn block_rawlen(reader: &ArchiveReader, idx: u64, chunk_size: u32) -> u64 {
+    let cs = chunk_size as u64;
+    let total = reader.footer().uncompressed_size;
+    let start = idx * cs;
+    (total.saturating_sub(start)).min(cs)
+}
+
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "archive".to_string());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!(
+        ".{name}.compact-tmp-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::codec::decompress_block;
+    use crate::core::wsession::TailSessions;
+    use crate::store::shadow::ShadowStore;
+    use crate::store::Store;
+
+    fn params() -> crate::core::rmw::CodecParams {
+        crate::core::rmw::CodecParams {
+            algo: Algo::Zstd,
+            level: 3,
+            dict: None,
+        }
+    }
+
+    #[test]
+    fn 压实回收频繁fsync空洞_内容一致() {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = 4096u32;
+        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
+        let attr = crate::store::Attr {
+            ino: 0,
+            size: 0,
+            kind: fuser::FileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            chunk_size: cs,
+        };
+        let ino = store.create(1, "t.jsonl", attr).unwrap();
+        let ws = TailSessions::new(true);
+        let mut expected = Vec::new();
+        for i in 0..400u32 {
+            let line = format!("line {i:04} payload............\n").into_bytes();
+            let off = ws.geometry(&store, ino).unwrap().0;
+            ws.write_at(&store, ino, off, &line, &params()).unwrap();
+            expected.extend_from_slice(&line);
+            ws.seal(&store, ino, &params()).unwrap(); // 每行 fsync → 膨胀
+            store.fsync(ino).unwrap();
+        }
+        let path = dir.path().join("t.jsonl");
+        let before = std::fs::metadata(&path).unwrap().len();
+        let stats = compact_shadow_tree(dir.path(), 3).unwrap();
+        assert_eq!(stats.compacted, 1, "应压实 1 文件：{:?}", stats.errors);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "压实后更小：{before}->{after}");
+        // 内容逐字节一致。
+        let r = ArchiveReader::open(&path).unwrap();
+        let mut got = Vec::new();
+        for idx in 0..r.chunk_count() {
+            let (b, e) = r.read_block(idx).unwrap().unwrap();
+            got.extend_from_slice(
+                &decompress_block(&b, Algo::Zstd, e.is_verbatim(), None).unwrap(),
+            );
+        }
+        if let Some(t) = r.read_tail().unwrap() {
+            got.extend_from_slice(&t);
+        }
+        assert_eq!(got, expected, "压实后逐字节一致");
+    }
+}
