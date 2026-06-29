@@ -467,7 +467,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 dict,
             )
             .with_max_write(args.max_write);
-            fuser::mount2(fs, &mountpoint, &cfg)
+            serve_rw(fs, &mountpoint, &cfg)
         }
         Backend::Container => {
             let store: Arc<dyn Store> = Arc::new(ContainerStore::open_with_chunk_size(
@@ -483,13 +483,41 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 dict,
             )
             .with_max_write(args.max_write);
-            fuser::mount2(fs, &mountpoint, &cfg)
+            serve_rw(fs, &mountpoint, &cfg)
         }
     };
     if let Some(pf) = &args.pid_file {
         let _ = std::fs::remove_file(pf); // 尽力清理，缺失不算错
     }
     res
+}
+
+/// 后台挂载读写 fs + 注入内核失效通知器（fsync 后失效只读 mmap 缓存）后阻塞，等价 mount2 前台。
+/// 挂载就绪后向 systemd 发 READY，并起看门狗周期心跳（无 systemd / 未配 WATCHDOG 时静默降级）。
+fn serve_rw(fs: ZipfsRw, mountpoint: &std::path::Path, cfg: &fuser::Config) -> std::io::Result<()> {
+    let slot = fs.notifier_slot();
+    let session = fuser::spawn_mount2(fs, mountpoint, cfg)?;
+    let _ = slot.set(session.notifier()); // 注入后 fsync/flush 可发 inval_inode
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]); // 就绪（非 systemd 下静默失败）
+    if let Some(usec) = systemd_watchdog_usec() {
+        // detached 心跳线程：进程退出（join 返回）即随之回收，故无显式停止条件。
+        let half = std::time::Duration::from_micros(usec / 2);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(half);
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+        });
+    }
+    session.join() // 阻塞至卸载（前台守护语义不变）
+}
+
+/// systemd 看门狗周期（µs），仅当 WATCHDOG_USEC 已设；非 systemd 下 None（不起心跳）。
+fn systemd_watchdog_usec() -> Option<u64> {
+    let mut usec = 0u64;
+    if sd_notify::watchdog_enabled(false, &mut usec) {
+        Some(usec)
+    } else {
+        None
+    }
 }
 
 /// 构造「挂载参数缺失」错误。

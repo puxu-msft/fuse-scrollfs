@@ -13,13 +13,13 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
-    TimeOrNow,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, Notifier, OpenFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, Request, TimeOrNow,
 };
 use log::warn;
 
@@ -45,6 +45,9 @@ pub struct ZipfsRw {
     /// 协商的最大单次 write 字节数（init 时 set_max_write）。0=用 fuser 默认（128KiB）。大值减
     /// 内核拆分（2–4MiB 单行 append 少 8–32x 回调）；上限由 fuser 截到 16MiB。
     max_write: u32,
+    /// 内核失效通知器（mount 后注入）：fsync/flush 提交后 `inval_inode` 失效只读 mmap 的陈旧
+    /// page cache，堵跨 fd 一致性窗口。None=无（mount2 路径或注入前）。
+    notifier: Arc<OnceLock<Notifier>>,
 }
 
 impl ZipfsRw {
@@ -69,6 +72,7 @@ impl ZipfsRw {
             locks: Mutex::new(HashMap::new()),
             tails: TailSessions::new(tail_buffer),
             max_write: 0,
+            notifier: Arc::new(OnceLock::new()),
         }
     }
 
@@ -76,6 +80,21 @@ impl ZipfsRw {
     pub fn with_max_write(mut self, max_write: u32) -> Self {
         self.max_write = max_write;
         self
+    }
+
+    /// 取内核通知器句柄（spawn_mount2 后 main 注入 Notifier，使 fsync 后失效只读 mmap 缓存）。
+    pub fn notifier_slot(&self) -> Arc<OnceLock<Notifier>> {
+        Arc::clone(&self.notifier)
+    }
+
+    /// fsync/flush 提交后失效该 inode 内核缓存（off=0,len=0 表整 inode）：只读 mmap 跨 fd 见新数据。
+    fn invalidate_kernel_cache(&self, ino: u64) {
+        if let Some(n) = self.notifier.get() {
+            if let Err(e) = n.inval_inode(INodeNo(ino), 0, 0) {
+                // best-effort：失效失败不阻断 fsync，但记日志（只读 mmap 可能短暂读到旧页）。
+                warn!("inval_inode ino={ino} 失败：{e}");
+            }
+        }
     }
 
     /// 取（或建）某 inode 的写锁句柄。
@@ -561,7 +580,10 @@ impl Filesystem for ZipfsRw {
             return;
         }
         match self.store.flush(ino.0) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.invalidate_kernel_cache(ino.0);
+                reply.ok()
+            }
             Err(e) => reply.error(io_to_errno(&e)),
         }
     }
@@ -583,7 +605,10 @@ impl Filesystem for ZipfsRw {
             return;
         }
         match self.store.fsync(ino.0) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.invalidate_kernel_cache(ino.0);
+                reply.ok()
+            }
             Err(e) => reply.error(io_to_errno(&e)),
         }
     }

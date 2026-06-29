@@ -55,6 +55,8 @@ zstd = "0.13"
 # 作变长 blob 分配器 + 事务，见 §6.1。写批处理一次 write 多块合并一事务（microbench 8-18x）。
 redb = "4"
 crc32fast = "1.5.0"
+# systemd Type=notify 守护：挂载就绪后发 READY、周期 WATCHDOG（无 systemd 时静默降级）。
+sd-notify = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
