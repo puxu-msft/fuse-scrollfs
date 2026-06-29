@@ -412,7 +412,8 @@ pub fn purge_backing(paths: &Paths, name: &str, yes: bool) -> io::Result<()> {
 // ── 内部助手 ──────────────────────────────────────────────────────────────
 
 /// 组装挂载守护参数（apply / remount 共用，DRY）。
-fn mount_spec(paths: &Paths, name: &str, opts: &ApplyOptions) -> MountSpec {
+/// 由 paths + 选项构造一个 MountSpec（apply / remount / mount-managed 共享）。
+pub(crate) fn mount_spec(paths: &Paths, name: &str, opts: &ApplyOptions) -> MountSpec {
     MountSpec {
         name: name.to_string(),
         backend: opts.backend,

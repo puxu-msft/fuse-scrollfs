@@ -72,10 +72,32 @@ pub fn systemd_unescape(inst: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// 由 sidecar meta 解析出 managed mount 的 `MountSpec`（systemd `mount-managed` 子命令用）。
+///
+/// sidecar meta 是唯一真值源（对齐 `remount`）：未提交（半灌）→ Err，拒绝挂载半灌 backing。
+/// `name` 是 project 原始名（调用方已 unescape）。
+pub fn resolve_managed_spec(
+    paths: &crate::enable::model::Paths,
+    name: &str,
+) -> std::io::Result<crate::enable::daemon::MountSpec> {
+    crate::enable::model::validate_name(name)?;
+    let meta = crate::enable::discovery::read_meta(&paths.meta_path(name))?
+        .filter(|m| m.committed)
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "{name} backing 未提交（半灌），拒绝 managed 挂载；需 re-ingest 或 restore"
+            ))
+        })?;
+    Ok(crate::enable::lifecycle::mount_spec(
+        paths,
+        name,
+        &meta.options(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn escape_matches_systemd_oracle() {
         // 硬编码 oracle = 真实 `systemd-escape -- <s>` 输出（见 cheeky-hatching-clock.md）。
@@ -112,5 +134,54 @@ mod tests {
             systemd_unescape("\\x2dhome\\x2dxp\\x2dsrc\\x2dneighbors"),
             "-home-xp-src-neighbors"
         );
+    }
+
+    #[test]
+    fn resolve_managed_spec_from_committed_meta() {
+        use crate::enable::discovery::{write_meta, Meta};
+        use crate::enable::model::{ApplyOptions, Backend, Paths};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        std::fs::create_dir_all(paths.back_root()).unwrap();
+        let opts = ApplyOptions {
+            backend: Backend::Shadow,
+            chunk_size: 65536,
+            level: 7,
+            ..ApplyOptions::default()
+        };
+        let meta = Meta::from_apply(&opts, 100, 50, 0);
+        write_meta(&paths.meta_path("demo"), &meta).unwrap();
+
+        let spec = resolve_managed_spec(&paths, "demo").unwrap();
+        assert_eq!(spec.name, "demo");
+        assert_eq!(spec.backend, Backend::Shadow);
+        assert_eq!(spec.chunk_size, 65536);
+        assert_eq!(spec.level, 7);
+        assert_eq!(spec.backing, paths.backing("demo", Backend::Shadow));
+        assert_eq!(spec.mountpoint, paths.mountpoint("demo"));
+    }
+
+    #[test]
+    fn resolve_managed_spec_rejects_uncommitted() {
+        use crate::enable::discovery::{write_meta, Meta};
+        use crate::enable::model::Paths;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        std::fs::create_dir_all(paths.back_root()).unwrap();
+        // 半灌：committed=false（默认）。
+        let meta = Meta::default();
+        write_meta(&paths.meta_path("demo"), &meta).unwrap();
+        assert!(
+            resolve_managed_spec(&paths, "demo").is_err(),
+            "未提交 meta 应拒绝 managed 挂载"
+        );
+        // 完全无 meta → 也 Err。
+        assert!(resolve_managed_spec(&paths, "nope").is_err());
     }
 }

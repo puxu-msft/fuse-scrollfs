@@ -82,6 +82,23 @@ enum Command {
     ///
     /// 用法：`zipfs enable`（TUI）或 `zipfs enable list|apply|restore|remount|status|purge|autostart`。
     Enable(EnableArgs),
+
+    /// systemd 托管挂载（内部子命令，由 `zipfs@<inst>.service` 的 ExecStart 调用）。
+    ///
+    /// `--name` 取 systemd **实例字符串**（escaped，模板里的 `%i`）；Rust 侧 unescape 回原名，
+    /// 读 sidecar meta 自拼挂载参数后复用 `run_mount`。半灌（未提交）拒绝挂载。
+    MountManaged(MountManagedArgs),
+
+    /// systemd 托管卸载（内部子命令，供 `zipfs@<inst>.service` 的 ExecStop 调用）。
+    UmountManaged(MountManagedArgs),
+}
+
+/// `mount-managed` / `umount-managed` 子命令参数。
+#[derive(clap::Args, Debug)]
+struct MountManagedArgs {
+    /// systemd 实例字符串（escaped 形态，即模板里的 `%i`）。
+    #[arg(long)]
+    name: String,
 }
 
 /// `enable` 子命令参数：无子动作 → TUI。
@@ -186,15 +203,68 @@ fn main() -> std::io::Result<()> {
         Some(Command::Enable(args)) => {
             // HOME 缺失时不猜测 /root：enable 操作真实用户数据，错树即误操作（fail-closed）。
             // 需要非默认根时显式用 env CLAUDE_PROJECTS / ZIPFS_HOME 覆盖。
-            let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "未设置 HOME，拒绝猜测路径；请设 HOME，或用 CLAUDE_PROJECTS / ZIPFS_HOME 显式指定",
-                )
-            })?;
+            let home = home_or_err()?;
             zipfs::enable::run(args.action, home)
         }
+        Some(Command::MountManaged(args)) => run_mount_managed(args),
+        Some(Command::UmountManaged(args)) => run_umount_managed(args),
         None => run_mount(cli.mount),
+    }
+}
+
+/// 解析 `$HOME`，缺失则 fail-closed（不猜测 /root；enable 系操作真实用户数据，错树即误操作）。
+fn home_or_err() -> std::io::Result<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "未设置 HOME，拒绝猜测路径；请设 HOME，或用 CLAUDE_PROJECTS / ZIPFS_HOME 显式指定",
+        )
+    })
+}
+
+/// systemd 托管挂载：unescape 实例名 → 读 sidecar meta 自拼 spec → 复用 run_mount。
+fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
+    let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
+    let name = zipfs::enable::systemd::systemd_unescape(&args.name);
+    let spec = zipfs::enable::systemd::resolve_managed_spec(&paths, &name)?;
+    info!(
+        "systemd 托管挂载：name={name} backing={}",
+        spec.backing.display()
+    );
+    run_mount(mount_args_from_spec(&spec))
+}
+
+/// systemd 托管卸载（ExecStop）：unescape 实例名 → 卸载其挂载点。
+fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
+    use zipfs::enable::daemon::Mounter;
+    let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
+    let name = zipfs::enable::systemd::systemd_unescape(&args.name);
+    zipfs::enable::model::validate_name(&name)?;
+    zipfs::enable::daemon::RealMounter.unmount(&paths.mountpoint(&name))
+}
+
+/// 由 `MountSpec` 构造等价的 `MountArgs`，让 managed 挂载复用 `run_mount` 全部 FUSE 装配逻辑。
+fn mount_args_from_spec(spec: &zipfs::enable::daemon::MountSpec) -> MountArgs {
+    use zipfs::enable::model::Backend as MBackend;
+    let backend = match spec.backend {
+        MBackend::Shadow => Backend::Shadow,
+        MBackend::Container => Backend::Container,
+    };
+    MountArgs {
+        backend: Some(backend),
+        backing: Some(spec.backing.clone()),
+        mountpoint: Some(spec.mountpoint.clone()),
+        chunk_size: spec.chunk_size,
+        level: spec.level,
+        dict: spec.dict.clone(),
+        auto_unmount: spec.auto_unmount,
+        allow_other: spec.allow_other,
+        no_tail_buffer: spec.no_tail_buffer,
+        threads: spec.threads,
+        pid_file: Some(spec.pid_file.clone()),
+        max_write: spec.max_write,
+        writeback: spec.writeback,
+        metrics_file: spec.metrics_file.clone(),
     }
 }
 
