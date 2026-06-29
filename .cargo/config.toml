@@ -1,0 +1,10 @@
+# 测试/bench 的临时目录改走 tmpfs 内存盘，避免在磁盘上反复写删 archive/backing。
+# tempfile（tempdir/NamedTempFile）与 std::env::temp_dir() 都读 TMPDIR；cargo 会把
+# 这里的 [env] 注入它启动的测试与 bench 二进制，故无需改任何调用点。
+#
+# 仅在 TMPDIR 未显式设置时生效（force 缺省 false），尊重调用者的显式覆盖：
+#   - 跑会吞掉数 GB 真实语料的大 bench 时，可 `TMPDIR=/tmp cargo run --bin ratio-bench`
+#     回退到磁盘，避免占用等量内存。
+# /dev/shm 是 Linux 标准 tmpfs（受 swap 兜底）；本项目仅 Linux/WSL（FUSE），可安全假定其存在。
+[env]
+TMPDIR = "/dev/shm"
