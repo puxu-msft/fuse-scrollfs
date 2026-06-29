@@ -158,6 +158,56 @@ impl crate::enable::daemon::Mounter for SystemdMounter {
     }
 }
 
+/// 选哪个 mounter 的纯决策（真值表可单测）：三个探测都通过才用 systemd，否则降级 Real。
+/// 降级不劣化——RealMounter 叠加 Bug A flock 仍杜绝双守护覆盖，只是少了崩溃自愈/监管。
+/// `template_installed` 必查：SystemdMounter.spawn 走 `systemctl start zipfs@<esc>`，模板单元
+/// 不在则 start 报 "Unit not found"——故 systemd 路径是 opt-in（先 `enable autostart install`）。
+fn pick_systemd(has_systemd_run_dir: bool, user_bus_ok: bool, template_installed: bool) -> bool {
+    has_systemd_run_dir && user_bus_ok && template_installed
+}
+
+/// `systemctl --user is-system-running` 能连上 user bus 即返回状态词（running/degraded/…），
+/// 连不上（无 user systemd）则非零 + stderr。任一已知状态词视为 user bus 可达。
+fn user_bus_reachable() -> bool {
+    use std::process::Command;
+    Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .output()
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            matches!(
+                s.trim(),
+                "running" | "degraded" | "starting" | "stopping" | "maintenance" | "initializing"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 模板单元 `~/.config/systemd/user/zipfs@.service` 是否已安装（`enable autostart install` 装）。
+fn template_installed() -> bool {
+    std::env::var_os("HOME")
+        .map(|home| {
+            std::path::Path::new(&home)
+                .join(".config/systemd/user/zipfs@.service")
+                .is_file()
+        })
+        .unwrap_or(false)
+}
+
+/// 运行时选 mounter：探测 systemd user 会话可达性 + 模板已装。systemd → `SystemdMounter`
+/// （单实例 + 自愈 + 监管）；否则 `RealMounter`（叠加 Bug A flock 兜底，行为不劣于改造前）。
+/// 单点供 `enable::run` / TUI 用。
+pub fn select_mounter() -> Box<dyn crate::enable::daemon::Mounter> {
+    let has_dir = std::path::Path::new("/run/systemd/system").is_dir();
+    let bus_ok = has_dir && user_bus_reachable();
+    let tmpl = bus_ok && template_installed();
+    if pick_systemd(has_dir, bus_ok, tmpl) {
+        Box::new(SystemdMounter)
+    } else {
+        Box::new(crate::enable::daemon::RealMounter)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +263,21 @@ mod tests {
             systemctl_args("stop", "plain"),
             vec!["--user", "stop", "zipfs@plain.service"]
         );
+    }
+
+    #[test]
+    fn pick_systemd_requires_all_probes() {
+        assert!(
+            pick_systemd(true, true, true),
+            "systemd 目录 + user bus + 模板已装 → systemd"
+        );
+        assert!(!pick_systemd(true, true, false), "模板未装 → 降级 Real");
+        assert!(!pick_systemd(true, false, true), "user bus 不可达 → Real");
+        assert!(
+            !pick_systemd(false, true, true),
+            "无 /run/systemd/system → Real"
+        );
+        assert!(!pick_systemd(false, false, false), "都无 → Real");
     }
 
     #[test]

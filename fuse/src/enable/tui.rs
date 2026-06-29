@@ -16,10 +16,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use crate::enable::daemon::RealMounter;
+use crate::enable::daemon::Mounter;
 use crate::enable::discovery::{self, ProjectInfo};
 use crate::enable::lifecycle;
 use crate::enable::model::{Activity, ApplyOptions, Backend, Paths, ProjectStatus};
+use crate::enable::systemd::select_mounter;
 
 /// 块大小预设（选项弹窗循环）。
 const CHUNK_PRESETS: [u32; 4] = [65536, 262144, 1048576, 4194304];
@@ -115,8 +116,8 @@ impl App {
         let opts = self.opts.clone();
         let what = describe(&pending);
         let handle = std::thread::spawn(move || {
-            let m = RealMounter;
-            let msg = run_pending(&paths, pending, opts, &m);
+            let m = select_mounter();
+            let msg = run_pending(&paths, pending, opts, m.as_ref());
             let _ = tx.send(msg);
         });
         self.mode = Mode::Working { what: what.clone() };
@@ -154,7 +155,7 @@ fn describe(p: &Pending) -> String {
 }
 
 /// 在 worker 线程内执行 pending，返回结果摘要。
-fn run_pending(paths: &Paths, p: Pending, opts: ApplyOptions, m: &RealMounter) -> String {
+fn run_pending(paths: &Paths, p: Pending, opts: ApplyOptions, m: &dyn Mounter) -> String {
     match p {
         Pending::Apply { name, force } => match lifecycle::apply(paths, &name, opts, force, m) {
             Ok(o) => format!("✓ {name} 已切换（{} 文件 {:.2}x）", o.files, o.ratio()),

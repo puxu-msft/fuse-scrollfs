@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 
-use crate::enable::daemon::RealMounter;
+use crate::enable::systemd::select_mounter;
 pub use model::{ApplyOptions, Backend, Paths, ProjectStatus};
 
 /// `zipfs enable` 的子动作。`None`（不给）→ 启动 TUI。
@@ -185,7 +185,7 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
             force,
         ),
         Some(EnableAction::Restore { name }) => {
-            lifecycle::restore(&paths, &name, &RealMounter)?;
+            lifecycle::restore(&paths, &name, select_mounter().as_ref())?;
             println!("restore: {name} 已还原（backing 保留，可 `enable purge {name}` 清理）");
             Ok(())
         }
@@ -350,7 +350,7 @@ fn cmd_apply(paths: &Paths, name: &str, ov: ApplyOverrides, force: bool) -> std:
         }
     }
     let backend = opts.backend;
-    let out = lifecycle::apply(paths, name, opts, force, &RealMounter)?;
+    let out = lifecycle::apply(paths, name, opts, force, select_mounter().as_ref())?;
     println!(
         "apply: {name} 已切换并挂载（backend={} files={} {}B→{}B {:.2}x）",
         backend.flag(),
@@ -365,7 +365,7 @@ fn cmd_apply(paths: &Paths, name: &str, ov: ApplyOverrides, force: bool) -> std:
 /// `remount`：单项目或 `--all`。
 fn cmd_remount(paths: &Paths, name: Option<String>, all: bool) -> std::io::Result<()> {
     if all {
-        let results = lifecycle::remount_all(paths, &RealMounter)?;
+        let results = lifecycle::remount_all(paths, select_mounter().as_ref())?;
         if results.is_empty() {
             println!("remount --all: 无 STOPPED 项目");
         }
@@ -383,7 +383,7 @@ fn cmd_remount(paths: &Paths, name: Option<String>, all: bool) -> std::io::Resul
                 "remount 需 <name> 或 --all",
             )
         })?;
-        lifecycle::remount(paths, &name, &RealMounter)?;
+        lifecycle::remount(paths, &name, select_mounter().as_ref())?;
         println!("remount: {name} ✓");
         Ok(())
     }
@@ -391,7 +391,7 @@ fn cmd_remount(paths: &Paths, name: Option<String>, all: bool) -> std::io::Resul
 
 /// `compact <name>`：卸载→压实→重挂。
 fn cmd_compact(paths: &Paths, name: &str) -> std::io::Result<()> {
-    let report = lifecycle::compact(paths, name, &RealMounter)?;
+    let report = lifecycle::compact(paths, name, select_mounter().as_ref())?;
     println!("compact: {name} — {report}");
     Ok(())
 }
@@ -405,7 +405,7 @@ fn cmd_seal(
 ) -> std::io::Result<()> {
     let chunk = seal_chunk.unwrap_or(crate::seal::DEFAULT_SEAL_CHUNK);
     let lvl = level.unwrap_or(crate::seal::DEFAULT_SEAL_LEVEL);
-    let report = lifecycle::seal(paths, name, chunk, lvl, &RealMounter)?;
+    let report = lifecycle::seal(paths, name, chunk, lvl, select_mounter().as_ref())?;
     println!("seal: {name} — {report}");
     Ok(())
 }
