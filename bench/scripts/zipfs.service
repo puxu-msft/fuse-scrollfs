@@ -1,0 +1,21 @@
+# zipfs systemd user unit — 长期运行 + 崩溃自重挂（生产化，ROADMAP T1）。
+# 安装：cp 到 ~/.config/systemd/user/zipfs.service，改下面 ExecStart 路径，再
+#   systemctl --user daemon-reload && systemctl --user enable --now zipfs
+# WSL（无 systemd 时）改用 /etc/wsl.conf：
+#   [boot]
+#   command = /home/USER/src/zipfs/bench/scripts/zipfs-mount.sh /data/back /mnt/zipfs
+[Unit]
+Description=zipfs transparent-compression FUSE mount (layout S)
+After=local-fs.target
+
+[Service]
+Type=forking
+# zipfs-mount.sh 后台挂载并写 PID 文件；崩溃自动重挂。
+ExecStart=%h/src/zipfs/bench/scripts/zipfs-mount.sh %h/.claude-zip/back %h/.claude-zip/mnt
+PIDFile=%h/.claude-zip/mnt.zipfs.pid
+ExecStop=/usr/bin/fusermount3 -u %h/.claude-zip/mnt
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

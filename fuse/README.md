@@ -95,3 +95,12 @@ fusermount3 -u /tmp/zipfs-mnt
 
 - `fuser`（0.17）以 `default-features = false` 引入：本机未装 `libfuse3-dev`（无 `fuse3.pc`），关闭 libfuse 链接、改用 `fusermount3` 二进制挂载，避免 build 因 pkg-config 找不到 fuse3 而失败。
 - P0 **不引** `zstd` / `lz4_flex` / `redb` / `rusqlite`——透传零压缩无需它们，按设计 §11 在 P1+ 引入。
+
+## 长期运行 / 自启（生产化，ROADMAP T1）
+
+守护是前台阻塞 `mount2`；长期运行用 `--auto-unmount` + `--pid-file` 配脚本/ systemd：
+
+- **多线程**：`--threads N`（默认 = CPU 数，下限 4），降写尾 p99；per-inode RwLock 保并发安全。
+- **幂等自挂载**：`bench/scripts/zipfs-mount.sh <backing> <mnt> [chunk]`——已挂跳过、清 stale endpoint、后台挂载写 PID。
+- **systemd 自启 + 崩溃重挂**：`bench/scripts/zipfs.service`（`Restart=on-failure`）→ `~/.config/systemd/user/`。
+- **WSL 无 systemd**：`/etc/wsl.conf` 加 `[boot] command = .../zipfs-mount.sh <backing> <mnt>`。

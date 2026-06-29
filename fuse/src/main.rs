@@ -117,6 +117,16 @@ struct MountArgs {
     /// （每次小 append 把尾块整块重压一遍），仅供基准前后对照（§1.1）。
     #[arg(long, default_value_t = false)]
     no_tail_buffer: bool,
+
+    /// FUSE 工作线程数（默认 = CPU 数，下限 4）。多线程派发降写尾 p99（单线程是结构瓶颈，
+    /// ROADMAP T2）；per-inode RwLock 保并发安全（不同 inode 并行、同 inode 读读并行、写排他）。
+    /// 0 = 取默认。
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
+    /// 写入自身 PID 到此文件（自挂载脚本/ systemd 用以监控、SIGTERM 干净卸载）。退出时尽力删除。
+    #[arg(long)]
+    pid_file: Option<PathBuf>,
 }
 
 /// `compact` 子命令参数。
@@ -398,21 +408,42 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
 
     let mut cfg = fuser::Config::default();
     cfg.mount_options.extend(options);
+    // 多线程派发：默认取 CPU 数（下限 4、上限 64），降写尾 p99。clone_fd 让各线程独立 fd 通道。
+    // 仅 Linux：fuser 0.17 对非 Linux 的 n_threads>1 / clone_fd 直接报错，故非 Linux 退回单线程。
+    let mut threads = if args.threads == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(4, 64)
+    } else {
+        args.threads
+    };
+    if !cfg!(target_os = "linux") {
+        threads = 1;
+    }
+    cfg.n_threads = Some(threads);
+    cfg.clone_fd = threads > 1;
 
     info!(
-        "挂载 zipfs：backend={:?} backing={} -> mountpoint={} chunk_size={} level={} tail_buffer={}",
+        "挂载 zipfs：backend={:?} backing={} -> mountpoint={} chunk_size={} level={} tail_buffer={} threads={}",
         backend,
         backing.display(),
         mountpoint.display(),
         args.chunk_size,
         args.level,
         !args.no_tail_buffer,
+        threads,
     );
 
     let tail_buffer = !args.no_tail_buffer;
     // 加载共享字典（若 --dict 给定）：读原始字节 → 用挂载等级预消化 CDict/DDict。
     let dict = load_dict(args.dict.as_deref(), args.level)?;
-    match backend {
+    // 写 PID 文件（自挂载脚本/systemd 监控用），退出时尽力删除。SIGKILL/panic 下 remove 不可达
+    // → PID 文件可能残留；监控方须校验 PID 存活，勿仅凭文件存在判定守护活着。
+    if let Some(pf) = &args.pid_file {
+        std::fs::write(pf, format!("{}\n", std::process::id()))?;
+    }
+    let res = match backend {
         Backend::Passthrough => {
             let backing = canonicalize_dir(&backing)?;
             let fs = PassthroughFs::new(backing)?;
@@ -447,7 +478,11 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             );
             fuser::mount2(fs, &mountpoint, &cfg)
         }
+    };
+    if let Some(pf) = &args.pid_file {
+        let _ = std::fs::remove_file(pf); // 尽力清理，缺失不算错
     }
+    res
 }
 
 /// 构造「挂载参数缺失」错误。
