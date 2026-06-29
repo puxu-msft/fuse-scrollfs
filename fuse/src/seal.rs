@@ -120,6 +120,9 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
         return Ok(None);
     }
     let size_before = std::fs::metadata(path)?.len();
+    // Bug D：捕获原 archive 文件的 mtime/atime，rename 覆盖后须还原——否则封存把会话
+    // 文件时间重置为 now，打乱按时间排序的会话列表。在任何读操作前取，atime 才是真值。
+    let orig_times = crate::core::read_file_times(path);
 
     // 临时文件写新 archive（同目录，便于原子 rename）。**流式封存**（rust-review H1）：逐源块解压、
     // 累进缓冲，攒满一个 seal 块即压缩落盘并 drain——内存峰值 ~seal_chunk + 一个源块，而非整文件
@@ -163,6 +166,10 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
         if let Ok(d) = std::fs::File::open(parent) {
             let _ = d.sync_all();
         }
+    }
+    // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。
+    if let Some((atime, mtime)) = orig_times {
+        let _ = crate::core::set_file_times(path, atime, mtime);
     }
     let size_after = std::fs::metadata(path)?.len();
     Ok(Some((size_before, size_after)))
@@ -257,6 +264,29 @@ mod tests {
         );
         let got = read_whole(&store, attr.ino, attr.size);
         assert_eq!(got, content, "封存后读回内容必须一致");
+    }
+
+    #[test]
+    fn seal_preserves_file_mtime() {
+        // Bug D 延伸：seal 重写 archive（temp+rename）会把文件 mtime 重置为 now，
+        // 与 ingest 同样打乱按时间排序的会话列表。封存后须保留原 archive 文件 mtime。
+        let dir = tempfile::tempdir().unwrap();
+        let small_chunk = 64 * 1024;
+        let content = redundant_content(50_000);
+        let backing = dir.path().to_path_buf();
+        {
+            let store = ShadowStore::open_with_chunk_size(backing.clone(), small_chunk).unwrap();
+            write_file(&store, "t.jsonl", &content, small_chunk);
+        }
+        let file = backing.join("t.jsonl");
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        crate::core::set_file_times(&file, past, past).unwrap();
+
+        let stats = seal_shadow_tree(&backing, 1024 * 1024, 19).unwrap();
+        assert_eq!(stats.sealed, 1, "应封存 1 个文件");
+
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert_eq!(mtime, past, "seal 重写后应保留原 archive 文件 mtime");
     }
 
     #[test]

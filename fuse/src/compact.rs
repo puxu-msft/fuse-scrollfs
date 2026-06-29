@@ -84,6 +84,8 @@ fn compact_file(path: &Path, level: i32) -> io::Result<Option<(u64, u64)>> {
     };
     let chunk_size = reader.footer().chunk_size;
     let size_before = std::fs::metadata(path)?.len();
+    // Bug D：捕获原 archive 文件的 mtime/atime，rename 覆盖后还原（见 seal.rs 同理）。
+    let orig_times = crate::core::read_file_times(path);
     let tmp = tmp_sibling(path);
     {
         let mut writer = ArchiveWriter::create(&tmp, chunk_size)?;
@@ -123,6 +125,10 @@ fn compact_file(path: &Path, level: i32) -> io::Result<Option<(u64, u64)>> {
         if let Ok(d) = std::fs::File::open(parent) {
             let _ = d.sync_all();
         }
+    }
+    // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。
+    if let Some((atime, mtime)) = orig_times {
+        let _ = crate::core::set_file_times(path, atime, mtime);
     }
     Ok(Some((size_before, std::fs::metadata(path)?.len())))
 }
@@ -213,5 +219,45 @@ mod tests {
             got.extend_from_slice(&t);
         }
         assert_eq!(got, expected, "压实后逐字节一致");
+    }
+
+    #[test]
+    fn compact_preserves_file_mtime() {
+        // Bug D 延伸：compact 重写 archive（temp+rename）会把文件 mtime 重置为 now，
+        // 与 ingest/seal 同样打乱按时间排序的会话列表。压实后须保留原 archive 文件 mtime。
+        let dir = tempfile::tempdir().unwrap();
+        let cs = 4096u32;
+        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
+        let attr = crate::store::Attr {
+            ino: 0,
+            size: 0,
+            kind: fuser::FileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
+            chunk_size: cs,
+        };
+        let ino = store.create(1, "t.jsonl", attr).unwrap();
+        let ws = TailSessions::new(true);
+        for i in 0..400u32 {
+            let line = format!("line {i:04} payload............\n").into_bytes();
+            let off = ws.geometry(&store, ino).unwrap().0;
+            ws.write_at(&store, ino, off, &line, &params()).unwrap();
+            ws.seal(&store, ino, &params()).unwrap(); // 每行 fsync → 膨胀，制造空洞
+            store.fsync(ino).unwrap();
+        }
+        let path = dir.path().join("t.jsonl");
+        // 盖一个已知的过去 mtime（模拟真实会话文件已被 ingest 保留的源时间）。
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        crate::core::set_file_times(&path, past, past).unwrap();
+
+        let stats = compact_shadow_tree(dir.path(), 3).unwrap();
+        assert_eq!(stats.compacted, 1, "应压实 1 文件：{:?}", stats.errors);
+
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(mtime, past, "compact 重写后应保留原 archive 文件 mtime");
     }
 }

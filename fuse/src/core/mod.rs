@@ -49,6 +49,55 @@ pub fn system_time_from(secs: i64, nsec: i64) -> std::time::SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+/// 读取文件的 `(atime, mtime)`，供重写 archive（seal/compact）前捕获、rename 后还原。
+/// 读不到（文件不存在等）返回 `None`，调用方据此跳过还原而不阻断主流程。
+/// 用 `symlink_metadata` 不跟随符号链接，与 [`set_file_times`] 的 NOFOLLOW 语义对齐。
+pub fn read_file_times(
+    path: &std::path::Path,
+) -> Option<(std::time::SystemTime, std::time::SystemTime)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.accessed().ok()?, meta.modified().ok()?))
+}
+
+/// 把 atime/mtime 落到底层文件（`utimensat`，不跟随符号链接，对齐 symlink_metadata 语义）。
+/// epoch 之前的时间 clamp 到 0。ctime 不可由用户态直接设定，故不处理。
+///
+/// 写路径共享：shadow setattr 写回、ingest/seal/compact 重写 archive 后保留源 mtime
+/// （避免挂载点文件时间退化为注入/重写时刻，打乱按时间排序的会话列表）。
+pub fn set_file_times(
+    abs: &std::path::Path,
+    atime: std::time::SystemTime,
+    mtime: std::time::SystemTime,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    fn to_timespec(t: std::time::SystemTime) -> libc::timespec {
+        let (secs, nsec) = match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as libc::time_t, d.subsec_nanos() as i64),
+            Err(_) => (0, 0),
+        };
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: nsec as _,
+        }
+    }
+    let times = [to_timespec(atime), to_timespec(mtime)];
+    let c_path = std::ffi::CString::new(abs.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径含 NUL"))?;
+    // SAFETY: c_path 是有效的 NUL 结尾 C 字符串；times 指向本栈上长度为 2 的合法数组。
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::system_time_from;

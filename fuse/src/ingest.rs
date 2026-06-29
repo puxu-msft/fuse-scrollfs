@@ -298,6 +298,14 @@ fn ingest_file(
         src_bytes += n as u64;
     }
     writer.finish()?.sync_all()?;
+    // Bug D：保留源文件 mtime/atime 到 dst archive 文件。shadow getattr 由底层文件 fs
+    // metadata 取时间真值，不设则挂载点文件时间退化为注入时刻、打乱按时间排序的会话列表。
+    // 诚实标注：这是**冷会话近似**——首次 append 写入即被改回 now（写会话提交重写
+    // archive）。compact/seal 重写 archive 同样需补设，否则复发（见对应路径）。
+    let src_meta = fs::symlink_metadata(src)?;
+    let mtime = crate::core::system_time_from(src_meta.mtime(), src_meta.mtime_nsec());
+    let atime = crate::core::system_time_from(src_meta.atime(), src_meta.atime_nsec());
+    crate::core::set_file_times(dst, atime, mtime)?;
     let arch_bytes = fs::metadata(dst)?.len();
     let ok = if verify { verify_file(src, dst)? } else { true };
     Ok((src_bytes, arch_bytes, ok))
@@ -362,6 +370,31 @@ mod tests {
             );
         }
         assert_eq!(got, big);
+    }
+
+    #[test]
+    fn ingest_preserves_source_mtime_on_shadow() {
+        // Bug D：shadow ingest 写 dst archive 文件却从不设其 mtime，挂载点文件时间
+        // 退化为注入时刻，打乱 Claude Code 按时间排序会话。dst archive 文件的 fs mtime
+        // 必须等于源文件 mtime（shadow getattr 由底层文件 metadata 取真值）。
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let file = src.path().join("a.jsonl");
+        fs::write(&file, b"jsonl content for a session log\n").unwrap();
+        // 给源文件盖一个已知的过去 mtime（2020-01-01T00:00:00Z = 1577836800）。
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        crate::core::set_file_times(&file, past, past).unwrap();
+
+        ingest_tree(src.path(), dst.path(), 65536, 3, false).unwrap();
+
+        let dst_mtime = fs::metadata(dst.path().join("a.jsonl"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            dst_mtime, past,
+            "ingest 后 dst archive 文件 mtime 应保留源文件 mtime（当前=注入时刻）"
+        );
     }
 
     #[test]

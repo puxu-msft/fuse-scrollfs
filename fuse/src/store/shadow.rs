@@ -387,41 +387,8 @@ fn read_footer_geometry(abs: &Path) -> Option<(u64, u32)> {
         .map(|r| (r.footer().uncompressed_size, r.footer().chunk_size))
 }
 
-/// 把 atime/mtime 落到底层文件（`utimensat`，不跟随符号链接，对齐 symlink_metadata 语义）。
-/// epoch 之前的时间 clamp 到 0。ctime 不可由用户态直接设定，故不处理。
-fn set_file_times(
-    abs: &Path,
-    atime: std::time::SystemTime,
-    mtime: std::time::SystemTime,
-) -> io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    fn to_timespec(t: std::time::SystemTime) -> libc::timespec {
-        let (secs, nsec) = match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-            Ok(d) => (d.as_secs() as libc::time_t, d.subsec_nanos() as i64),
-            Err(_) => (0, 0),
-        };
-        libc::timespec {
-            tv_sec: secs,
-            tv_nsec: nsec as _,
-        }
-    }
-    let times = [to_timespec(atime), to_timespec(mtime)];
-    let c_path = std::ffi::CString::new(abs.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "路径含 NUL"))?;
-    // SAFETY: c_path 是有效的 NUL 结尾 C 字符串；times 指向本栈上长度为 2 的合法数组。
-    let rc = unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
+/// 把 atime/mtime 落到底层文件，见 [`crate::core::set_file_times`]（共享时间写入原语）。
+use crate::core::set_file_times;
 
 fn filetype_from_meta(meta: &fs::Metadata) -> fuser::FileType {
     let ft = meta.file_type();
