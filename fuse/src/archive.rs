@@ -851,6 +851,12 @@ impl ArchiveUpdater {
         self.journal_len = 0;
     }
 
+    /// 设置逻辑文件大小（尾日志追加未封尾块原始字节后，逻辑大小增长但块集不变，commit_journal
+    /// 须随之更新 SB.uncompressed_size，否则重开看不到新增尾字节，docs/04 §8.4）。
+    pub fn set_size(&mut self, new_size: u64) {
+        self.uncompressed_size = new_size;
+    }
+
     /// 设置 / 更新 head 缓存（块 0 首次封存或头区 RMW 后由上层调用，docs/02 §4.3）。
     pub fn set_head_cache(&mut self, stored_bytes: Vec<u8>, verbatim: bool, raw_len: u64) {
         self.head_cache = Some((stored_bytes, verbatim, raw_len));
@@ -1664,7 +1670,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.archive");
         {
-            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            let w = ArchiveWriter::create(&path, 64).unwrap();
             w.finish().unwrap().sync_all().unwrap();
         }
         {
@@ -1690,7 +1696,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.archive");
         {
-            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            let w = ArchiveWriter::create(&path, 64).unwrap();
             w.finish().unwrap().sync_all().unwrap();
         }
         {
@@ -1717,7 +1723,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.archive");
         {
-            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            let w = ArchiveWriter::create(&path, 64).unwrap();
             w.finish().unwrap().sync_all().unwrap();
         }
         {
@@ -1743,7 +1749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.archive");
         {
-            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            let w = ArchiveWriter::create(&path, 64).unwrap();
             w.finish().unwrap().sync_all().unwrap();
         }
         {

@@ -99,6 +99,33 @@ pub(crate) fn store_plain_block(
     Ok(())
 }
 
+/// 封块（尾日志路径，docs/04 §8.4）：压缩尾块后经 `seal_tail_block` 落盘并**重置尾日志**
+/// （把累积 journal 字节迁入不可变压缩块）。与 `store_plain_block` 同样过启发式 + 建 head 缓存，
+/// 唯一区别是写入用 `seal_tail_block` 而非 `put_block`（无尾日志后端默认即 put_block，等价）。
+pub(crate) fn seal_plain_block(
+    store: &dyn Store,
+    ino: u64,
+    idx: u64,
+    plain: &[u8],
+    new_size: u64,
+    params: &CodecParams,
+) -> io::Result<()> {
+    let (bytes, verbatim) =
+        compress_block(plain, params.algo, params.level, params.dict.as_deref())?;
+    BLOCK_COMPRESS_COUNT.fetch_add(1, Ordering::Relaxed);
+    store.seal_tail_block(
+        ino,
+        idx,
+        StoredBlock {
+            bytes,
+            stored_verbatim: verbatim,
+        },
+        new_size,
+    )?;
+    maybe_build_head_cache(store, ino, idx, plain, new_size, params)?;
+    Ok(())
+}
+
 /// head 缓存（发现读快路径，docs/02 §4.3）：仅当块 0 成为**满的不可变正文块**（其后还有内容，
 /// `new_size > 块0逻辑长度`）且覆盖窗口（`>= HEAD_CACHE_BYTES`）时，把首 `HEAD_CACHE_BYTES` 字节
 /// 单独压一份交 Store。块 0 明文此刻在手，免事后 `get_block`+解压回捞（审查 M2）。append 主负载下

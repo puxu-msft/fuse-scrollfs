@@ -166,6 +166,9 @@ VERSION: 1 → 2
 ### 12.3 §8.3 暂不接 journal（与 §8.4 解耦）
 本步 `tail_journal_len` 恒 0：尾块仍由 shadow/wsession **压缩后经 set_block(0) 写**（现状），但走 append-only + 双 SB → **durability bug 结构性消除**（harness 可验，活跃写用小 `--chunk-size` 控文件增长）。**写放大（每 fsync 重压重写块 0）留 §8.4 用 journal 根治**——届时 set_block(0) 改为 append raw 增量到尾日志、`tail_journal_len>0`、reader 把 journal 重放为「块 count 的 verbatim 尾块」。
 
+### 12.4 §8.4 已实现（fsync 热路径接尾日志，写放大根治）
+状态：**已落地**（§8.4a 格式层 + §8.4b 热路径接线）。Store trait 加 `supports_tail_journal`/`append_tail`/`seal_tail_block`；ShadowStore 实现 = true，`append_tail` 开 updater→`append_journal`+`set_size`+`commit_journal`、`seal_tail_block` 开 updater→`set_block`+`reset_journal`+`commit`，`get_block(chunk_count)` 重放 journal 为 verbatim 尾块（remount 重建）；ContainerStore=false 走旧 put_block。wsession `Tail.journaled_len`：fsync(`seal`) 只追加 `plain[journaled_len..]` 原始增量保留缓冲，块满/非追加/truncate 走 `materialize`(seal_tail_block 重置 journal)。验收：117 测全绿、clippy 0、崩溃 harness 10/10 0% 丢失、频繁 fsync 物理体积由旧 reuse ~20x 降至 <5x 稀疏（剩余 raw 待压实回收）。
+
 ### 12.4 测试迁移（与代码同一原子单元）
 - `build_archive`/round-trip：适配新布局（数据从 DATA_START 起）。
 - **删** `updater_reuse_尾块原地覆盖中崩溃_*`（该路径已删除）。

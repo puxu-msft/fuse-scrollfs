@@ -42,6 +42,9 @@ struct Tail {
     chunk_size: u32,
     /// 文件当前逻辑大小（含本未封尾块）。等于 `idx*chunk_size + plain.len()`。
     file_size: u64,
+    /// 已 journal 落盘的逻辑长度（尾日志写放大根治，docs/04 §8.4）：fsync 只追加 `plain[journaled_len..]`
+    /// 的原始增量，不重压整块。从 Store 装入的尾块视为已全 journal（=plain.len）；新空尾块为 0。
+    journaled_len: usize,
 }
 
 /// per-inode 开放尾块缓冲表。Core 层持有（rwfs 拥有一个实例），Store 不感知。
@@ -143,7 +146,7 @@ impl TailSessions {
 
         // 非纯 append（随机写 / 越 EOF 空洞 / 改写已封块或尾块中部）：先封掉开放尾块，
         // 让 Store 持有自洽的全量已封块，再走旧无状态 RMW；写完把新尾块重新装入缓冲。
-        self.seal(store, ino, params)?;
+        self.materialize(store, ino, params)?;
         let n = rmw::write_at(store, ino, offset, data, params)?;
         self.refill_tail_from_store(store, ino, params)?;
         Ok(n)
@@ -184,12 +187,12 @@ impl TailSessions {
 
             if full && written < total {
                 // 尾块填满且还有数据：封块落 Store，开下一块空尾块。
-                self.seal(store, ino, params)?;
+                self.materialize(store, ino, params)?;
                 let next_size = cur_size + written as u64;
                 self.start_empty_tail(ino, next_size, chunk_size);
             } else if full {
                 // 正好填满且数据写完：封块（不留半块在内存，下次 append 再装入）。
-                self.seal(store, ino, params)?;
+                self.materialize(store, ino, params)?;
             }
         }
         Ok(total)
@@ -221,6 +224,7 @@ impl TailSessions {
         if plain.len() != tail_len_in_block {
             plain.resize(tail_len_in_block, 0);
         }
+        let journaled_len = plain.len();
         self.tails.lock().unwrap().insert(
             ino,
             Tail {
@@ -228,6 +232,7 @@ impl TailSessions {
                 plain,
                 chunk_size,
                 file_size: cur_size,
+                journaled_len,
             },
         );
         Ok(())
@@ -243,38 +248,64 @@ impl TailSessions {
                 plain: Vec::with_capacity(chunk_size as usize),
                 chunk_size,
                 file_size: size,
+                journaled_len: 0,
             },
         );
     }
 
-    /// 封块（seal）：把开放尾块压缩并 `put_block` 落 Store，移除缓冲项。无开放尾块则 no-op。
+    /// fsync 路径——把未封尾块持久化但**保留缓冲**（尾块仍开放，可继续 append）。支持尾日志的后端
+    /// 只追加 `plain[journaled_len..]` 原始增量（O(delta)，不压缩，根治写放大）；否则回退旧
+    /// `store_plain_block`（整块重压 + put_block）。空对齐尾块无需写。
     ///
-    /// fsync/flush/release，以及任何需要 Store 持有自洽全量块的操作前都要先 seal。
-    ///
-    /// **顺序（堵无锁读者的 torn-read，rust-review HIGH-1）**：先 `store_plain_block` 把尾块落 Store，
-    /// **再**从缓冲移除。期间尾块同时在缓冲与 Store（字节一致，读者优先读缓冲，安全）；绝不出现
-    /// 「缓冲已删、Store 未写」的空窗——否则并发读会把有数据的块零填充。调用方持该 inode 写锁，
-    /// 故 seal 之间不会相互交错；唯一并发方是无锁读者（`read_tail_block`/`geometry`）。
+    /// fsync/flush/release/rename 调用。块满 / 非追加写 / truncate 走 `materialize`（封不可变块、重置
+    /// 日志、移除缓冲）。调用方持该 inode 写锁。
     pub fn seal(&self, store: &dyn Store, ino: u64, params: &CodecParams) -> io::Result<()> {
         if !self.enabled {
             return Ok(());
         }
-        // 取尾块快照（克隆），不立刻移除：先落 Store 再删缓冲。
         let snapshot = self.tails.lock().unwrap().get(&ino).cloned();
         let Some(t) = snapshot else {
             return Ok(());
         };
-        // 空尾块（块对齐文件刚开的空 tail，无任何 append）无需写：避免凭空多存一个零长块。
-        // 此时 size 已由前一次满块 seal 的 put_block(new_size) 落 Store，移除缓冲不丢 size。
         if t.plain.is_empty() && t.file_size % (t.chunk_size as u64) == 0 {
             self.tails.lock().unwrap().remove(&ino);
             return Ok(());
         }
-        // 先落 Store（尾块仍在缓冲，读者读到一致字节）。
+        if store.supports_tail_journal() {
+            // 只追加自上次以来的原始增量；无新增（journaled_len==plain.len）则跳过，不写空记录。
+            if t.journaled_len < t.plain.len() {
+                store.append_tail(ino, &t.plain[t.journaled_len..], t.file_size)?;
+                if let Some(b) = self.tails.lock().unwrap().get_mut(&ino) {
+                    b.journaled_len = b.plain.len();
+                }
+            }
+            return Ok(());
+        }
+        // 无尾日志后端：整块重压落 Store，移除缓冲（下次 append 再装入）。
         rmw::store_plain_block(store, ino, t.idx, &t.plain, t.file_size, params)?;
         self.seal_count.fetch_add(1, Ordering::Relaxed);
-        // 落盘成功后再移除缓冲——此后读者回落 Store，块已在。若 store 失败提前返回，缓冲保留，
-        // 下次 seal 重试（不丢数据）。
+        self.tails.lock().unwrap().remove(&ino);
+        Ok(())
+    }
+
+    /// 把开放尾块封为**不可变压缩块**落 Store 并重置尾日志，移除缓冲。块满 / 非追加写前 / truncate 前
+    /// 调用——让 Store 持有自洽全量已封块，后续 RMW 经 get_block 读它。空对齐尾块仅移除不写。
+    fn materialize(&self, store: &dyn Store, ino: u64, params: &CodecParams) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let snapshot = self.tails.lock().unwrap().get(&ino).cloned();
+        let Some(t) = snapshot else {
+            return Ok(());
+        };
+        if t.plain.is_empty() && t.file_size % (t.chunk_size as u64) == 0 {
+            self.tails.lock().unwrap().remove(&ino);
+            return Ok(());
+        }
+        // seal_plain_block 用 seal_tail_block（支持后端重置 journal；否则 = put_block）。先落 Store
+        // 再删缓冲，堵无锁读者 torn-read（rust-review HIGH-1）。
+        rmw::seal_plain_block(store, ino, t.idx, &t.plain, t.file_size, params)?;
+        self.seal_count.fetch_add(1, Ordering::Relaxed);
         self.tails.lock().unwrap().remove(&ino);
         Ok(())
     }
@@ -291,7 +322,7 @@ impl TailSessions {
         if !self.enabled {
             return rmw::truncate(store, ino, new_size, params);
         }
-        self.seal(store, ino, params)?;
+        self.materialize(store, ino, params)?;
         rmw::truncate(store, ino, new_size, params)?;
         Ok(())
     }
@@ -317,6 +348,7 @@ impl TailSessions {
         if plain.len() != tail_len {
             plain.resize(tail_len, 0);
         }
+        let journaled_len = plain.len();
         self.tails.lock().unwrap().insert(
             ino,
             Tail {
@@ -324,6 +356,7 @@ impl TailSessions {
                 plain,
                 chunk_size,
                 file_size: size,
+                journaled_len,
             },
         );
         Ok(())

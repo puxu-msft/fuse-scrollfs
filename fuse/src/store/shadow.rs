@@ -490,7 +490,14 @@ impl Store for ShadowStore {
                 bytes,
                 stored_verbatim: entry.is_verbatim(),
             })),
-            None => Ok(None),
+            // idx == 封块数 且有尾日志 → 重放未封尾块原始字节，包成 verbatim 尾块（docs/04 §8.4）。
+            None => match reader.read_tail()? {
+                Some(raw) if idx == reader.chunk_count() => Ok(Some(StoredBlock {
+                    bytes: raw,
+                    stored_verbatim: true,
+                })),
+                _ => Ok(None),
+            },
         }
     }
 
@@ -523,6 +530,46 @@ impl Store for ShadowStore {
             None => keep_from,
         });
         s.size = new_size;
+        Ok(())
+    }
+
+    // ---- in-archive 尾日志（写放大根治，docs/04 §8.4）----
+    fn supports_tail_journal(&self) -> bool {
+        true
+    }
+
+    /// fsync 路径：把未封尾块原始增量追加进 archive 尾日志并 durable。开 updater →
+    /// append_journal(delta) → commit_journal（不重写 index、双段 barrier）。绕开脏会话直接落盘，
+    /// 故 reader 缓存随之失效（盘上 SB/journal 已变）。
+    fn append_tail(&self, ino: Ino, delta: &[u8], new_size: u64) -> io::Result<()> {
+        let abs = self
+            .abs_of_ino(ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
+        let mut up = ArchiveUpdater::open(&abs)?;
+        up.append_journal(delta)?;
+        up.set_size(new_size);
+        up.commit_journal()?;
+        self.invalidate_reader(ino);
+        Ok(())
+    }
+
+    /// 封块：把累积尾块作为压缩块 idx 落盘 + 重置尾日志。开 updater → set_block → reset_journal →
+    /// commit。绕开脏会话直接落盘，失效 reader 缓存。
+    fn seal_tail_block(
+        &self,
+        ino: Ino,
+        idx: u64,
+        blk: StoredBlock,
+        new_size: u64,
+    ) -> io::Result<()> {
+        let abs = self
+            .abs_of_ino(ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
+        let mut up = ArchiveUpdater::open(&abs)?;
+        up.set_block(idx, &blk.bytes, blk.stored_verbatim, new_size)?;
+        up.reset_journal();
+        up.commit()?;
+        self.invalidate_reader(ino);
         Ok(())
     }
 

@@ -271,18 +271,67 @@ fn shadow_append_run(
 
 #[test]
 fn shadow_频繁_fsync_块数一致_append_only() {
-    // §8.3 崩溃安全（append-only + 双 superblock）取代了旧 reuse-tail-slot：每次 fsync 把渐增尾块
-    // append 到 EOF（旧版本成空洞，由压实回收）。故**频繁 fsync 现在会让物理体积增长**——这是
-    // 已知 trade-off（用临时写放大换 durability），§8.4 的 in-archive 尾日志会根治写放大。
-    // 本测验证 append-only 下仍成立的不变量：**块数与 fsync 频率无关（只取决于逻辑数据量）**。
+    // §8.4 in-archive 尾日志：fsync 只追加未封尾块原始增量，不再每次重压尾块。故频繁/稀疏 fsync
+    // 块数一致（只取决于逻辑量），且**物理体积接近**——写放大根治（§8.3 曾因 append-only 暂放宽，
+    // journal 让它重新成立）。
     let lines = 5000usize;
-    let (_phys_freq, blocks_freq, _logical) = shadow_append_run(lines, 1024, 65536, 5);
-    let (_phys_sparse, blocks_sparse, _) = shadow_append_run(lines, 1024, 65536, 100);
+    let (phys_freq, blocks_freq, _logical) = shadow_append_run(lines, 1024, 65536, 5);
+    let (phys_sparse, blocks_sparse, _) = shadow_append_run(lines, 1024, 65536, 100);
 
     assert_eq!(
         blocks_freq, blocks_sparse,
         "频繁/稀疏 fsync 最终块数应一致：freq={blocks_freq} sparse={blocks_sparse}"
     );
+    // 频繁 fsync 只追加原始增量（≤ 一个块的 raw + 8B/次记录头，封块时折叠重置），不再每次重压
+    // 整块。旧 reuse 路径频繁 fsync ≈20x 体积；现以 5x 为回归上界（封块前 raw 与压缩块并存的稳态）。
+    assert!(
+        phys_freq < phys_sparse * 5,
+        "写放大失控：频繁 fsync 物理 {phys_freq} 应被尾日志界住（旧 reuse ~20x，现应 <5x 稀疏 {phys_sparse}）"
+    );
+}
+
+#[test]
+fn shadow_remount_journal_重建尾块逐字节一致() {
+    // remount 安全网：多次 fsync 但不封块（行远小于块），尾块全在 journal。卸载（drop store）→
+    // 重开 → 经 get_block 重放 journal 重建未封尾块，整文件逐字节与期望一致（§8.4 (2)：只做写放大
+    // 不做重建会丢已 fsync 数据）。
+    let dir = tempfile::tempdir().unwrap();
+    let cs = 65536u32; // 大块，确保尾块不被封满
+    let path = dir.path().join("t.jsonl");
+    let mut expected = Vec::new();
+    {
+        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
+        let mut a = new_attr();
+        a.chunk_size = cs;
+        let ino = store.create(ROOT_INO, "t.jsonl", a).unwrap();
+        let ws = TailSessions::new(true);
+        for i in 0..30usize {
+            let line = semi_line(i, 200);
+            let off = ws.geometry(&store, ino).unwrap().0;
+            ws.write_at(&store, ino, off, &line, &params()).unwrap();
+            expected.extend_from_slice(&line);
+            ws.seal(&store, ino, &params()).unwrap(); // 每行 fsync → journal 增量，绝不封块
+            store.fsync(ino).unwrap();
+        }
+    }
+    // 重开 store（模拟 remount）：尾块仅存在于 journal。
+    let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
+    let ino = store.lookup(ROOT_INO, "t.jsonl").unwrap().ino;
+    use zipfs::archive::ArchiveReader;
+    let r = ArchiveReader::open(&path).unwrap();
+    assert_eq!(
+        r.chunk_count(),
+        0,
+        "30×200B 远小于 64KiB，应无封块、全在 journal"
+    );
+    // 经 get_block(0) 取重建尾块；逐字节一致。
+    let blk = store
+        .get_block(ino, 0)
+        .unwrap()
+        .expect("get_block 应从 journal 重建尾块");
+    let plain = decompress(&blk.bytes, Algo::Zstd, blk.stored_verbatim).unwrap();
+    assert_eq!(plain, expected, "remount 后 journal 重建尾块应逐字节一致");
+    assert_eq!(read_whole(&TailSessions::new(true), &store, ino), expected);
 }
 
 #[test]
@@ -323,6 +372,10 @@ fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
         for idx in 0..r.chunk_count() {
             let (bytes, entry) = r.read_block(idx).unwrap().unwrap();
             out.extend_from_slice(&decompress(&bytes, Algo::Zstd, entry.is_verbatim()).unwrap());
+        }
+        // 未封尾块在尾日志（fsync 只追加原始增量，不封块）：remount 重建须重放它（§8.4）。
+        if let Some(tail) = r.read_tail().unwrap() {
+            out.extend_from_slice(&tail);
         }
         out
     };

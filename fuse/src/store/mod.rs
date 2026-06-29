@@ -89,6 +89,35 @@ pub trait Store: Send + Sync {
     /// `keep_from` = ceil(new_size / chunk_size)（末块若被部分截断由 Core 先 RMW 再调本方法）。
     fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> io::Result<()>;
 
+    // ---- in-archive 尾日志（写放大根治，docs/04 §8.4）----
+    /// 该后端是否支持 in-archive 尾日志（fsync 只追加未封尾块的原始增量，不重压整块）。
+    /// 默认 false——容器布局（redb 自带 WAL）走旧 put_block 路径。ShadowStore 重写为 true。
+    fn supports_tail_journal(&self) -> bool {
+        false
+    }
+
+    /// fsync 路径：把未封尾块自上次以来的**原始字节增量**追加进 archive 尾日志并 durable
+    /// （O(delta)，不压缩、不重写整块）。`new_size` 是该 fsync 后文件应有的逻辑大小（含未封尾）。
+    /// 默认 `Unsupported`——仅 `supports_tail_journal()` 为 true 的后端实现。
+    fn append_tail(&self, _ino: Ino, _delta: &[u8], _new_size: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "该后端不支持尾日志（append_tail）",
+        ))
+    }
+
+    /// 封块：把累积的尾块作为压缩块 `idx` 落盘并**重置尾日志**（idx 转为不可变封块）。
+    /// 默认 = `put_block`（无尾日志的后端，封块即普通写块）。ShadowStore 重置 journal。
+    fn seal_tail_block(
+        &self,
+        ino: Ino,
+        idx: u64,
+        blk: StoredBlock,
+        new_size: u64,
+    ) -> io::Result<()> {
+        self.put_block(ino, idx, blk, new_size)
+    }
+
     // ---- head 缓存（发现读快路径，docs/02）----
     /// 设置 head 缓存：Core 在块 0 封为满的不可变正文块时，把首 `rawlen` 字节的**已压缩**字节
     /// 交来（压缩在 Core 完成，§2/M2：明文此刻在手，免事后解压回捞）。Store 累积进脏会话，
