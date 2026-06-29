@@ -137,6 +137,11 @@ struct MountArgs {
     /// 大行 append 拆分（2–4MiB 单条 json 少 8–32x 回调）。仅 shadow/container 生效。
     #[arg(long, default_value_t = 0)]
     max_write: u32,
+
+    /// 启用 FUSE 写回缓存（内核合并小写、async 回刷，降写尾 p99）。去写 fd direct_io 改用 page cache；
+    /// 默认关（direct_io 求 RMW 精确）。仅 shadow/container 生效。
+    #[arg(long, default_value_t = false)]
+    writeback: bool,
 }
 
 /// `compact` 子命令参数。
@@ -545,7 +550,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 tail_buffer,
                 dict,
             )
-            .with_max_write(args.max_write);
+            .with_max_write(args.max_write)
+            .with_writeback(args.writeback);
             serve_rw(fs, &mountpoint, &cfg)
         }
         Backend::Container => {
@@ -561,7 +567,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 tail_buffer,
                 dict,
             )
-            .with_max_write(args.max_write);
+            .with_max_write(args.max_write)
+            .with_writeback(args.writeback);
             serve_rw(fs, &mountpoint, &cfg)
         }
     };

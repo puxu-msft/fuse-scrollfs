@@ -48,6 +48,9 @@ pub struct ZipfsRw {
     /// 内核失效通知器（mount 后注入）：fsync/flush 提交后 `inval_inode` 失效只读 mmap 的陈旧
     /// page cache，堵跨 fd 一致性窗口。None=无（mount2 路径或注入前）。
     notifier: Arc<OnceLock<Notifier>>,
+    /// 写回缓存（opt-in）：init 协商 FUSE_WRITEBACK_CACHE、写 fd 去 direct_io，内核合并小写降 p99。
+    /// 默认 false（direct_io 求 RMW offset/size 精确）。
+    writeback: bool,
 }
 
 impl ZipfsRw {
@@ -73,12 +76,19 @@ impl ZipfsRw {
             tails: TailSessions::new(tail_buffer),
             max_write: 0,
             notifier: Arc::new(OnceLock::new()),
+            writeback: false,
         }
     }
 
     /// 设协商最大 write（main 据 --max-write 注入；0 保持 fuser 默认）。返回自身便于链式。
     pub fn with_max_write(mut self, max_write: u32) -> Self {
         self.max_write = max_write;
+        self
+    }
+
+    /// 开写回缓存（init 协商 FUSE_WRITEBACK_CACHE、写 fd 去 direct_io，内核合并小写降 p99）。
+    pub fn with_writeback(mut self, writeback: bool) -> Self {
+        self.writeback = writeback;
         self
     }
 
@@ -284,6 +294,13 @@ impl Filesystem for ZipfsRw {
                 let _ = config.set_max_write(nearest);
             }
         }
+        // writeback 缓存：内核合并小写、async 回刷，降写尾 p99（须配合 open 去 direct_io）。
+        if self.writeback {
+            if let Err(missing) = config.add_capabilities(fuser::InitFlags::FUSE_WRITEBACK_CACHE) {
+                warn!("内核不支持 FUSE_WRITEBACK_CACHE（{missing:?}），仍走 direct_io");
+                self.writeback = false;
+            }
+        }
         Ok(())
     }
 
@@ -312,8 +329,9 @@ impl Filesystem for ZipfsRw {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if self.store.getattr_ino(ino.0).is_some() {
             // 只读 open：用 page cache（FOPEN_KEEP_CACHE）→ 支持只读 mmap（T2）；read 仍精确切片。
-            // 读写/只写 open：保留 direct_io，求 RMW 写路径 offset/size 精确、写后读一致（§4.1）。
-            let fopen = if flags.acc_mode() == fuser::OpenAccMode::O_RDONLY {
+            // 读写/只写 open：默认 direct_io 求 RMW offset/size 精确；--writeback 下去 direct_io 用
+            // page cache（内核合并小写、async 回刷，降 p99），KEEP_CACHE 保读缓存。
+            let fopen = if flags.acc_mode() == fuser::OpenAccMode::O_RDONLY || self.writeback {
                 fuser::FopenFlags::FOPEN_KEEP_CACHE
             } else {
                 fuser::FopenFlags::FOPEN_DIRECT_IO
