@@ -12,6 +12,7 @@
 //! 也避免重蹈 `sqlitefs`「每写 COW sync」覆辙。
 
 pub mod container;
+pub(crate) mod lock;
 pub mod shadow;
 
 #[cfg(test)]

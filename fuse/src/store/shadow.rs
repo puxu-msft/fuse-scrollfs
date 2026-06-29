@@ -104,6 +104,10 @@ struct WriteSession {
 /// 影子树后端（布局 S）。`backing` 为底层目录根（archive 树）。
 pub struct ShadowStore {
     backing: PathBuf,
+    /// backing 的跨进程排他锁（Bug A）。RAII 持有到 drop：守护退出（含 SIGKILL）时
+    /// 内核自动释放，故第二个守护 open 同一 backing 必失败，杜绝双守护并发覆盖。
+    /// 锁文件是 backing 外的 sibling `<backing>.zipfs.lock`，不进 readdir/写路径。
+    _lock: std::fs::File,
     inodes: Mutex<InodeMap>,
     /// per-inode 写会话表。键为 ino，值为挂起的脏块缓冲。fsync/flush 落盘后移除。
     sessions: Mutex<HashMap<u64, WriteSession>>,
@@ -137,6 +141,20 @@ pub struct ShadowStore {
     fault_commit_sync: std::sync::atomic::AtomicBool,
 }
 
+/// backing 的锁文件路径：同级 sibling `<backing>.zipfs.lock`（位于 backing **外**）。
+///
+/// 控制文件一律放 backing 外（与 `.zipfs.meta` 同理）：backing 内只有用户原始数据，
+/// readdir 无脑透传、不需任何按名过滤——按名过滤会误伤恰好同名的用户文件、违反零丢失。
+/// 用 `OsString::push` 拼接，避免要求 backing 路径是合法 UTF-8。
+fn lock_path_for(backing: &Path) -> PathBuf {
+    let mut name = backing.file_name().unwrap_or_default().to_os_string();
+    name.push(".zipfs.lock");
+    match backing.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 impl ShadowStore {
     /// 用底层 archive 树根构造（默认 chunk_size 取 Core 默认 64KiB）。
     pub fn open(backing: PathBuf) -> io::Result<Self> {
@@ -158,8 +176,12 @@ impl ShadowStore {
                 "default_chunk_size 不能为 0",
             ));
         }
+        // Bug A：取 backing 的跨进程排他锁，挡住第二个守护并发持有同一 backing。
+        // 锁文件放 backing 外 sibling，绝不进 readdir/写路径（避免被当数据/暴露成幽灵文件）。
+        let lock = super::lock::acquire_exclusive(&lock_path_for(&backing))?;
         Ok(Self {
             backing,
+            _lock: lock,
             inodes: Mutex::new(InodeMap::new()),
             sessions: Mutex::new(HashMap::new()),
             readers: Mutex::new(HashMap::new()),
@@ -764,6 +786,42 @@ impl Store for ShadowStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_second_on_same_backing_rejected_by_lock() {
+        // Bug A：两个守护同时持有同一 shadow backing 是数据损坏直接成因
+        // （孤儿守护用空视图周期性覆盖）。open 须取跨进程排他锁，第二个 open 失败。
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("proj");
+        std::fs::create_dir(&backing).unwrap();
+        let s1 = ShadowStore::open_with_chunk_size(backing.clone(), 65536).unwrap();
+        let s2 = ShadowStore::open_with_chunk_size(backing.clone(), 65536);
+        assert!(
+            s2.is_err(),
+            "第二个守护 open 同一 backing 应被排他锁拒绝（防双守护覆盖）"
+        );
+        drop(s1); // 释放锁（drop / 进程退出含 SIGKILL 内核自动释放）
+        let s3 = ShadowStore::open_with_chunk_size(backing.clone(), 65536);
+        assert!(s3.is_ok(), "锁释放后应可重新 open");
+    }
+
+    #[test]
+    fn lock_file_lives_outside_backing() {
+        // 锁文件必须放 backing 外 sibling，否则被 readdir 暴露成幽灵文件、
+        // 被 compact/seal/ingest 误当数据（与 .zipfs.meta 同理）。
+        let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("proj");
+        std::fs::create_dir(&backing).unwrap();
+        let _s = ShadowStore::open_with_chunk_size(backing.clone(), 65536).unwrap();
+        assert!(
+            !backing.join(".zipfs.lock").exists(),
+            "lock 绝不能在 backing 内（否则被 readdir 暴露）"
+        );
+        assert!(
+            dir.path().join("proj.zipfs.lock").exists(),
+            "lock 应在 backing 同级 sibling: proj.zipfs.lock"
+        );
+    }
 
     #[test]
     fn inode_map_根为_1_路径为空() {
