@@ -169,6 +169,10 @@ pub fn apply(
         )));
     }
 
+    // 挂载成功 → 注册自启（systemd：enable zipfs@<esc>，重启后自动重挂）。best-effort：
+    // 失败不回滚已成功的挂载（RealMounter 下是 no-op）。
+    let _ = mounter.enable_autostart(name);
+
     Ok(ApplyOutcome {
         files: stats.files,
         bytes_src: stats.bytes_src,
@@ -201,6 +205,8 @@ pub fn restore(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
             let _ = discovery::write_meta(&paths.meta_path(name), &m);
         }
     }
+    // 注销自启（systemd：disable zipfs@<esc>）。best-effort（RealMounter 下 no-op）。
+    let _ = mounter.disable_autostart(name);
     Ok(())
 }
 
@@ -646,6 +652,28 @@ mod tests {
         assert_eq!(
             discovery::probe(&paths, "demo").status,
             ProjectStatus::Plain
+        );
+    }
+
+    #[test]
+    fn apply_enables_and_restore_disables_autostart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        make_project(&paths, "demo", "a.jsonl", b"data\n".repeat(100).as_slice());
+        let m = FakeMounter::default();
+
+        apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
+        assert_eq!(
+            &*m.autostart_enabled.lock().unwrap(),
+            &["demo".to_string()],
+            "apply 成功后应 enable_autostart(demo)"
+        );
+
+        restore(&paths, "demo", &m).unwrap();
+        assert_eq!(
+            &*m.autostart_disabled.lock().unwrap(),
+            &["demo".to_string()],
+            "restore 后应 disable_autostart(demo)"
         );
     }
 

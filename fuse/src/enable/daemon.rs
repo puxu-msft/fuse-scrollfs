@@ -41,6 +41,19 @@ pub trait Mounter {
     fn unmount(&self, name: &str, mountpoint: &Path) -> std::io::Result<()>;
     /// 是否为活的 zipfs 挂载点。
     fn is_mounted(&self, mountpoint: &Path) -> bool;
+
+    /// 注册项目自启（apply 成功后调用）。default no-op：`RealMounter`/`FakeMounter` 无 systemd
+    /// 自启概念。`SystemdMounter` 覆盖为 `systemctl --user enable zipfs@<esc>`，使 apply 的项目
+    /// 重启后自动重挂。best-effort：失败不应回滚已成功的挂载（调用方忽略错误）。
+    fn enable_autostart(&self, _name: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// 注销项目自启（restore/purge 时调用）。default no-op；`SystemdMounter` 覆盖为
+    /// `systemctl --user disable zipfs@<esc>`。
+    fn disable_autostart(&self, _name: &str) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 就绪/卸载轮询步进与上限。
@@ -208,6 +221,10 @@ pub(crate) mod fake {
         pub mounted: Mutex<HashSet<PathBuf>>,
         /// 若为 true，spawn 直接失败（模拟挂载失败路径）。
         pub fail_spawn: bool,
+        /// 记录 enable_autostart 被调用的项目名（验证 apply 成功后注册自启）。
+        pub autostart_enabled: Mutex<Vec<String>>,
+        /// 记录 disable_autostart 被调用的项目名（验证 restore/purge 注销自启）。
+        pub autostart_disabled: Mutex<Vec<String>>,
     }
 
     impl Mounter for FakeMounter {
@@ -226,6 +243,20 @@ pub(crate) mod fake {
         }
         fn is_mounted(&self, mountpoint: &Path) -> bool {
             self.mounted.lock().unwrap().contains(mountpoint)
+        }
+        fn enable_autostart(&self, name: &str) -> std::io::Result<()> {
+            self.autostart_enabled
+                .lock()
+                .unwrap()
+                .push(name.to_string());
+            Ok(())
+        }
+        fn disable_autostart(&self, name: &str) -> std::io::Result<()> {
+            self.autostart_disabled
+                .lock()
+                .unwrap()
+                .push(name.to_string());
+            Ok(())
         }
     }
 }

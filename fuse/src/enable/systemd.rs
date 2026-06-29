@@ -156,6 +156,15 @@ impl crate::enable::daemon::Mounter for SystemdMounter {
     fn is_mounted(&self, mountpoint: &std::path::Path) -> bool {
         discovery::is_mounted(mountpoint)
     }
+
+    fn enable_autostart(&self, name: &str) -> std::io::Result<()> {
+        // 项目重启后自动重挂（模板实例随 default.target 拉起）。
+        run_systemctl(&systemctl_args("enable", name))
+    }
+
+    fn disable_autostart(&self, name: &str) -> std::io::Result<()> {
+        run_systemctl(&systemctl_args("disable", name))
+    }
 }
 
 /// 选哪个 mounter 的纯决策（真值表可单测）：三个探测都通过才用 systemd，否则降级 Real。
