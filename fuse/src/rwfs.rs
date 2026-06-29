@@ -420,7 +420,12 @@ impl Filesystem for ZipfsRw {
                     &self.to_file_attr(&a),
                     Generation(0),
                     FileHandle(0),
-                    fuser::FopenFlags::FOPEN_DIRECT_IO,
+                    // 与 open 一致：writeback 下用 page cache 合并写，否则 direct_io 求精确。
+                    if self.writeback {
+                        fuser::FopenFlags::FOPEN_KEEP_CACHE
+                    } else {
+                        fuser::FopenFlags::FOPEN_DIRECT_IO
+                    },
                 ),
                 None => reply.error(Errno::EIO),
             },

@@ -10,6 +10,8 @@ ORIG="$TARGET.zipfs-orig"
 
 [ -e "$ORIG" ] && { echo "[cutover] $ORIG 已存在，疑似已切换；先 rollback" >&2; exit 1; }
 mountpoint -q "$TARGET" && { echo "[cutover] $TARGET 已是挂载点" >&2; exit 1; }
+# backing 须不存在或为空——回退时会 rm -rf 它，绝不删用户已有非空目录（no-unconscious）。
+[ -e "$BACKING" ] && [ -n "$(ls -A "$BACKING" 2>/dev/null)" ] && { echo "[cutover] backing $BACKING 非空，拒绝（防误删）" >&2; exit 1; }
 mv "$TARGET" "$ORIG"                       # 备份源（可逆关键）
 mkdir -p "$BACKING" "$TARGET"
 # verify 通过才算成功；失败则回退（源仍在 $ORIG）。
