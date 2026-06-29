@@ -43,8 +43,8 @@ const SB_B_OFFSET: u64 = HEADER_LEN + SB_LEN;
 /// 数据区起点：header + 两个 superblock 槽。块/index/journal/head 缓存一律 append 到此后。
 const DATA_START: u64 = HEADER_LEN + 2 * SB_LEN;
 
-/// 单个块索引项的序列化大小：offset(8) + clen(8) + flags(4) = 20 字节。
-const INDEX_ENTRY_LEN: u64 = 20;
+/// 单个块索引项的序列化大小：offset(8) + clen(8) + flags(4) + block_crc(4) = 24 字节。
+const INDEX_ENTRY_LEN: u64 = 24;
 
 /// head 缓存的发现读窗口（= harness `Rv`，docs/02 §4.4）。首版默认 64KiB。
 pub const HEAD_CACHE_BYTES: u64 = 65536;
@@ -52,7 +52,7 @@ pub const HEAD_CACHE_BYTES: u64 = 65536;
 /// 块 flags 位：原样存储（不可压缩启发式置位，读时跳过解压）。
 pub const FLAG_VERBATIM: u32 = 0b0000_0001;
 
-/// 一个块在 archive 中的索引项：物理位置、压缩长度、flags。
+/// 一个块在 archive 中的索引项：物理位置、压缩长度、flags、块 CRC。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkEntry {
     /// 块压缩数据在文件中的字节偏移。
@@ -61,6 +61,9 @@ pub struct ChunkEntry {
     pub clen: u64,
     /// 标志位（当前仅 FLAG_VERBATIM）。
     pub flags: u32,
+    /// 该块**存储字节**（压缩/verbatim 后）的 CRC32：read_block 校验封块静默错读（ROADMAP T1）。
+    /// 仅覆盖封块；尾日志另有 rec_crc，head 缓存属可丢弃派生数据（M2 不 fail-closed）。
+    pub block_crc: u32,
 }
 
 impl ChunkEntry {
@@ -413,6 +416,11 @@ impl ArchiveReader {
         };
         let mut buf = vec![0u8; entry.clen as usize];
         read_exact_at(&self.file, &mut buf, entry.offset)?;
+        // per-block CRC：校验封块存储字节，单块静默翻转即 fail-closed（ROADMAP T1）。head 缓存/
+        // 尾日志走另路（前者可丢弃回退、后者 rec_crc），不经此校验。
+        if crc32(&buf) != entry.block_crc {
+            return Err(corrupt(&format!("块 {idx} CRC 不符（静默错读防护）")));
+        }
         Ok(Some((buf, entry)))
     }
 
@@ -552,10 +560,12 @@ fn parse_index(bytes: &[u8], count: usize) -> Vec<ChunkEntry> {
             let offset = u64::from_le_bytes(bytes[base..base + 8].try_into().unwrap());
             let clen = u64::from_le_bytes(bytes[base + 8..base + 16].try_into().unwrap());
             let flags = u32::from_le_bytes(bytes[base + 16..base + 20].try_into().unwrap());
+            let block_crc = u32::from_le_bytes(bytes[base + 20..base + 24].try_into().unwrap());
             ChunkEntry {
                 offset,
                 clen,
                 flags,
+                block_crc,
             }
         })
         .collect()
@@ -568,6 +578,7 @@ fn serialize_index(index: &[ChunkEntry]) -> Vec<u8> {
         bytes.extend_from_slice(&e.offset.to_le_bytes());
         bytes.extend_from_slice(&e.clen.to_le_bytes());
         bytes.extend_from_slice(&e.flags.to_le_bytes());
+        bytes.extend_from_slice(&e.block_crc.to_le_bytes());
     }
     bytes
 }
@@ -654,6 +665,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             offset: self.cursor,
             clen: stored_bytes.len() as u64,
             flags,
+            block_crc: crc32(stored_bytes),
         });
         self.cursor += stored_bytes.len() as u64;
         self.uncompressed_size += raw_len;
@@ -894,6 +906,7 @@ impl ArchiveUpdater {
         // 缺口补零块（[count, idx)）。
         if (self.index.len() as u64) < idx {
             let zeros = vec![0u8; self.chunk_size as usize];
+            let zeros_crc = crc32(&zeros);
             while (self.index.len() as u64) < idx {
                 let offset = self.write_cursor;
                 self.file.seek(SeekFrom::Start(offset))?;
@@ -903,6 +916,7 @@ impl ArchiveUpdater {
                     offset,
                     clen: zeros.len() as u64,
                     flags: FLAG_VERBATIM,
+                    block_crc: zeros_crc,
                 });
             }
         }
@@ -915,6 +929,7 @@ impl ArchiveUpdater {
             offset,
             clen: stored_bytes.len() as u64,
             flags: if verbatim { FLAG_VERBATIM } else { 0 },
+            block_crc: crc32(stored_bytes),
         };
         let count = self.index.len() as u64;
         if idx == count {
@@ -1319,6 +1334,23 @@ mod tests {
     fn crc32_已知向量() {
         // "123456789" 的 IEEE CRC32 标准向量 = 0xCBF43926。
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn 块字节静默翻转_被_per_block_crc_检出() {
+        // index_crc/越界都自洽，仅某块数据字节翻转 → read_block 应 fail-closed（per-block CRC，T1）。
+        let bytes = build_archive(64, &[(b"compressed-block-0".to_vec(), false, 50)]);
+        let r = reader_from_bytes(&bytes);
+        let off = r.entry(0).unwrap().offset as usize;
+        let mut corrupted = bytes;
+        corrupted[off] ^= 0xFF; // 翻转块0首字节（不动 index/SB，故 index_crc 仍自洽）
+        let r2 = reader_from_bytes(&corrupted);
+        let err = r2.read_block(0).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "块字节损坏应 fail-closed"
+        );
     }
 
     #[test]

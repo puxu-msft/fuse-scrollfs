@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
@@ -37,7 +37,9 @@ pub struct ZipfsRw {
     params: CodecParams,
     default_chunk_size: u32,
     /// per-inode 写锁（§4）：保证同一文件的 RMW / truncate / 封块 / fsync 串行、原子。
-    locks: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    /// `RwLock`：read 取读锁（同 inode 多读并发），write/seal/truncate/fsync 取写锁（排他，仍堵
+    /// HIGH-1 torn-read——seal 与读互斥）。
+    locks: Mutex<HashMap<u64, Arc<RwLock<()>>>>,
     /// 开放尾块缓冲（append 优化，§1.1）。写/封块由 per-inode 写锁串行；读尾块多读者安全。
     tails: TailSessions,
 }
@@ -67,7 +69,7 @@ impl ZipfsRw {
     }
 
     /// 取（或建）某 inode 的写锁句柄。
-    fn lock_for(&self, ino: u64) -> Arc<Mutex<()>> {
+    fn lock_for(&self, ino: u64) -> Arc<RwLock<()>> {
         let mut g = self.locks.lock().unwrap();
         g.entry(ino).or_default().clone()
     }
@@ -89,7 +91,7 @@ impl ZipfsRw {
     fn forget_inode_locked(&self, ino: u64) {
         {
             let lock = self.lock_for(ino);
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.write().unwrap();
             self.tails.forget(ino);
         }
         // 出锁作用域后再 evict（evict 要求 strong_count==1，持 guard 时计数为 2 会漏删）。
@@ -136,7 +138,7 @@ impl ZipfsRw {
     /// 同 inode 的读写并发少，串行化代价可忽略；正确性优先（§10）。
     fn read_range(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
         let lock = self.lock_for(ino);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.read().unwrap();
         let Some((uncompressed_size, chunk_size)) = self.tails.geometry(self.store.as_ref(), ino)
         else {
             return Err(Errno::ENOENT);
@@ -264,10 +266,16 @@ impl Filesystem for ZipfsRw {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if self.store.getattr_ino(ino.0).is_some() {
-            // §4.1：首版 direct_io 求正确（offset/size 精确，便于 RMW 校验）。
-            reply.opened(FileHandle(0), fuser::FopenFlags::FOPEN_DIRECT_IO);
+            // 只读 open：用 page cache（FOPEN_KEEP_CACHE）→ 支持只读 mmap（T2）；read 仍精确切片。
+            // 读写/只写 open：保留 direct_io，求 RMW 写路径 offset/size 精确、写后读一致（§4.1）。
+            let fopen = if flags.acc_mode() == fuser::OpenAccMode::O_RDONLY {
+                fuser::FopenFlags::FOPEN_KEEP_CACHE
+            } else {
+                fuser::FopenFlags::FOPEN_DIRECT_IO
+            };
+            reply.opened(FileHandle(0), fopen);
         } else {
             reply.error(Errno::ENOENT);
         }
@@ -304,7 +312,7 @@ impl Filesystem for ZipfsRw {
         reply: ReplyWrite,
     ) {
         let lock = self.lock_for(ino.0);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.write().unwrap();
         match self
             .tails
             .write_at(self.store.as_ref(), ino.0, offset, data, &self.params)
@@ -439,7 +447,7 @@ impl Filesystem for ZipfsRw {
         // 同 ino 的尾块缓冲与底层路径变动产生不一致（封块是幂等的安全操作）。
         if let Some(src) = self.store.lookup(parent.0, name).map(|a| a.ino) {
             let lock = self.lock_for(src);
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.write().unwrap();
             if let Err(e) = self.tails.seal(self.store.as_ref(), src, &self.params) {
                 // 非致命（rename 仍可进行，源内容由底层路径承载），但不静默吞——记日志。
                 warn!("rename：封源 ino={src} 尾块失败：{e}");
@@ -482,7 +490,7 @@ impl Filesystem for ZipfsRw {
         // truncate / extend：走 Core 写编排（持 inode 写锁）。先封开放尾块再截断。
         if let Some(new_size) = size {
             let lock = self.lock_for(ino.0);
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.write().unwrap();
             if let Err(e) = self
                 .tails
                 .truncate(self.store.as_ref(), ino.0, new_size, &self.params)
@@ -523,7 +531,7 @@ impl Filesystem for ZipfsRw {
     ) {
         // 持 inode 写锁再封块 + 提交，避免与并发 write/truncate 的 RMW 序列交错（rust-review C1）。
         let lock = self.lock_for(ino.0);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.write().unwrap();
         if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
             reply.error(io_to_errno(&e));
             return;
@@ -545,7 +553,7 @@ impl Filesystem for ZipfsRw {
         // 持 inode 写锁再封块 + 提交（rust-review C1）：fsync 须先把开放尾块封块落 Store，
         // 再让 Store 持久化，符合 POSIX fsync 契约（§10），且不能与同 inode 的 RMW 交错。
         let lock = self.lock_for(ino.0);
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.write().unwrap();
         if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
             reply.error(io_to_errno(&e));
             return;
@@ -571,7 +579,7 @@ impl Filesystem for ZipfsRw {
         // 注意：close 不保证 durability（那是 fsync 的职责），此处尽力而为。
         {
             let lock = self.lock_for(ino.0);
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.write().unwrap();
             if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
                 warn!("release：封 ino={} 尾块失败：{e}", ino.0);
             }
