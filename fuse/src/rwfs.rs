@@ -54,6 +54,13 @@ pub struct ZipfsRw {
 }
 
 impl ZipfsRw {
+    /// 取后端引用（main 后台 metrics 线程读 compression_stats 写 .prom）。
+    pub fn store_handle(&self) -> Arc<dyn Store> {
+        Arc::clone(&self.store)
+    }
+}
+
+impl ZipfsRw {
     pub fn new(store: Arc<dyn Store>, algo: Algo, level: i32, default_chunk_size: u32) -> Self {
         Self::with_tail_buffer(store, algo, level, default_chunk_size, true, None)
     }

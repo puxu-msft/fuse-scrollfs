@@ -142,6 +142,11 @@ struct MountArgs {
     /// 默认关（direct_io 求 RMW 精确）。仅 shadow/container 生效。
     #[arg(long, default_value_t = false)]
     writeback: bool,
+
+    /// Prometheus textfile 指标输出路径（.prom）。给定则守护后台每 15s 写逻辑/物理字节/压缩比，
+    /// 供 node_exporter textfile collector 抓取（dep-free，仅 shadow 后端有压缩比）。
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
 }
 
 /// `compact` 子命令参数。
@@ -552,7 +557,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             )
             .with_max_write(args.max_write)
             .with_writeback(args.writeback);
-            serve_rw(fs, &mountpoint, &cfg)
+            serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone())
         }
         Backend::Container => {
             let store: Arc<dyn Store> = Arc::new(ContainerStore::open_with_chunk_size(
@@ -569,7 +574,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             )
             .with_max_write(args.max_write)
             .with_writeback(args.writeback);
-            serve_rw(fs, &mountpoint, &cfg)
+            serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone())
         }
     };
     if let Some(pf) = &args.pid_file {
@@ -580,8 +585,14 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
 
 /// 后台挂载读写 fs + 注入内核失效通知器（fsync 后失效只读 mmap 缓存）后阻塞，等价 mount2 前台。
 /// 挂载就绪后向 systemd 发 READY，并起看门狗周期心跳（无 systemd / 未配 WATCHDOG 时静默降级）。
-fn serve_rw(fs: ZipfsRw, mountpoint: &std::path::Path, cfg: &fuser::Config) -> std::io::Result<()> {
+fn serve_rw(
+    fs: ZipfsRw,
+    mountpoint: &std::path::Path,
+    cfg: &fuser::Config,
+    metrics_file: Option<PathBuf>,
+) -> std::io::Result<()> {
     let slot = fs.notifier_slot();
+    let store = fs.store_handle();
     let session = fuser::spawn_mount2(fs, mountpoint, cfg)?;
     let _ = slot.set(session.notifier()); // 注入后 fsync/flush 可发 inval_inode
     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]); // 就绪（非 systemd 下静默失败）
@@ -591,6 +602,31 @@ fn serve_rw(fs: ZipfsRw, mountpoint: &std::path::Path, cfg: &fuser::Config) -> s
         std::thread::spawn(move || loop {
             std::thread::sleep(half);
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+        });
+    }
+    if let Some(path) = metrics_file {
+        // detached 指标线程：每 15s 写 prometheus textfile（压缩比/字节）。
+        std::thread::spawn(move || loop {
+            if let Some((phys, logical)) = store.compression_stats() {
+                let ratio = if phys > 0 {
+                    logical as f64 / phys as f64
+                } else {
+                    0.0
+                };
+                let body = format!(
+                    "# HELP zipfs_logical_bytes 逻辑字节\n# TYPE zipfs_logical_bytes gauge\nzipfs_logical_bytes {logical}\n\
+                     # HELP zipfs_physical_bytes 物理字节\n# TYPE zipfs_physical_bytes gauge\nzipfs_physical_bytes {phys}\n\
+                     # HELP zipfs_compression_ratio 压缩比\n# TYPE zipfs_compression_ratio gauge\nzipfs_compression_ratio {ratio:.4}\n"
+                );
+                let tmp = path.with_extension("prom.tmp");
+                if std::fs::write(&tmp, &body)
+                    .and_then(|_| std::fs::rename(&tmp, &path))
+                    .is_err()
+                {
+                    eprintln!("[zipfs] 写 metrics 文件失败：{}", path.display());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(15));
         });
     }
     session.join() // 阻塞至卸载（前台守护语义不变）
