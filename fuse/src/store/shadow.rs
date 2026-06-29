@@ -626,6 +626,29 @@ impl Store for ShadowStore {
     fn release(&self, ino: Ino) {
         self.invalidate_reader(ino);
     }
+
+    /// 遍历 backing 树聚合 (物理字节=archive 文件实际占用, 逻辑字节=Σ footer uncompressed_size)。
+    /// statfs 据此让 `df` 显压缩比；遍历 O(文件数)，statfs 罕调，可接受。
+    fn compression_stats(&self) -> Option<(u64, u64)> {
+        let mut phys = 0u64;
+        let mut logical = 0u64;
+        let mut stack = vec![self.backing.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                match ent.file_type() {
+                    Ok(t) if t.is_dir() => stack.push(p),
+                    Ok(t) if t.is_file() => {
+                        phys += fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                        logical += read_footer_geometry(&p).map(|(s, _)| s).unwrap_or(0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some((phys, logical))
+    }
 }
 
 #[cfg(test)]

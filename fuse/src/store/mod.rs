@@ -158,4 +158,9 @@ pub trait Store: Send + Sync {
     /// （如布局 S 的已打开 `ArchiveReader` 缓存）。默认空实现——不缓存的后端无需关心。
     /// 注意：仅作为「释放缓存」的提示，不承担持久化职责（落盘由 flush/fsync 负责）。
     fn release(&self, _ino: Ino) {}
+
+    /// 可观测：返回 `(物理字节, 逻辑字节)`——statfs 据此让 `df` 显压缩比。默认 None（不支持）。
+    fn compression_stats(&self) -> Option<(u64, u64)> {
+        None
+    }
 }

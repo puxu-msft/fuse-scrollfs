@@ -666,6 +666,68 @@ impl Filesystem for ZipfsRw {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+        // df 显压缩比：blocks=逻辑总量、bavail/bfree=逻辑−物理（已省空间作可用），bsize=4KiB。
+        const BS: u64 = 4096;
+        let (phys, logical) = self.store.compression_stats().unwrap_or((0, 0));
+        let blocks = logical / BS;
+        let used = phys / BS;
+        let free = blocks.saturating_sub(used);
+        reply.statfs(blocks, free, free, 0, 0, BS as u32, 255, BS as u32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::HEAD_CACHE_BYTES;
+    use crate::core::rmw;
+    use crate::store::shadow::ShadowStore;
+    use crate::store::Attr;
+
+    const ROOT: u64 = 1;
+
+    /// 建 shadow ZipfsRw + 一个 200KiB 文件（128KiB 块 → 块0 满封建 head 缓存），返回 (fs, 内容, ino)。
+    fn fs_with_head_cache() -> (ZipfsRw, Vec<u8>, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = 128 * 1024u32;
+        let store =
+            Arc::new(ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap());
+        let attr = Attr {
+            ino: 0,
+            size: 0,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            chunk_size: cs,
+        };
+        let ino = store.create(ROOT, "f.bin", attr).unwrap();
+        let data: Vec<u8> = (0..200 * 1024).map(|i| b"abcde \n"[i % 7]).collect();
+        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs);
+        rmw::write_at(store.as_ref(), ino, 0, &data, &fs.params).unwrap();
+        store.fsync(ino).unwrap();
+        std::mem::forget(dir); // 测试期保留 backing
+        (fs, data, ino)
+    }
+
+    #[test]
+    fn read_range_head_缓存命中_逐字节正确() {
+        let (fs, data, ino) = fs_with_head_cache();
+        // 区间完全落在 head 缓存前缀（< 64KiB）→ 走快路径，免整块解压。
+        let got = fs.read_range(ino, 100, 4000).unwrap();
+        assert_eq!(got, &data[100..4100], "head 缓存切片逐字节一致");
+    }
+
+    #[test]
+    fn read_range_越缓存前缀_回退逐块仍正确() {
+        let (fs, data, ino) = fs_with_head_cache();
+        // 跨越 head 缓存末端（HEAD_CACHE_BYTES 附近）→ 回退逐块路径，仍逐字节正确。
+        let off = HEAD_CACHE_BYTES - 50;
+        let got = fs.read_range(ino, off, 200).unwrap();
+        assert_eq!(
+            got,
+            &data[off as usize..off as usize + 200],
+            "回退逐块逐字节一致"
+        );
     }
 }
