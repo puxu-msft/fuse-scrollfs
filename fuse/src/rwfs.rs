@@ -42,6 +42,9 @@ pub struct ZipfsRw {
     locks: Mutex<HashMap<u64, Arc<RwLock<()>>>>,
     /// 开放尾块缓冲（append 优化，§1.1）。写/封块由 per-inode 写锁串行；读尾块多读者安全。
     tails: TailSessions,
+    /// 协商的最大单次 write 字节数（init 时 set_max_write）。0=用 fuser 默认（128KiB）。大值减
+    /// 内核拆分（2–4MiB 单行 append 少 8–32x 回调）；上限由 fuser 截到 16MiB。
+    max_write: u32,
 }
 
 impl ZipfsRw {
@@ -65,7 +68,14 @@ impl ZipfsRw {
             default_chunk_size,
             locks: Mutex::new(HashMap::new()),
             tails: TailSessions::new(tail_buffer),
+            max_write: 0,
         }
+    }
+
+    /// 设协商最大 write（main 据 --max-write 注入；0 保持 fuser 默认）。返回自身便于链式。
+    pub fn with_max_write(mut self, max_write: u32) -> Self {
+        self.max_write = max_write;
+        self
     }
 
     /// 取（或建）某 inode 的写锁句柄。
@@ -244,6 +254,20 @@ pub fn io_to_errno(e: &std::io::Error) -> Errno {
 }
 
 impl Filesystem for ZipfsRw {
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        // 协商更大 max_write，减大行 append 的内核拆分（fuser 默认 128KiB→ 可到 16MiB）。
+        if self.max_write > 0 {
+            if let Err(nearest) = config.set_max_write(self.max_write) {
+                warn!(
+                    "set_max_write({}) 失败，回退最近值 {nearest}",
+                    self.max_write
+                );
+                let _ = config.set_max_write(nearest);
+            }
+        }
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name.to_str() else {
             reply.error(Errno::ENOENT);

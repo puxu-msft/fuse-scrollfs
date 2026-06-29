@@ -127,6 +127,11 @@ struct MountArgs {
     /// 写入自身 PID 到此文件（自挂载脚本/ systemd 用以监控、SIGTERM 干净卸载）。退出时尽力删除。
     #[arg(long)]
     pid_file: Option<PathBuf>,
+
+    /// 协商最大单次 write 字节（默认 0=沿用 fuser/内核默认 128KiB；上限 16MiB）。显式调大可减
+    /// 大行 append 拆分（2–4MiB 单条 json 少 8–32x 回调）。仅 shadow/container 生效。
+    #[arg(long, default_value_t = 0)]
+    max_write: u32,
 }
 
 /// `compact` 子命令参数。
@@ -460,7 +465,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 args.chunk_size,
                 tail_buffer,
                 dict,
-            );
+            )
+            .with_max_write(args.max_write);
             fuser::mount2(fs, &mountpoint, &cfg)
         }
         Backend::Container => {
@@ -475,7 +481,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 args.chunk_size,
                 tail_buffer,
                 dict,
-            );
+            )
+            .with_max_write(args.max_write);
             fuser::mount2(fs, &mountpoint, &cfg)
         }
     };
