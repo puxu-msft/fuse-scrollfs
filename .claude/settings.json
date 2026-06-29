@@ -6,6 +6,8 @@
       "Skill"
     ],
     "additionalDirectories": [
+      "//home/xp/.claude/projects/-home-xp-src-zipfs/**",
+      "/home/xp/.claude/projects/-home-xp-src-zipfs/**"
     ]
   }
 }

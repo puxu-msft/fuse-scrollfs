@@ -23,20 +23,21 @@
 
 | 方向 | 为什么 | 工作量/风险 | 状态 |
 |---|---|---|---|
-| **archive per-block CRC** | 现靠 `set_len+sync` 构造性 fail-closed；每块 CRC 是更稳的根治，杜绝静默错读 | 中 | ☐ |
-| **S 崩溃恢复（双 footer / 扫回最近合法 footer）** | 设计 §10 已承认「完整恢复属后续」；mid-commit 崩溃现在 fail-closed 但不可恢复 | 中 | ☐ |
-| **掉电/崩溃测试 harness** | `kill -9` 守护于写中途，自动验证 fail-closed/恢复，把一致性边界变成可回归测试 | 中 | ☐ |
-| **daemon 健壮 + WSL `[boot]` 自挂载** | 目标负载是 Claude Code 运行时写入，守护必须随 WSL 起、崩溃可重挂 | 中 | ☐ |
-| **hardlink 决策** | 现 `ENOTSUP`（`cp -al`/git 会触发）；决定支持（需 inode-id 命名层）或正式不支持 | 中/低 | ☐ |
+| **archive per-block CRC** | 现靠 `set_len+sync` 构造性 fail-closed；每块 CRC 是更稳的根治，杜绝静默错读 | 中 | ✅ block_crc（封块）；head 缓存/尾日志暂无 CRC（前者可丢弃、后者 rec_crc） |
+| **S 崩溃恢复（双 footer / 扫回最近合法 footer）** | 设计 §10 已承认「完整恢复属后续」；mid-commit 崩溃现在 fail-closed 但不可恢复 | 中 | ✅ 双 superblock + append-only（§8.3） |
+| **掉电/崩溃测试 harness** | `kill -9` 守护于写中途，自动验证 fail-closed/恢复，把一致性边界变成可回归测试 | 中 | ✅ crash-test.sh 10/10 0% |
+| **fsync 写放大根治（in-archive 尾日志）** | append 微行 + fsync 每次重压整块 → §8.4 尾日志只追原始增量 + remount 重放重建 | 中 | ✅ §8.4 |
+| **daemon 健壮 + WSL `[boot]` 自挂载** | 目标负载是 Claude Code 运行时写入，守护必须随 WSL 起、崩溃可重挂 | 中 | ✅ --pid-file + zipfs-mount.sh（幂等/stale 清理）+ systemd unit + wsl.conf 片段；fork 守护化未做 |
+| **hardlink 决策** | 现 `ENOTSUP`（`cp -al`/git 会触发）；决定支持（需 inode-id 命名层）或正式不支持 | 中/低 | ✅ 定调：正式**不支持**（保持 ENOTSUP，布局 S 一文件=一 archive，无 inode-id 命名层） |
 
 ## T2 · 性能（FUSE 用户态对内核的差距）
 
 | 方向 | 为什么 | 工作量/风险 | 状态 |
 |---|---|---|---|
-| **FUSE 写尾延迟优化** | CONSOLIDATED 指认：FUSE 三条写 p99 ms 级 vs btrfs 亚毫秒，是对内核**最大结构劣势**。方向：异步/批量 commit、writeback cache、FUSE passthrough/io_uring | 大/中 | ☐ |
+| **FUSE 写尾延迟优化** | CONSOLIDATED 指认：FUSE 三条写 p99 ms 级 vs btrfs 亚毫秒，是对内核**最大结构劣势**。方向：异步/批量 commit、writeback cache、FUSE passthrough/io_uring | 大/中 | ◐ 多线程派发（--threads，per-inode RwLock）；writeback/passthrough 待 fuser 升级 |
 | **BV 写尾抖动定位** | rand-write-64k p99 抖到 28ms，疑 redb commit/MVCC；profile 定位（曾叫停，待需要时再做） | 中 | ☐（搁置） |
-| **读写锁粒度** | append 修复让 `read_range` 持 per-inode 写锁、读写串行；高并发读需改 RwLock/更细粒度 | 中 | ☐ |
-| **mmap（至少只读）** | 与 `direct_io` 互斥，需定写模型后回填；overview 列为 B 核查项 | 中 | ☐ |
+| **读写锁粒度** | append 修复让 `read_range` 持 per-inode 写锁、读写串行；高并发读需改 RwLock/更细粒度 | 中 | ✅ per-inode RwLock（多读并发、写排他堵 torn-read） |
+| **mmap（至少只读）** | 与 `direct_io` 互斥，需定写模型后回填；overview 列为 B 核查项 | 中 | ✅ 只读 fd KEEP_CACHE 启 mmap、写 fd 仍 direct_io；跨 fd 并发写陈旧页未保证（待 notify_inval） |
 
 ## T3 · 空间与压缩（本负载高冗余，空间是核心收益）
 
@@ -45,8 +46,9 @@
 | **块大小退役 64KiB → 1MiB** | 两套独立基准（ratio-bench 真实路径 + algo-compare）裁定 64KiB 砍掉长程冗余 | 小 | ☑ **已落地**（`DEFAULT_CHUNK_SIZE=1MiB`，提交 18b2d25；Shadow 真实 5.43x→13.7x、Container 1.89x→8.84x） |
 | **冷文件封存 seal** | 会话写完即冷、读为归档；活跃块 1MiB 随机访问甜点，冷文件大块重压逼近整流 | 中 | ☑ **已落地**（`zipfs seal` + `src/seal.rs`，提交 bb04640；shadow 8MiB/zstd-19→~25-30x，读路径零改动）。container 封存 + 单块>8MiB 的 --long 留后续 |
 | **共享字典压缩** | 用 transcript 语料训练 zstd 字典补回 boilerplate 长程冗余 | 中（研究性） | ☑ **已实现 + 实测：收益次于大块**（提交 96e69a9/df47794；真实路径 64K+字典 10.24x 仍输纯 256K 11.2x；先前 CLI「16x」是单文件过拟合）。保留 opt-in `--dict`/`train-dict`，默认关 |
-| **head 缓存（archive v2，发现读）** | 头尾 64KB 发现读现解压整个 1MiB（16x 放大）；源码实证访问面（[[claude-code-session-io-access-pattern]]） | 中偏高 | ◐ **已设计 + 过 bench 门**（[02-layered-chunking.md](./02-layered-chunking.md)；discovery-bench 测 HOT 砍 82%/COLD 砍 42%）→ **TDD 实现待做**（§7 步骤 1-3：footer v2 → 写 head 缓存 → read_range 快路径） |
+| **head 缓存（archive v2，发现读）** | 头尾 64KB 发现读现解压整个 1MiB（16x 放大）；源码实证访问面（[[claude-code-session-io-access-pattern]]） | 中偏高 | ✅ **已落地**（rmw 建/shadow 存读/rwfs 快路径 + 单测；discovery-bench HOT 砍 82%） |
 | **algo/chunk 自适应** | 按文件类型/可压缩性选等级/lz4；不可压缩媒体走 verbatim | 中 | ◐ 块大小已据实测定 1MiB + `--level` 可配；lz4 codec 仍 unimplemented、自动选择未做 |
+| **S 压实（append-only 空洞回收）** | §8.4 尾日志 raw + 旧块成空洞、文件增长；temp+rename 整文件重写回收 | 小/中 | ✅ `zipfs compact --backend shadow`（实测 16x 收缩） |
 | **V 全局去重（内容寻址）** | 跨会话巨量重复；去重收益可叠加在压缩之上 | 大 | ☐（G3 门控；注意定长块去重实测 0% 命中，须 CDC） |
 | **BV compact 自动化** | 覆盖写产生 MVCC 膨胀，需卸载时/后台 GC 兜底 | 小/中 | ☐ |
 
@@ -54,8 +56,8 @@
 
 | 方向 | 为什么 | 工作量/风险 | 状态 |
 |---|---|---|---|
-| **迁移 `~/.claude/projects`（分层）** | 目标范围已分层界定（[03-target-data-scope.md](./03-target-data-scope.md)）：**Tier 1a** projects/*.jsonl(8GB)→**1b** append 日志→**Tier 2** file-history(524MB)；plugins/已压缩类排除。灌入、校验、切换工具，可逆零丢失，活跃会话实时追加压测 | 中 | ☐ |
-| **可观测性** | 守护健康、实时压缩比、append 吞吐的监控，便于长期运行排障 | 中 | ☐ |
+| **迁移 `~/.claude/projects`（分层）** | 目标范围已分层界定（[03-target-data-scope.md](./03-target-data-scope.md)）：**Tier 1a** projects/*.jsonl(8GB)→**1b** append 日志→**Tier 2** file-history(524MB)；plugins/已压缩类排除。灌入、校验、切换工具，可逆零丢失，活跃会话实时追加压测 | 中 | ◐ `zipfs ingest --src --backing --verify`（流式灌入+逐字节校验）；切换/活跃压测待做 |
+| **可观测性** | 守护健康、实时压缩比、append 吞吐的监控，便于长期运行排障 | 中 | ◐ statfs 显压缩比（df）+ sd-notify 健康；吞吐/比值监控待扩 |
 | **物理空间回收** | 压缩省的是逻辑量；WSL `ext4.vhdx` 物理回收需 `wsl --shutdown` + `Optimize-VHD`，需文档化/脚本化 | 小 | ☐ |
 
 ## 决策门汇总
