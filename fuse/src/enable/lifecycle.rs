@@ -154,12 +154,19 @@ pub fn apply(
     let meta = Meta::from_apply(&opts, stats.bytes_src, stats.bytes_archive, now_unix());
     discovery::write_meta(&meta_path, &meta)?;
 
-    // ── 挂载守护；失败则完整回滚到 Plain（删 backing + meta，下次重试重新灌）──
+    // ── 挂载守护；失败时 backing 已 committed → 保留切换态为 STOPPED，绝不删已提交 backing ──
+    // Bug B：旧码无条件 rollback_to_plain → remove_backing，把一个已 ingest 完整 + 逐字节
+    // 校验通过 + committed 的 backing 当半灌垃圾删掉，放大损坏、强制全量重灌。事故现场正是
+    // 反复 apply 撞上孤儿守护占用的挂载点而 mount 失败、每次又删掉刚灌好的 backing。
+    // 改：mount 失败但已提交 → 不回滚、不还原 orig，数据安全留在 orig 备份 + 已提交 backing，
+    // 状态为 STOPPED（orig 在、未挂载、committed），用户 `enable remount` 直接复用，无需重灌。
     let spec = mount_spec(paths, name, &opts);
     if let Err(e) = mounter.spawn(&spec) {
-        let _ = mounter.unmount(&mp);
-        let rb = rollback_to_plain(&mp, &orig, &backing, &meta_path);
-        return Err(rollback_msg(rb, &orig, name, format!("挂载失败：{e}")));
+        let _ = mounter.unmount(&mp); // 清理可能残留的半挂载 endpoint
+        return Err(err(format!(
+            "挂载失败：{e}；backing 已提交、数据完好（未删除），状态置为 STOPPED。\
+             运行 `enable remount {name}` 重挂，或 `enable restore {name}` 回到 Plain"
+        )));
     }
 
     Ok(ApplyOutcome {
@@ -641,11 +648,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_rolls_back_to_plain_on_mount_failure() {
+    fn apply_keeps_committed_backing_on_mount_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
         make_project(&paths, "demo", "a.jsonl", b"hello");
-        // 灌入成功但挂载守护起不来：必须完整回滚到 Plain，且错误如实说明已回滚。
+        // 灌入+校验+提交成功，但挂载守护起不来：backing 已 committed，绝不删（Bug B）。
+        // 旧码无条件 rollback_to_plain 删掉有效 backing、放大损坏、强制全量重灌；
+        // 新码保留切换态为 STOPPED（数据在 orig 备份 + 已提交 backing），可直接 remount。
         let m = FakeMounter {
             fail_spawn: true,
             ..FakeMounter::default()
@@ -654,23 +663,26 @@ mod tests {
         let res = apply(&paths, "demo", ApplyOptions::default(), true, &m);
         let e = res.unwrap_err().to_string();
         assert!(e.contains("挂载失败"), "应点明挂载失败：{e}");
-        assert!(e.contains("已回滚到 Plain"), "应如实报告已回滚：{e}");
+        assert!(e.contains("remount"), "应提示可 remount 恢复：{e}");
 
-        // Plain 不变式：源在原位、无残留备份/backing、未挂载。
+        // 已提交 backing 必须保留（不被误删）。
         assert!(
-            paths.mountpoint("demo").join("a.jsonl").exists(),
-            "源应回原位"
+            paths.backing("demo", Backend::Shadow).exists(),
+            "已提交 backing 不应被删除（Bug B 核心）"
         );
-        assert!(!paths.orig("demo").exists(), "不应残留备份");
-        assert!(
-            !paths.backing("demo", Backend::Shadow).exists(),
-            "应删除 backing"
-        );
+        // 源备份保留、未挂载 → STOPPED（可 remount，无需重灌）。
+        assert!(paths.orig("demo").exists(), "源备份应保留");
         assert!(!m.is_mounted(&paths.mountpoint("demo")));
         assert_eq!(
             discovery::probe(&paths, "demo").status,
-            ProjectStatus::Plain
+            ProjectStatus::Stopped,
+            "mount 失败但已提交 → STOPPED"
         );
+
+        // 用正常 mounter 可直接 remount（证明数据完好、无需重灌）。
+        let ok = FakeMounter::default();
+        remount(&paths, "demo", &ok).unwrap();
+        assert!(ok.is_mounted(&paths.mountpoint("demo")), "应能重挂恢复");
     }
 
     #[test]
