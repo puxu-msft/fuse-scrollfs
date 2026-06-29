@@ -7,6 +7,7 @@
 pub mod archive;
 pub mod core;
 pub mod fixture;
+pub mod ingest;
 pub mod passthrough;
 pub mod rwfs;
 pub mod seal;

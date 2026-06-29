@@ -72,6 +72,12 @@ enum Command {
     /// 须在 backing **未挂载**时跑（每文件临时文件 + 原子 rename）。活跃块 1MiB 换冷归档大块，
     /// 把比值从 ~16x 推向 ~25–30x。读路径无需改（按每文件 footer chunk_size 解块）。
     Seal(SealArgs),
+
+    /// 迁移灌入：把源目录流式转成布局 S archive 树（可选逐字节校验）。
+    ///
+    /// 用法：`zipfs ingest --src <目录> --backing <dst 树> [--verify] [--chunk-size --level]`。
+    /// 源只读、流式（单文件内存 ~chunk），适合大 jsonl；`--verify` 灌后逐字节比对。
+    Ingest(IngestArgs),
 }
 
 /// 挂载所需参数（无子命令时生效）。所有字段 `Option`，便于在 `compact` 子命令下不强制提供。
@@ -155,6 +161,7 @@ fn main() -> std::io::Result<()> {
         Some(Command::Compact(args)) => run_compact(args),
         Some(Command::TrainDict(args)) => run_train_dict(args),
         Some(Command::Seal(args)) => run_seal(args),
+        Some(Command::Ingest(args)) => run_ingest(args),
         None => run_mount(cli.mount),
     }
 }
@@ -210,6 +217,48 @@ fn run_seal(args: SealArgs) -> std::io::Result<()> {
         stats.bytes_before,
         stats.bytes_after,
         stats.ratio()
+    );
+    Ok(())
+}
+
+/// `ingest` 子命令参数：源目录 → dst archive 树流式灌入。
+#[derive(clap::Args, Debug)]
+struct IngestArgs {
+    /// 源目录（只读，递归灌入）。
+    #[arg(long)]
+    src: PathBuf,
+    /// 目标 backing 树（不存在则建）。
+    #[arg(long)]
+    backing: PathBuf,
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE as u32)]
+    chunk_size: u32,
+    #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
+    level: i32,
+    /// 灌后逐字节 read-back 校验。
+    #[arg(long, default_value_t = false)]
+    verify: bool,
+}
+
+/// 流式灌入源目录到 shadow 树，报告文件数/压缩比/校验。
+fn run_ingest(args: IngestArgs) -> std::io::Result<()> {
+    let s = zipfs::ingest::ingest_tree(
+        &args.src,
+        &args.backing,
+        args.chunk_size,
+        args.level,
+        args.verify,
+    )?;
+    for (p, e) in &s.errors {
+        log::warn!("灌入失败（跳过）：{} — {e}", p.display());
+    }
+    println!(
+        "ingest: files={} verified={} errors={} bytes {} -> {} ({:.2}x)",
+        s.files,
+        s.verified,
+        s.errors.len(),
+        s.bytes_src,
+        s.bytes_archive,
+        s.ratio()
     );
     Ok(())
 }
