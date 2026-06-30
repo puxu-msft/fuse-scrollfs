@@ -236,7 +236,18 @@ pub fn remount(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
         return Ok(()); // 幂等。
     }
     if !discovery::endpoint_ok(&mp) {
-        let _ = mounter.unmount(name, &mp); // 清 stale endpoint。
+        // 清 stale endpoint。卸载失败仅 warn（dead 挂载 fusermount 常返错，不一定是真失败）。
+        if let Err(e) = mounter.unmount(name, &mp) {
+            log::warn!("remount：清 {name} stale endpoint 失败：{e}");
+        }
+        // 评审 M1：复核实际挂载态——若挂载点仍被占（stale 未清除），spawn 必撞已占用挂载点，
+        // 提前 fail 而非盲目 spawn 留半清理态。
+        if mounter.is_mounted(&mp) {
+            return Err(err(format!(
+                "{name} 挂载点仍被占（stale endpoint 未清除），手动 `fusermount3 -u {}` 后重试",
+                mp.display()
+            )));
+        }
     }
     let meta = discovery::read_meta(&paths.meta_path(name))?
         .filter(|m| m.committed)
