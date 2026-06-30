@@ -151,15 +151,67 @@ impl Pending {
     fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.sizes.is_empty() && self.truncations.is_empty()
     }
+
+    /// commit 失败回滚：把 `flushing` 的条目并回（self=active）。**active 已有的键不覆盖**——
+    /// active 是 swap 之后更新的写，优先级高于回滚的旧 flushing 内容（D1 lost-update 修复）。
+    fn merge_from_flushing(&mut self, flushing: Pending) {
+        for (k, v) in flushing.blocks {
+            self.blocks.entry(k).or_insert(v);
+        }
+        for (k, v) in flushing.sizes {
+            self.sizes.entry(k).or_insert(v);
+        }
+        for (k, v) in flushing.truncations {
+            // truncation 取「保留更多」语义（min keep_from）；但 active 若已有该 ino 的写意图，
+            // 以 active 为准（更新）。active 无则采纳 flushing 的旧 truncation。
+            self.truncations.entry(k).or_insert(v);
+        }
+    }
+}
+
+/// 读路径单层查询结果：命中块 / 被截断越界 / 本层无信息（继续查下一层）。
+enum BlockLookup {
+    Hit(StoredBlock),
+    Truncated,
+    Miss,
+}
+
+/// 在单个 `Pending` 缓冲内查 (ino, idx)：先看块命中，再看 truncation 拦截。与原 read-through 一致。
+fn lookup_block_in(p: &Pending, ino: u64, idx: u64) -> BlockLookup {
+    if let Some(blk) = p.blocks.get(&(ino, idx)) {
+        return BlockLookup::Hit(blk.clone());
+    }
+    if let Some(&keep_from) = p.truncations.get(&ino) {
+        if idx >= keep_from {
+            return BlockLookup::Truncated;
+        }
+    }
+    BlockLookup::Miss
+}
+
+/// 写批处理的双缓冲暂存（D1 torn-read + lost-update 根治）。
+/// - `active`：接收新写（put/truncate）。
+/// - `flushing`：commit_pending swap 出来、正落 redb 的那一代（IO 期间不持 inner 锁，故读路径须查它）。
+///   稳态为空；commit 成功后清空，失败则合并回 active。
+#[derive(Default)]
+struct Inner {
+    active: Pending,
+    flushing: Pending,
 }
 
 /// 容器后端（布局 V）。
 pub struct ContainerStore {
     db: Database,
     next_ino: Mutex<u64>,
-    /// 写批处理的挂起暂存（§6.1）。fsync/flush/sync_all 才落 redb 事务。
-    pending: Mutex<Pending>,
+    /// 写批处理的双缓冲暂存（§6.1 + D1）。fsync/flush/sync_all 才落 redb 事务。
+    inner: Mutex<Inner>,
+    /// 串行化 commit_pending，与 `inner` 锁分离：IO 期间不阻塞读写并发（D1）。
+    commit_lock: Mutex<()>,
     default_chunk_size: u32,
+    /// 故障注入（仅测试）：置位时下一次 commit_pending 的 redb commit 返回 EIO，用于
+    /// 确定性复现 lost-update。仿 shadow.rs `fault_commit_sync` 模式。
+    #[cfg(test)]
+    fault_commit: std::sync::atomic::AtomicBool,
 }
 
 impl ContainerStore {
@@ -223,8 +275,11 @@ impl ContainerStore {
         Ok(Self {
             db,
             next_ino: Mutex::new(max_ino + 1),
-            pending: Mutex::new(Pending::default()),
+            inner: Mutex::new(Inner::default()),
+            commit_lock: Mutex::new(()),
             default_chunk_size,
+            #[cfg(test)]
+            fault_commit: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -260,9 +315,14 @@ impl ContainerStore {
     }
 
     fn row_to_attr(&self, ino: u64, mut row: InodeRow) -> Attr {
-        // size read-through 挂起暂存（写后读一致）。
-        if let Some(&sz) = self.pending.lock().unwrap().sizes.get(&ino) {
-            row.size = sz;
+        // size read-through 暂存（写后读一致）：active 优先于 flushing（active 是更新的写）。
+        {
+            let inner = self.inner.lock().unwrap();
+            if let Some(&sz) = inner.active.sizes.get(&ino) {
+                row.size = sz;
+            } else if let Some(&sz) = inner.flushing.sizes.get(&ino) {
+                row.size = sz;
+            }
         }
         Attr {
             ino,
@@ -389,10 +449,13 @@ impl Store for ContainerStore {
             //   2) 即便 flush 抢在清理与本事务 commit 之间跑，commit_pending 也会
             //      因 INODES 表里该 inode 仍在/已删而分别得到一致结果（删后跳过）。
             {
-                let mut p = self.pending.lock().unwrap();
-                p.blocks.retain(|&(i, _), _| i != child);
-                p.sizes.remove(&child);
-                p.truncations.remove(&child);
+                let mut inner = self.inner.lock().unwrap();
+                let Inner { active, flushing } = &mut *inner;
+                for p in [active, flushing] {
+                    p.blocks.retain(|&(i, _), _| i != child);
+                    p.sizes.remove(&child);
+                    p.truncations.remove(&child);
+                }
             }
             inodes
                 .remove(child)
@@ -412,12 +475,15 @@ impl Store for ContainerStore {
         }
         txn.commit().map_err(|e| db_err("commit unlink", e))?;
         // 兜底：本事务期间（pending 清理之后、commit 之前）仍可能有并发线程把该
-        // child 的块重新入 pending（例如尚持旧 ino 句柄的写）。再清一次确保不留残块。
+        // child 的块重新入 active（例如尚持旧 ino 句柄的写）。再清一次确保不留残块。
         {
-            let mut p = self.pending.lock().unwrap();
-            p.blocks.retain(|&(i, _), _| i != removed_child);
-            p.sizes.remove(&removed_child);
-            p.truncations.remove(&removed_child);
+            let mut inner = self.inner.lock().unwrap();
+            let Inner { active, flushing } = &mut *inner;
+            for p in [active, flushing] {
+                p.blocks.retain(|&(i, _), _| i != removed_child);
+                p.sizes.remove(&removed_child);
+                p.truncations.remove(&removed_child);
+            }
         }
         Ok(())
     }
@@ -566,16 +632,19 @@ impl Store for ContainerStore {
     }
 
     fn get_block(&self, ino: Ino, idx: u64) -> io::Result<Option<StoredBlock>> {
-        // 1) read-through 挂起暂存。
+        // 1) read-through 双缓冲：active 先于 flushing（active 更新）。条目恒在
+        //    active∪flushing∪redb → 消灭 commit 中间窗口的 torn read（D1）。
         {
-            let p = self.pending.lock().unwrap();
-            if let Some(blk) = p.blocks.get(&(ino, idx)) {
-                return Ok(Some(blk.clone()));
+            let inner = self.inner.lock().unwrap();
+            match lookup_block_in(&inner.active, ino, idx) {
+                BlockLookup::Hit(blk) => return Ok(Some(blk)),
+                BlockLookup::Truncated => return Ok(None),
+                BlockLookup::Miss => {}
             }
-            if let Some(&keep_from) = p.truncations.get(&ino) {
-                if idx >= keep_from {
-                    return Ok(None);
-                }
+            match lookup_block_in(&inner.flushing, ino, idx) {
+                BlockLookup::Hit(blk) => return Ok(Some(blk)),
+                BlockLookup::Truncated => return Ok(None),
+                BlockLookup::Miss => {}
             }
         }
         // 2) 落 redb。
@@ -594,28 +663,32 @@ impl Store for ContainerStore {
         if row.kind != 2 {
             return None;
         }
-        // size read-through 挂起。
-        let size = self
-            .pending
-            .lock()
-            .unwrap()
-            .sizes
-            .get(&ino)
-            .copied()
-            .unwrap_or(row.size);
+        // size read-through 暂存：active 优先于 flushing。
+        let size = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .active
+                .sizes
+                .get(&ino)
+                .or_else(|| inner.flushing.sizes.get(&ino))
+                .copied()
+                .unwrap_or(row.size)
+        };
         Some((size, row.chunk_size))
     }
 
     fn put_block(&self, ino: Ino, idx: u64, blk: StoredBlock, new_size: u64) -> io::Result<()> {
-        let mut p = self.pending.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let p = &mut inner.active;
         p.blocks.insert((ino, idx), blk);
         p.sizes.insert(ino, new_size);
         Ok(())
     }
 
     fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> io::Result<()> {
-        let mut p = self.pending.lock().unwrap();
-        // 丢弃挂起块中 >= keep_from 的。
+        let mut inner = self.inner.lock().unwrap();
+        let p = &mut inner.active;
+        // 丢弃 active 块中 >= keep_from 的。flushing 的旧块由 truncation 拦截（读 active-first）。
         p.blocks
             .retain(|&(i, blk_idx), _| i != ino || blk_idx < keep_from);
         let entry = p.truncations.entry(ino).or_insert(keep_from);
@@ -636,12 +709,57 @@ impl Store for ContainerStore {
 }
 
 impl ContainerStore {
-    /// 把挂起暂存合并到一个 redb 写事务并 commit（写批处理核心，§6.1）。
+    /// 把挂起暂存合并到一个 redb 写事务并 commit（写批处理核心，§6.1 + D1）。
+    ///
+    /// **双缓冲协议**（消灭 torn-read 与 lost-update）：
+    /// ① 持 `commit_lock` 串行化 commit；② 持 inner 锁 swap active↔flushing（active 清空，
+    /// 新写继续进 active），释放 inner 锁；③ 用 flushing 落 redb（IO 期间不持 inner 锁，
+    /// 读写并发不阻塞——读路径仍能查 flushing）；④ 成功清空 flushing；失败把 flushing
+    /// 合并回 active（active 已有键不覆盖，那是更新的写）并返回 Err。
     fn commit_pending(&self) -> io::Result<()> {
-        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
-        if pending.is_empty() {
-            return Ok(());
+        // 串行化 commit：保证同一时刻只有一代 flushing 在落盘，swap/merge 不交错。
+        let _commit_guard = self.commit_lock.lock().unwrap();
+
+        // swap：active → flushing，active 清空（新写继续进 active）。
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.active.is_empty() {
+                // 无新挂起。flushing 此刻必为空（上一次 commit 已清/合并），直接返回。
+                return Ok(());
+            }
+            let Inner { active, flushing } = &mut *inner;
+            std::mem::swap(active, flushing);
         }
+
+        // IO 期间不持 inner 锁。读路径查 active∪flushing∪redb，flushing 仍可见 → 无 torn read。
+        let flushing = {
+            let inner = self.inner.lock().unwrap();
+            // 克隆出 flushing 内容用于落盘（保留缓冲本体在 inner 内供读路径查询）。
+            Pending {
+                blocks: inner.flushing.blocks.clone(),
+                sizes: inner.flushing.sizes.clone(),
+                truncations: inner.flushing.truncations.clone(),
+            }
+        };
+
+        match self.flush_to_redb(&flushing) {
+            Ok(()) => {
+                // 成功：清空 flushing（其内容已 durable 进 redb）。
+                self.inner.lock().unwrap().flushing = Pending::default();
+                Ok(())
+            }
+            Err(e) => {
+                // 失败：把 flushing 合并回 active（active 已有键不覆盖）→ 数据不丢，下次 fsync 重试。
+                let mut inner = self.inner.lock().unwrap();
+                let flushing = std::mem::take(&mut inner.flushing);
+                inner.active.merge_from_flushing(flushing);
+                Err(e)
+            }
+        }
+    }
+
+    /// 把一代 `Pending` 落进一个 redb 写事务并 commit。失败返回 Err（调用方负责回滚）。
+    fn flush_to_redb(&self, pending: &Pending) -> io::Result<()> {
         let txn = self
             .db
             .begin_write()
@@ -717,8 +835,32 @@ impl ContainerStore {
                     .map_err(|e| db_err("insert inode", e))?;
             }
         }
+        // 故障注入（仅测试）：在 commit 前置位检查，确定性复现 commit 失败 → lost-update 路径。
+        #[cfg(test)]
+        if self
+            .fault_commit
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(io::Error::other("注入的 commit 故障"));
+        }
         txn.commit().map_err(|e| db_err("commit pending", e))?;
         Ok(())
+    }
+
+    /// 故障注入（仅测试）：令下一次 `commit_pending` 的 redb commit 返回 EIO。
+    #[cfg(test)]
+    fn fault_next_commit(&self) {
+        self.fault_commit
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 测试钩子：把 active swap 进 flushing 但不 commit redb，构造「flushing 有块、
+    /// active 无、redb 无」的中间态，验证读路径查三层（torn-read 自洽）。
+    #[cfg(test)]
+    fn test_swap_active_into_flushing(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { active, flushing } = &mut *inner;
+        std::mem::swap(active, flushing);
     }
 }
 
@@ -989,6 +1131,89 @@ mod tests {
         assert!(
             store.getattr_ino(ino).is_none(),
             "inode 已删，getattr 应为 None"
+        );
+    }
+
+    // ----- D1：torn-read + lost-update（双缓冲根治）-----
+
+    /// lost-update：put 多块未 fsync → 注入 commit 失败 → commit_pending 返 Err →
+    /// 后续 get_block 仍须读到全部块（旧码 mem::take 在事务成败已知前清空 pending，
+    /// commit 早返回即 drop 暂存 → 数据永久丢失，下次 fsync 因 pending 空假成功掩盖）。
+    #[test]
+    fn commit_failure_does_not_lose_pending_blocks() {
+        let cs = 4096u32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.redb");
+        let store = ContainerStore::open_with_chunk_size(&path, cs).unwrap();
+
+        let ino = new_file(&store, "f.bin", cs);
+        let p0 = vec![b'A'; cs as usize];
+        let p1 = vec![b'B'; cs as usize];
+        store
+            .put_block(ino, 0, mk_block(&p0), cs as u64)
+            .unwrap();
+        store
+            .put_block(ino, 1, mk_block(&p1), 2 * cs as u64)
+            .unwrap();
+
+        // 注入：下一次 commit_pending 的 redb commit 返回 EIO。
+        store.fault_next_commit();
+        let res = store.fsync(ino);
+        assert!(res.is_err(), "注入故障后 commit_pending 应返回 Err，实际 {res:?}");
+
+        // 关键断言：暂存未丢，写后读仍可见两块（合并回 active）。
+        let b0 = store.get_block(ino, 0).unwrap().expect("块0 不得丢失");
+        let plain0 = decompress(&b0.bytes, Algo::Zstd, b0.stored_verbatim).unwrap();
+        assert_eq!(plain0, p0, "块0 内容须保留");
+        let b1 = store.get_block(ino, 1).unwrap().expect("块1 不得丢失");
+        let plain1 = decompress(&b1.bytes, Algo::Zstd, b1.stored_verbatim).unwrap();
+        assert_eq!(plain1, p1, "块1 内容须保留");
+        // size read-through 仍反映最新逻辑大小。
+        assert_eq!(
+            store.block_geometry(ino).map(|(s, _)| s),
+            Some(2 * cs as u64),
+            "size 不得回退"
+        );
+
+        // 故障已清，再 fsync 应成功落盘（pending 仍含两块，非空）。
+        store.fsync(ino).unwrap();
+        assert_eq!(redb_block_count(&store, ino), 2, "重试后两块应落 redb");
+    }
+
+    /// torn-read 自洽：构造「flushing 有块、active 无、redb 无」的中间态（swap 后未 commit），
+    /// 断言 get_block 仍返回该块、block_geometry 返回正确 size（验证读路径查三层 active∪flushing∪redb）。
+    #[test]
+    fn get_block_reads_from_flushing_buffer_mid_commit() {
+        let cs = 4096u32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.redb");
+        let store = ContainerStore::open_with_chunk_size(&path, cs).unwrap();
+
+        let ino = new_file(&store, "f.bin", cs);
+        let plain = vec![b'Q'; cs as usize];
+        store
+            .put_block(ino, 0, mk_block(&plain), cs as u64)
+            .unwrap();
+
+        // 模拟 commit 进行中：把 active swap 进 flushing，但尚未把块落 redb。
+        // 此刻 active 空、redb 无块、块只在 flushing。旧单缓冲读路径只查 active+redb → 撕裂为 None。
+        store.test_swap_active_into_flushing();
+
+        let blk = store
+            .get_block(ino, 0)
+            .unwrap()
+            .expect("中间态 get_block 须从 flushing 读到块（消灭 torn read）");
+        let got = decompress(&blk.bytes, Algo::Zstd, blk.stored_verbatim).unwrap();
+        assert_eq!(got, plain, "flushing 中的块内容须正确");
+        assert_eq!(
+            store.block_geometry(ino).map(|(s, _)| s),
+            Some(cs as u64),
+            "size 须从 flushing read-through，不撕裂为旧值"
+        );
+        // truncation 跨缓冲：flushing 有 ino 块、active 无 → idx>=1 应越界 None（无残留）。
+        assert!(
+            store.get_block(ino, 1).unwrap().is_none(),
+            "未写过的块仍 None"
         );
     }
 }
