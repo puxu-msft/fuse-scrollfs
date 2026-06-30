@@ -144,6 +144,37 @@ impl ZipfsRw {
         self.evict_lock(ino);
     }
 
+    /// 内核 forget（lookup 引用归零，此时无打开句柄、release 已封尾）：回收 per-inode 锁项 +
+    /// 尾缓冲 + 后端缓存，杜绝 locks/tails 映射随只读/只追加不删除的会话**无界增长**（评审 D1）。
+    ///
+    /// 与 [`Self::forget_inode_locked`]（unlink 用，直接丢弃尾块）区别：此处先 `seal` 把任何未
+    /// journal 的增量刷入 Store，**再**丢内存缓冲——绝不丢数据。seal 失败则保留缓冲与锁、下次重试。
+    fn forget_inode_flush(&self, ino: u64) {
+        let sealed = {
+            let lock = self.lock_for(ino);
+            let _guard = lock.write().unwrap();
+            match self.tails.seal(self.store.as_ref(), ino, &self.params) {
+                Ok(()) => {
+                    // 封尾只追加 journal 增量；须 flush 提交 SB 尾指针，否则丢弃内存缓冲后
+                    // 新 reader 看不到未提交的尾字节（与 release 一致）。flush 失败仅 warn。
+                    if let Err(e) = self.store.flush(ino) {
+                        warn!("forget：flush ino={ino} 失败：{e}");
+                    }
+                    self.tails.forget(ino);
+                    true
+                }
+                Err(e) => {
+                    warn!("forget：封 ino={ino} 尾块失败：{e}，保留尾缓冲与锁待重试");
+                    false
+                }
+            }
+        };
+        if sealed {
+            self.store.release(ino);
+            self.evict_lock(ino);
+        }
+    }
+
     fn to_file_attr(&self, a: &Attr) -> FileAttr {
         FileAttr {
             ino: INodeNo(a.ino),
@@ -342,6 +373,12 @@ impl Filesystem for ZipfsRw {
             Some(a) => reply.attr(&TTL, &self.to_file_attr(&self.overlay_tail_size(a))),
             None => reply.error(Errno::ENOENT),
         }
+    }
+
+    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
+        // 内核丢弃对该 inode 的 lookup 引用 → 回收锁/尾缓冲，杜绝映射无界增长（评审 D1）。
+        // 无打开句柄保证（release 已封尾）；forget_inode_flush 仍先 seal 再丢弃，双保险不丢数据。
+        self.forget_inode_flush(ino.0);
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
@@ -827,5 +864,65 @@ mod tests {
             &data[off as usize..off as usize + 200],
             "回退逐块逐字节一致"
         );
+    }
+
+    #[test]
+    fn forget_evicts_lock_and_tail_preserving_data() {
+        // 评审 D1：只追加不删除的会话负载下，旧码无 forget → per-inode 锁与尾缓冲永久驻留、
+        // 无界增长。forget 须回收锁/尾缓冲，且先封尾再丢弃、绝不丢未落盘数据。
+        let dir = tempfile::tempdir().unwrap();
+        let cs = 65536u32;
+        let store =
+            Arc::new(ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap());
+        let attr = Attr {
+            ino: 0,
+            size: 0,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: SystemTime::UNIX_EPOCH,
+            atime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            chunk_size: cs,
+        };
+        let ino = store.create(ROOT, "f.bin", attr).unwrap();
+        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs);
+        // 写恰好一个满块（cs 字节）并封块，使后续 append 落在 cs 边界的新开放尾块（生产真实
+        // append 路径：尾日志记录对应 idx==chunk_count 的新尾块）。
+        let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
+        {
+            let lock = fs.lock_for(ino);
+            let _g = lock.write().unwrap();
+            fs.tails
+                .write_at(store.as_ref(), ino, 0, &base, &fs.params)
+                .unwrap();
+            fs.tails.seal(store.as_ref(), ino, &fs.params).unwrap();
+        }
+        store.fsync(ino).unwrap();
+        // 经尾缓冲追加一行（建立 tails 缓冲 + 锁项）。
+        let extra = b"appended-session-line\n";
+        {
+            let lock = fs.lock_for(ino);
+            let _g = lock.write().unwrap();
+            fs.tails
+                .write_at(store.as_ref(), ino, cs as u64, extra, &fs.params)
+                .unwrap();
+        }
+        assert!(
+            fs.locks.lock().unwrap().contains_key(&ino),
+            "追加后应有锁项"
+        );
+
+        fs.forget_inode_flush(ino);
+
+        assert!(
+            !fs.locks.lock().unwrap().contains_key(&ino),
+            "forget 后锁项应回收（评审 D1：杜绝锁表无界增长）"
+        );
+        // 数据未丢：重读追加区间仍得追加内容（forget 先 seal 刷盘再丢弃内存缓冲）。
+        let got = fs.read_range(ino, cs as u64, extra.len() as u32).unwrap();
+        assert_eq!(got, extra, "forget 先封尾再丢弃，追加数据不丢");
+        std::mem::forget(dir);
     }
 }
