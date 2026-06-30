@@ -769,6 +769,9 @@ pub struct ArchiveUpdater<W: BlockIo> {
     journal_offset: Option<u64>,
     /// 尾日志区累计字节长度（含记录头）。commit 写入 SB 的 `tail_journal_len`。
     journal_len: u64,
+    /// 自上次 full commit 起 index 是否被 `set_block`/`truncate` 改过（评审 B3）。
+    /// `commit_journal` 要求其为 false（否则新块不可达）；`commit` 收尾置回 false。
+    index_dirty: bool,
 }
 
 impl ArchiveUpdater<File> {
@@ -826,6 +829,7 @@ impl<W: BlockIo> ArchiveUpdater<W> {
                 None
             },
             journal_len: sb.tail_journal_len,
+            index_dirty: false,
         })
     }
 
@@ -844,6 +848,12 @@ impl<W: BlockIo> ArchiveUpdater<W> {
     /// 调用前应已 `append_journal`。双段 barrier 同 `commit`。**契约**：自上次 full commit 起未发生
     /// `set_block`/`truncate`（否则 index 已变、必须走 `commit`）。
     pub fn commit_journal(&mut self) -> io::Result<()> {
+        // 评审 B3：commit_journal 复用 committed_index，要求自上次 full commit 起 index 未变。
+        // 否则新块写到 EOF 但 SB 仍指旧 index → 新块不可达（数据丢失）。误用时 debug 崩溃定位。
+        debug_assert!(
+            !self.index_dirty,
+            "commit_journal 在 index 变更后被调用——应改用 commit（否则新块不可达）"
+        );
         // barrier 1：journal 记录已落盘（append_journal 已写，这里确保 durable）。
         self.io.sync()?;
         let (index_offset, index_len, index_crc) = self.committed_index;
@@ -960,6 +970,7 @@ impl<W: BlockIo> ArchiveUpdater<W> {
             self.index[idx as usize] = entry; // 旧块成空洞
         }
         self.uncompressed_size = new_size;
+        self.index_dirty = true; // 评审 B3：index 已变，commit_journal 不再可用
         Ok(())
     }
 
@@ -969,9 +980,10 @@ impl<W: BlockIo> ArchiveUpdater<W> {
             self.index.truncate(keep_from as usize);
         }
         self.uncompressed_size = new_size;
-        // 评审 B1：head 缓存覆盖块 0 的前 rawlen 字节。若截断使文件短于该前缀，缓存即越界
-        // （发现读会返回已被截掉的陈旧字节）。文件仍长于 rawlen 时块 0 前缀不变、缓存仍有效。
-        // 同时清 committed_head_cache，杜绝 commit/commit_journal 任一路径重写陈旧指针。
+        self.index_dirty = true; // 评审 B3：index 已变
+                                 // 评审 B1：head 缓存覆盖块 0 的前 rawlen 字节。若截断使文件短于该前缀，缓存即越界
+                                 // （发现读会返回已被截掉的陈旧字节）。文件仍长于 rawlen 时块 0 前缀不变、缓存仍有效。
+                                 // 同时清 committed_head_cache，杜绝 commit/commit_journal 任一路径重写陈旧指针。
         let rawlen = self
             .head_cache
             .as_ref()
@@ -987,6 +999,13 @@ impl<W: BlockIo> ArchiveUpdater<W> {
     /// 原子提交（docs/04 §3）：append [head 缓存] + 新 index 到 EOF → **barrier 1 fsync** →
     /// 写非活跃 superblock 槽（seq+1）→ **barrier 2 fsync（原子提交点）** → 翻转活跃槽。
     pub fn commit(&mut self) -> io::Result<()> {
+        // 评审 B3：index 已变时 journal 必须已重置（封块契约 set_block→reset_journal→commit），
+        // 否则新 SB 同时指向新 index + 旧 journal 区间 → read_tail 把陈旧 raw delta 叠加到新封块
+        // 逻辑尾部 → 静默逻辑损坏（journal 有自己的 rec_crc，检不出）。误用时 debug 崩溃定位。
+        debug_assert!(
+            !(self.index_dirty && self.journal_len > 0),
+            "commit 时 index 已变但 journal 未重置——封块前须 reset_journal，否则重放污染封块"
+        );
         // 1) append head 缓存（若有）+ 新 index 到 EOF。
         let head_cache = match &self.head_cache {
             Some((bytes, verbatim, raw_len)) => {
@@ -1032,6 +1051,7 @@ impl<W: BlockIo> ArchiveUpdater<W> {
         // 更新已提交 index / head 缓存描述符（供后续 commit_journal 复用），翻转活跃槽。
         self.committed_index = (index_offset, index_bytes.len() as u64, index_crc);
         self.committed_head_cache = head_cache;
+        self.index_dirty = false; // 评审 B3：新 index 已 durable，commit_journal 可再次复用
         self.flip_active(new_seq);
         Ok(())
     }
