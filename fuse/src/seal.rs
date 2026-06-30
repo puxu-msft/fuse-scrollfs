@@ -109,6 +109,10 @@ fn seal_dir(dir: &Path, seal_chunk: u32, level: i32, stats: &mut SealStats) -> i
 /// 步骤：ArchiveReader 读全部块 → 解压拼接成全量 plain → 按 seal_chunk 重切 → 高等级重压 →
 /// 写临时 archive → fsync → 原子 rename 覆盖原文件。
 fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64, u64)>> {
+    // Bug D：在**任何读操作前**捕获原 archive 文件的 mtime/atime（ArchiveReader::open 会在
+    // strictatime 下更新 atime），rename 覆盖后须还原——否则封存把会话文件时间重置为 now，
+    // 打乱按时间排序的会话列表。
+    let orig_times = crate::core::read_file_times(path);
     // 只处理能被认出的 archive；否则跳过（非 archive 文件 / 损坏）。
     let reader = match ArchiveReader::open(path) {
         Ok(r) => r,
@@ -120,9 +124,6 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
         return Ok(None);
     }
     let size_before = std::fs::metadata(path)?.len();
-    // Bug D：捕获原 archive 文件的 mtime/atime，rename 覆盖后须还原——否则封存把会话
-    // 文件时间重置为 now，打乱按时间排序的会话列表。在任何读操作前取，atime 才是真值。
-    let orig_times = crate::core::read_file_times(path);
 
     // 临时文件写新 archive（同目录，便于原子 rename）。**流式封存**（rust-review H1）：逐源块解压、
     // 累进缓冲，攒满一个 seal 块即压缩落盘并 drain——内存峰值 ~seal_chunk + 一个源块，而非整文件
@@ -167,9 +168,16 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
             let _ = d.sync_all();
         }
     }
-    // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。
+    // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。best-effort：
+    // 设时间失败不该让整个封存失败（数据已正确落盘），但要 warn——否则该文件的 mtime 修复
+    // 静默回退、Bug D 症状悄悄复发，不可观测。
     if let Some((atime, mtime)) = orig_times {
-        let _ = crate::core::set_file_times(path, atime, mtime);
+        if let Err(e) = crate::core::set_file_times(path, atime, mtime) {
+            log::warn!(
+                "seal: 还原 {} 的 mtime 失败：{e}（该文件时间可能退化为 now）",
+                path.display()
+            );
+        }
     }
     let size_after = std::fs::metadata(path)?.len();
     Ok(Some((size_before, size_after)))

@@ -169,9 +169,14 @@ pub fn apply(
         )));
     }
 
-    // 挂载成功 → 注册自启（systemd：enable zipfs@<esc>，重启后自动重挂）。best-effort：
-    // 失败不回滚已成功的挂载（RealMounter 下是 no-op）。
-    let _ = mounter.enable_autostart(name);
+    // 挂载成功 → 注册自启（systemd：enable zipfs@<esc>，重启后自动重挂）。best-effort：失败
+    // 不回滚已成功的挂载（RealMounter 下是 no-op），但要 warn——否则 systemd 下注册失败会让
+    // 项目重启后不自动重挂，用户无从知晓。
+    if let Err(e) = mounter.enable_autostart(name) {
+        log::warn!(
+            "{name} 已挂载，但 systemd 自启注册失败：{e}（重启后需手动 `enable remount {name}`）"
+        );
+    }
 
     Ok(ApplyOutcome {
         files: stats.files,
@@ -205,8 +210,12 @@ pub fn restore(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
             let _ = discovery::write_meta(&paths.meta_path(name), &m);
         }
     }
-    // 注销自启（systemd：disable zipfs@<esc>）。best-effort（RealMounter 下 no-op）。
-    let _ = mounter.disable_autostart(name);
+    // 注销自启（systemd：disable zipfs@<esc>）。best-effort（RealMounter 下 no-op），warn 可观测。
+    if let Err(e) = mounter.disable_autostart(name) {
+        log::warn!(
+            "{name} 已还原，但 systemd 自启注销失败：{e}（可手动 `systemctl --user disable`）"
+        );
+    }
     Ok(())
 }
 
@@ -375,40 +384,59 @@ pub fn reingest(
         )));
     }
 
-    // 2) 卸载并等守护退出（释放 flock，新守护才能开同一锁文件）。
+    // 2) 卸载并**确认守护退出**（释放 flock）。守护未退出就换 backing 会与活守护抢同一锁文件、
+    //    新 spawn 必失败，且正撞上 Bug A 的孤儿守护场景——故 fail-fast、不动 backing、重挂回去
+    //    （与 maintain 对 container 的守卫同理；shadow flock 有同样的退出依赖）。
     let mp = paths.mountpoint(name);
     if mounter.is_mounted(&mp) {
         mounter.unmount(name, &mp)?;
-        wait_daemon_exit(paths, name);
+    }
+    if !wait_daemon_exit(paths, name) {
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = mounter.spawn(&mount_spec(paths, name, &opts)); // 尽力恢复原挂载
+        return Err(err(format!(
+            "reingest 取消：守护未在超时内退出、flock 未释放（未动 backing，已尝试重挂 {name}）"
+        )));
     }
 
-    // 3) 旧 backing 留底 → 新 backing 就位（失败尽力回滚 + 重挂）。
+    // 3) 旧 backing 留底 → 新 backing 就位（失败尽力回滚 + 重挂；回滚也失败则大声指明 bak 位置）。
     fs::rename(&backing, &bak)?;
     if let Err(e) = fs::rename(&tmp, &backing) {
-        let _ = fs::rename(&bak, &backing);
+        let restored = fs::rename(&bak, &backing).is_ok();
         let _ = mounter.spawn(&mount_spec(paths, name, &opts));
-        return Err(err(format!(
-            "reingest 换 backing 失败：{e}（已尝试回滚 + 重挂）"
-        )));
+        return Err(err(if restored {
+            format!("reingest 换 backing 失败：{e}（已回滚旧 backing + 重挂）")
+        } else {
+            format!(
+                "reingest 换 backing 失败：{e}；且回滚失败——数据完好留存于 {}，请手动 `mv {} {}` 后 `enable remount {name}`",
+                bak.display(),
+                bak.display(),
+                backing.display()
+            )
+        }));
     }
     fsync_parent(&backing);
 
     // 4) 重挂（结束态 = 已挂载）。
     let spawn_err = mounter.spawn(&mount_spec(paths, name, &opts)).err();
 
-    // 5) 工具自写更新后的 committed meta（含新字节数）——免手编 sidecar。
+    // 5) 工具自写更新后的 committed meta（含新字节数）——免手编 sidecar。backing 已就位且
+    //    committed 不变，故 meta 写失败只是 list 显示的字节数过时（非数据/挂载安全），warn 不 fail。
     let new_meta = Meta::from_apply(&opts, stats.bytes_src, stats.bytes_archive, now_unix());
-    let _ = discovery::write_meta(&paths.meta_path(name), &new_meta);
+    let meta_warn = match discovery::write_meta(&paths.meta_path(name), &new_meta) {
+        Ok(()) => String::new(),
+        Err(e) => format!("；但 meta 更新失败：{e}，list 显示的字节数可能过时"),
+    };
 
     match spawn_err {
         None => Ok(format!(
-            "reingest: {} 文件从 orig 重灌（{:.2}x），mtime/属性已保留；旧 backing 留底于 {}（核对后可删）",
+            "reingest: {} 文件从 orig 重灌（{:.2}x），mtime/属性已保留；旧 backing 留底于 {}（核对后可删）{meta_warn}",
             stats.files,
             stats.ratio(),
             bak.display()
         )),
         Some(re) => Err(err(format!(
-            "reingest 已重建 backing 但重挂失败：{re}，请 `enable remount {name}`；旧 backing 留底于 {}",
+            "reingest 已重建 backing 但重挂失败：{re}，请 `enable remount {name}`；旧 backing 留底于 {}{meta_warn}",
             bak.display()
         ))),
     }

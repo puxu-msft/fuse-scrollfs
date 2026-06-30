@@ -78,14 +78,14 @@ fn compact_dir(dir: &Path, level: i32, stats: &mut CompactStats) -> io::Result<(
 /// 压实单文件：读活块 round-trip + 折叠尾日志为末块（同 chunk_size 重压）→ temp → rename → fsync 父目录。
 /// 物理无空洞者跳过（after 不小于 before）。错误清理 temp，不破坏原文件。
 fn compact_file(path: &Path, level: i32) -> io::Result<Option<(u64, u64)>> {
+    // Bug D：在任何读操作前捕获原文件 mtime/atime（见 seal.rs 同理），rename 覆盖后还原。
+    let orig_times = crate::core::read_file_times(path);
     let reader = match ArchiveReader::open(path) {
         Ok(r) => r,
         Err(_) => return Ok(None), // 非 archive / 损坏 → 跳过
     };
     let chunk_size = reader.footer().chunk_size;
     let size_before = std::fs::metadata(path)?.len();
-    // Bug D：捕获原 archive 文件的 mtime/atime，rename 覆盖后还原（见 seal.rs 同理）。
-    let orig_times = crate::core::read_file_times(path);
     let tmp = tmp_sibling(path);
     {
         let mut writer = ArchiveWriter::create(&tmp, chunk_size)?;
@@ -126,9 +126,15 @@ fn compact_file(path: &Path, level: i32) -> io::Result<Option<(u64, u64)>> {
             let _ = d.sync_all();
         }
     }
-    // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。
+    // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。best-effort +
+    // warn（见 seal.rs 同理）：失败不让压实失败，但要可观测、不让 Bug D 静默复发。
     if let Some((atime, mtime)) = orig_times {
-        let _ = crate::core::set_file_times(path, atime, mtime);
+        if let Err(e) = crate::core::set_file_times(path, atime, mtime) {
+            log::warn!(
+                "compact: 还原 {} 的 mtime 失败：{e}（该文件时间可能退化为 now）",
+                path.display()
+            );
+        }
     }
     Ok(Some((size_before, std::fs::metadata(path)?.len())))
 }
