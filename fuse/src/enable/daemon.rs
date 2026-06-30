@@ -182,7 +182,7 @@ fn mount_argv(spec: &MountSpec) -> Vec<std::ffi::OsString> {
 }
 
 /// 卸载：先 fusermount3 -u，回退 fusermount -u。两者皆失败返回后者错误。
-fn unmount_path(mountpoint: &Path) -> std::io::Result<()> {
+pub(crate) fn unmount_path(mountpoint: &Path) -> std::io::Result<()> {
     for bin in ["fusermount3", "fusermount"] {
         match Command::new(bin)
             .arg("-u")

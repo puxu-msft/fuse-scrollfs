@@ -148,9 +148,25 @@ impl crate::enable::daemon::Mounter for SystemdMounter {
         }
     }
 
-    fn unmount(&self, name: &str, _mountpoint: &std::path::Path) -> std::io::Result<()> {
-        // 必须 systemctl stop（而非直接 fusermount -u），否则 Restart=on-failure 会与卸载抢挂。
-        run_systemctl(&systemctl_args("stop", name))
+    fn unmount(&self, name: &str, mountpoint: &std::path::Path) -> std::io::Result<()> {
+        // 优先 systemctl stop（压住 Restart=on-failure，避免与卸载抢挂）。但若该项目实际由
+        // RealMounter 裸守护挂载（unit 不存在 / 未 active），stop 报错——回退直接 fusermount -u，
+        // 避免 mounter 漂移（apply 走 Real、restore 走 Systemd）导致 restore 卡在卸载（评审 H4）。
+        match run_systemctl(&systemctl_args("stop", name)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if discovery::is_mounted(mountpoint) {
+                    log::warn!(
+                        "systemd stop {name} 失败（{e}），回退 fusermount -u {}",
+                        mountpoint.display()
+                    );
+                    crate::enable::daemon::unmount_path(mountpoint)
+                } else {
+                    // 已不是挂载点 → 卸载目标已达成（幂等），stop 报错无害。
+                    Ok(())
+                }
+            }
+        }
     }
 
     fn is_mounted(&self, mountpoint: &std::path::Path) -> bool {
