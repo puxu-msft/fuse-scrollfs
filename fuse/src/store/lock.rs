@@ -14,7 +14,28 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// shadow backing 的锁文件路径：同级 sibling `<backing>.zipfs.lock`（位于 backing **外**）。
+///
+/// 控制文件一律放 backing 外（与 `.zipfs.meta` 同理）：backing 内只有用户原始数据，
+/// readdir 无脑透传、不需任何按名过滤。所有触碰同一 backing 字节的路径（守护 open、
+/// 离线 compact/seal）都用本函数算同一锁路径，作为单一互斥域真值（评审 A3）。
+/// 用 `OsString::push` 拼接，避免要求 backing 路径是合法 UTF-8。
+pub(crate) fn backing_lock_path(backing: &Path) -> PathBuf {
+    let mut name = backing.file_name().unwrap_or_default().to_os_string();
+    name.push(".zipfs.lock");
+    match backing.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+/// 取某 shadow backing 的跨进程排他锁（drop 即释放）。守护 open 与离线 compact/seal
+/// 共用，确保「会改 archive 字节的操作」互斥——避免离线维护与活守护并发覆盖（评审 A3）。
+pub(crate) fn acquire_backing(backing: &Path) -> io::Result<File> {
+    acquire_exclusive(&backing_lock_path(backing))
+}
 
 /// 在 `path` 上取一把非阻塞排他 flock，成功则返回持锁的 `File`（drop 即释放）。
 ///

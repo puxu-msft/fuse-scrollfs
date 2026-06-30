@@ -141,20 +141,8 @@ pub struct ShadowStore {
     fault_commit_sync: std::sync::atomic::AtomicBool,
 }
 
-/// backing 的锁文件路径：同级 sibling `<backing>.zipfs.lock`（位于 backing **外**）。
-///
-/// 控制文件一律放 backing 外（与 `.zipfs.meta` 同理）：backing 内只有用户原始数据，
-/// readdir 无脑透传、不需任何按名过滤——按名过滤会误伤恰好同名的用户文件、违反零丢失。
-/// 用 `OsString::push` 拼接，避免要求 backing 路径是合法 UTF-8。
-fn lock_path_for(backing: &Path) -> PathBuf {
-    let mut name = backing.file_name().unwrap_or_default().to_os_string();
-    name.push(".zipfs.lock");
-    match backing.parent() {
-        Some(parent) => parent.join(name),
-        None => PathBuf::from(name),
-    }
-}
-
+/// backing 的锁文件路径由 [`super::lock::backing_lock_path`] 统一提供（守护 open 与离线
+/// compact/seal 共用同一互斥域真值，评审 A3）。
 impl ShadowStore {
     /// 用底层 archive 树根构造（默认 chunk_size 取 Core 默认 64KiB）。
     pub fn open(backing: PathBuf) -> io::Result<Self> {
@@ -177,8 +165,8 @@ impl ShadowStore {
             ));
         }
         // Bug A：取 backing 的跨进程排他锁，挡住第二个守护并发持有同一 backing。
-        // 锁文件放 backing 外 sibling，绝不进 readdir/写路径（避免被当数据/暴露成幽灵文件）。
-        let lock = super::lock::acquire_exclusive(&lock_path_for(&backing))?;
+        // 锁路径由 `lock::backing_lock_path` 统一计算（与离线 compact/seal 同一互斥域，评审 A3）。
+        let lock = super::lock::acquire_backing(&backing)?;
         Ok(Self {
             backing,
             _lock: lock,

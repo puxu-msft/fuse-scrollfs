@@ -39,6 +39,9 @@ pub fn compact_shadow_tree(backing: &Path, level: i32) -> io::Result<CompactStat
             format!("压实 backing 不是目录：{}", backing.display()),
         ));
     }
+    // 评审 A3：取 backing 排他锁，与活守护（ShadowStore::open）互斥。否则离线 compact 的
+    // temp+rename 会整文件覆盖守护正在写的版本（Bug A 同构损坏）。WouldBlock = 守护仍在。
+    let _lock = crate::store::lock::acquire_backing(backing)?;
     let mut stats = CompactStats::default();
     compact_dir(backing, level, &mut stats)?;
     Ok(stats)
@@ -204,6 +207,7 @@ mod tests {
         }
         let path = dir.path().join("t.jsonl");
         let before = std::fs::metadata(&path).unwrap().len();
+        drop(store); // 评审 A3：compact 需 backing 锁，先释放活守护（= 卸载守护）
         let stats = compact_shadow_tree(dir.path(), 3).unwrap();
         assert_eq!(stats.compacted, 1, "应压实 1 文件：{:?}", stats.errors);
         let after = std::fs::metadata(&path).unwrap().len();
@@ -221,6 +225,22 @@ mod tests {
             got.extend_from_slice(&t);
         }
         assert_eq!(got, expected, "压实后逐字节一致");
+    }
+
+    #[test]
+    fn compact_shadow_tree_blocked_while_backing_locked() {
+        // 评审 A3：离线 compact 必须与活守护互斥，否则 temp+rename 覆盖守护刚写的版本
+        // （Bug A 在维护路径复发）。活守护 = 一个仍持有 backing flock 的 ShadowStore。
+        let dir = tempfile::tempdir().unwrap();
+        let _live = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), 4096).unwrap();
+        let res = compact_shadow_tree(dir.path(), 3);
+        assert!(
+            matches!(
+                res.as_ref().map_err(|e| e.kind()),
+                Err(io::ErrorKind::WouldBlock)
+            ),
+            "backing 被活守护持锁时 compact 应得 WouldBlock，实际：{res:?}"
+        );
     }
 
     #[test]
@@ -256,6 +276,7 @@ mod tests {
         let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
         crate::core::set_file_times(&path, past, past).unwrap();
 
+        drop(store); // 评审 A3：compact 需 backing 锁，先释放活守护
         let stats = compact_shadow_tree(dir.path(), 3).unwrap();
         assert_eq!(stats.compacted, 1, "应压实 1 文件：{:?}", stats.errors);
 

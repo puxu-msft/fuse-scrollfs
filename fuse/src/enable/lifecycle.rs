@@ -465,11 +465,12 @@ fn maintain(
     if was_mounted {
         mounter.unmount(name, &mp)?;
         let exited = wait_daemon_exit(paths, name);
-        // container 的 redb 排他锁须等旧守护退出才释放；未确认退出则不动手，重挂回去（H2）。
-        if meta.backend == Backend::Container && !exited {
+        // 两种后端都须等旧守护退出才动手：container 释放 redb 排他锁，shadow 释放 backing
+        // flock（compact/seal 现取同一锁，评审 A3）。未确认退出则不动手，重挂回去（H2）。
+        if !exited {
             let _ = mounter.spawn(&mount_spec(paths, name, &meta.options()));
             return Err(err(format!(
-                "{op_name} 取消：守护未在超时内退出、redb 锁未释放（已尝试重挂 {name}）"
+                "{op_name} 取消：守护未在超时内退出、backing 锁未释放（已尝试重挂 {name}）"
             )));
         }
     }
