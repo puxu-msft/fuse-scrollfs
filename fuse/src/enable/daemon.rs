@@ -30,6 +30,8 @@ pub struct MountSpec {
     pub allow_other: bool,
     pub auto_unmount: bool,
     pub metrics_file: Option<PathBuf>,
+    /// 解压块缓存字节上限（perf #1），见 `MountArgs::block_cache_bytes`。默认 `DEFAULT_CACHE_BYTES`。
+    pub block_cache_bytes: usize,
 }
 
 /// 挂载操作抽象（可注入测试）。
@@ -178,6 +180,11 @@ fn mount_argv(spec: &MountSpec) -> Vec<std::ffi::OsString> {
         v.push(OsString::from("--metrics-file"));
         v.push(mf.clone().into_os_string());
     }
+    // 仅在非默认时传递（默认由 CLI default_value_t 兜底，保持 argv 最小）。
+    if spec.block_cache_bytes != crate::core::blockcache::DEFAULT_CACHE_BYTES {
+        v.push(OsString::from("--block-cache-bytes"));
+        v.push(OsString::from(spec.block_cache_bytes.to_string()));
+    }
     v
 }
 
@@ -283,6 +290,7 @@ mod tests {
             allow_other: false,
             auto_unmount: false,
             metrics_file: None,
+            block_cache_bytes: crate::core::blockcache::DEFAULT_CACHE_BYTES,
         };
         let argv: Vec<String> = mount_argv(&spec)
             .iter()
@@ -325,6 +333,7 @@ mod tests {
             allow_other: true,
             auto_unmount: true,
             metrics_file: Some(PathBuf::from("/z.prom")),
+            block_cache_bytes: crate::core::blockcache::DEFAULT_CACHE_BYTES,
         };
         let argv: Vec<String> = mount_argv(&spec)
             .iter()

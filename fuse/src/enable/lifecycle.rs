@@ -616,6 +616,9 @@ pub(crate) fn mount_spec(paths: &Paths, name: &str, opts: &ApplyOptions) -> Moun
         allow_other: opts.allow_other,
         auto_unmount: opts.auto_unmount,
         metrics_file: opts.metrics_file.clone(),
+        // managed/systemd 挂载用块缓存默认值（ApplyOptions 暂不暴露此旋钮；默认 128MiB 压力感知
+        // 正是 ~/.claude 托管挂载的目标行为）。
+        block_cache_bytes: crate::core::blockcache::DEFAULT_CACHE_BYTES,
     }
 }
 

@@ -7,6 +7,7 @@
 //! P0 阶段大部分尚未 wire-in，故 allow(dead_code)；P1 起逐步去除。
 #![allow(dead_code)]
 
+pub mod blockcache;
 pub mod chunk;
 pub mod codec;
 pub mod inode;

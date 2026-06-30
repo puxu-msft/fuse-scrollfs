@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use fuser::MountOption;
 use log::info;
 
+use zipfs::core::blockcache::DEFAULT_CACHE_BYTES;
 use zipfs::core::codec::{train_dict, Algo, SharedDict};
 use zipfs::core::{DEFAULT_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL};
 use zipfs::passthrough::PassthroughFs;
@@ -176,6 +177,13 @@ struct MountArgs {
     /// 供 node_exporter textfile collector 抓取（dep-free，仅 shadow 后端有压缩比）。
     #[arg(long)]
     metrics_file: Option<PathBuf>,
+
+    /// 解压块缓存字节上限（perf #1），默认 **128MiB**，0 = 关闭。缓存已解压的不可变内部块明文，
+    /// 消除 resume 顺序读对同一大块的重复解压（内核 ~128KiB 粒度 vs 1MiB 块 → 约 8x 解压放大）。
+    /// **感知内存压力自动缩减**：按 `/proc/meminfo` MemAvailable 动态压低预算，低内存时清空自身占用。
+    /// 仅 shadow/container 生效。
+    #[arg(long, default_value_t = DEFAULT_CACHE_BYTES)]
+    block_cache_bytes: usize,
 }
 
 /// `compact` 子命令参数。
@@ -276,6 +284,7 @@ fn mount_args_from_spec(spec: &zipfs::enable::daemon::MountSpec) -> MountArgs {
         max_write: spec.max_write,
         writeback: spec.writeback,
         metrics_file: spec.metrics_file.clone(),
+        block_cache_bytes: spec.block_cache_bytes,
     }
 }
 
@@ -673,7 +682,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 dict,
             )
             .with_max_write(args.max_write)
-            .with_writeback(args.writeback);
+            .with_writeback(args.writeback)
+            .with_block_cache(args.block_cache_bytes);
             serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone())
         }
         Backend::Container => {
@@ -690,7 +700,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 dict,
             )
             .with_max_write(args.max_write)
-            .with_writeback(args.writeback);
+            .with_writeback(args.writeback)
+            .with_block_cache(args.block_cache_bytes);
             serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone())
         }
     };

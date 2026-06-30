@@ -23,6 +23,7 @@ use fuser::{
 };
 use log::warn;
 
+use crate::core::blockcache::BlockCache;
 use crate::core::chunk::block_range;
 use crate::core::codec::{decompress_block, Algo, SharedDict};
 use crate::core::rmw::CodecParams;
@@ -51,6 +52,10 @@ pub struct ZipfsRw {
     /// 写回缓存（opt-in）：init 协商 FUSE_WRITEBACK_CACHE、写 fd 去 direct_io，内核合并小写降 p99。
     /// 默认 false（direct_io 求 RMW offset/size 精确）。
     writeback: bool,
+    /// 解压块缓存（perf #1）：缓存已解压的**不可变内部块**明文，消除顺序读放大。只缓存
+    /// `idx < tail_idx` 的块（见 [`BlockCache`] 模块文档「杠杆 A」）。失效靠 per-inode 写锁串行
+    /// 化：变更路径持写锁调 `invalidate`，读路径持读锁 `get`/`insert`，二者对同 inode 互斥。
+    block_cache: BlockCache,
 }
 
 impl ZipfsRw {
@@ -84,7 +89,15 @@ impl ZipfsRw {
             max_write: 0,
             notifier: Arc::new(OnceLock::new()),
             writeback: false,
+            // 默认禁用（cap=0 全 no-op），保持既有单测确定性、零行为变更；main 经 flag 注入。
+            block_cache: BlockCache::new(0),
         }
+    }
+
+    /// 设解压块缓存字节上限（main 据 `--block-cache-bytes` 注入；0 禁用）。返回自身便于链式。
+    pub fn with_block_cache(mut self, cap_bytes: usize) -> Self {
+        self.block_cache = BlockCache::new(cap_bytes);
+        self
     }
 
     /// 设协商最大 write（main 据 --max-write 注入；0 保持 fuser 默认）。返回自身便于链式。
@@ -131,6 +144,15 @@ impl ZipfsRw {
         }
     }
 
+    /// 在**调用方已持该 inode 写锁**的前提下执行 append/RMW 写。先无条件失效块缓存（评审
+    /// CRITICAL-1：失效在改写之前、不依赖每条返回路径都记得失效），再走尾块缓冲/RMW 写编排。
+    /// 抽成独立方法既给 `fn write` 复用，也便于单测直接驱动（绕开 fuser `Request`/`reply`）。
+    fn write_at_locked(&self, ino: u64, offset: u64, data: &[u8]) -> std::io::Result<usize> {
+        self.block_cache.invalidate(ino);
+        self.tails
+            .write_at(self.store.as_ref(), ino, offset, data, &self.params)
+    }
+
     /// 在持该 inode 写锁的前提下丢弃其开放尾块（不封块），再回收锁项。
     /// unlink/rmdir/rename-覆盖用：与并发的同 inode write/seal 串行，堵 rust-review MEDIUM-3
     /// 的「ensure_tail_loaded 后尾块被并发 forget 移除」panic 窗口。
@@ -138,6 +160,7 @@ impl ZipfsRw {
         {
             let lock = self.lock_for(ino);
             let _guard = lock.write().unwrap();
+            self.block_cache.invalidate(ino);
             self.tails.forget(ino);
         }
         // 出锁作用域后再 evict（evict 要求 strong_count==1，持 guard 时计数为 2 会漏删）。
@@ -153,6 +176,7 @@ impl ZipfsRw {
         let sealed = {
             let lock = self.lock_for(ino);
             let _guard = lock.write().unwrap();
+            self.block_cache.invalidate(ino);
             match self.tails.seal(self.store.as_ref(), ino, &self.params) {
                 Ok(()) => {
                     // 封尾只追加 journal 增量；须 flush 提交 SB 尾指针，否则丢弃内存缓冲后
@@ -254,6 +278,11 @@ impl ZipfsRw {
 
         let (first, last) = block_range(offset, (end - offset).max(1), cs);
 
+        // 块缓存只收「严格内部块」`idx < tail_idx`：排除可变尾块 / 尾日志重放块（`get_block` 对
+        // `idx == chunk_count` 返回可变 verbatim 尾块），append/seal 只动尾块、内部块恒不可变。
+        // tail_idx = 含文件末字节的块号；uncompressed_size>0（offset<size 已保证）。
+        let tail_idx = (uncompressed_size - 1) / cs;
+
         let mut out = Vec::with_capacity(want);
         for idx in first..=last {
             let block_start = idx * cs;
@@ -278,24 +307,35 @@ impl ZipfsRw {
                 }
                 continue;
             }
-            let stored = match self
-                .store
-                .get_block(ino, idx)
-                .map_err(|e| io_to_errno(&e))?
-            {
-                Some(b) => b,
-                None => {
-                    out.resize(out.len() + (copy_end - copy_start) as usize, 0);
-                    continue;
+            // 块缓存：命中免整块解压（顺序读放大的主因）。未命中走 Store + 解压，仅严格内部块
+            // （idx < tail_idx）回填缓存。空洞块（get_block=None）零填充、不缓存。
+            let plain: std::sync::Arc<[u8]> = if let Some(cached) = self.block_cache.get(ino, idx) {
+                cached
+            } else {
+                let stored = match self
+                    .store
+                    .get_block(ino, idx)
+                    .map_err(|e| io_to_errno(&e))?
+                {
+                    Some(b) => b,
+                    None => {
+                        out.resize(out.len() + (copy_end - copy_start) as usize, 0);
+                        continue;
+                    }
+                };
+                let decoded = decompress_block(
+                    &stored.bytes,
+                    self.params.algo,
+                    stored.stored_verbatim,
+                    self.params.dict.as_deref(),
+                )
+                .map_err(|e| io_to_errno(&e))?;
+                let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(decoded.into_boxed_slice());
+                if idx < tail_idx {
+                    self.block_cache.insert(ino, idx, arc.clone());
                 }
+                arc
             };
-            let plain = decompress_block(
-                &stored.bytes,
-                self.params.algo,
-                stored.stored_verbatim,
-                self.params.dict.as_deref(),
-            )
-            .map_err(|e| io_to_errno(&e))?;
             let in_block_start = (copy_start - block_start) as usize;
             let in_block_end = ((copy_end - block_start) as usize).min(plain.len());
             if in_block_start < in_block_end {
@@ -455,10 +495,7 @@ impl Filesystem for ZipfsRw {
     ) {
         let lock = self.lock_for(ino.0);
         let _guard = lock.write().unwrap();
-        match self
-            .tails
-            .write_at(self.store.as_ref(), ino.0, offset, data, &self.params)
-        {
+        match self.write_at_locked(ino.0, offset, data) {
             Ok(n) => reply.written(n as u32),
             Err(e) => reply.error(io_to_errno(&e)),
         }
@@ -603,6 +640,7 @@ impl Filesystem for ZipfsRw {
         if let Some(src) = self.store.lookup(parent.0, name).map(|a| a.ino) {
             let lock = self.lock_for(src);
             let _guard = lock.write().unwrap();
+            self.block_cache.invalidate(src);
             if let Err(e) = self.tails.seal(self.store.as_ref(), src, &self.params) {
                 // 非致命（rename 仍可进行，源内容由底层路径承载），但不静默吞——记日志。
                 warn!("rename：封源 ino={src} 尾块失败：{e}");
@@ -646,6 +684,7 @@ impl Filesystem for ZipfsRw {
         if let Some(new_size) = size {
             let lock = self.lock_for(ino.0);
             let _guard = lock.write().unwrap();
+            self.block_cache.invalidate(ino.0);
             if let Err(e) = self
                 .tails
                 .truncate(self.store.as_ref(), ino.0, new_size, &self.params)
@@ -698,6 +737,7 @@ impl Filesystem for ZipfsRw {
         // 持 inode 写锁再封块 + 提交，避免与并发 write/truncate 的 RMW 序列交错（rust-review C1）。
         let lock = self.lock_for(ino.0);
         let _guard = lock.write().unwrap();
+        self.block_cache.invalidate(ino.0);
         if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
             reply.error(io_to_errno(&e));
             return;
@@ -723,6 +763,7 @@ impl Filesystem for ZipfsRw {
         // 再让 Store 持久化，符合 POSIX fsync 契约（§10），且不能与同 inode 的 RMW 交错。
         let lock = self.lock_for(ino.0);
         let _guard = lock.write().unwrap();
+        self.block_cache.invalidate(ino.0);
         if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
             reply.error(io_to_errno(&e));
             return;
@@ -752,6 +793,7 @@ impl Filesystem for ZipfsRw {
         {
             let lock = self.lock_for(ino.0);
             let _guard = lock.write().unwrap();
+            self.block_cache.invalidate(ino.0);
             if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
                 warn!("release：封 ino={} 尾块失败：{e}", ino.0);
             }
@@ -924,5 +966,184 @@ mod tests {
         let got = fs.read_range(ino, cs as u64, extra.len() as u32).unwrap();
         assert_eq!(got, extra, "forget 先封尾再丢弃，追加数据不丢");
         std::mem::forget(dir);
+    }
+
+    // ---- 块缓存集成回归（perf #1）----
+
+    use crate::core::inode::Ino;
+    use crate::store::tests_support::MemStore;
+    use crate::store::{DirEntry, Store, StoredBlock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 透明转发全部 Store 方法、统计 `get_block` 调用次数的装饰器。默认方法（flush/seal_tail_block/
+    /// head_cache 等）经 trait 默认实现转调 `self.*` → 仍落到 inner，故无需逐一覆写。
+    struct CountingStore {
+        inner: Arc<dyn Store>,
+        get_block_calls: AtomicUsize,
+    }
+    impl CountingStore {
+        fn new(inner: Arc<dyn Store>) -> Self {
+            Self {
+                inner,
+                get_block_calls: AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.get_block_calls.load(Ordering::SeqCst)
+        }
+        fn reset(&self) {
+            self.get_block_calls.store(0, Ordering::SeqCst);
+        }
+    }
+    impl Store for CountingStore {
+        fn lookup(&self, parent: Ino, name: &str) -> Option<Attr> {
+            self.inner.lookup(parent, name)
+        }
+        fn create(&self, parent: Ino, name: &str, attr: Attr) -> std::io::Result<Ino> {
+            self.inner.create(parent, name, attr)
+        }
+        fn mkdir(&self, parent: Ino, name: &str, attr: Attr) -> std::io::Result<Ino> {
+            self.inner.mkdir(parent, name, attr)
+        }
+        fn unlink(&self, parent: Ino, name: &str) -> std::io::Result<()> {
+            self.inner.unlink(parent, name)
+        }
+        fn rmdir(&self, parent: Ino, name: &str) -> std::io::Result<()> {
+            self.inner.rmdir(parent, name)
+        }
+        fn rename(&self, old: (Ino, &str), new: (Ino, &str)) -> std::io::Result<()> {
+            self.inner.rename(old, new)
+        }
+        fn readdir(&self, dir: Ino) -> Vec<DirEntry> {
+            self.inner.readdir(dir)
+        }
+        fn setattr(&self, ino: Ino, attr: Attr) -> std::io::Result<()> {
+            self.inner.setattr(ino, attr)
+        }
+        fn getattr_ino(&self, ino: Ino) -> Option<Attr> {
+            self.inner.getattr_ino(ino)
+        }
+        fn get_block(&self, ino: Ino, idx: u64) -> std::io::Result<Option<StoredBlock>> {
+            self.get_block_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_block(ino, idx)
+        }
+        fn block_geometry(&self, ino: Ino) -> Option<(u64, u32)> {
+            self.inner.block_geometry(ino)
+        }
+        fn put_block(
+            &self,
+            ino: Ino,
+            idx: u64,
+            blk: StoredBlock,
+            new_size: u64,
+        ) -> std::io::Result<()> {
+            self.inner.put_block(ino, idx, blk, new_size)
+        }
+        fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> std::io::Result<()> {
+            self.inner.truncate_blocks(ino, keep_from, new_size)
+        }
+        fn fsync(&self, ino: Ino) -> std::io::Result<()> {
+            self.inner.fsync(ino)
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            self.inner.sync_all()
+        }
+    }
+
+    /// 建 CountingStore(MemStore) 后端 + 一个 `nbytes` 字节的多块已封存文件（经 rmw 直写 committed
+    /// 块，绕开尾缓冲），返回 (fs, 计数 store, 内容, ino)。`cap` 为块缓存字节上限。
+    fn fs_counting(
+        cs: u32,
+        nbytes: usize,
+        cap: usize,
+    ) -> (ZipfsRw, Arc<CountingStore>, Vec<u8>, u64) {
+        let mem: Arc<dyn Store> = Arc::new(MemStore::new(cs));
+        let ino = {
+            // 经 MemStore 便捷入口在根下建匿名文件。
+            let attr = Attr {
+                ino: 0,
+                size: 0,
+                kind: FileType::RegularFile,
+                perm: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: SystemTime::UNIX_EPOCH,
+                atime: SystemTime::UNIX_EPOCH,
+                ctime: SystemTime::UNIX_EPOCH,
+                chunk_size: cs,
+            };
+            mem.create(ROOT, "f.bin", attr).unwrap()
+        };
+        let store = Arc::new(CountingStore::new(mem));
+        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs).with_block_cache(cap);
+        let data: Vec<u8> = (0..nbytes).map(|i| b"abcde \n"[i % 7]).collect();
+        rmw::write_at(store.as_ref(), ino, 0, &data, &fs.params).unwrap();
+        store.fsync(ino).unwrap();
+        (fs, store, data, ino)
+    }
+
+    #[test]
+    fn 块缓存_同内部块多次小读只取块一次() {
+        let cs = 4096u32;
+        // 4 满块 + 100B 尾块 → tail_idx=4，块 0..3 为可缓存内部块。
+        let (fs, store, data, ino) = fs_counting(cs, 4 * cs as usize + 100, 1 << 20);
+        store.reset();
+        let b1 = cs as u64; // 块 1 起点。
+        let r1 = fs.read_range(ino, b1, 100).unwrap();
+        let r2 = fs.read_range(ino, b1 + 100, 100).unwrap();
+        let r3 = fs.read_range(ino, b1 + 1000, 50).unwrap();
+        assert_eq!(r1, &data[b1 as usize..b1 as usize + 100], "首读逐字节正确");
+        assert_eq!(
+            r2,
+            &data[b1 as usize + 100..b1 as usize + 200],
+            "缓存命中切片正确"
+        );
+        assert_eq!(r3, &data[b1 as usize + 1000..b1 as usize + 1050]);
+        assert_eq!(
+            store.calls(),
+            1,
+            "内部块只取/解压一次，其余命中缓存（消除顺序读放大）"
+        );
+    }
+
+    #[test]
+    fn 块缓存_尾块不缓存_每次读都取块() {
+        let cs = 4096u32;
+        let nbytes = 4 * cs as usize + 100; // tail_idx=4，尾块部分 100B。
+        let (fs, store, data, ino) = fs_counting(cs, nbytes, 1 << 20);
+        store.reset();
+        let tail = 4 * cs as u64; // 尾块（idx==tail_idx）起点。
+        let _ = fs.read_range(ino, tail, 50).unwrap();
+        let _ = fs.read_range(ino, tail + 10, 40).unwrap();
+        assert_eq!(
+            store.calls(),
+            2,
+            "尾块 idx==tail_idx 不进缓存（防可变尾日志重放陈旧，杠杆 A），每次读都取块"
+        );
+        let g = fs.read_range(ino, tail, 100).unwrap();
+        assert_eq!(
+            g,
+            &data[tail as usize..tail as usize + 100],
+            "尾块内容仍正确"
+        );
+    }
+
+    #[test]
+    fn 块缓存_写内部块后失效_读到新字节非缓存旧值() {
+        let cs = 4096u32;
+        let (fs, store, _data, ino) = fs_counting(cs, 4 * cs as usize + 100, 1 << 20);
+        let b1 = cs as u64;
+        let before = fs.read_range(ino, b1, 100).unwrap(); // 缓存块 1。
+        let newbytes = vec![0xABu8; 100];
+        {
+            // 经 write_at_locked（持写锁、写前无条件失效）改写块 1 内一段。
+            let lock = fs.lock_for(ino);
+            let _g = lock.write().unwrap();
+            fs.write_at_locked(ino, b1, &newbytes).unwrap();
+        }
+        let after = fs.read_range(ino, b1, 100).unwrap();
+        assert_ne!(after, before, "写后缓存须失效，不得返回陈旧旧值");
+        assert_eq!(after, newbytes, "读到新写入字节");
+        let _ = store;
     }
 }
