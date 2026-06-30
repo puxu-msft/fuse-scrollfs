@@ -447,6 +447,20 @@ impl Filesystem for ZipfsRw {
         }
     }
 
+    /// hardlink 正式不支持：布局 S 一文件 = 一 archive、布局 V 的 inode 无多名命名层，
+    /// 无法表达「多个目录项指向同一 inode」（docs/01 §4、ROADMAP T1 定调）。显式返回 ENOTSUP
+    /// 给 `cp -al` / git 明确语义，而非未实现 handler 时内核 VFS 回退的 EPERM。
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::from_i32(libc::ENOTSUP));
+    }
+
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if self.store.getattr_ino(ino.0).is_some() {
             // 只读 open：用 page cache（FOPEN_KEEP_CACHE）→ 支持只读 mmap（T2）；read 仍精确切片。

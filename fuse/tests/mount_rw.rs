@@ -244,6 +244,19 @@ fn rw_assertions(mountpoint: &Path) {
         }
     }
 
+    // 9) hardlink 不支持：布局 S/V 一文件=一 archive，无 inode-id 命名层（设计定调，docs/01 §4
+    //    + ROADMAP T1）。应失败且 errno=ENOTSUP（非默认 ENOSYS），让 cp -al / git 拿到明确语义。
+    {
+        let link_path = mountpoint.join("hardlink.dat");
+        let err = fs::hard_link(&big_path, &link_path).expect_err("hardlink 应被拒绝");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ENOTSUP),
+            "hardlink 应返回 ENOTSUP（设计定调不支持），得到 {err:?}"
+        );
+        assert!(!link_path.exists(), "被拒的 hardlink 不应留下条目");
+    }
+
     eprintln!("[OK] 读写 round-trip 全部断言通过（真实挂载）");
 }
 

@@ -68,6 +68,8 @@ crossterm = "0.29.0"
 
 [dev-dependencies]
 tempfile = "3"
+# 集成测试断言 errno（如 hardlink → ENOTSUP）；tests/ 是独立 crate，不继承主依赖。
+libc = "0.2"
 
 # 发布构建优化（perf #3）：compress/decompress 是纯 CPU 热点，lto + 单 codegen-unit 让跨
 # crate 内联/优化生效。**不设 panic="abort"**：守护进程中单个 FUSE worker panic 不应 abort
