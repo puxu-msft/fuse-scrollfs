@@ -385,9 +385,10 @@ impl Store for ContainerStore {
             inodes
                 .remove(child)
                 .map_err(|e| db_err("remove inode", e))?;
-            // 删除该 inode 的所有数据块。
+            // 删除该 inode 的所有数据块。评审 D2：用 RangeInclusive 到 (child, u64::MAX)，
+            // 避免 child==u64::MAX 时 `child+1` 溢出（release 回绕成空范围 → 块漏删、资源泄漏）。
             let to_del: Vec<(u64, u64)> = blocks
-                .range((child, 0)..(child + 1, 0))
+                .range((child, 0)..=(child, u64::MAX))
                 .map_err(|e| db_err("range blocks", e))?
                 .map(|r| r.map(|(k, _)| k.value()))
                 .collect::<Result<_, _>>()
@@ -460,7 +461,7 @@ impl Store for ContainerStore {
                     .remove(prev)
                     .map_err(|e| db_err("remove prev inode", e))?;
                 let to_del: Vec<(u64, u64)> = blocks
-                    .range((prev, 0)..(prev + 1, 0))
+                    .range((prev, 0)..=(prev, u64::MAX)) // 评审 D2：避免 prev+1 溢出
                     .map_err(|e| db_err("range blocks", e))?
                     .map(|r| r.map(|(k, _)| k.value()))
                     .collect::<Result<_, _>>()
@@ -643,7 +644,7 @@ impl ContainerStore {
             // 截断：删除 >= keep_from 的块。
             for (&ino, &keep_from) in &pending.truncations {
                 let to_del: Vec<(u64, u64)> = blocks
-                    .range((ino, keep_from)..(ino + 1, 0))
+                    .range((ino, keep_from)..=(ino, u64::MAX)) // 评审 D2：避免 ino+1 溢出
                     .map_err(|e| db_err("range blocks", e))?
                     .map(|r| r.map(|(k, _)| k.value()))
                     .collect::<Result<_, _>>()
