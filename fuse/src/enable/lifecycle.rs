@@ -83,8 +83,17 @@ pub fn apply(
     // ── mv 源 → 备份（可逆关键），fsync 父目录持久化 dirent ──
     fs::rename(&mp, &orig)?;
     fsync_parent(&mp);
-    fs::create_dir_all(paths.back_root())?;
-    fs::create_dir(&mp)?;
+    // 评审 A1：rename 已发生，此后任何建目录失败都必须回滚 rename，否则项目目录"消失"到
+    // orig（enable list 跳过 *.zipfs-orig 后缀 → 列表里蒸发），用户恐慌驱动二次误操作。
+    if let Err(e) = fs::create_dir_all(paths.back_root()).and_then(|_| fs::create_dir(&mp)) {
+        let rb = rollback_to_plain(&mp, &orig, &backing, &meta_path);
+        return Err(rollback_msg(
+            rb,
+            &orig,
+            name,
+            format!("建挂载点/backing 目录失败：{e}"),
+        ));
+    }
 
     // ── 按 backend 流式灌入 + 逐字节校验；任何失败回滚到 Plain ──
     let ingest_res = match backend {
@@ -788,6 +797,38 @@ mod tests {
             discovery::probe(&paths, "demo").status,
             ProjectStatus::Plain
         );
+    }
+
+    #[test]
+    fn apply_rolls_back_rename_when_dir_setup_fails() {
+        // 评审 A1：rename(mp→orig) 与 create_dir(mp) 之间失败时，旧码用 `?` 直接传播、
+        // 不回滚 rename → 项目目录"消失"到 .zipfs-orig，enable list 扫不到，用户恐慌。
+        // 注入：在 back_root 路径放一个普通文件，使 create_dir_all(back_root) 必失败。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let content = b"real session\n".repeat(10);
+        make_project(&paths, "demo", "a.jsonl", &content);
+        let m = FakeMounter::default();
+
+        // back_root 占位为文件 → create_dir_all 失败（路径已存在且非目录）。
+        fs::create_dir_all(&paths.zipfs_home).unwrap();
+        fs::write(paths.back_root(), b"blocker").unwrap();
+
+        let res = apply(&paths, "demo", ApplyOptions::default(), true, &m);
+        assert!(res.is_err(), "建目录失败应返回 Err");
+
+        // 关键：必须回滚 rename，源数据回到原挂载点、无遗留 .zipfs-orig 备份。
+        assert!(
+            paths.mountpoint("demo").join("a.jsonl").exists(),
+            "源应回到原挂载点（rename 已回滚），而非消失到 orig"
+        );
+        assert_eq!(
+            fs::read(paths.mountpoint("demo").join("a.jsonl")).unwrap(),
+            content,
+            "回滚后内容逐字节一致"
+        );
+        assert!(!paths.orig("demo").exists(), "不应残留 .zipfs-orig 备份");
+        assert!(!m.is_mounted(&paths.mountpoint("demo")));
     }
 
     #[test]
