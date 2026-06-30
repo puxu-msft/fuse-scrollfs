@@ -29,6 +29,7 @@ docs/        设计与对照文档
 - [docs/02-layered-chunking.md](docs/02-layered-chunking.md) —— 分层分块 / head 缓存 / 发现读快路径设计
 - [docs/03-target-data-scope.md](docs/03-target-data-scope.md) —— **目标数据范围**（首要 projects/jsonl+log、后续 file-history、排除 plugins/已压缩类）
 - [docs/ROADMAP.md](docs/ROADMAP.md) —— **未来方向路线图**（T0–T4 优先级 + 决策门，单一信息源）
+- [docs/06-defect-audit.md](docs/06-defect-audit.md) —— **缺陷审查台账**（两轮审查的发现 / 修复 / 未做项 + 判断依据，单一信息源）
 - [docs/environment-snapshot.md](docs/environment-snapshot.md) —— 实测环境
 
 ## 构建 / 测试
