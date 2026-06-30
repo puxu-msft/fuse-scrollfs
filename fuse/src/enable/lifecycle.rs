@@ -306,7 +306,114 @@ pub fn seal(
     })
 }
 
-/// 维护编排（compact/seal 共用，评审 H1/H2）：卸载→等守护退出→op→**无论成败都恢复挂载**。
+/// 路径加后缀得 sibling（`<path><suffix>`）。用 OsString 拼接避免要求路径是合法 UTF-8。
+fn sibling_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
+}
+
+/// 用源备份（orig）重新灌入某项目的 backing（**修复指令**）。仅 shadow。
+///
+/// 典型用途：backing 由**旧版本**二进制灌入、带早期缺陷（如 Bug D 不保留 mtime），用修好的
+/// 当前二进制从 orig 金副本重建。container ingest 一直经 `file_attr` 保留属性，无此问题，故拒绝。
+///
+/// 流程：`ingest_tree` orig→临时 backing（lock-free，旧守护继续服务）+ 逐字节 verify → 卸载并等
+/// 守护退出（释放 flock）→ 旧 backing 移到 `<backing>.reingest-bak` **保留** → 新 backing 就位 →
+/// 重挂 → 工具自写更新后的 committed meta（含新字节数，免手编 sidecar）。
+///
+/// **数据安全**：旧 backing 始终留底为 `.reingest-bak`（不删，供核对后手动清理）；orig 不动；
+/// 活跃项目无 `--force` 拒绝（避免写入中重建丢新数据，与 apply 一致）。
+pub fn reingest(
+    paths: &Paths,
+    name: &str,
+    force: bool,
+    mounter: &dyn Mounter,
+) -> io::Result<String> {
+    let meta = committed_meta(paths, name)?;
+    if meta.backend != Backend::Shadow {
+        return Err(err(
+            "reingest 仅支持 shadow（container 一直保留文件属性，无需重灌）".into(),
+        ));
+    }
+    let orig = paths.orig(name);
+    if !orig.exists() {
+        return Err(err(format!(
+            "{name} 无源备份 {}，无法 reingest（已 purge?）",
+            orig.display()
+        )));
+    }
+    if !force {
+        if let Some(reason) = discovery::detect_activity(&paths.mountpoint(name)).reason() {
+            return Err(err(format!(
+                "项目活跃（{reason}）；拒绝 reingest。确认空闲后加 --force"
+            )));
+        }
+    }
+    let backing = paths.backing(name, Backend::Shadow);
+    let tmp = sibling_suffix(&backing, ".reingest-tmp");
+    let bak = sibling_suffix(&backing, ".reingest-bak");
+    if bak.exists() {
+        return Err(err(format!(
+            "{} 已存在（上次 reingest 未清理）；核对后删除再试",
+            bak.display()
+        )));
+    }
+
+    // 1) orig → 临时 backing（lock-free，旧守护仍可服务）+ 逐字节校验。
+    let _ = fs::remove_dir_all(&tmp);
+    let opts = meta.options();
+    let stats = crate::ingest::ingest_tree(&orig, &tmp, opts.chunk_size, opts.level, true)?;
+    if !stats.errors.is_empty() || stats.skipped > 0 || stats.verified != stats.files {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(err(format!(
+            "reingest 灌入校验未通过（files={} verified={} skipped={} errors={}），已弃临时 backing",
+            stats.files,
+            stats.verified,
+            stats.skipped,
+            stats.errors.len()
+        )));
+    }
+
+    // 2) 卸载并等守护退出（释放 flock，新守护才能开同一锁文件）。
+    let mp = paths.mountpoint(name);
+    if mounter.is_mounted(&mp) {
+        mounter.unmount(name, &mp)?;
+        wait_daemon_exit(paths, name);
+    }
+
+    // 3) 旧 backing 留底 → 新 backing 就位（失败尽力回滚 + 重挂）。
+    fs::rename(&backing, &bak)?;
+    if let Err(e) = fs::rename(&tmp, &backing) {
+        let _ = fs::rename(&bak, &backing);
+        let _ = mounter.spawn(&mount_spec(paths, name, &opts));
+        return Err(err(format!(
+            "reingest 换 backing 失败：{e}（已尝试回滚 + 重挂）"
+        )));
+    }
+    fsync_parent(&backing);
+
+    // 4) 重挂（结束态 = 已挂载）。
+    let spawn_err = mounter.spawn(&mount_spec(paths, name, &opts)).err();
+
+    // 5) 工具自写更新后的 committed meta（含新字节数）——免手编 sidecar。
+    let new_meta = Meta::from_apply(&opts, stats.bytes_src, stats.bytes_archive, now_unix());
+    let _ = discovery::write_meta(&paths.meta_path(name), &new_meta);
+
+    match spawn_err {
+        None => Ok(format!(
+            "reingest: {} 文件从 orig 重灌（{:.2}x），mtime/属性已保留；旧 backing 留底于 {}（核对后可删）",
+            stats.files,
+            stats.ratio(),
+            bak.display()
+        )),
+        Some(re) => Err(err(format!(
+            "reingest 已重建 backing 但重挂失败：{re}，请 `enable remount {name}`；旧 backing 留底于 {}",
+            bak.display()
+        ))),
+    }
+}
+
 /// container 必须确认守护退出（redb 排他锁）才动手，否则 fail-fast 并重挂回去。
 fn maintain(
     paths: &Paths,
@@ -653,6 +760,70 @@ mod tests {
             discovery::probe(&paths, "demo").status,
             ProjectStatus::Plain
         );
+    }
+
+    #[test]
+    fn reingest_rebuilds_backing_from_orig_preserving_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        make_project(
+            &paths,
+            "demo",
+            "a.jsonl",
+            b"session data\n".repeat(50).as_slice(),
+        );
+        let m = FakeMounter::default();
+        apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
+
+        // orig 文件盖一个已知过去 mtime（模拟原始会话时间，2020-01-01）。
+        let orig_file = paths.orig("demo").join("a.jsonl");
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        crate::core::set_file_times(&orig_file, past, past).unwrap();
+
+        let report = reingest(&paths, "demo", true, &m).unwrap();
+        assert!(report.contains("reingest"), "报告：{report}");
+
+        // 新 backing archive 文件 mtime == orig 的过去时间（reingest 从 orig 重建并保留 mtime）。
+        let backing_file = paths.backing("demo", Backend::Shadow).join("a.jsonl");
+        let got = std::fs::metadata(&backing_file)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(got, past, "reingest 后 backing mtime 应保留 orig 原始时间");
+
+        // 旧 backing 留底于 .reingest-bak（不删，可恢复）。
+        let bak = {
+            let mut s = paths.backing("demo", Backend::Shadow).into_os_string();
+            s.push(".reingest-bak");
+            std::path::PathBuf::from(s)
+        };
+        assert!(bak.is_dir(), "旧 backing 应留底于 .reingest-bak");
+
+        // 重新挂载 + meta 仍 committed（工具自写）。
+        assert!(
+            m.is_mounted(&paths.mountpoint("demo")),
+            "reingest 后应已重挂"
+        );
+        assert!(
+            discovery::read_meta(&paths.meta_path("demo"))
+                .unwrap()
+                .is_some_and(|mm| mm.committed),
+            "meta 应仍 committed"
+        );
+    }
+
+    #[test]
+    fn reingest_rejects_without_orig() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        make_project(&paths, "demo", "a.jsonl", b"x");
+        let m = FakeMounter::default();
+        apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
+        // 移走 orig（模拟已 purge 源备份）→ reingest 无源，拒绝。
+        std::fs::remove_dir_all(paths.orig("demo")).unwrap();
+        let res = reingest(&paths, "demo", true, &m);
+        assert!(res.is_err(), "无 orig 应拒绝 reingest");
+        assert!(res.unwrap_err().to_string().contains("无源备份"));
     }
 
     #[test]

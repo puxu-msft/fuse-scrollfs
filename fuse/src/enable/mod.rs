@@ -86,6 +86,14 @@ pub enum EnableAction {
     },
     /// 离线压实某项目 backing（回收空间）：卸载 → compact → 重挂。
     Compact { name: String },
+    /// 从源备份（orig）重新灌入某项目 backing（修复指令，仅 shadow）：ingest --verify → 卸载 →
+    /// 换 backing（旧的留 .reingest-bak）→ 重挂。修旧版本灌出的 backing（如 mtime 缺陷）。
+    Reingest {
+        name: String,
+        /// 越过活跃会话防护（**危险**：会在写入中重建）。
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// 冷文件封存某项目（仅 shadow：大块高等级重编码逼近整流）：卸载 → seal → 重挂。
     Seal {
         name: String,
@@ -143,6 +151,7 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
         }
         | EnableAction::Purge { name, .. }
         | EnableAction::Compact { name }
+        | EnableAction::Reingest { name, .. }
         | EnableAction::Seal { name, .. },
     ) = &action
     {
@@ -196,6 +205,7 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
             Ok(())
         }
         Some(EnableAction::Compact { name }) => cmd_compact(&paths, &name),
+        Some(EnableAction::Reingest { name, force }) => cmd_reingest(&paths, &name, force),
         Some(EnableAction::Seal {
             name,
             seal_chunk,
@@ -393,6 +403,13 @@ fn cmd_remount(paths: &Paths, name: Option<String>, all: bool) -> std::io::Resul
 fn cmd_compact(paths: &Paths, name: &str) -> std::io::Result<()> {
     let report = lifecycle::compact(paths, name, select_mounter().as_ref())?;
     println!("compact: {name} — {report}");
+    Ok(())
+}
+
+/// `reingest <name> [--force]`：从 orig 重灌 backing（修复指令，仅 shadow）。
+fn cmd_reingest(paths: &Paths, name: &str, force: bool) -> std::io::Result<()> {
+    let report = lifecycle::reingest(paths, name, force, select_mounter().as_ref())?;
+    println!("{report}");
     Ok(())
 }
 
