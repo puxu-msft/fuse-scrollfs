@@ -418,3 +418,79 @@ fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
         "续写后重读 archive 仍逐字节一致"
     );
 }
+
+/// 大文件边界（评审测试盲区）：>1MiB 默认块、多块、跨块 append、>5MB 体量。
+/// 现有测试最大仅 ~200KiB，从不跨越 1MiB 默认块多次——本测试补该回归。
+#[test]
+fn 大文件_多块_跨块append_逐字节正确() {
+    use zipfs::core::rmw;
+    let cs = 1024 * 1024u32; // 1MiB 默认块
+    let dir = tempfile::tempdir().unwrap();
+    let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
+    let mut attr = new_attr();
+    attr.chunk_size = cs;
+    let ino = store.create(ROOT_INO, "big.bin", attr).unwrap();
+    let ws = TailSessions::new(true);
+
+    // 写 5.5 MiB（跨 6 个 1MiB 块，末块部分）——半可压缩内容（确定性，避免依赖 rand）。
+    let total = 5_500_000usize;
+    let mut data: Vec<u8> = Vec::with_capacity(total);
+    let mut x: u32 = 0x9e37_79b9;
+    for i in 0..total {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        // 混入可压缩前缀 + 伪随机字节，逼出真实多块压缩路径。
+        data.push(if i % 16 < 10 { b'A' } else { (x >> 24) as u8 });
+    }
+    rmw::write_at(&store, ino, 0, &data, &params()).unwrap();
+    store.fsync(ino).unwrap();
+
+    // 整文件逐字节读回（跨 6 块）。
+    assert_eq!(
+        read_whole(&ws, &store, ino),
+        data,
+        "5.5MiB 多块写回逐字节一致"
+    );
+
+    // 跨块边界 append：在 EOF（5.5MiB，落在第 6 块中部）追加 3MiB，跨到第 8 块。
+    let extra: Vec<u8> = (0..3_000_000u32)
+        .map(|i| b"xyz \n"[(i % 5) as usize])
+        .collect();
+    let off = ws.geometry(&store, ino).unwrap().0;
+    ws.write_at(&store, ino, off, &extra, &params()).unwrap();
+    ws.seal(&store, ino, &params()).unwrap();
+    store.fsync(ino).unwrap();
+
+    let mut expected = data.clone();
+    expected.extend_from_slice(&extra);
+    assert_eq!(
+        read_whole(&ws, &store, ino),
+        expected,
+        "跨块 append 后 8.5MiB 整文件逐字节一致"
+    );
+    let attr2 = store.lookup(ROOT_INO, "big.bin").unwrap();
+    assert_eq!(
+        attr2.size as usize,
+        expected.len(),
+        "size 反映 append 后总长"
+    );
+
+    // 随机中段读（跨块边界 [1MiB-10, 1MiB+10)）仍正确。
+    let mid = 1024 * 1024 - 10;
+    assert_eq!(
+        read_range_helper(&ws, &store, ino, mid as u64, 20),
+        expected[mid..mid + 20],
+        "跨块边界中段读逐字节正确"
+    );
+}
+
+/// 读 [off, off+len) 区间（复用 read_whole 的协调逻辑做切片）。
+fn read_range_helper(
+    ws: &TailSessions,
+    store: &dyn Store,
+    ino: u64,
+    off: u64,
+    len: usize,
+) -> Vec<u8> {
+    let whole = read_whole(ws, store, ino);
+    whole[off as usize..(off as usize + len).min(whole.len())].to_vec()
+}
