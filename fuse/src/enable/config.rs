@@ -117,6 +117,13 @@ pub fn run(paths: &Paths, cmd: ConfigCmd) -> io::Result<()> {
                     format!("未知配置键 {key:?}；可用：{}", KEYS.join(", ")),
                 ));
             }
+            // 评审 M4：含换行的值会注入伪造 config 行（key=value 解析被污染）。fail-closed。
+            if value.contains('\n') || value.contains('\r') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "配置值含换行/回车，拒绝（防注入伪造配置行）",
+                ));
+            }
             let mut o = load_defaults(paths);
             apply_kv(&mut o, &format!("{key}={value}"));
             std::fs::create_dir_all(&paths.zipfs_home)?;

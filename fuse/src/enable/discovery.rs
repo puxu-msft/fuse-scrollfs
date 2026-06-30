@@ -332,6 +332,11 @@ fn recent_log_write_rec(
 /// 之后再调本函数；本函数自身 fsync sidecar + 其父目录，使「sidecar 存在且 committed=1」成为
 /// 可信提交点（评审 C1/C2）。
 pub fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
+    // 评审 M4：sidecar 是数据安全信任根（committed 是挂载闸门）。自由文本值 dict/metrics_file
+    // 是路径，Unix 路径可含换行——含 `\n` 的路径会注入伪造行（如 `\ncommitted=1`），parse 末键
+    // 胜出即可把半灌 backing 伪造成权威挂出。写入端 fail-closed 拒绝含控制字符的值。
+    let dict = sidecar_value(meta.dict.as_deref().unwrap_or(""))?;
+    let metrics_file = sidecar_value(meta.metrics_file.as_deref().unwrap_or(""))?;
     let tmp = with_ext(path, "tmp");
     let body = format!(
         "backend={}\nchunk_size={}\nlevel={}\nbytes_src={}\nbytes_archive={}\napplied_at={}\ncommitted={}\ndict={}\nthreads={}\nwriteback={}\nmax_write={}\nno_tail_buffer={}\nallow_other={}\nauto_unmount={}\nmetrics_file={}\n",
@@ -342,14 +347,14 @@ pub fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
         meta.bytes_archive,
         meta.applied_at,
         if meta.committed { 1 } else { 0 },
-        meta.dict.as_deref().unwrap_or(""),
+        dict,
         meta.threads,
         if meta.writeback { 1 } else { 0 },
         meta.max_write,
         if meta.no_tail_buffer { 1 } else { 0 },
         if meta.allow_other { 1 } else { 0 },
         if meta.auto_unmount { 1 } else { 0 },
-        meta.metrics_file.as_deref().unwrap_or(""),
+        metrics_file,
     );
     {
         let mut f = fs::File::create(&tmp)?;
@@ -358,12 +363,20 @@ pub fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
     }
     fs::rename(&tmp, path)?;
     // fsync 父目录使 rename 持久（dirent durability）。
-    if let Some(parent) = path.parent() {
-        if let Ok(dirf) = fs::File::open(parent) {
-            let _ = dirf.sync_all();
-        }
-    }
+    crate::core::fsync_dir_of(path);
     Ok(())
+}
+
+/// 校验一个 sidecar key=value 的 value 不含会破坏 key=value 解析 / 伪造键的控制字符
+/// （`\n`/`\r`）。含则 fail-closed 报错（评审 M4）。返回原值便于内联使用。
+fn sidecar_value(v: &str) -> io::Result<&str> {
+    if v.contains('\n') || v.contains('\r') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("sidecar 值含换行/回车，拒绝写入（防伪造提交标记）：{v:?}"),
+        ));
+    }
+    Ok(v)
 }
 
 /// 读提交标记 sidecar。不存在 → Ok(None)。解析未知键忽略，缺失键取默认（parse-don't-validate）。
@@ -493,6 +506,26 @@ mod tests {
             o.metrics_file.as_deref(),
             Some(std::path::Path::new("/m/z.prom"))
         );
+    }
+
+    #[test]
+    fn write_meta_rejects_newline_injection_in_paths() {
+        // 评审 M4：含换行的路径会注入伪造行（如 `\ncommitted=1`）篡改提交闸门。须 fail-closed。
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = Meta {
+            committed: false,
+            ..Meta::default()
+        };
+        meta.dict = Some("/tmp/x\ncommitted=1".to_string());
+        let res = write_meta(&dir.path().join("p.zipfs.meta"), &meta);
+        assert!(res.is_err(), "含换行的 dict 路径须拒绝写入");
+        // 干净路径正常写入并读回，committed 保持 false（未被伪造）。
+        meta.dict = Some("/tmp/clean-dict".to_string());
+        let p = dir.path().join("q.zipfs.meta");
+        write_meta(&p, &meta).unwrap();
+        let back = read_meta(&p).unwrap().unwrap();
+        assert!(!back.committed, "干净写入后 committed 应仍为 false");
+        assert_eq!(back.dict.as_deref(), Some("/tmp/clean-dict"));
     }
 
     #[test]
