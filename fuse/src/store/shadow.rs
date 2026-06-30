@@ -687,10 +687,13 @@ impl Store for ShadowStore {
         };
         let rawlen = reader.head_cache_rawlen();
         // 仅当请求区间 [off, off+len) 完全落在缓存覆盖前缀内才命中（避免部分命中拼接）。
-        let covered = rawlen > 0
+        // 评审 B2：覆盖前缀额外 clamp 到当前逻辑文件大小——纵深防御，即便陈旧缓存（rawlen >
+        // 实际大小）漏过 B1 的失效，也绝不返回超过 EOF 的旧字节。
+        let effective = rawlen.min(reader.footer().uncompressed_size);
+        let covered = effective > 0
             && off
                 .checked_add(len)
-                .map(|end| end <= rawlen)
+                .map(|end| end <= effective)
                 .unwrap_or(false);
         if covered {
             reader.read_head_cache()

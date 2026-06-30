@@ -969,6 +969,19 @@ impl<W: BlockIo> ArchiveUpdater<W> {
             self.index.truncate(keep_from as usize);
         }
         self.uncompressed_size = new_size;
+        // 评审 B1：head 缓存覆盖块 0 的前 rawlen 字节。若截断使文件短于该前缀，缓存即越界
+        // （发现读会返回已被截掉的陈旧字节）。文件仍长于 rawlen 时块 0 前缀不变、缓存仍有效。
+        // 同时清 committed_head_cache，杜绝 commit/commit_journal 任一路径重写陈旧指针。
+        let rawlen = self
+            .head_cache
+            .as_ref()
+            .map(|(_, _, r)| *r)
+            .or_else(|| self.committed_head_cache.map(|h| h.rawlen))
+            .unwrap_or(0);
+        if rawlen > 0 && new_size < rawlen {
+            self.head_cache = None;
+            self.committed_head_cache = None;
+        }
     }
 
     /// 原子提交（docs/04 §3）：append [head 缓存] + 新 index 到 EOF → **barrier 1 fsync** →
@@ -1676,6 +1689,36 @@ mod tests {
             b"HC-COMPRESSED-BYTES"
         );
         assert_eq!(r.read_block(1).unwrap().unwrap().0, b"BBBB");
+    }
+
+    #[test]
+    fn updater_truncate_丢弃越界_head_cache() {
+        // 评审 B1：head 缓存覆盖块 0 前缀 rawlen 字节。若 truncate 使文件短于 rawlen，
+        // 旧码不动 head_cache → commit 原样重写陈旧缓存 → 发现读返回已被截掉的旧前缀。
+        // 截断到短于 rawlen 后，缓存必须失效（rawlen 归 0）。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.archive");
+        {
+            let mut w = ArchiveWriter::create(&path, 8).unwrap();
+            w.append_block(b"AAAAAAAA", false, 8).unwrap();
+            w.append_block(b"BBBBBBBB", false, 8).unwrap();
+            w.set_head_cache(b"HEADCACHE-16B".to_vec(), false, 16); // 缓存覆盖前 16 字节
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        assert_eq!(up.head_cache_rawlen(), 16);
+        // 截断到 4 字节（< rawlen=16）：缓存越界，必须丢弃。
+        up.truncate(0, 4);
+        up.set_block(0, b"AAAA", false, 4).unwrap();
+        up.commit().unwrap();
+
+        let r = ArchiveReader::open(&path).unwrap();
+        assert_eq!(r.footer().uncompressed_size, 4);
+        assert_eq!(
+            r.head_cache_rawlen(),
+            0,
+            "截断到短于 rawlen 后，陈旧 head 缓存必须失效（否则发现读越界返回旧数据）"
+        );
     }
 
     #[test]
