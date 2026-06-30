@@ -6,9 +6,13 @@
 //! 把比值推向 ~25–30x（4–8MiB/zstd-19）乃至整流 35x。本模块做**离线**封存（backing 未挂载时跑），
 //! 故无需在线读路径改动——读路径本就按每文件 footer 的 chunk_size 解块，封存后照常可读。
 //!
-//! ## 为何无需改 codec
-//! seal 块默认 8MiB，落在 zstd-19 默认窗口（windowLog 23 = 8MiB）内，`encode_all(_, 19)` 已能
-//! 捕获块内长程匹配，无需显式 `--long`（仅整文件单块 > 8MiB 才需要，留作后续）。
+//! ## LDM（长程匹配）：>8MiB 块自动开启
+//! 8MiB 块落在 zstd-19 默认窗口（windowLog 23 = 8MiB）内，`encode_all(_, 19)` 已能捕获块内长程匹配，
+//! 无需 LDM——故默认 8MiB 封存**不开 LDM，行为零回归**。但封存块若 > 8MiB（`--seal-chunk` 调大，
+//! 上限 64MiB），默认窗口跨不出整块，>8MiB 距离的文件内长程重复（系统提示 / 重读文件逐轮重录相隔
+//! ≫8MiB）吃不到。此时经 [`CompressParams::sealed`] 自动开 LDM + 更大 windowLog（`ceil(log2(chunk)`)，
+//! **硬 clamp ≤27** = 解码 `window_log_max`，编 ≤ 解保证封存后必可解出），逼近整流上界。
+//! codec 侧 LDM 实现见 [`crate::core::codec::CompressParams`]。
 //!
 //! ## 安全
 //! 每文件**临时文件 + 原子 rename** 重写，全程不破坏原文件直到新文件 fsync 落盘；失败跳过该文件
@@ -19,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::archive::{ArchiveReader, ArchiveWriter};
-use crate::core::codec::{compress, decompress_block, Algo};
+use crate::core::codec::{compress_with_params, decompress_block, Algo, CompressParams};
 
 /// 默认封存块大小（8MiB）：落在 zstd-19 默认窗口内，单点读解压上限 8MiB（冷数据可接受）。
 pub const DEFAULT_SEAL_CHUNK: u32 = 8 * 1024 * 1024;
@@ -133,6 +137,8 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
     {
         let mut writer = ArchiveWriter::create(&tmp, seal_chunk)?;
         let seal = seal_chunk as usize;
+        // 封存压缩参数：>8MiB 块自动开 LDM + 更大 windowLog（已 clamp ≤27）；≤8MiB 等价 plain。
+        let params = CompressParams::sealed(level, seal_chunk);
         let mut buf: Vec<u8> = Vec::with_capacity(seal + cur_chunk as usize);
         let nblocks = reader.chunk_count();
         for idx in 0..nblocks {
@@ -142,14 +148,14 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
             }
             // 攒满一个或多个 seal 块就压缩落盘（源块可能比 seal 块小，故 while）。
             while buf.len() >= seal {
-                let (stored, verbatim) = compress(&buf[..seal], Algo::Zstd, level)?;
+                let (stored, verbatim) = compress_with_params(&buf[..seal], Algo::Zstd, &params)?;
                 writer.append_block(&stored, verbatim, seal as u64)?;
                 buf.drain(..seal);
             }
         }
         // 末尾不足一个 seal 块的余量（空文件则 buf 空，写 0 块 archive）。
         if !buf.is_empty() {
-            let (stored, verbatim) = compress(&buf, Algo::Zstd, level)?;
+            let (stored, verbatim) = compress_with_params(&buf, Algo::Zstd, &params)?;
             writer.append_block(&stored, verbatim, buf.len() as u64)?;
         }
         let file = writer.finish()?;
@@ -317,6 +323,61 @@ mod tests {
         assert_eq!(stats.sealed, 0);
         assert_eq!(stats.skipped, 1);
         assert!(stats.errors.is_empty());
+    }
+
+    /// >8MiB 距离自重复内容：两段相同伪随机块，中间夹不可压缩填充，迫使长程重复跨越 8MiB 默认窗口。
+    fn long_range_dup_content() -> Vec<u8> {
+        let seg_len = 4 * 1024 * 1024;
+        let mut seg = Vec::with_capacity(seg_len);
+        let mut x: u64 = 0xabcd_1234_5678_9f01;
+        for _ in 0..seg_len {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seg.push((x >> 56) as u8);
+        }
+        let fill_len = 10 * 1024 * 1024;
+        let mut fill = Vec::with_capacity(fill_len);
+        let mut y: u64 = 0x1357_9bdf_2468_ace0;
+        for _ in 0..fill_len {
+            y = y
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            fill.push((y >> 56) as u8);
+        }
+        let mut out = Vec::with_capacity(seg_len * 2 + fill_len);
+        out.extend_from_slice(&seg);
+        out.extend_from_slice(&fill);
+        out.extend_from_slice(&seg);
+        out
+    }
+
+    #[test]
+    fn 封存大块_ldm_自动开_round_trip_一致() {
+        // 封存到 16MiB 单块（>8MiB → seal 自动开 LDM）。整文件 ~18MiB 含 >8MiB 距离的 4MiB 自重复。
+        // 红线：经完整 seal 管线（temp+fsync+rename）写出的 LDM 大块，读路径必须逐字节 round-trip。
+        let dir = tempfile::tempdir().unwrap();
+        let small_chunk = 1024 * 1024; // 1MiB 活跃块
+        let content = long_range_dup_content();
+        let backing = dir.path().to_path_buf();
+        {
+            let store = ShadowStore::open_with_chunk_size(backing.clone(), small_chunk).unwrap();
+            write_file(&store, "big.jsonl", &content, small_chunk);
+        }
+        let seal_chunk = 16 * 1024 * 1024; // >8MiB，触发 LDM
+        let stats = seal_shadow_tree(&backing, seal_chunk, 19).unwrap();
+        assert_eq!(stats.sealed, 1, "应封存 1 个文件");
+        assert!(stats.errors.is_empty(), "无错误：{:?}", stats.errors);
+
+        // round-trip：读路径按新 footer chunk_size（16MiB，含 LDM 帧）解块，必须逐字节一致。
+        let store = ShadowStore::open_with_chunk_size(backing.clone(), small_chunk).unwrap();
+        let attr = store.lookup(1, "big.jsonl").unwrap();
+        assert_eq!(
+            attr.chunk_size, seal_chunk,
+            "footer chunk_size 应更新为封存块"
+        );
+        let got = read_whole(&store, attr.ino, attr.size);
+        assert_eq!(got, content, "LDM 大块封存后读回必须逐字节一致");
     }
 
     fn dir_bytes(dir: &Path) -> u64 {

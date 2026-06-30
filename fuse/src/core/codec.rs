@@ -24,6 +24,66 @@ const MAX_DECOMPRESSED_BLOCK: usize = 256 * 1024 * 1024;
 /// 解压 window_log 上限（27 = 128 MiB 窗口）：限制解码器内部窗口缓冲分配，挡"巨窗口"帧 DoS。
 const DECOMPRESS_WINDOW_LOG_MAX: u32 = 27;
 
+/// 编码侧压缩参数（等级 + 可选长程匹配 LDM）。
+///
+/// **默认（[`CompressParams::plain`]）不开 LDM**：现有热路径 / 1MiB 块 / 8MiB 封存块行为零回归。
+/// LDM 仅在封存块 > 8MiB（[`CompressParams::sealed`]）时开启：zstd-19 默认窗口 8MiB（windowLog 23）
+/// 跨不出更大的块，>8MiB 距离的文件内长程重复吃不到，需 LDM + 更大 windowLog 才能逼近整流。
+///
+/// ## windowLog 硬 clamp ≤27（正确性红线）
+/// `window_log` 由 [`CompressParams::sealed`] 取 `ceil(log2(chunk_size))` 并**硬 clamp 到
+/// [`DECOMPRESS_WINDOW_LOG_MAX`]（27）**——解码器 [`decompress_block`] 设了 `window_log_max(27)`，
+/// 编码 windowLog 超此值的帧解码器会拒绝（封存后解不出 = 数据损坏）。clamp 保证编 ≤ 解上限。
+///
+/// ## 与共享字典互斥
+/// LDM 路径与字典路径互斥：seal 不用字典、热路径不用 LDM，二者不会同时正当出现。
+/// `compress_block_full` 在 `enable_ldm && dict.is_some()` 时显式报错（见其文档），不静默走错分支。
+#[derive(Debug, Clone, Copy)]
+pub struct CompressParams {
+    /// 无字典路径的 zstd 等级。
+    pub level: i32,
+    /// 是否启用长程匹配（LDM / `--long`）。
+    pub enable_ldm: bool,
+    /// LDM 开启时的 windowLog（已 clamp ≤27）；`enable_ldm == false` 时忽略。
+    pub window_log: u32,
+}
+
+impl CompressParams {
+    /// 普通路径：仅等级，不开 LDM（热路径 / ≤8MiB 块默认）。
+    pub fn plain(level: i32) -> Self {
+        Self {
+            level,
+            enable_ldm: false,
+            window_log: 0,
+        }
+    }
+
+    /// 封存路径：块 > 8MiB 时自动开 LDM，windowLog = `ceil(log2(chunk_size))` 硬 clamp ≤27；
+    /// 块 ≤ 8MiB 落在 zstd 默认窗口内，等价于 [`plain`](Self::plain)（不开 LDM，零开销）。
+    pub fn sealed(level: i32, chunk_size: u32) -> Self {
+        // zstd-19 默认 windowLog=23（8MiB）。块 ≤8MiB 默认窗口已覆盖，无需 LDM。
+        const LDM_THRESHOLD: u32 = 8 * 1024 * 1024;
+        if chunk_size <= LDM_THRESHOLD {
+            return Self::plain(level);
+        }
+        Self {
+            level,
+            enable_ldm: true,
+            window_log: window_log_for(chunk_size),
+        }
+    }
+}
+
+/// 取覆盖 `chunk_size` 的最小 windowLog（`ceil(log2(chunk_size))`），**硬 clamp 到
+/// [`DECOMPRESS_WINDOW_LOG_MAX`]（27）**。clamp 是正确性红线：编码 windowLog 不得超解码上限。
+fn window_log_for(chunk_size: u32) -> u32 {
+    debug_assert!(chunk_size > 0);
+    // ceil(log2(n)) = 一个 ≥n 的最小 2 的幂的指数。
+    let wl = 32 - (chunk_size.saturating_sub(1)).leading_zeros();
+    // 硬 clamp ≤27（解码器 window_log_max）。也防 chunk_size==1 时 wl==0 这种边角（无实际意义但安全）。
+    wl.min(DECOMPRESS_WINDOW_LOG_MAX)
+}
+
 /// 压缩算法选择。`--algo` 切换，见 §13 已定项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Algo {
@@ -102,8 +162,39 @@ pub fn compress_block(
     level: i32,
     dict: Option<&SharedDict>,
 ) -> io::Result<(Vec<u8>, bool)> {
+    compress_block_full(raw, algo, &CompressParams::plain(level), dict)
+}
+
+/// 用显式 [`CompressParams`] 压缩（无字典），暴露 LDM。封存大块经此开 LDM。
+///
+/// 现有 [`compress`]/[`compress_block`] 仍走 `CompressParams::plain`（不开 LDM），行为零回归。
+pub fn compress_with_params(
+    raw: &[u8],
+    algo: Algo,
+    params: &CompressParams,
+) -> io::Result<(Vec<u8>, bool)> {
+    compress_block_full(raw, algo, params, None)
+}
+
+/// 压缩内核：统一处理 zstd 等级 / LDM / 字典三条路径与不可压缩启发式。
+///
+/// **LDM 与字典互斥**：`params.enable_ldm && dict.is_some()` 时显式返回 `InvalidInput`——
+/// seal 路径不用字典、热路径不用 LDM，二者不会同时正当出现；同传说明调用方逻辑错乱，
+/// 绝不静默走某一条分支产出"看似成功"的错配帧。
+pub fn compress_block_full(
+    raw: &[u8],
+    algo: Algo,
+    params: &CompressParams,
+    dict: Option<&SharedDict>,
+) -> io::Result<(Vec<u8>, bool)> {
     if raw.is_empty() {
         return Ok((Vec::new(), true));
+    }
+    if params.enable_ldm && dict.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LDM 与共享字典互斥：seal 不用字典、热路径不用 LDM，二者不可同传",
+        ));
     }
     match algo {
         Algo::None => Ok((raw.to_vec(), true)),
@@ -120,7 +211,8 @@ pub fn compress_block(
                     c.compress(raw)
                         .map_err(|e| io::Error::other(format!("zstd 字典压缩失败：{e}")))?
                 }
-                None => zstd::stream::encode_all(raw, level)
+                None if params.enable_ldm => compress_ldm(raw, params)?,
+                None => zstd::stream::encode_all(raw, params.level)
                     .map_err(|e| io::Error::other(format!("zstd 压缩失败：{e}")))?,
             };
             // 不可压缩启发式：压缩没省下足够空间就原样存，避免「解压成本 + 轻微膨胀」双输。
@@ -131,6 +223,28 @@ pub fn compress_block(
             }
         }
     }
+}
+
+/// LDM 路径：bulk Compressor + `EnableLongDistanceMatching` + `WindowLog`（已 clamp ≤27）。
+///
+/// windowLog 取自 `params.window_log`（[`CompressParams::sealed`] 已硬 clamp 到
+/// [`DECOMPRESS_WINDOW_LOG_MAX`]）；这里再 `debug_assert` 一道，确保任何调用方传入的 window_log
+/// 都不超解码上限——超了的帧解码器会拒绝 = 封存后解不出 = 损坏。
+fn compress_ldm(raw: &[u8], params: &CompressParams) -> io::Result<Vec<u8>> {
+    use zstd::zstd_safe::CParameter;
+    debug_assert!(
+        params.window_log <= DECOMPRESS_WINDOW_LOG_MAX,
+        "编码 windowLog {} 超解码上限 {DECOMPRESS_WINDOW_LOG_MAX}（会损坏）",
+        params.window_log
+    );
+    let mut c = zstd::bulk::Compressor::new(params.level)
+        .map_err(|e| io::Error::other(format!("zstd LDM 压缩器构造失败：{e}")))?;
+    c.set_parameter(CParameter::EnableLongDistanceMatching(true))
+        .map_err(|e| io::Error::other(format!("启用 LDM 失败：{e}")))?;
+    c.set_parameter(CParameter::WindowLog(params.window_log))
+        .map_err(|e| io::Error::other(format!("设 LDM windowLog 失败：{e}")))?;
+    c.compress(raw)
+        .map_err(|e| io::Error::other(format!("zstd LDM 压缩失败：{e}")))
 }
 
 /// 解压一个逻辑块（无字典）。`stored_verbatim` 为真时返回的就是原字节（不解压）。
@@ -338,6 +452,101 @@ mod tests {
     #[test]
     fn 空字典返回_none() {
         assert!(SharedDict::new(Vec::new(), 3).is_none(), "空字典不应构造");
+    }
+
+    /// 构造一个含 >8MiB 距离自重复的样本：两段相同的伪随机块，中间塞不可压缩填充，
+    /// 使两段相同内容相隔超过 zstd-19 默认窗口（8MiB）。无 LDM 时第二段引用不到第一段；
+    /// 开 LDM + 大 windowLog 才能跨窗口命中，压缩显著更小。
+    fn long_range_dup_sample() -> Vec<u8> {
+        // 4MiB 伪随机段（不可压缩，确定性 LCG）。
+        let seg_len = 4 * 1024 * 1024;
+        let mut seg = Vec::with_capacity(seg_len);
+        let mut x: u64 = 0xdead_beef_1234_5678;
+        for _ in 0..seg_len {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seg.push((x >> 56) as u8);
+        }
+        // 10MiB 不可压缩填充（另一条 LCG 流），把两段 seg 推到 >8MiB 距离。
+        let fill_len = 10 * 1024 * 1024;
+        let mut fill = Vec::with_capacity(fill_len);
+        let mut y: u64 = 0x0f0f_0f0f_a5a5_a5a5;
+        for _ in 0..fill_len {
+            y = y
+                .wrapping_mul(2_862_933_555_777_941_757)
+                .wrapping_add(3_037_000_493);
+            fill.push((y >> 56) as u8);
+        }
+        // 布局：seg | fill | seg  → 两个 seg 相隔 ~14MiB > 8MiB 默认窗口。
+        let mut out = Vec::with_capacity(seg_len * 2 + fill_len);
+        out.extend_from_slice(&seg);
+        out.extend_from_slice(&fill);
+        out.extend_from_slice(&seg);
+        out
+    }
+
+    #[test]
+    fn ldm_对超窗口长程重复显著更省() {
+        // RED→GREEN：>8MiB 距离的自重复，开 LDM 应显著小于不开 LDM。
+        let raw = long_range_dup_sample();
+        let chunk = raw.len() as u32;
+
+        let (no_ldm, _) =
+            compress_with_params(&raw, Algo::Zstd, &CompressParams::plain(19)).unwrap();
+        let (with_ldm, _) =
+            compress_with_params(&raw, Algo::Zstd, &CompressParams::sealed(19, chunk)).unwrap();
+
+        // 第二段 4MiB 应几乎被 LDM 整段消除；保守断言至少省 20%。
+        assert!(
+            (with_ldm.len() as f64) < (no_ldm.len() as f64) * 0.80,
+            "LDM 应显著更省：no_ldm={} with_ldm={}",
+            no_ldm.len(),
+            with_ldm.len()
+        );
+    }
+
+    #[test]
+    fn ldm_大块_round_trip_逐字节一致() {
+        // 正确性红线：LDM + 大 windowLog 压缩的块必须能被 decompress_block 逐字节解回。
+        let raw = long_range_dup_sample();
+        let chunk = raw.len() as u32;
+        let (stored, verbatim) =
+            compress_with_params(&raw, Algo::Zstd, &CompressParams::sealed(19, chunk)).unwrap();
+        assert!(!verbatim, "高冗余大块不应触发 verbatim");
+        let back = decompress_block(&stored, Algo::Zstd, verbatim, None).unwrap();
+        assert_eq!(back, raw, "LDM 大块解压必须逐字节 round-trip");
+    }
+
+    #[test]
+    fn windowlog_硬clamp_不超27() {
+        // 即便块大小 > 128MiB（windowLog 28+），编码 windowLog 必须 clamp 到 ≤27（=解码上限），
+        // 否则封存后帧窗口超解码器 window_log_max → 解不出 = 损坏。
+        // 直接验证：用一个 >128MiB 声明的 chunk_size 构造 params，对一个可解的小样本压缩→解压成功。
+        let params = CompressParams::sealed(19, 256 * 1024 * 1024);
+        assert!(
+            params.window_log <= DECOMPRESS_WINDOW_LOG_MAX,
+            "windowLog 必须 clamp ≤27"
+        );
+        // round-trip 一个含长程重复的样本，确保 clamp 后帧仍可解码。
+        let raw = long_range_dup_sample();
+        let (stored, verbatim) = compress_with_params(&raw, Algo::Zstd, &params).unwrap();
+        let back = decompress_block(&stored, Algo::Zstd, verbatim, None).unwrap();
+        assert_eq!(back, raw, "clamp 后帧必须仍可解码");
+    }
+
+    #[test]
+    fn ldm_与字典互斥_显式拒绝() {
+        // 安全：LDM 与共享字典路径互斥（seal 不用字典，热路径不用 LDM），同传必须显式拒绝而非静默走错。
+        let samples = boilerplate_samples(16);
+        let dict = SharedDict::new(train_dict(&samples, 8 * 1024).unwrap(), 3).unwrap();
+        let params = CompressParams {
+            level: 19,
+            enable_ldm: true,
+            window_log: 25,
+        };
+        let err = compress_block_full(b"hello world", Algo::Zstd, &params, Some(&dict));
+        assert!(err.is_err(), "LDM + 字典同传必须报错");
     }
 
     #[test]

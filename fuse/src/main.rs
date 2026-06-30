@@ -306,6 +306,8 @@ struct SealArgs {
 
 /// 离线封存 shadow 树：重编码冷文件为大块 + 高等级，报告前后大小。
 fn run_seal(args: SealArgs) -> std::io::Result<()> {
+    // 校验 seal_chunk ≤ MAX_CHUNK_SIZE（64MiB）：过大块缓冲会 OOM，且封存逐块驻留更敏感。
+    zipfs::core::validate_chunk_size(args.seal_chunk)?;
     if !args.backing.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotADirectory,
