@@ -101,7 +101,7 @@ flowchart LR
 
 | 数据集 | 特征 | 考察点 |
 |---|---|---|
-| **★ `~/.claude/projects` 副本（旗舰真实负载）** | 8.7GB，jsonl/txt/json，**31x 可压缩**，双峰大小，追加写为主，跨会话高冗余 | 项目最终目标负载；append 路径、巨文件分块、去重潜力、综合表现（见 [01-zipfs-design.md](./01-zipfs-design.md) §1.1） |
+| **★ `~/.claude/projects` 副本（旗舰真实负载）** | 8.7GB，jsonl/txt/json，**单 838MB jsonl 单流 31x**（FS 级实测仅 5.4/13.7x；冗余主在文件内），双峰大小，追加写为主 | 项目最终目标负载；append 路径、巨文件分块、去重潜力、综合表现（见 [01-zipfs-design.md](./01-zipfs-design.md) §1.1） |
 | 文本/源码（Linux 源码树、JSON dump、日志） | 高可压缩 | 压缩比上限、压缩 CPU |
 | 类家目录混合树 | 混合 | 真实场景综合表现 |
 | 预压缩媒体（jpg/mp4/.zst） | 近乎不可压缩 | 启发式跳过是否生效、无谓开销 |

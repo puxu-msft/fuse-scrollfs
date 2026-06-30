@@ -52,7 +52,8 @@
 | **head 缓存（archive v2，发现读）** | 头尾 64KB 发现读现解压整个 1MiB（16x 放大）；源码实证访问面（[[claude-code-session-io-access-pattern]]） | 中偏高 | ✅ **已落地**（rmw 建/shadow 存读/rwfs 快路径 + 单测；discovery-bench HOT 砍 82%） |
 | **algo/chunk 自适应** | 按文件类型/可压缩性选等级/lz4；不可压缩媒体走 verbatim | 中 | ◐ 块大小已据实测定 1MiB + `--level` 可配；lz4 codec 仍 unimplemented、自动选择未做 |
 | **S 压实（append-only 空洞回收）** | §8.4 尾日志 raw + 旧块成空洞、文件增长；temp+rename 整文件重写回收 | 小/中 | ✅ `zipfs compact --backend shadow`（实测 16x 收缩） |
-| **V 全局去重（内容寻址）** | 跨会话巨量重复；去重收益可叠加在压缩之上 | 大 | ☐（G3 门控；注意定长块去重实测 0% 命中，须 CDC） |
+| **编码侧 zstd `--long`/更大窗口（长程匹配）** | 冗余主在**文件内长程**、重复点常 ≫1MiB 块距，放大 LDM 窗口是逼近 18–21x 单流上限**最便宜**的杠杆（编码路径现为裸 `encode_all`，无 LDM）；ROI 高于去重 | 中 | ☐ **未做**（仅块大小→1MiB ☑；seal 单块>8MiB 的 --long 亦留后续） |
+| **V 全局去重（内容寻址）—— 价值待证实** | 概念上跨会话共享前缀，但**实测定长块 0% 命中、同目录拼接增益仅 1.0x**，冗余主在文件内；须 CDC 且命中率未测 | 大 | ☐（G3 门控；**先做编码侧 --long**，dedup 价值由 CDC 命中率实测裁定） |
 | **BV compact 自动化** | 覆盖写产生 MVCC 膨胀，需卸载时/后台 GC 兜底 | 小/中 | ☐ |
 
 ## T4 · 生产化 / 迁移（把它真正用起来）
