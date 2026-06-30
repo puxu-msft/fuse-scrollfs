@@ -69,4 +69,11 @@ crossterm = "0.29.0"
 [dev-dependencies]
 tempfile = "3"
 
+# 发布构建优化（perf #3）：compress/decompress 是纯 CPU 热点，lto + 单 codegen-unit 让跨
+# crate 内联/优化生效。**不设 panic="abort"**：守护进程中单个 FUSE worker panic 不应 abort
+# 整个挂载，保留 unwind。代价是 release 编译变慢（单 crate 构建可接受）。
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 # P2/P3 引入 redb；lz4_flex / rusqlite 仍留待后续（codec lz4 对照 / 空间敏感备选）。
