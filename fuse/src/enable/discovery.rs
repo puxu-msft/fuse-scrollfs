@@ -183,7 +183,7 @@ pub fn endpoint_ok(path: &Path) -> bool {
 
 /// `path` 是否为活的 fuse 挂载点：解析 `/proc/self/mountinfo`，精确匹配挂载点且 fstype=fuse。
 pub fn is_mounted(path: &Path) -> bool {
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = canonicalized_target(path);
     let Ok(content) = fs::read_to_string("/proc/self/mountinfo") else {
         return false;
     };
@@ -197,6 +197,21 @@ pub fn is_mounted(path: &Path) -> bool {
         }
     }
     mounted
+}
+
+/// 规范化挂载点用于与 mountinfo（内核规范路径）精确比对。整路径 `canonicalize` 失败时
+/// （如 stale ENOTCONN endpoint，挂载点自身已无法 stat），退而规范化**父目录**再拼回末段——
+/// 父目录通常仍可解析，避免回退到未规范化原路径导致与 mountinfo 失配、漏判已挂载（评审 A4/C2）。
+fn canonicalized_target(path: &Path) -> std::path::PathBuf {
+    if let Ok(p) = fs::canonicalize(path) {
+        return p;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(cp) = fs::canonicalize(parent) {
+            return cp.join(name);
+        }
+    }
+    path.to_path_buf()
 }
 
 /// 解析一行 mountinfo，返回（反转义后的挂载点, fstype 是否 fuse 系）。格式：
@@ -534,6 +549,22 @@ mod tests {
         assert!(read_meta(&dir.path().join("none.zipfs.meta"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn canonicalized_target_resolves_symlinked_parent_for_stale_endpoint() {
+        // 评审 A4/C2：挂载点 endpoint 自身不可 stat（stale）时，仍应经父目录解析出规范路径，
+        // 而非回退未规范化原路径（会与 mountinfo 失配漏判已挂载）。
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // link/ep 不存在（模拟 stale endpoint）：整路径 canonicalize 失败，须经父（link→real）解析。
+        let stale = link.join("ep");
+        let got = canonicalized_target(&stale);
+        let want = fs::canonicalize(&real).unwrap().join("ep");
+        assert_eq!(got, want, "应经规范化父目录拼回末段，而非回退原路径");
     }
 
     #[test]
