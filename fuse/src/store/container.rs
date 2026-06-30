@@ -382,6 +382,18 @@ impl Store for ContainerStore {
                 .map_err(|e| db_err("remove dirent", e))?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "不存在"))?
                 .value();
+            // D2 孤儿块修复：在删 redb inode 之前先持 pending 锁清掉该 child 的
+            // blocks/sizes/truncations。配合 commit_pending 的存在性检查，使任何
+            // 并发 flush 都不能复活该 ino 的块——窗口被双向堵死：
+            //   1) 清理在 inode 删除之前发生，flush 若在此之后跑，pending 里已无该块；
+            //   2) 即便 flush 抢在清理与本事务 commit 之间跑，commit_pending 也会
+            //      因 INODES 表里该 inode 仍在/已删而分别得到一致结果（删后跳过）。
+            {
+                let mut p = self.pending.lock().unwrap();
+                p.blocks.retain(|&(i, _), _| i != child);
+                p.sizes.remove(&child);
+                p.truncations.remove(&child);
+            }
             inodes
                 .remove(child)
                 .map_err(|e| db_err("remove inode", e))?;
@@ -399,7 +411,8 @@ impl Store for ContainerStore {
             removed_child = child;
         }
         txn.commit().map_err(|e| db_err("commit unlink", e))?;
-        // 清挂起暂存里该 inode 的残留。
+        // 兜底：本事务期间（pending 清理之后、commit 之前）仍可能有并发线程把该
+        // child 的块重新入 pending（例如尚持旧 ino 句柄的写）。再清一次确保不留残块。
         {
             let mut p = self.pending.lock().unwrap();
             p.blocks.retain(|&(i, _), _| i != removed_child);
@@ -641,8 +654,29 @@ impl ContainerStore {
                 .open_table(INODES)
                 .map_err(|e| db_err("open inodes", e))?;
 
-            // 截断：删除 >= keep_from 的块。
+            // D2 孤儿块修复：本事务内按 ino 缓存「INODES 表是否仍存在该 inode」，
+            // 供 truncations / blocks 两个循环复用，避免每块查一次表。已删 inode
+            // （并发 unlink 已 commit）的挂起块/截断一律跳过，与下方 sizes 循环对称，
+            // 否则会把无 inode 引用的脏块写进 BLOCKS → 孤儿块（lookup 不可达、compact 回收不掉）。
+            let mut ino_exists: HashMap<u64, bool> = HashMap::new();
+            let mut inode_present = |ino: u64| -> io::Result<bool> {
+                if let Some(&e) = ino_exists.get(&ino) {
+                    return Ok(e);
+                }
+                let exists = inodes
+                    .get(ino)
+                    .map_err(|e| db_err("get inode", e))?
+                    .is_some();
+                ino_exists.insert(ino, exists);
+                Ok(exists)
+            };
+
+            // 截断：删除 >= keep_from 的块。仅对仍存在的 inode 执行（删已删 inode 的块
+            // 本是无害幂等，但与 sizes/blocks 同标准处理，保持一致性）。
             for (&ino, &keep_from) in &pending.truncations {
+                if !inode_present(ino)? {
+                    continue;
+                }
                 let to_del: Vec<(u64, u64)> = blocks
                     .range((ino, keep_from)..=(ino, u64::MAX)) // 评审 D2：避免 ino+1 溢出
                     .map_err(|e| db_err("range blocks", e))?
@@ -653,8 +687,11 @@ impl ContainerStore {
                     blocks.remove(k).map_err(|e| db_err("remove block", e))?;
                 }
             }
-            // 写挂起块。
+            // 写挂起块。inode 不存在则跳过（孤儿块防护）。
             for (&(ino, idx), blk) in &pending.blocks {
+                if !inode_present(ino)? {
+                    continue;
+                }
                 let encoded = Self::encode_block(blk);
                 blocks
                     .insert((ino, idx), &encoded[..])
@@ -893,5 +930,65 @@ mod tests {
         let store2 = ContainerStore::open(&path).unwrap();
         let a2 = store2.getattr_ino(ino).unwrap();
         assert_eq!(a2.mtime, t, "container setattr 的 mtime 应跨 reopen 持久");
+    }
+
+    // ----- D2：unlink 与并发 flush 的孤儿块缺陷 -----
+
+    /// redb BLOCKS 表里某 ino 的块数（绕过挂起暂存，直查持久层）。
+    fn redb_block_count(store: &ContainerStore, ino: u64) -> usize {
+        let txn = store.db.begin_read().unwrap();
+        let blocks = txn.open_table(BLOCKS).unwrap();
+        blocks
+            .range((ino, 0)..=(ino, u64::MAX))
+            .unwrap()
+            .count()
+    }
+
+    /// 复现 HIGH C-2 孤儿块：put_block 入 pending → unlink 删 redb inode →
+    /// 并发 flush（commit_pending）若把 pending 里已删 ino 的脏块照插 redb，
+    /// 就产生无 inode 引用、lookup 不可达、compact 回收不掉的孤儿块。
+    ///
+    /// 旧码缺陷不对称：commit_pending 的 sizes 循环对不存在 inode 已 continue，
+    /// 但 blocks 循环无存在性检查 → 照插。本测试断言 commit_pending 后 redb 无该 ino 的块。
+    #[test]
+    fn commit_pending_does_not_resurrect_unlinked_inode_blocks() {
+        let cs = 4096u32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.redb");
+        let store = ContainerStore::open_with_chunk_size(&path, cs).unwrap();
+
+        let ino = new_file(&store, "f.bin", cs);
+        let plain = vec![b'X'; cs as usize];
+        // 写一块进 pending（未 fsync，仍在内存暂存）。
+        store
+            .put_block(ino, 0, mk_block(&plain), cs as u64)
+            .unwrap();
+
+        // unlink 删 redb inode/dirent。旧码会清 pending，但若并发 flush 抢在
+        // 「redb inode 已删」与「pending 清理」之间运行，块就被复活。
+        // 这里直接构造该时序的等价末态：put_block 后立刻 commit_pending，
+        // 模拟另一线程在 unlink 清理 pending 之前 flush。
+        store.commit_pending().unwrap();
+
+        // unlink 删除 inode。
+        store.unlink(ROOT_INO, "f.bin").unwrap();
+
+        // 再来一次 flush（模拟 unlink 删 inode 之后、仍可能有该 ino 残留块被并发
+        // 写入的窗口）。无论 pending 是否已清，commit_pending 都不得把不存在
+        // inode 的块写进 redb。
+        store
+            .put_block(ino, 1, mk_block(&plain), 2 * cs as u64)
+            .unwrap();
+        store.commit_pending().unwrap();
+
+        assert_eq!(
+            redb_block_count(&store, ino),
+            0,
+            "已删 inode 的块不得被 commit_pending 复活进 redb（孤儿块）"
+        );
+        assert!(
+            store.getattr_ino(ino).is_none(),
+            "inode 已删，getattr 应为 None"
+        );
     }
 }
