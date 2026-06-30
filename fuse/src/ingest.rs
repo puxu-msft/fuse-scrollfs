@@ -174,12 +174,13 @@ fn ingest_file_into_store(
 
 /// 逐字节校验 container 内某 ino 与源文件一致（流式，内存 ~chunk）。
 fn verify_file_in_store(store: &ContainerStore, src: &Path, ino: Ino) -> io::Result<bool> {
-    let Some((_size, cs)) = store.block_geometry(ino) else {
+    let Some((size, cs)) = store.block_geometry(ino) else {
         return Ok(false);
     };
     let mut f = fs::File::open(src)?;
     let mut buf = vec![0u8; cs as usize];
     let mut idx = 0u64;
+    let mut total = 0u64;
     loop {
         let n = read_full(&mut f, &mut buf)?;
         if n == 0 {
@@ -196,6 +197,27 @@ fn verify_file_in_store(store: &ContainerStore, src: &Path, ino: Ino) -> io::Res
             ));
         }
         idx += 1;
+        total += n as u64;
+    }
+    // 评审 C1：源已到 EOF；还须确认 archive 不比源长（无残留多余块）且总长一致，否则
+    // archive 多出的块/字节漏检。
+    if store.get_block(ino, idx)?.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "校验失败：{} archive 比源长（块 {idx} 多余）",
+                src.display()
+            ),
+        ));
+    }
+    if total != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "校验失败：{} 总长不符（校验 {total} != archive {size}）",
+                src.display()
+            ),
+        ));
     }
     Ok(true)
 }
@@ -317,6 +339,7 @@ fn verify_file(src: &Path, dst: &Path) -> io::Result<bool> {
     let mut f = fs::File::open(src)?;
     let cs = r.footer().chunk_size as usize;
     let mut buf = vec![0u8; cs];
+    let mut total = 0u64;
     for idx in 0..r.chunk_count() {
         let n = read_full(&mut f, &mut buf)?;
         let (bytes, entry) = r.read_block(idx)?.expect("idx < chunk_count");
@@ -327,6 +350,30 @@ fn verify_file(src: &Path, dst: &Path) -> io::Result<bool> {
                 format!("校验失败：{} 块 {idx} 不一致", src.display()),
             ));
         }
+        total += n as u64;
+    }
+    // 评审 C1：archive 块读尽后，源必须也到 EOF——否则 archive 块数少于源、源尾部多余字节
+    // 漏检（旧码在此静默 Ok，使"逐字节校验"形同虚设）。再交叉核对总长 == archive 逻辑大小，
+    // 兼防意外尾日志（ingest 不产生尾日志，故 total 应恰等 uncompressed_size）。
+    let mut extra = [0u8; 1];
+    if read_full(&mut f, &mut extra)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "校验失败：{} 源比 archive 长，archive 丢失尾部数据",
+                src.display()
+            ),
+        ));
+    }
+    if total != r.footer().uncompressed_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "校验失败：{} 总长不符（校验 {total} != archive {}）",
+                src.display(),
+                r.footer().uncompressed_size
+            ),
+        ));
     }
     Ok(true)
 }
@@ -370,6 +417,32 @@ mod tests {
             );
         }
         assert_eq!(got, big);
+    }
+
+    #[test]
+    fn verify_rejects_archive_shorter_than_source() {
+        // 评审 C1：archive 块数少于源时，旧 verify_file 只循环 archive 块、循环后静默 Ok，
+        // 源尾部多余字节漏检。手造一个仅含源前缀的 archive，verify 必须报错。
+        let dst = tempfile::tempdir().unwrap();
+        let srcdir = tempfile::tempdir().unwrap();
+        let cs = 4u32;
+        let arch = dst.path().join("short.archive");
+        // archive 只封了 "AAAA"（1 块，逻辑 4 字节）。
+        {
+            let mut w = ArchiveWriter::create(&arch, cs).unwrap();
+            let (stored, verbatim) = compress(b"AAAA", Algo::Zstd, 3).unwrap();
+            w.append_block(&stored, verbatim, 4).unwrap();
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        // 源是 "AAAABBBB"（8 字节，archive 丢了尾部 "BBBB"）。
+        let src = srcdir.path().join("src.bin");
+        fs::write(&src, b"AAAABBBB").unwrap();
+
+        let res = verify_file(&src, &arch);
+        assert!(
+            res.is_err(),
+            "archive 比源短，verify 必须报错而非静默通过，实际：{res:?}"
+        );
     }
 
     #[test]
