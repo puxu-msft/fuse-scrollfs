@@ -98,6 +98,25 @@ pub fn set_file_times(
     Ok(())
 }
 
+/// fsync `path` 的父目录，持久化对 `path` 的 create/rename 产生的 dirent。
+///
+/// 崩溃一致性共享点：仅 `fsync(file)` 不保证目录项 durable——崩溃后文件内容在盘、dentry 未落
+/// → 文件整体消失。shadow `create` 新建 archive、seal/compact 的 temp+rename 都必须补这一步
+/// （评审 A1/A2）。失败按 best-effort 处理但**记 warn**（不静默吞错误），因为此时主对象已落盘、
+/// 仅持久化时机受影响，硬失败反而会让 create 误报。
+pub fn fsync_dir_of(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        match std::fs::File::open(parent) {
+            Ok(d) => {
+                if let Err(e) = d.sync_all() {
+                    log::warn!("fsync 父目录 {} 失败：{e}", parent.display());
+                }
+            }
+            Err(e) => log::warn!("打开父目录 {} 以 fsync 失败：{e}", parent.display()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::system_time_from;

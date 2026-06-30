@@ -121,11 +121,7 @@ fn compact_file(path: &Path, level: i32) -> io::Result<Option<(u64, u64)>> {
         return Err(e);
     }
     // rename 持久化需父目录项落盘（§6：崩溃后看到新文件而非旧）。
-    if let Some(parent) = path.parent() {
-        if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
-        }
-    }
+    crate::core::fsync_dir_of(path);
     // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。best-effort +
     // warn（见 seal.rs 同理）：失败不让压实失败，但要可观测、不让 Bug D 静默复发。
     if let Some((atime, mtime)) = orig_times {

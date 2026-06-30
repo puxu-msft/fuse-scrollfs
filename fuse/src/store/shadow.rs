@@ -426,6 +426,9 @@ impl Store for ShadowStore {
         let w = ArchiveWriter::create(&abs, chunk_size)?;
         let f = w.finish()?;
         f.sync_all()?;
+        // 评审 A2：fsync 文件本身不保证 dentry durable，崩溃后新文件可能整体消失（后续
+        // commit_session 的 open 会失败）。与 seal/compact 的 rename 后 fsync 父目录一致。
+        crate::core::fsync_dir_of(&abs);
         // 应用权限。失败不致命（文件已建好）但不可静默吞——记日志（用户规则：不静默吞错误）。
         if let Err(e) = fs::set_permissions(&abs, fs::Permissions::from_mode(attr.perm as u32)) {
             log::warn!("create：设置 {} 权限失败：{e}", abs.display());

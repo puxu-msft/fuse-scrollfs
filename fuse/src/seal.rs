@@ -163,11 +163,7 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
     }
     // rename 持久化需父目录项落盘（docs/04 §6：崩溃后看到新文件而非旧）。
     // 与 compact.rs 一致；缺此步则崩溃后 seal 的 rename 可能丢失。
-    if let Some(parent) = path.parent() {
-        if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
-        }
-    }
+    crate::core::fsync_dir_of(path);
     // Bug D：还原原 archive 文件的 mtime/atime（rename 进来的新文件 mtime=now）。best-effort：
     // 设时间失败不该让整个封存失败（数据已正确落盘），但要 warn——否则该文件的 mtime 修复
     // 静默回退、Bug D 症状悄悄复发，不可观测。
