@@ -517,23 +517,38 @@ fn committed_meta(paths: &Paths, name: &str) -> io::Result<Meta> {
 /// 卸载后等守护进程真正退出（释放 redb 排他锁 / 落盘）。轮询 pid-file 的 pid 直至不存活或超时（≤3s）。
 /// 返回是否**确认退出**（true=已退出/无 pid；false=超时仍存活）。fusermount3 -u 只摘挂载点，
 /// 守护 `session.join()` 返回后才退出，故 container compact 前必须等并据返回值决定是否动手。
+///
+/// 评审 D4/H2：单次读 pid-file 失败不立即判退出——守护被 systemd `Restart=on-failure` 重启时，
+/// pid-file 有"删除→新守护重写"的窗口，此刻读失败误判退出会在锁实际仍被占时动手换 backing。
+/// 故要求 pid-file **连续缺失** N 次才判退出；中途出现存活 pid 则继续等其退出。最终防线仍是
+/// compact/seal 自身的 backing flock（评审 A3）——锁被占时维护操作 fail-closed，不依赖本探测。
 fn wait_daemon_exit(paths: &Paths, name: &str) -> bool {
     let pid_file = paths.pid_file(name);
-    let Ok(s) = fs::read_to_string(&pid_file) else {
-        return true; // 无 pid 文件（已退出/未写）→ 视为已退出。
-    };
-    let Ok(pid) = s.trim().parse::<i32>() else {
-        return true;
-    };
-    if pid <= 0 {
-        return true; // 0 = FakeMounter 占位，无真实进程。
-    }
-    for _ in 0..30 {
-        // kill(pid, 0)：仅探测存活，不发信号。返回 -1/ESRCH = 已退出。
-        // SAFETY: 标准存活探测，sig=0 不影响目标。
-        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-        if !alive {
-            return true;
+    const POLLS: u32 = 30;
+    const MISS_THRESHOLD: u32 = 3; // 连续缺失阈值（~300ms），riding out 重启重写窗口
+    let mut consecutive_missing = 0u32;
+    for _ in 0..POLLS {
+        match fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            None => {
+                // 无 pid 文件 / 不可解析。可能已退出，也可能守护正被重启、pid 文件刚删将重写。
+                consecutive_missing += 1;
+                if consecutive_missing >= MISS_THRESHOLD {
+                    return true; // 持续缺失 → 确认无守护
+                }
+            }
+            Some(pid) if pid <= 0 => return true, // 0 = FakeMounter 占位，无真实进程
+            Some(pid) => {
+                consecutive_missing = 0; // 出现 pid → 重置缺失计数
+                                         // kill(pid, 0)：仅探测存活，不发信号。返回 -1/ESRCH = 已退出。
+                                         // SAFETY: 标准存活探测，sig=0 不影响目标。
+                let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                if !alive {
+                    return true;
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
