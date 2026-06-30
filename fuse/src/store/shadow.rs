@@ -400,6 +400,7 @@ impl Store for ShadowStore {
     }
 
     fn create(&self, parent: Ino, name: &str, attr: Attr) -> io::Result<Ino> {
+        super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
@@ -426,6 +427,7 @@ impl Store for ShadowStore {
     }
 
     fn mkdir(&self, parent: Ino, name: &str, attr: Attr) -> io::Result<Ino> {
+        super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
@@ -467,6 +469,8 @@ impl Store for ShadowStore {
     }
 
     fn rename(&self, old: (Ino, &str), new: (Ino, &str)) -> io::Result<()> {
+        super::validate_name(old.1)?;
+        super::validate_name(new.1)?;
         let old_parent_rel = self
             .rel_of(old.0)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "源父目录不存在"))?;
@@ -526,6 +530,7 @@ impl Store for ShadowStore {
     }
 
     fn symlink(&self, parent: Ino, name: &str, target: &Path) -> io::Result<Attr> {
+        super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;

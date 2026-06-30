@@ -306,6 +306,7 @@ impl Store for ContainerStore {
     }
 
     fn create(&self, parent: Ino, name: &str, attr: Attr) -> io::Result<Ino> {
+        super::validate_name(name)?;
         let ino = self.alloc_ino();
         let chunk_size = if attr.chunk_size == 0 {
             self.default_chunk_size
@@ -426,6 +427,8 @@ impl Store for ContainerStore {
     }
 
     fn rename(&self, old: (Ino, &str), new: (Ino, &str)) -> io::Result<()> {
+        super::validate_name(old.1)?;
+        super::validate_name(new.1)?;
         let txn = self
             .db
             .begin_write()

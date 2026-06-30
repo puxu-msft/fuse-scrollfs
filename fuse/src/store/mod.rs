@@ -21,6 +21,34 @@ pub mod tests_support;
 use crate::core::inode::Ino;
 use std::io;
 
+/// 校验单个目录项名，作为 Store 写入口（create/mkdir/symlink/rename 新名）的不变量。
+///
+/// 评审 E1：把路径安全做成**后端契约**，不依赖调用方恰好喂干净数据。挂载期 FUSE 内核会过滤
+/// `/`、`.`、`..`，但 `ingest_dir_into_store` 直接把 `read_dir` 名喂给 `Store::create/mkdir`
+/// **绕过内核**——一旦源含病态名（`/` 污染 container 键空间、`..` 让 shadow `join` 逃出 backing），
+/// 无此防线即可越界。拒空名 / 含 NUL / `.` / `..` / 含 `/`。
+pub(crate) fn validate_name(name: &str) -> io::Result<()> {
+    let bad = |msg: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("非法目录项名 {name:?}：{msg}"),
+        )
+    };
+    if name.is_empty() {
+        return Err(bad("不能为空"));
+    }
+    if name.contains('\0') {
+        return Err(bad("含 NUL"));
+    }
+    if name == "." || name == ".." {
+        return Err(bad("不能为 . 或 .."));
+    }
+    if name.contains('/') {
+        return Err(bad("不能含 /"));
+    }
+    Ok(())
+}
+
 /// 目录项（readdir 返回）。
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -180,5 +208,60 @@ pub trait Store: Send + Sync {
     /// 可观测：返回 `(物理字节, 逻辑字节)`——statfs 据此让 `df` 显压缩比。默认 None（不支持）。
     fn compression_stats(&self) -> Option<(u64, u64)> {
         None
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use crate::store::shadow::ShadowStore;
+
+    #[test]
+    fn validate_name_rejects_traversal_and_separators() {
+        for bad in ["", ".", "..", "a/b", "/abs", "../escape", "x\0y"] {
+            assert!(validate_name(bad).is_err(), "应拒绝非法名: {bad:?}");
+        }
+        for ok in ["a.jsonl", "-home-xp-proj", "f_1", "session.log"] {
+            assert!(validate_name(ok).is_ok(), "应接受合法名: {ok:?}");
+        }
+    }
+
+    #[test]
+    fn shadow_create_mkdir_reject_path_traversal() {
+        // 评审 E1：绕过内核（ingest 直喂 read_dir 名）时，后端须自挡 `..`/`/`，否则 join 逃出 backing。
+        let dir = tempfile::tempdir().unwrap();
+        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), 4096).unwrap();
+        let mk = |kind| Attr {
+            ino: 0,
+            size: 0,
+            kind,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
+            chunk_size: 4096,
+        };
+        assert!(
+            store
+                .create(1, "..", mk(fuser::FileType::RegularFile))
+                .is_err(),
+            "create('..') 须拒绝"
+        );
+        assert!(
+            store
+                .create(1, "a/b", mk(fuser::FileType::RegularFile))
+                .is_err(),
+            "create 含 / 须拒绝"
+        );
+        assert!(
+            store
+                .mkdir(1, "../x", mk(fuser::FileType::Directory))
+                .is_err(),
+            "mkdir('../x') 须拒绝"
+        );
+        // backing 父目录下不应出现逃逸文件。
+        assert!(!dir.path().parent().unwrap().join("b").exists());
     }
 }
