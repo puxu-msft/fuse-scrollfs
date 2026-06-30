@@ -408,6 +408,20 @@ impl Store for ContainerStore {
     }
 
     fn rmdir(&self, parent: Ino, name: &str) -> io::Result<()> {
+        // 评审 D3：rmdir 必须拒绝非空目录（ENOTEMPTY），否则 unlink 删掉目录 dirent + inode 却
+        // 留下子项的 dirent/inode 成孤儿（既无法 lookup 又永占空间，compact 也回收不掉）。
+        let child = self
+            .lookup(parent, name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "不存在"))?;
+        if child.kind != fuser::FileType::Directory {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "rmdir 目标非目录",
+            ));
+        }
+        if !self.readdir(child.ino).is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTEMPTY));
+        }
         self.unlink(parent, name)
     }
 
@@ -694,6 +708,52 @@ mod tests {
             chunk_size: cs,
         };
         store.create(ROOT_INO, name, attr).unwrap()
+    }
+
+    fn dir_attr_t(cs: u32) -> Attr {
+        Attr {
+            ino: 0,
+            size: 0,
+            kind: fuser::FileType::Directory,
+            perm: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
+            chunk_size: cs,
+        }
+    }
+
+    #[test]
+    fn rmdir_rejects_non_empty_dir() {
+        // 评审 D3：rmdir 非空目录旧码直接 unlink → 子项成孤儿。须返回 ENOTEMPTY 且不动子项。
+        let cs = 4096u32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.redb");
+        let store = ContainerStore::open_with_chunk_size(&path, cs).unwrap();
+        let sub = store.mkdir(ROOT_INO, "sub", dir_attr_t(cs)).unwrap();
+        let child_attr = Attr {
+            chunk_size: cs,
+            ..dir_attr_t(cs)
+        };
+        let mut fattr = child_attr;
+        fattr.kind = fuser::FileType::RegularFile;
+        store.create(sub, "inner.txt", fattr).unwrap();
+
+        let res = store.rmdir(ROOT_INO, "sub");
+        assert_eq!(
+            res.as_ref().map_err(|e| e.raw_os_error()),
+            Err(Some(libc::ENOTEMPTY)),
+            "rmdir 非空目录应 ENOTEMPTY，实际：{res:?}"
+        );
+        // 子项与目录都还在（未被破坏）。
+        assert!(store.lookup(ROOT_INO, "sub").is_some(), "目录应保留");
+        assert!(store.lookup(sub, "inner.txt").is_some(), "子项应保留");
+        // 删空后可成功 rmdir。
+        store.unlink(sub, "inner.txt").unwrap();
+        store.rmdir(ROOT_INO, "sub").unwrap();
+        assert!(store.lookup(ROOT_INO, "sub").is_none(), "空目录应删除");
     }
 
     /// compact 后数据仍可读，且物理文件不大于 compact 前（通常显著收缩）。
