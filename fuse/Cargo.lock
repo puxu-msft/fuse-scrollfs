@@ -2156,6 +2156,7 @@ dependencies = [
  "fuser",
  "libc",
  "log",
+ "parking_lot",
  "ratatui",
  "redb",
  "sd-notify",

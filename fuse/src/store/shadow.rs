@@ -21,13 +21,14 @@ use crate::archive::{ArchiveReader, ArchiveUpdater, ArchiveWriter};
 use crate::blockio::BlockIo;
 use crate::core::inode::Ino;
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// 根 inode 编号，对齐 FUSE 约定。
 const ROOT_INO: u64 = 1;
@@ -195,7 +196,7 @@ impl ShadowStore {
     }
 
     fn rel_of(&self, ino: Ino) -> Option<PathBuf> {
-        self.inodes.lock().unwrap().path_of(ino)
+        self.inodes.lock().path_of(ino)
     }
 
     fn abs_of_ino(&self, ino: Ino) -> Option<PathBuf> {
@@ -208,7 +209,7 @@ impl ShadowStore {
         let kind = filetype_from_meta(meta);
         let (size, chunk_size) = if kind == fuser::FileType::RegularFile {
             // 脏会话优先（写后读一致）。
-            if let Some(s) = self.sessions.lock().unwrap().get(&ino) {
+            if let Some(s) = self.sessions.lock().get(&ino) {
                 (s.size, s.chunk_size)
             } else {
                 read_footer_geometry(abs).unwrap_or_else(|| (meta.size(), self.default_chunk_size))
@@ -266,7 +267,7 @@ impl ShadowStore {
     /// 无论是否回填，本次都返回刚开的 reader 供当前读使用（其引用的块仍在文件内，append-only +
     /// pread 保证读到自洽旧版本字节）。
     fn cached_reader(&self, ino: Ino) -> io::Result<Option<Arc<ArchiveReader>>> {
-        if let Some(r) = self.readers.lock().unwrap().get(&ino) {
+        if let Some(r) = self.readers.lock().get(&ino) {
             return Ok(Some(r.clone()));
         }
         let epoch_before = self.reader_epoch.load(Ordering::Acquire);
@@ -278,7 +279,7 @@ impl ShadowStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let mut cache = self.readers.lock().unwrap();
+        let mut cache = self.readers.lock();
         // 世代未变且槽位仍空才回填；否则沿用已存在项（若有）或直接返回本次 reader 不缓存。
         if self.reader_epoch.load(Ordering::Acquire) == epoch_before {
             return Ok(Some(cache.entry(ino).or_insert(reader).clone()));
@@ -293,12 +294,12 @@ impl ShadowStore {
     /// 同时递增失效世代，使「正在 open 但尚未回填」的并发读不把陈旧 reader 写回缓存（H1）。
     fn invalidate_reader(&self, ino: Ino) {
         self.reader_epoch.fetch_add(1, Ordering::AcqRel);
-        self.readers.lock().unwrap().remove(&ino);
+        self.readers.lock().remove(&ino);
     }
 
     /// 把某 ino 的脏会话落盘到底层 archive，并移除会话。无会话则只 fsync 文件。
     fn commit_session(&self, ino: Ino) -> io::Result<()> {
-        let session = self.sessions.lock().unwrap().remove(&ino);
+        let session = self.sessions.lock().remove(&ino);
         let Some(session) = session else {
             // 无脏数据：仍对底层文件 fsync（POSIX fsync 语义）。
             // 注意：这条 `fs::File::open + sync_all` 是一条**独立的 durable 写点**，**有意留在
@@ -405,13 +406,13 @@ impl Store for ShadowStore {
         let child_rel = parent_rel.join(name);
         let abs = self.abs_of(&child_rel);
         let meta = fs::symlink_metadata(&abs).ok()?;
-        let ino = self.inodes.lock().unwrap().intern(child_rel);
+        let ino = self.inodes.lock().intern(child_rel);
         Some(self.attr_from_meta(ino, &meta, &abs))
     }
 
     fn create(&self, parent: Ino, name: &str, attr: Attr) -> io::Result<Ino> {
         // ns 锁全程持有：使「O_EXCL 建文件 → fsync → 改 inodes 表」对同目录并发原子（阶段 D3）。
-        let _ns = self.ns.lock().unwrap();
+        let _ns = self.ns.lock();
         super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
@@ -436,12 +437,12 @@ impl Store for ShadowStore {
         if let Err(e) = fs::set_permissions(&abs, fs::Permissions::from_mode(attr.perm as u32)) {
             log::warn!("create：设置 {} 权限失败：{e}", abs.display());
         }
-        let ino = self.inodes.lock().unwrap().intern(child_rel);
+        let ino = self.inodes.lock().intern(child_rel);
         Ok(ino)
     }
 
     fn mkdir(&self, parent: Ino, name: &str, attr: Attr) -> io::Result<Ino> {
-        let _ns = self.ns.lock().unwrap();
+        let _ns = self.ns.lock();
         super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
@@ -452,13 +453,13 @@ impl Store for ShadowStore {
         if let Err(e) = fs::set_permissions(&abs, fs::Permissions::from_mode(attr.perm as u32)) {
             log::warn!("mkdir：设置 {} 权限失败：{e}", abs.display());
         }
-        let ino = self.inodes.lock().unwrap().intern(child_rel);
+        let ino = self.inodes.lock().intern(child_rel);
         Ok(ino)
     }
 
     fn unlink(&self, parent: Ino, name: &str) -> io::Result<()> {
         // ns 锁全程持有：使「remove_file → 清 sessions/readers/inodes 三表」原子（阶段 D3）。
-        let _ns = self.ns.lock().unwrap();
+        let _ns = self.ns.lock();
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
@@ -466,30 +467,30 @@ impl Store for ShadowStore {
         let abs = self.abs_of(&child_rel);
         fs::remove_file(&abs)?;
         // 丢弃可能残留的写会话 + 缓存 reader + 映射项。
-        if let Some(ino) = self.inodes.lock().unwrap().by_path.get(&child_rel).copied() {
-            self.sessions.lock().unwrap().remove(&ino);
+        if let Some(ino) = self.inodes.lock().by_path.get(&child_rel).copied() {
+            self.sessions.lock().remove(&ino);
             self.invalidate_reader(ino);
         }
-        self.inodes.lock().unwrap().remove_path(&child_rel);
+        self.inodes.lock().remove_path(&child_rel);
         Ok(())
     }
 
     fn rmdir(&self, parent: Ino, name: &str) -> io::Result<()> {
-        let _ns = self.ns.lock().unwrap();
+        let _ns = self.ns.lock();
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
         let child_rel = parent_rel.join(name);
         let abs = self.abs_of(&child_rel);
         fs::remove_dir(&abs)?;
-        self.inodes.lock().unwrap().remove_path(&child_rel);
+        self.inodes.lock().remove_path(&child_rel);
         Ok(())
     }
 
     fn rename(&self, old: (Ino, &str), new: (Ino, &str)) -> io::Result<()> {
         // ns 锁全程持有：overwritten_ino 快照与 fs::rename 同临界区取得（消除快照过期），
         // 「失效 victim 三表 → rename_path」整段原子（阶段 D3）。
-        let _ns = self.ns.lock().unwrap();
+        let _ns = self.ns.lock();
         super::validate_name(old.1)?;
         super::validate_name(new.1)?;
         let old_parent_rel = self
@@ -502,14 +503,14 @@ impl Store for ShadowStore {
         let new_rel = new_parent_rel.join(new.1);
         // 若目标已存在（被 rename 原子覆盖），其旧 ino 的缓存 reader / 写会话指向的内容即将被
         // old 的内容替换，须一并失效 + 清映射，防陈旧读（rust-review M2）。
-        let overwritten_ino = self.inodes.lock().unwrap().by_path.get(&new_rel).copied();
+        let overwritten_ino = self.inodes.lock().by_path.get(&new_rel).copied();
         fs::rename(self.abs_of(&old_rel), self.abs_of(&new_rel))?;
         if let Some(victim) = overwritten_ino {
-            self.sessions.lock().unwrap().remove(&victim);
+            self.sessions.lock().remove(&victim);
             self.invalidate_reader(victim);
-            self.inodes.lock().unwrap().remove_path(&new_rel);
+            self.inodes.lock().remove_path(&new_rel);
         }
-        self.inodes.lock().unwrap().rename_path(&old_rel, &new_rel);
+        self.inodes.lock().rename_path(&old_rel, &new_rel);
         Ok(())
     }
 
@@ -528,7 +529,7 @@ impl Store for ShadowStore {
                 continue;
             };
             let child_rel = dir_rel.join(&name);
-            let ino = self.inodes.lock().unwrap().intern(child_rel);
+            let ino = self.inodes.lock().intern(child_rel);
             let kind = match dent.file_type() {
                 Ok(ft) if ft.is_dir() => fuser::FileType::Directory,
                 Ok(ft) if ft.is_symlink() => fuser::FileType::Symlink,
@@ -551,7 +552,7 @@ impl Store for ShadowStore {
     }
 
     fn symlink(&self, parent: Ino, name: &str, target: &Path) -> io::Result<Attr> {
-        let _ns = self.ns.lock().unwrap();
+        let _ns = self.ns.lock();
         super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
@@ -560,7 +561,7 @@ impl Store for ShadowStore {
         let abs = self.abs_of(&child_rel);
         std::os::unix::fs::symlink(target, &abs)?;
         let meta = fs::symlink_metadata(&abs)?;
-        let ino = self.inodes.lock().unwrap().intern(child_rel);
+        let ino = self.inodes.lock().intern(child_rel);
         Ok(self.attr_from_meta(ino, &meta, &abs))
     }
 
@@ -587,7 +588,7 @@ impl Store for ShadowStore {
 
     fn get_block(&self, ino: Ino, idx: u64) -> io::Result<Option<StoredBlock>> {
         // 1) read-through 脏会话。
-        if let Some(s) = self.sessions.lock().unwrap().get(&ino) {
+        if let Some(s) = self.sessions.lock().get(&ino) {
             if let Some(blk) = s.dirty.get(&idx) {
                 return Ok(Some(blk.clone()));
             }
@@ -620,7 +621,7 @@ impl Store for ShadowStore {
 
     fn block_geometry(&self, ino: Ino) -> Option<(u64, u32)> {
         // 脏会话优先。
-        if let Some(s) = self.sessions.lock().unwrap().get(&ino) {
+        if let Some(s) = self.sessions.lock().get(&ino) {
             return Some((s.size, s.chunk_size));
         }
         // 经缓存 reader 取 footer 几何，避免每次 read 都重开 archive（rwfs::read_range 每读一次）。
@@ -630,7 +631,7 @@ impl Store for ShadowStore {
     }
 
     fn put_block(&self, ino: Ino, idx: u64, blk: StoredBlock, new_size: u64) -> io::Result<()> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let s = self.ensure_session(ino, &mut sessions)?;
         s.dirty.insert(idx, blk);
         s.size = new_size;
@@ -638,7 +639,7 @@ impl Store for ShadowStore {
     }
 
     fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> io::Result<()> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let s = self.ensure_session(ino, &mut sessions)?;
         // 丢弃脏块中 >= keep_from 的，并记录截断点（提交时一并应用到底层）。
         s.dirty.retain(|&i, _| i < keep_from);
@@ -697,7 +698,7 @@ impl Store for ShadowStore {
         verbatim: bool,
         rawlen: u64,
     ) -> io::Result<()> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock();
         let s = self.ensure_session(ino, &mut sessions)?;
         s.head_cache = Some((stored_bytes, verbatim, rawlen));
         Ok(())
@@ -706,7 +707,7 @@ impl Store for ShadowStore {
     fn read_head_cache(&self, ino: Ino, off: u64, len: u64) -> io::Result<Option<(Vec<u8>, bool)>> {
         // 有挂起写会话时跳过快路径：脏块 0 可能与盘上 head 缓存不一致（如块 0 刚被 RMW 尚未
         // 提交）→ 回退逐块路径（get_block read-through 脏块）。fsync 后会话移除、快路径恢复。
-        if self.sessions.lock().unwrap().contains_key(&ino) {
+        if self.sessions.lock().contains_key(&ino) {
             return Ok(None);
         }
         let Some(reader) = self.cached_reader(ino)? else {
@@ -734,7 +735,7 @@ impl Store for ShadowStore {
     }
 
     fn sync_all(&self) -> io::Result<()> {
-        let inos: Vec<u64> = self.sessions.lock().unwrap().keys().copied().collect();
+        let inos: Vec<u64> = self.sessions.lock().keys().copied().collect();
         for ino in inos {
             self.commit_session(ino)?;
         }
@@ -924,7 +925,7 @@ mod tests {
             Some(&b"AAAAAAAA"[..])
         );
         assert!(
-            store.readers.lock().unwrap().contains_key(&ino),
+            store.readers.lock().contains_key(&ino),
             "首次读后应缓存 reader"
         );
         // 再读应命中同一缓存（内容仍正确）。
@@ -944,13 +945,13 @@ mod tests {
             read_plain(&store, ino, 0).as_deref(),
             Some(&b"AAAAAAAA"[..])
         );
-        assert!(store.readers.lock().unwrap().contains_key(&ino));
+        assert!(store.readers.lock().contains_key(&ino));
 
         // 第二次写覆盖块0，提交：提交应淘汰缓存。
         store.put_block(ino, 0, mk_block(b"ZZZZZZZZ"), 8).unwrap();
         store.fsync(ino).unwrap();
         assert!(
-            !store.readers.lock().unwrap().contains_key(&ino),
+            !store.readers.lock().contains_key(&ino),
             "提交后缓存 reader 必须失效"
         );
         // 再读必须看到新数据（绝不读陈旧 footer/index）。
@@ -967,10 +968,10 @@ mod tests {
         store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
         store.fsync(ino).unwrap();
         let _ = read_plain(&store, ino, 0);
-        assert!(store.readers.lock().unwrap().contains_key(&ino));
+        assert!(store.readers.lock().contains_key(&ino));
         store.release(ino);
         assert!(
-            !store.readers.lock().unwrap().contains_key(&ino),
+            !store.readers.lock().contains_key(&ino),
             "release 后应释放缓存 reader"
         );
     }
@@ -1027,7 +1028,7 @@ mod tests {
             read_plain(&store, dst_ino, 0).as_deref(),
             Some(&b"OLDOLDOL"[..])
         );
-        assert!(store.readers.lock().unwrap().contains_key(&dst_ino));
+        assert!(store.readers.lock().contains_key(&dst_ino));
 
         // 源文件 f.bin（store_with_file 建的）写入新内容并提交。
         let src = store.lookup(ROOT_INO, "f.bin").unwrap();
@@ -1041,7 +1042,7 @@ mod tests {
             .rename((ROOT_INO, "f.bin"), (ROOT_INO, "dst.bin"))
             .unwrap();
         assert!(
-            !store.readers.lock().unwrap().contains_key(&dst_ino),
+            !store.readers.lock().contains_key(&dst_ino),
             "被覆盖目标的旧缓存 reader 必须失效"
         );
         // 经新路径读 dst.bin，必须看到 f.bin 的内容（NEW），不得读到旧 OLD。
@@ -1069,10 +1070,7 @@ mod tests {
             read_plain(&store, ino, 0).as_deref(),
             Some(&b"AAAAAAAA"[..])
         );
-        assert!(
-            store.readers.lock().unwrap().contains_key(&ino),
-            "读后应缓存 reader"
-        );
+        assert!(store.readers.lock().contains_key(&ino), "读后应缓存 reader");
 
         // 再写块0，武装「下次 commit_session 的 up.sync() 返 EIO」。
         store.put_block(ino, 0, mk_block(b"ZZZZZZZZ"), 8).unwrap();
@@ -1085,7 +1083,7 @@ mod tests {
 
         // 不变量：sync 失败提前返回，但 reader 缓存已在 sync 前失效，后续读不命中陈旧 footer。
         assert!(
-            !store.readers.lock().unwrap().contains_key(&ino),
+            !store.readers.lock().contains_key(&ino),
             "sync 失败后旧 reader 缓存必已失效（invalidate 先于 up.sync）"
         );
     }
@@ -1292,7 +1290,7 @@ mod tests {
 
     /// inodes 三/双向表自洽断言：by_ino 与 by_path 互为逆，无悬挂项。
     fn assert_inode_map_consistent(store: &ShadowStore) {
-        let m = store.inodes.lock().unwrap();
+        let m = store.inodes.lock();
         for (ino, path) in m.by_ino.iter() {
             assert_eq!(
                 m.by_path.get(path).copied(),
@@ -1408,8 +1406,8 @@ mod tests {
             assert_inode_map_consistent(&store);
             // 残存映射项对应的 ino 不应留有孤儿写会话（被清/被覆盖的 ino 不得悬挂在 sessions）。
             let live: std::collections::HashSet<u64> =
-                store.inodes.lock().unwrap().by_ino.keys().copied().collect();
-            let sess: Vec<u64> = store.sessions.lock().unwrap().keys().copied().collect();
+                store.inodes.lock().by_ino.keys().copied().collect();
+            let sess: Vec<u64> = store.sessions.lock().keys().copied().collect();
             for ino in sess {
                 assert!(
                     live.contains(&ino),

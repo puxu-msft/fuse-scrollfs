@@ -26,6 +26,7 @@
 //! 未 flush 的尾块在内存（与 page cache 未刷一致）；fsync/flush 必须先 `seal` 把尾块封块
 //! 落 Store，再由 Store 持久化，符合 POSIX fsync 契约（§10）。
 
+use parking_lot::Mutex;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -74,7 +75,7 @@ pub struct TailSessions {
     /// 累计封块次数（含每次「把尾块压缩落 Store」），基准量化重压次数用。
     seal_count: AtomicU64,
     /// 便捷 API 专用 per-inode 状态（compact/bench 单线程驱动；生产 rwfs 不用——见结构体文档）。
-    legacy_states: std::sync::Mutex<std::collections::HashMap<u64, InodeState>>,
+    legacy_states: Mutex<std::collections::HashMap<u64, InodeState>>,
 }
 
 impl TailSessions {
@@ -83,7 +84,7 @@ impl TailSessions {
         Self {
             enabled,
             seal_count: AtomicU64::new(0),
-            legacy_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+            legacy_states: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -103,7 +104,7 @@ impl TailSessions {
 
     /// 便捷 API：取逻辑几何（含未封尾块）。见 [`Self::geometry_locked`]。
     pub fn geometry(&self, store: &dyn Store, ino: u64) -> Option<(u64, u32)> {
-        let states = self.legacy_states.lock().unwrap();
+        let states = self.legacy_states.lock();
         match states.get(&ino) {
             // 有缓冲项：经核心读其 file_size（含未封尾块）。
             Some(s) => self.geometry_locked(store, ino, s),
@@ -121,14 +122,14 @@ impl TailSessions {
         data: &[u8],
         params: &CodecParams,
     ) -> io::Result<usize> {
-        let mut states = self.legacy_states.lock().unwrap();
+        let mut states = self.legacy_states.lock();
         let state = states.entry(ino).or_default();
         self.write_at_locked(store, ino, state, offset, data, params)
     }
 
     /// 便捷 API：fsync 封尾（保留缓冲）。见 [`Self::seal_locked`]。
     pub fn seal(&self, store: &dyn Store, ino: u64, params: &CodecParams) -> io::Result<()> {
-        let mut states = self.legacy_states.lock().unwrap();
+        let mut states = self.legacy_states.lock();
         let state = states.entry(ino).or_default();
         self.seal_locked(store, ino, state, params)
     }

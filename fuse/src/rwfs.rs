@@ -11,8 +11,9 @@
 //! 跨 inode 操作（rename）由 Store 内部事务/底层 FS 保证一致，前端不额外加全局锁
 //! （首版：跨目录原子性以后端契约为准，§10）。
 
+use parking_lot::RwLock;
 use std::ffi::OsStr;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
@@ -171,7 +172,7 @@ impl ZipfsRw {
     fn forget_inode_locked(&self, ino: u64) {
         {
             let lock = self.lock_for(ino);
-            let mut guard = lock.write().unwrap();
+            let mut guard = lock.write();
             self.block_cache.invalidate(ino);
             self.tails.forget_locked(&mut guard);
         }
@@ -187,7 +188,7 @@ impl ZipfsRw {
     fn forget_inode_flush(&self, ino: u64) {
         let sealed = {
             let lock = self.lock_for(ino);
-            let mut guard = lock.write().unwrap();
+            let mut guard = lock.write();
             self.block_cache.invalidate(ino);
             match self
                 .tails
@@ -248,7 +249,7 @@ impl ZipfsRw {
     fn overlay_tail_size(&self, mut a: Attr) -> Attr {
         if a.kind == FileType::RegularFile {
             let lock = self.lock_for(a.ino);
-            let guard = lock.read().unwrap();
+            let guard = lock.read();
             if let Some((size, _cs)) =
                 self.tails
                     .geometry_locked(self.store.as_ref(), a.ino, &guard)
@@ -268,7 +269,7 @@ impl ZipfsRw {
     /// 同 inode 的读写并发少，串行化代价可忽略；正确性优先（§10）。
     fn read_range(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
         let lock = self.lock_for(ino);
-        let guard = lock.read().unwrap();
+        let guard = lock.read();
         let Some((uncompressed_size, chunk_size)) =
             self.tails.geometry_locked(self.store.as_ref(), ino, &guard)
         else {
@@ -536,7 +537,7 @@ impl Filesystem for ZipfsRw {
         reply: ReplyWrite,
     ) {
         let lock = self.lock_for(ino.0);
-        let mut guard = lock.write().unwrap();
+        let mut guard = lock.write();
         match self.write_at_locked(ino.0, &mut guard, offset, data) {
             Ok(n) => reply.written(n as u32),
             Err(e) => reply.error(io_to_errno(&e)),
@@ -681,7 +682,7 @@ impl Filesystem for ZipfsRw {
         // 同 ino 的尾块缓冲与底层路径变动产生不一致（封块是幂等的安全操作）。
         if let Some(src) = self.store.lookup(parent.0, name).map(|a| a.ino) {
             let lock = self.lock_for(src);
-            let mut guard = lock.write().unwrap();
+            let mut guard = lock.write();
             self.block_cache.invalidate(src);
             if let Err(e) =
                 self.tails
@@ -728,7 +729,7 @@ impl Filesystem for ZipfsRw {
         // truncate / extend：走 Core 写编排（持 inode 写锁）。先封开放尾块再截断。
         if let Some(new_size) = size {
             let lock = self.lock_for(ino.0);
-            let mut guard = lock.write().unwrap();
+            let mut guard = lock.write();
             self.block_cache.invalidate(ino.0);
             if let Err(e) = self.tails.truncate_locked(
                 self.store.as_ref(),
@@ -784,7 +785,7 @@ impl Filesystem for ZipfsRw {
     ) {
         // 持 inode 写锁再封块 + 提交，避免与并发 write/truncate 的 RMW 序列交错（rust-review C1）。
         let lock = self.lock_for(ino.0);
-        let mut guard = lock.write().unwrap();
+        let mut guard = lock.write();
         self.block_cache.invalidate(ino.0);
         if let Err(e) = self
             .tails
@@ -813,7 +814,7 @@ impl Filesystem for ZipfsRw {
         // 持 inode 写锁再封块 + 提交（rust-review C1）：fsync 须先把开放尾块封块落 Store，
         // 再让 Store 持久化，符合 POSIX fsync 契约（§10），且不能与同 inode 的 RMW 交错。
         let lock = self.lock_for(ino.0);
-        let mut guard = lock.write().unwrap();
+        let mut guard = lock.write();
         self.block_cache.invalidate(ino.0);
         if let Err(e) = self
             .tails
@@ -846,7 +847,7 @@ impl Filesystem for ZipfsRw {
         // 注意：close 不保证 durability（那是 fsync 的职责），此处尽力而为。
         {
             let lock = self.lock_for(ino.0);
-            let mut guard = lock.write().unwrap();
+            let mut guard = lock.write();
             self.block_cache.invalidate(ino.0);
             if let Err(e) =
                 self.tails
@@ -992,7 +993,7 @@ mod tests {
         let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
         {
             let lock = fs.lock_for(ino);
-            let mut g = lock.write().unwrap();
+            let mut g = lock.write();
             fs.tails
                 .write_at_locked(store.as_ref(), ino, &mut g, 0, &base, &fs.params)
                 .unwrap();
@@ -1005,7 +1006,7 @@ mod tests {
         let extra = b"appended-session-line\n";
         {
             let lock = fs.lock_for(ino);
-            let mut g = lock.write().unwrap();
+            let mut g = lock.write();
             fs.tails
                 .write_at_locked(store.as_ref(), ino, &mut g, cs as u64, extra, &fs.params)
                 .unwrap();
@@ -1054,7 +1055,7 @@ mod tests {
         let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
         {
             let lock = fs.lock_for(ino);
-            let mut g = lock.write().unwrap();
+            let mut g = lock.write();
             fs.tails
                 .write_at_locked(store.as_ref(), ino, &mut g, 0, &base, &fs.params)
                 .unwrap();
@@ -1067,7 +1068,7 @@ mod tests {
         let extra = b"appended-session-line\n";
         {
             let lock = fs.lock_for(ino);
-            let mut g = lock.write().unwrap();
+            let mut g = lock.write();
             fs.tails
                 .write_at_locked(store.as_ref(), ino, &mut g, cs as u64, extra, &fs.params)
                 .unwrap();
@@ -1135,7 +1136,7 @@ mod tests {
                 let mut n = 0u64;
                 while !stop.load(AOrd::Relaxed) {
                     let lock = fs.lock_for(ino);
-                    let mut g = lock.write().unwrap();
+                    let mut g = lock.write();
                     // 追加到当前几何尾部（含未封尾块），保持纯 append 快路径。
                     let off = fs
                         .tails
@@ -1471,7 +1472,7 @@ mod tests {
         {
             // 经 write_at_locked（持写锁、写前无条件失效）改写块 1 内一段。
             let lock = fs.lock_for(ino);
-            let mut g = lock.write().unwrap();
+            let mut g = lock.write();
             fs.write_at_locked(ino, &mut g, b1, &newbytes).unwrap();
         }
         let after = fs.read_range(ino, b1, 100).unwrap();

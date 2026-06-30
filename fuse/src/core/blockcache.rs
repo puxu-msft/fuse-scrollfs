@@ -27,8 +27,9 @@
 //! [`AvailableMemory`] 抽象（生产读 `/proc/meminfo`），按 `probe_interval` 节流。低内存自动缩
 //! `eff_cap` 直至 0（清空自身占用）。
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 默认缓存字节上限（128 MiB）。0 = 禁用。
@@ -94,7 +95,7 @@ pub struct BlockCache {
 
 impl std::fmt::Debug for BlockCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock();
         f.debug_struct("BlockCache")
             .field("configured_cap", &self.configured_cap)
             .field("eff_cap", &g.eff_cap)
@@ -147,7 +148,7 @@ impl BlockCache {
         if self.configured_cap == 0 {
             return None;
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         let g = &mut *g;
         let key = (ino, idx);
         if !g.map.contains_key(&key) {
@@ -172,7 +173,7 @@ impl BlockCache {
         if self.configured_cap == 0 {
             return;
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         self.refresh_effective_cap(&mut g);
         let key = (ino, idx);
         let blen = bytes.len();
@@ -215,7 +216,7 @@ impl BlockCache {
         if self.configured_cap == 0 {
             return;
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock();
         let Some(idxs) = g.by_ino.remove(&ino) else {
             return;
         };
@@ -256,23 +257,23 @@ impl BlockCache {
 
     #[cfg(test)]
     fn cur_bytes(&self) -> usize {
-        self.inner.lock().unwrap().cur_bytes
+        self.inner.lock().cur_bytes
     }
 
     #[cfg(test)]
     fn eff_cap(&self) -> usize {
-        self.inner.lock().unwrap().eff_cap
+        self.inner.lock().eff_cap
     }
 
     #[cfg(test)]
     fn entry_count(&self) -> usize {
-        self.inner.lock().unwrap().map.len()
+        self.inner.lock().map.len()
     }
 
     /// 测试用：`by_ino` 索引覆盖的 ino 数（验证索引不泄漏、与 map 一致）。
     #[cfg(test)]
     fn ino_index_len(&self) -> usize {
-        self.inner.lock().unwrap().by_ino.len()
+        self.inner.lock().by_ino.len()
     }
 }
 
@@ -316,7 +317,7 @@ mod tests {
             }
         }
         fn set(&self, v: Option<u64>) {
-            *self.avail.lock().unwrap() = v;
+            *self.avail.lock() = v;
         }
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
@@ -326,7 +327,7 @@ mod tests {
     impl AvailableMemory for FakeMem {
         fn available_bytes(&self) -> Option<u64> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.avail.lock().unwrap()
+            *self.avail.lock()
         }
     }
 

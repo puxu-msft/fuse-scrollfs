@@ -68,6 +68,10 @@ crossterm = "0.29.0"
 # per-inode 分片并发表（D4-b）：locks 表从 Mutex<HashMap> 改 DashMap，锁包住 InodeState 数据，
 # entry/remove_if 在同 key 同 shard 锁内串行 → 与旧 std 版「单活锁」不变量等价，且降全表锁争用。
 dashmap = "6"
+# 热路径锁去毒化（C-6）：std 锁单线程持锁 panic 会毒化锁 → 整挂载级联拒服务（DoS）。
+# parking_lot 锁无毒化语义（panic 后正常释放，其他 fuser worker 可继续），lock()/read()/write()
+# 直接返回 guard。仅替换多线程 FUSE 数据/存储热路径的 std 锁，atomic/Arc/OnceLock 保持 std。
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
