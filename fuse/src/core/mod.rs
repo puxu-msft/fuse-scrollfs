@@ -24,6 +24,23 @@ pub mod wsession;
 /// 仍可 `--chunk-size` 覆盖。原 64KiB 默认（§6.1「不默认 256KiB」）按真实数据退役。
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// chunk_size 上限（64 MiB）。块缓冲是 `vec![0u8; chunk_size]`（ingest/RMW/seal 各处），
+/// 用户给的 `--chunk-size` 接近 u32::MAX 会一次性分配数 GB → OOM/DoS。封存最大 8MiB，
+/// 64 MiB 上限远高于任何合理用途，把病态值挡在 CLI 边界（评审：CLI 无 chunk-size 上限）。
+pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
+
+/// 校验用户给定的 chunk_size：非 0、不超 [`MAX_CHUNK_SIZE`]。0 在部分路径表"用默认"，
+/// 故仅在 >MAX 时拒绝；调用方对 0 的语义自行处理。
+pub fn validate_chunk_size(chunk_size: u32) -> std::io::Result<()> {
+    if chunk_size > MAX_CHUNK_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("chunk_size {chunk_size} 超上限 {MAX_CHUNK_SIZE}（64MiB）——过大块缓冲会 OOM"),
+        ));
+    }
+    Ok(())
+}
+
 /// 默认 zstd 压缩等级（3）。`--level` 可覆盖。
 ///
 /// 保持 3 而非 19：活跃写负载下 19 的 CPU 代价 25–100x，比值仅 +13~16%（1MiB/L3=13.7x→L19=15.9x），
@@ -121,6 +138,18 @@ pub fn fsync_dir_of(path: &std::path::Path) {
 mod tests {
     use super::system_time_from;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn validate_chunk_size_rejects_oversize() {
+        assert!(super::validate_chunk_size(0).is_ok(), "0=用默认，放行");
+        assert!(super::validate_chunk_size(super::DEFAULT_CHUNK_SIZE as u32).is_ok());
+        assert!(super::validate_chunk_size(super::MAX_CHUNK_SIZE).is_ok());
+        assert!(
+            super::validate_chunk_size(super::MAX_CHUNK_SIZE + 1).is_err(),
+            "超 64MiB 上限须拒绝（防 OOM）"
+        );
+        assert!(super::validate_chunk_size(u32::MAX).is_err());
+    }
 
     #[test]
     fn system_time_from_maps_valid_and_clamps_extremes() {

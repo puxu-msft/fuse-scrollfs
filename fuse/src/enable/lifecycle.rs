@@ -46,6 +46,7 @@ pub fn apply(
     let meta_path = paths.meta_path(name);
 
     // ── 前置校验 ──
+    crate::core::validate_chunk_size(opts.chunk_size)?; // 评审：挡过大 chunk_size 的 OOM
     if orig.exists() {
         return Err(err(format!(
             "{} 已存在备份（疑似已切换），先 restore",

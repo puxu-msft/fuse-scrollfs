@@ -343,6 +343,7 @@ struct IngestArgs {
 
 /// 流式灌入源目录到 shadow 树，报告文件数/压缩比/校验。
 fn run_ingest(args: IngestArgs) -> std::io::Result<()> {
+    zipfs::core::validate_chunk_size(args.chunk_size)?;
     let s = zipfs::ingest::ingest_tree(
         &args.src,
         &args.backing,
@@ -364,6 +365,15 @@ fn run_ingest(args: IngestArgs) -> std::io::Result<()> {
         s.bytes_archive,
         s.ratio()
     );
+    // 评审 C2：退出码必须反映失败，否则外层脚本据 `ingest` 成功删/盖源 → 真实数据丢失。
+    // errors（个别文件灌入/校验失败）或 skipped（特殊文件无法表示）任一非零都判失败。
+    if !s.errors.is_empty() || s.skipped > 0 {
+        return Err(std::io::Error::other(format!(
+            "ingest 未完全成功：errors={} skipped={}（退出非零，勿据此删除源）",
+            s.errors.len(),
+            s.skipped
+        )));
+    }
     Ok(())
 }
 
@@ -574,6 +584,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
     // backend 缺省回退 passthrough（保持原 `default_value_t = Backend::Passthrough` 行为，
     // 向后兼容 `zipfs --backing ... --mountpoint ...` 不带 --backend 的 P0 透传用法）。
     let backend = args.backend.unwrap_or(Backend::Passthrough);
+    zipfs::core::validate_chunk_size(args.chunk_size)?;
     let backing = args.backing.ok_or_else(|| missing("--backing"))?;
     let mountpoint = args.mountpoint.ok_or_else(|| missing("--mountpoint"))?;
 
