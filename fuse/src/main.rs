@@ -226,7 +226,13 @@ fn home_or_err() -> std::io::Result<PathBuf> {
 fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
-    let spec = zipfs::enable::systemd::resolve_managed_spec(&paths, &name)?;
+    // 评审 H1：unescape 有损（裸 `-`→`/`），非法 %i 会被扭曲。出错时附原始实例名便于反查。
+    let spec = zipfs::enable::systemd::resolve_managed_spec(&paths, &name).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
+        )
+    })?;
     info!(
         "systemd 托管挂载：name={name} backing={}",
         spec.backing.display()
@@ -239,7 +245,12 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     use zipfs::enable::daemon::Mounter;
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
-    zipfs::enable::model::validate_name(&name)?;
+    zipfs::enable::model::validate_name(&name).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
+        )
+    })?;
     zipfs::enable::daemon::RealMounter.unmount(&name, &paths.mountpoint(&name))
 }
 

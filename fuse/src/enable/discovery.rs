@@ -266,6 +266,7 @@ pub fn detect_activity(path: &Path) -> Activity {
 /// 扫 `/proc/[pid]/fd/*` 与 `/proc/[pid]/cwd`，若有进程在 `target` 子树持 fd 或以其为 cwd 则返回原因。
 fn scan_proc_for_holders(target: &Path) -> Option<String> {
     let rd = fs::read_dir("/proc").ok()?;
+    let mut eacces_skipped = 0u32; // 评审 C3：他人 uid 进程 fd 目录不可读，计数使"拦截盲区"可观测
     for dent in rd.flatten() {
         let pid_name = dent.file_name();
         let pid_str = pid_name.to_string_lossy();
@@ -279,19 +280,30 @@ fn scan_proc_for_holders(target: &Path) -> Option<String> {
                 return Some(format!("pid {pid_str} 以此为 cwd"));
             }
         }
-        // 打开的 fd（他人进程目录 EACCES → 静默跳过）。
-        if let Ok(fds) = fs::read_dir(base.join("fd")) {
-            for fd in fds.flatten() {
-                if let Ok(p) = fs::read_link(fd.path()) {
-                    if p.starts_with(target) {
-                        let comm = fs::read_to_string(base.join("comm"))
-                            .map(|s| s.trim().to_string())
-                            .unwrap_or_default();
-                        return Some(format!("pid {pid_str} ({comm}) 持有打开 fd"));
+        // 打开的 fd（他人进程目录 EACCES → 跳过，但计数）。
+        match fs::read_dir(base.join("fd")) {
+            Ok(fds) => {
+                for fd in fds.flatten() {
+                    if let Ok(p) = fs::read_link(fd.path()) {
+                        if p.starts_with(target) {
+                            let comm = fs::read_to_string(base.join("comm"))
+                                .map(|s| s.trim().to_string())
+                                .unwrap_or_default();
+                            return Some(format!("pid {pid_str} ({comm}) 持有打开 fd"));
+                        }
                     }
                 }
             }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => eacces_skipped += 1,
+            Err(_) => {} // 进程已退出等 → 忽略
         }
+    }
+    // 未发现持有者，但若有进程无法探测，活跃检测可能不完整——告警，避免"无活跃"被误读为可靠。
+    if eacces_skipped > 0 {
+        log::warn!(
+            "活跃检测：{eacces_skipped} 个他人 uid 进程的 fd 不可探测（若 claude 以不同用户运行，\
+             fd 持有探测会漏判，仅余 mtime 窗口兜底）"
+        );
     }
     None
 }

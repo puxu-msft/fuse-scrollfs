@@ -162,7 +162,15 @@ pub fn apply(
 
     // ── 写提交标记（write_meta 自身 fsync sidecar + 父目录）→ 此刻起 committed，可挂载 ──
     let meta = Meta::from_apply(&opts, stats.bytes_src, stats.bytes_archive, now_unix());
-    discovery::write_meta(&meta_path, &meta)?;
+    // 评审 M3：write_meta 失败（ENOSPC 等）时 backing 已完整 + fsync，仅差提交标记 → 项目落
+    // Broken（orig+backing 都在，数据安全）。给出明确指引而非裸 io error，避免用户误判数据丢失。
+    if let Err(e) = discovery::write_meta(&meta_path, &meta) {
+        return Err(err(format!(
+            "写提交标记失败：{e}；backing 已完整灌入并 fsync、源安全保留在 {}（项目状态 Broken）。\
+             腾出空间后 `enable reingest {name}` 重建，或 `enable restore {name}` 回到 Plain",
+            orig.display()
+        )));
+    }
 
     // ── 挂载守护；失败时 backing 已 committed → 保留切换态为 STOPPED，绝不删已提交 backing ──
     // Bug B：旧码无条件 rollback_to_plain → remove_backing，把一个已 ingest 完整 + 逐字节
