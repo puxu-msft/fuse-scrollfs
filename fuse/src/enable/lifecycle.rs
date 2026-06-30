@@ -613,10 +613,17 @@ fn rollback_to_plain(mp: &Path, orig: &Path, backing: &Path, meta_path: &Path) -
         let _ = fs::rename(orig, mp);
         fsync_parent(mp);
     }
-    let _ = remove_backing(backing);
+    // 评审 M2：删 backing 失败要 warn 且纳入回滚完整性判定——否则 rollback_msg 谎称"已回滚"
+    // 而磁盘上躺着孤儿 backing（下次 apply 撞 backing_occupied 才暴露）。
+    if let Err(e) = remove_backing(backing) {
+        log::warn!(
+            "rollback：删 backing {} 失败：{e}（残留，需 `enable purge`）",
+            backing.display()
+        );
+    }
     let _ = fs::remove_file(meta_path);
-    // Plain 不变式：源回到挂载点且无遗留备份。任一不满足即回滚未完成（源安全留在 orig）。
-    mp.exists() && !orig.exists()
+    // Plain 不变式：源回到挂载点、无遗留备份、且无残留 backing/meta。任一不满足即回滚未完成。
+    mp.exists() && !orig.exists() && !backing.exists() && !meta_path.exists()
 }
 
 /// 构造「失败 + 回滚」错误：如实反映回滚是否完成，绝不在残留 BROKEN 时谎称已回滚。
@@ -671,6 +678,38 @@ mod tests {
     use super::*;
     use crate::enable::daemon::fake::FakeMounter;
     use crate::enable::model::ProjectStatus;
+
+    #[test]
+    fn rollback_to_plain_reports_incomplete_when_backing_residue() {
+        // 评审 M2：删 backing 失败时 rollback 必须返回 false（未完整回滚），不谎称已回 Plain。
+        use std::os::unix::fs::PermissionsExt;
+        // root 无视目录权限位，注入不成立 → 跳过（CI 可能以 root 跑）。
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mp = tmp.path().join("proj");
+        let orig = tmp.path().join("proj.zipfs-orig");
+        let backing = tmp.path().join("backdir");
+        let meta = tmp.path().join("p.zipfs.meta");
+        // 源已 mv 到 orig（apply 中段态），backing 是含一个文件的目录。
+        fs::create_dir(&orig).unwrap();
+        fs::write(orig.join("a.jsonl"), b"data").unwrap();
+        fs::create_dir(&backing).unwrap();
+        fs::write(backing.join("inner"), b"x").unwrap();
+        // 把 backing 设为只读 → 非 root 无法删除其条目 → remove_dir_all 失败、backing 残留。
+        fs::set_permissions(&backing, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let ok = rollback_to_plain(&mp, &orig, &backing, &meta);
+        // 还原权限以便 TempDir 清理。
+        let _ = fs::set_permissions(&backing, fs::Permissions::from_mode(0o755));
+
+        assert!(mp.join("a.jsonl").exists(), "源应已还原到挂载点");
+        assert!(
+            !ok,
+            "backing 残留时 rollback 须报未完成，不谎称已回滚（评审 M2）"
+        );
+    }
 
     /// 构造隔离 Paths（直接给路径，绕过 env）。
     fn paths_in(root: &Path) -> Paths {
