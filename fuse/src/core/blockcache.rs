@@ -222,7 +222,13 @@ impl BlockCache {
         for idx in idxs {
             if let Some(node) = g.map.remove(&(ino, idx)) {
                 g.order.remove(&node.seq);
-                g.cur_bytes -= node.bytes.len();
+                debug_assert!(
+                    g.cur_bytes >= node.bytes.len(),
+                    "cur_bytes 记账漂移：cur_bytes={} < node={}",
+                    g.cur_bytes,
+                    node.bytes.len()
+                );
+                g.cur_bytes = g.cur_bytes.saturating_sub(node.bytes.len());
             }
         }
     }
@@ -274,7 +280,13 @@ impl BlockCache {
 fn remove_key(g: &mut Inner, key: (u64, u64)) {
     if let Some(node) = g.map.remove(&key) {
         g.order.remove(&node.seq);
-        g.cur_bytes -= node.bytes.len();
+        debug_assert!(
+            g.cur_bytes >= node.bytes.len(),
+            "cur_bytes 记账漂移：cur_bytes={} < node={}",
+            g.cur_bytes,
+            node.bytes.len()
+        );
+        g.cur_bytes = g.cur_bytes.saturating_sub(node.bytes.len());
         if let Some(set) = g.by_ino.get_mut(&key.0) {
             set.remove(&key.1);
             if set.is_empty() {

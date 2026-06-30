@@ -564,6 +564,13 @@ impl Store for ContainerStore {
         let Ok(dirents) = txn.open_table(DIRENTS) else {
             return Vec::new();
         };
+        // C-8：在同一读事务内打开 INODES，使 dirent 与 child inode 取自同一快照，消除
+        // 「dirent 在但 child 在两次 begin_read 间被并发 unlink → inode None → unwrap_or
+        // 伪造 RegularFile」的跨事务类型错报。同快照下 dirent 存在则其 inode 必存在（create/
+        // unlink 原子提交），若仍缺失说明该 dirent 是真孤儿，跳过而非伪造类型。
+        let Ok(inodes) = txn.open_table(INODES) else {
+            return Vec::new();
+        };
         let prefix = format!("{dir}/");
         let mut out = Vec::new();
         let Ok(iter) = dirents.iter() else {
@@ -579,12 +586,15 @@ impl Store for ContainerStore {
                 continue;
             }
             let child = row.1.value();
-            let kind = self
-                .read_inode(child)
-                .ok()
-                .flatten()
-                .map(|r| r.kind_to_filetype())
-                .unwrap_or(fuser::FileType::RegularFile);
+            // 同快照读 child inode 行。缺失 → 真孤儿 dirent，跳过（不伪造类型）。
+            let kind = match inodes.get(child) {
+                Ok(Some(v)) => match InodeRow::decode(v.value()) {
+                    Ok(r) => r.kind_to_filetype(),
+                    Err(_) => continue,
+                },
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
             out.push(DirEntry {
                 ino: child,
                 name: name.to_string(),
@@ -937,6 +947,42 @@ mod tests {
         store.unlink(sub, "inner.txt").unwrap();
         store.rmdir(ROOT_INO, "sub").unwrap();
         assert!(store.lookup(ROOT_INO, "sub").is_none(), "空目录应删除");
+    }
+
+    /// C-8：readdir 须在单个读事务内一并读 dirents 与每个 child 的 inode 行（同快照），
+    /// 返回自洽的条目类型——文件报 RegularFile、子目录报 Directory，不靠 unwrap_or 伪造。
+    #[test]
+    fn readdir_reports_consistent_kinds_in_single_txn() {
+        let cs = 4096u32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.redb");
+        let store = ContainerStore::open_with_chunk_size(&path, cs).unwrap();
+
+        let file_ino = new_file(&store, "file.txt", cs);
+        let subdir_ino = store.mkdir(ROOT_INO, "subdir", dir_attr_t(cs)).unwrap();
+
+        let entries = store.readdir(ROOT_INO);
+        let file_entry = entries
+            .iter()
+            .find(|e| e.name == "file.txt")
+            .expect("file.txt 应在 readdir 结果中");
+        let dir_entry = entries
+            .iter()
+            .find(|e| e.name == "subdir")
+            .expect("subdir 应在 readdir 结果中");
+
+        assert_eq!(file_entry.ino, file_ino);
+        assert_eq!(
+            file_entry.kind,
+            fuser::FileType::RegularFile,
+            "文件项应报 RegularFile"
+        );
+        assert_eq!(dir_entry.ino, subdir_ino);
+        assert_eq!(
+            dir_entry.kind,
+            fuser::FileType::Directory,
+            "子目录项应报 Directory，不得被 unwrap_or(RegularFile) 伪造"
+        );
     }
 
     /// compact 后数据仍可读，且物理文件不大于 compact 前（通常显著收缩）。

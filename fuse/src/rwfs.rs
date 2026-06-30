@@ -180,12 +180,16 @@ impl ZipfsRw {
             match self.tails.seal(self.store.as_ref(), ino, &self.params) {
                 Ok(()) => {
                     // 封尾只追加 journal 增量；须 flush 提交 SB 尾指针，否则丢弃内存缓冲后
-                    // 新 reader 看不到未提交的尾字节（与 release 一致）。flush 失败仅 warn。
+                    // 新 reader 看不到未提交的尾字节（与 release 一致）。flush 失败 == 尾字节
+                    // 已 seal 但未提交 SB 尾指针：此时 forget 会丢失已 seal 的尾缓冲 → 静默数据
+                    // 丢失 + 零填充。故视同 seal 失败——保留尾缓冲与锁、不 forget、下次重试。
                     if let Err(e) = self.store.flush(ino) {
-                        warn!("forget：flush ino={ino} 失败：{e}");
+                        warn!("forget：flush ino={ino} 失败：{e}，保留尾缓冲与锁待重试");
+                        false
+                    } else {
+                        self.tails.forget(ino);
+                        true
                     }
-                    self.tails.forget(ino);
-                    true
                 }
                 Err(e) => {
                     warn!("forget：封 ino={ino} 尾块失败：{e}，保留尾缓冲与锁待重试");
@@ -982,12 +986,196 @@ mod tests {
         std::mem::forget(dir);
     }
 
+    /// C-4：forget 路径里 seal 成功但 store.flush 失败时——尾字节已 seal 进 journal 却未提交
+    /// SB 尾指针。旧码仅 warn 仍 forget 内存缓冲 → 新 reader 读不到这些尾字节（静默丢数据 +
+    /// 零填充）。修复后须视同 seal 失败：保留尾缓冲与锁、不 forget、下次重试。
+    #[test]
+    fn forget_flush_failure_preserves_tail_and_lock_no_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = 65536u32;
+        let inner =
+            Arc::new(ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap());
+        let attr = Attr {
+            ino: 0,
+            size: 0,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: SystemTime::UNIX_EPOCH,
+            atime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            chunk_size: cs,
+        };
+        let ino = inner.create(ROOT, "f.bin", attr).unwrap();
+        // flush 注入失败的装饰器（seal/append_tail 仍转发到 inner → seal 成功、flush 报错）。
+        let store = Arc::new(FlushFailStore::new(inner));
+        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs);
+
+        // 写满一个块并封块，使后续 append 落在新开放尾块（同 forget_evicts 测试的真实 append 路径）。
+        let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
+        {
+            let lock = fs.lock_for(ino);
+            let _g = lock.write().unwrap();
+            fs.tails
+                .write_at(store.as_ref(), ino, 0, &base, &fs.params)
+                .unwrap();
+            fs.tails.seal(store.as_ref(), ino, &fs.params).unwrap();
+        }
+        store.fsync(ino).unwrap();
+        // 经尾缓冲追加（建立 tails 缓冲 + 锁项）。
+        let extra = b"appended-session-line\n";
+        {
+            let lock = fs.lock_for(ino);
+            let _g = lock.write().unwrap();
+            fs.tails
+                .write_at(store.as_ref(), ino, cs as u64, extra, &fs.params)
+                .unwrap();
+        }
+
+        // 此后 flush 注入失败。forget 不得丢弃尾缓冲与锁。
+        store.set_flush_fail(true);
+        fs.forget_inode_flush(ino);
+
+        assert!(
+            fs.locks.lock().unwrap().contains_key(&ino),
+            "flush 失败时锁项须保留（视同 seal 失败、下次重试）"
+        );
+        // 尾缓冲仍在：read_range 仍读到追加内容（数据未被丢弃）。
+        let got = fs.read_range(ino, cs as u64, extra.len() as u32).unwrap();
+        assert_eq!(got, extra, "flush 失败不得丢弃已写入的尾字节");
+
+        // 恢复 flush 后重试 forget 成功收尾（锁项回收、数据仍在）。
+        store.set_flush_fail(false);
+        fs.forget_inode_flush(ino);
+        assert!(
+            !fs.locks.lock().unwrap().contains_key(&ino),
+            "flush 恢复后重试 forget 应成功回收锁项"
+        );
+        let got2 = fs.read_range(ino, cs as u64, extra.len() as u32).unwrap();
+        assert_eq!(got2, extra, "重试成功后数据仍完整");
+        std::mem::forget(dir);
+    }
+
     // ---- 块缓存集成回归（perf #1）----
 
     use crate::core::inode::Ino;
     use crate::store::tests_support::MemStore;
     use crate::store::{DirEntry, Store, StoredBlock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// C-4 用：透明转发全部 Store 方法，但可注入 `flush` 失败。`seal_tail_block`/`append_tail`
+    /// 转发到 inner（seal 成功），仅 `flush` 在开关打开时返回错误——精确复现「seal 成功、flush
+    /// 失败」分支。
+    struct FlushFailStore {
+        inner: Arc<dyn Store>,
+        flush_fail: std::sync::atomic::AtomicBool,
+    }
+    impl FlushFailStore {
+        fn new(inner: Arc<dyn Store>) -> Self {
+            Self {
+                inner,
+                flush_fail: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn set_flush_fail(&self, v: bool) {
+            self.flush_fail.store(v, Ordering::SeqCst);
+        }
+    }
+    impl Store for FlushFailStore {
+        fn lookup(&self, parent: Ino, name: &str) -> Option<Attr> {
+            self.inner.lookup(parent, name)
+        }
+        fn create(&self, parent: Ino, name: &str, attr: Attr) -> std::io::Result<Ino> {
+            self.inner.create(parent, name, attr)
+        }
+        fn mkdir(&self, parent: Ino, name: &str, attr: Attr) -> std::io::Result<Ino> {
+            self.inner.mkdir(parent, name, attr)
+        }
+        fn unlink(&self, parent: Ino, name: &str) -> std::io::Result<()> {
+            self.inner.unlink(parent, name)
+        }
+        fn rmdir(&self, parent: Ino, name: &str) -> std::io::Result<()> {
+            self.inner.rmdir(parent, name)
+        }
+        fn rename(&self, old: (Ino, &str), new: (Ino, &str)) -> std::io::Result<()> {
+            self.inner.rename(old, new)
+        }
+        fn readdir(&self, dir: Ino) -> Vec<DirEntry> {
+            self.inner.readdir(dir)
+        }
+        fn setattr(&self, ino: Ino, attr: Attr) -> std::io::Result<()> {
+            self.inner.setattr(ino, attr)
+        }
+        fn getattr_ino(&self, ino: Ino) -> Option<Attr> {
+            self.inner.getattr_ino(ino)
+        }
+        fn get_block(&self, ino: Ino, idx: u64) -> std::io::Result<Option<StoredBlock>> {
+            self.inner.get_block(ino, idx)
+        }
+        fn block_geometry(&self, ino: Ino) -> Option<(u64, u32)> {
+            self.inner.block_geometry(ino)
+        }
+        fn put_block(
+            &self,
+            ino: Ino,
+            idx: u64,
+            blk: StoredBlock,
+            new_size: u64,
+        ) -> std::io::Result<()> {
+            self.inner.put_block(ino, idx, blk, new_size)
+        }
+        fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> std::io::Result<()> {
+            self.inner.truncate_blocks(ino, keep_from, new_size)
+        }
+        fn supports_tail_journal(&self) -> bool {
+            self.inner.supports_tail_journal()
+        }
+        fn append_tail(&self, ino: Ino, delta: &[u8], new_size: u64) -> std::io::Result<()> {
+            self.inner.append_tail(ino, delta, new_size)
+        }
+        fn seal_tail_block(
+            &self,
+            ino: Ino,
+            idx: u64,
+            blk: StoredBlock,
+            new_size: u64,
+        ) -> std::io::Result<()> {
+            self.inner.seal_tail_block(ino, idx, blk, new_size)
+        }
+        fn set_head_cache(
+            &self,
+            ino: Ino,
+            stored_bytes: Vec<u8>,
+            verbatim: bool,
+            rawlen: u64,
+        ) -> std::io::Result<()> {
+            self.inner.set_head_cache(ino, stored_bytes, verbatim, rawlen)
+        }
+        fn read_head_cache(
+            &self,
+            ino: Ino,
+            off: u64,
+            len: u64,
+        ) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+            self.inner.read_head_cache(ino, off, len)
+        }
+        fn fsync(&self, ino: Ino) -> std::io::Result<()> {
+            self.inner.fsync(ino)
+        }
+        fn flush(&self, ino: Ino) -> std::io::Result<()> {
+            if self.flush_fail.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("注入的 flush 失败"));
+            }
+            self.inner.flush(ino)
+        }
+        fn release(&self, ino: Ino) {
+            self.inner.release(ino)
+        }
+        fn sync_all(&self) -> std::io::Result<()> {
+            self.inner.sync_all()
+        }
+    }
 
     /// 透明转发全部 Store 方法、统计 `get_block` 调用次数的装饰器。默认方法（flush/seal_tail_block/
     /// head_cache 等）经 trait 默认实现转调 `self.*` → 仍落到 inner，故无需逐一覆写。
