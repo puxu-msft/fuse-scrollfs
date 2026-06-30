@@ -11,11 +11,11 @@
 //! 跨 inode 操作（rename）由 Store 内部事务/底层 FS 保证一致，前端不额外加全局锁
 //! （首版：跨目录原子性以后端契约为准，§10）。
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
+use dashmap::DashMap;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, Notifier, OpenFlags,
     ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
@@ -27,21 +27,25 @@ use crate::core::blockcache::BlockCache;
 use crate::core::chunk::block_range;
 use crate::core::codec::{decompress_block, Algo, SharedDict};
 use crate::core::rmw::CodecParams;
-use crate::core::wsession::TailSessions;
+use crate::core::wsession::{InodeState, TailSessions};
 use crate::store::{Attr, Store};
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// 读写 zipfs 前端。持一个 `Store` + codec 参数 + per-inode 写锁表 + 开放尾块缓冲。
+/// 读写 zipfs 前端。持一个 `Store` + codec 参数 + per-inode 状态表（含写锁与开放尾块）。
 pub struct ZipfsRw {
     store: Arc<dyn Store>,
     params: CodecParams,
     default_chunk_size: u32,
-    /// per-inode 写锁（§4）：保证同一文件的 RMW / truncate / 封块 / fsync 串行、原子。
-    /// `RwLock`：read 取读锁（同 inode 多读并发），write/seal/truncate/fsync 取写锁（排他，仍堵
-    /// HIGH-1 torn-read——seal 与读互斥）。
-    locks: Mutex<HashMap<u64, Arc<RwLock<()>>>>,
-    /// 开放尾块缓冲（append 优化，§1.1）。写/封块由 per-inode 写锁串行；读尾块多读者安全。
+    /// per-inode 状态表（§4 + D4-b）：`DashMap<u64, Arc<RwLock<InodeState>>>`。`RwLock<InodeState>`
+    /// **真正包住该 inode 的开放尾块数据**（旧版是 `RwLock<()>` 包空元组、tail 另存一张 Mutex 表，
+    /// 物理分离、靠注释约定加锁）。现在「读/写某 ino 的 tail」在类型层面被强制先持该 `RwLock`：
+    /// read 取读锁（同 inode 多读并发），write/seal/truncate/fsync 取写锁（排他，仍堵 HIGH-1
+    /// torn-read——seal 与读互斥）。DashMap 分片降全表锁争用，`entry/remove_if` 在同 key 同 shard
+    /// 锁内串行 → 保持「同一 ino 任意时刻只有一把活 RwLock」不变量（与旧 std 版等价）。
+    inodes: DashMap<u64, Arc<RwLock<InodeState>>>,
+    /// 全局尾块缓冲策略（append 优化，§1.1）：只持 enabled 开关 + seal_count 计数，per-inode
+    /// 尾块数据已搬进 `InodeState`（由上面 `inodes` 表托管）。
     tails: TailSessions,
     /// 协商的最大单次 write 字节数（init 时 set_max_write）。0=用 fuser 默认（128KiB）。大值减
     /// 内核拆分（2–4MiB 单行 append 少 8–32x 回调）；上限由 fuser 截到 16MiB。
@@ -84,7 +88,7 @@ impl ZipfsRw {
             store,
             params: CodecParams { algo, level, dict },
             default_chunk_size,
-            locks: Mutex::new(HashMap::new()),
+            inodes: DashMap::new(),
             tails: TailSessions::new(tail_buffer),
             max_write: 0,
             notifier: Arc::new(OnceLock::new()),
@@ -127,30 +131,38 @@ impl ZipfsRw {
         }
     }
 
-    /// 取（或建）某 inode 的写锁句柄。
-    fn lock_for(&self, ino: u64) -> Arc<RwLock<()>> {
-        let mut g = self.locks.lock().unwrap();
-        g.entry(ino).or_default().clone()
+    /// 取（或建）某 inode 的状态锁句柄 `Arc<RwLock<InodeState>>`。
+    ///
+    /// **死锁规避（D4-b 关键）**：先 `entry().or_default()` 拿到 DashMap 的 `Ref`，立即 `clone`
+    /// 出内层 `Arc` 并让 `Ref` 在本函数返回时 drop（释放 shard 锁）。调用方拿到 `Arc` **之后**
+    /// 才对其取内层 `.read()/.write()`——绝不在持 DashMap `Ref`（shard 锁）时锁内层 `RwLock`，
+    /// 杜绝 shard 锁 × 内层锁的嵌套持有死锁面。
+    fn lock_for(&self, ino: u64) -> Arc<RwLock<InodeState>> {
+        self.inodes.entry(ino).or_default().clone()
     }
 
-    /// 回收某 inode 的写锁项（unlink/rmdir 成功后调用，避免锁表无界增长，rust-review H1）。
-    /// 仅当无其他持有者（strong_count==1，即只剩表内这一份）时移除，防止误删正在用的锁。
+    /// 回收某 inode 的状态项（unlink/rmdir/forget 成功后调用，避免表无界增长，rust-review H1）。
+    /// `remove_if` 仅当无其他持有者（`strong_count==1`，即只剩表内这一份 Arc）时移除，防止误删
+    /// 正在用的锁。`remove_if` 与 `lock_for` 的 `entry` 对同一 key 在同一 shard 锁内串行，故保持
+    /// 「同一 ino 任意时刻只有一把活 RwLock」不变量（与旧 std Mutex<HashMap> 版等价）。
     fn evict_lock(&self, ino: u64) {
-        let mut g = self.locks.lock().unwrap();
-        if let Some(arc) = g.get(&ino) {
-            if Arc::strong_count(arc) == 1 {
-                g.remove(&ino);
-            }
-        }
+        self.inodes
+            .remove_if(&ino, |_, arc| Arc::strong_count(arc) == 1);
     }
 
-    /// 在**调用方已持该 inode 写锁**的前提下执行 append/RMW 写。先无条件失效块缓存（评审
-    /// CRITICAL-1：失效在改写之前、不依赖每条返回路径都记得失效），再走尾块缓冲/RMW 写编排。
-    /// 抽成独立方法既给 `fn write` 复用，也便于单测直接驱动（绕开 fuser `Request`/`reply`）。
-    fn write_at_locked(&self, ino: u64, offset: u64, data: &[u8]) -> std::io::Result<usize> {
+    /// 在**调用方已持该 inode 写锁**（传入 `&mut InodeState`）的前提下执行 append/RMW 写。先无
+    /// 条件失效块缓存（评审 CRITICAL-1：失效在改写之前、不依赖每条返回路径都记得失效），再走尾块
+    /// 缓冲/RMW 写编排。抽成独立方法既给 `fn write` 复用，也便于单测直接驱动（绕开 fuser）。
+    fn write_at_locked(
+        &self,
+        ino: u64,
+        state: &mut InodeState,
+        offset: u64,
+        data: &[u8],
+    ) -> std::io::Result<usize> {
         self.block_cache.invalidate(ino);
         self.tails
-            .write_at(self.store.as_ref(), ino, offset, data, &self.params)
+            .write_at_locked(self.store.as_ref(), ino, state, offset, data, &self.params)
     }
 
     /// 在持该 inode 写锁的前提下丢弃其开放尾块（不封块），再回收锁项。
@@ -159,9 +171,9 @@ impl ZipfsRw {
     fn forget_inode_locked(&self, ino: u64) {
         {
             let lock = self.lock_for(ino);
-            let _guard = lock.write().unwrap();
+            let mut guard = lock.write().unwrap();
             self.block_cache.invalidate(ino);
-            self.tails.forget(ino);
+            self.tails.forget_locked(&mut guard);
         }
         // 出锁作用域后再 evict（evict 要求 strong_count==1，持 guard 时计数为 2 会漏删）。
         self.evict_lock(ino);
@@ -175,9 +187,12 @@ impl ZipfsRw {
     fn forget_inode_flush(&self, ino: u64) {
         let sealed = {
             let lock = self.lock_for(ino);
-            let _guard = lock.write().unwrap();
+            let mut guard = lock.write().unwrap();
             self.block_cache.invalidate(ino);
-            match self.tails.seal(self.store.as_ref(), ino, &self.params) {
+            match self
+                .tails
+                .seal_locked(self.store.as_ref(), ino, &mut guard, &self.params)
+            {
                 Ok(()) => {
                     // 封尾只追加 journal 增量；须 flush 提交 SB 尾指针，否则丢弃内存缓冲后
                     // 新 reader 看不到未提交的尾字节（与 release 一致）。flush 失败 == 尾字节
@@ -187,7 +202,7 @@ impl ZipfsRw {
                         warn!("forget：flush ino={ino} 失败：{e}，保留尾缓冲与锁待重试");
                         false
                     } else {
-                        self.tails.forget(ino);
+                        self.tails.forget_locked(&mut guard);
                         true
                     }
                 }
@@ -226,10 +241,18 @@ impl ZipfsRw {
     }
 
     /// 把开放尾块的逻辑大小覆盖进 `Attr`（getattr/lookup 须反映未封尾块，写后读一致）。
-    /// 持有该 inode 写锁期间调用最准；无锁的 getattr 仍读到自洽的「含尾块」大小（短暂持表锁）。
+    ///
+    /// **D4-b 语义变更**：原版走无锁路径（tail 另存的表锁），现折叠进该 inode **读锁**——`geometry`
+    /// 经 `&InodeState` 读，类型上要求先持锁。getattr/lookup 低频 + 1s 属性 TTL，正确性收益（与并发
+    /// seal/truncate 取得读后写一致视图）> 一次读锁代价（rust-review MEDIUM-2 的滞后窗口也随之消失）。
     fn overlay_tail_size(&self, mut a: Attr) -> Attr {
         if a.kind == FileType::RegularFile {
-            if let Some((size, _cs)) = self.tails.geometry(self.store.as_ref(), a.ino) {
+            let lock = self.lock_for(a.ino);
+            let guard = lock.read().unwrap();
+            if let Some((size, _cs)) =
+                self.tails
+                    .geometry_locked(self.store.as_ref(), a.ino, &guard)
+            {
                 a.size = size;
             }
         }
@@ -245,8 +268,9 @@ impl ZipfsRw {
     /// 同 inode 的读写并发少，串行化代价可忽略；正确性优先（§10）。
     fn read_range(&self, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
         let lock = self.lock_for(ino);
-        let _guard = lock.read().unwrap();
-        let Some((uncompressed_size, chunk_size)) = self.tails.geometry(self.store.as_ref(), ino)
+        let guard = lock.read().unwrap();
+        let Some((uncompressed_size, chunk_size)) =
+            self.tails.geometry_locked(self.store.as_ref(), ino, &guard)
         else {
             return Err(Errno::ENOENT);
         };
@@ -297,7 +321,7 @@ impl ZipfsRw {
                 continue;
             }
             // 读协调：先查开放尾块缓冲（未压缩字节）。命中则直接切片，不解压、不读 Store。
-            if let Some(plain) = self.tails.read_tail_block(ino, idx) {
+            if let Some(plain) = self.tails.read_tail_block(&guard, idx) {
                 let in_block_start = (copy_start - block_start) as usize;
                 let in_block_end = ((copy_end - block_start) as usize).min(plain.len());
                 if in_block_start < in_block_end {
@@ -512,8 +536,8 @@ impl Filesystem for ZipfsRw {
         reply: ReplyWrite,
     ) {
         let lock = self.lock_for(ino.0);
-        let _guard = lock.write().unwrap();
-        match self.write_at_locked(ino.0, offset, data) {
+        let mut guard = lock.write().unwrap();
+        match self.write_at_locked(ino.0, &mut guard, offset, data) {
             Ok(n) => reply.written(n as u32),
             Err(e) => reply.error(io_to_errno(&e)),
         }
@@ -657,9 +681,12 @@ impl Filesystem for ZipfsRw {
         // 同 ino 的尾块缓冲与底层路径变动产生不一致（封块是幂等的安全操作）。
         if let Some(src) = self.store.lookup(parent.0, name).map(|a| a.ino) {
             let lock = self.lock_for(src);
-            let _guard = lock.write().unwrap();
+            let mut guard = lock.write().unwrap();
             self.block_cache.invalidate(src);
-            if let Err(e) = self.tails.seal(self.store.as_ref(), src, &self.params) {
+            if let Err(e) =
+                self.tails
+                    .seal_locked(self.store.as_ref(), src, &mut guard, &self.params)
+            {
                 // 非致命（rename 仍可进行，源内容由底层路径承载），但不静默吞——记日志。
                 warn!("rename：封源 ino={src} 尾块失败：{e}");
             }
@@ -701,12 +728,15 @@ impl Filesystem for ZipfsRw {
         // truncate / extend：走 Core 写编排（持 inode 写锁）。先封开放尾块再截断。
         if let Some(new_size) = size {
             let lock = self.lock_for(ino.0);
-            let _guard = lock.write().unwrap();
+            let mut guard = lock.write().unwrap();
             self.block_cache.invalidate(ino.0);
-            if let Err(e) = self
-                .tails
-                .truncate(self.store.as_ref(), ino.0, new_size, &self.params)
-            {
+            if let Err(e) = self.tails.truncate_locked(
+                self.store.as_ref(),
+                ino.0,
+                &mut guard,
+                new_size,
+                &self.params,
+            ) {
                 reply.error(io_to_errno(&e));
                 return;
             }
@@ -754,9 +784,12 @@ impl Filesystem for ZipfsRw {
     ) {
         // 持 inode 写锁再封块 + 提交，避免与并发 write/truncate 的 RMW 序列交错（rust-review C1）。
         let lock = self.lock_for(ino.0);
-        let _guard = lock.write().unwrap();
+        let mut guard = lock.write().unwrap();
         self.block_cache.invalidate(ino.0);
-        if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
+        if let Err(e) = self
+            .tails
+            .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
+        {
             reply.error(io_to_errno(&e));
             return;
         }
@@ -780,9 +813,12 @@ impl Filesystem for ZipfsRw {
         // 持 inode 写锁再封块 + 提交（rust-review C1）：fsync 须先把开放尾块封块落 Store，
         // 再让 Store 持久化，符合 POSIX fsync 契约（§10），且不能与同 inode 的 RMW 交错。
         let lock = self.lock_for(ino.0);
-        let _guard = lock.write().unwrap();
+        let mut guard = lock.write().unwrap();
         self.block_cache.invalidate(ino.0);
-        if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
+        if let Err(e) = self
+            .tails
+            .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
+        {
             reply.error(io_to_errno(&e));
             return;
         }
@@ -810,9 +846,12 @@ impl Filesystem for ZipfsRw {
         // 注意：close 不保证 durability（那是 fsync 的职责），此处尽力而为。
         {
             let lock = self.lock_for(ino.0);
-            let _guard = lock.write().unwrap();
+            let mut guard = lock.write().unwrap();
             self.block_cache.invalidate(ino.0);
-            if let Err(e) = self.tails.seal(self.store.as_ref(), ino.0, &self.params) {
+            if let Err(e) =
+                self.tails
+                    .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
+            {
                 warn!("release：封 ino={} 尾块失败：{e}", ino.0);
             }
             if let Err(e) = self.store.flush(ino.0) {
@@ -953,31 +992,30 @@ mod tests {
         let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
         {
             let lock = fs.lock_for(ino);
-            let _g = lock.write().unwrap();
+            let mut g = lock.write().unwrap();
             fs.tails
-                .write_at(store.as_ref(), ino, 0, &base, &fs.params)
+                .write_at_locked(store.as_ref(), ino, &mut g, 0, &base, &fs.params)
                 .unwrap();
-            fs.tails.seal(store.as_ref(), ino, &fs.params).unwrap();
+            fs.tails
+                .seal_locked(store.as_ref(), ino, &mut g, &fs.params)
+                .unwrap();
         }
         store.fsync(ino).unwrap();
         // 经尾缓冲追加一行（建立 tails 缓冲 + 锁项）。
         let extra = b"appended-session-line\n";
         {
             let lock = fs.lock_for(ino);
-            let _g = lock.write().unwrap();
+            let mut g = lock.write().unwrap();
             fs.tails
-                .write_at(store.as_ref(), ino, cs as u64, extra, &fs.params)
+                .write_at_locked(store.as_ref(), ino, &mut g, cs as u64, extra, &fs.params)
                 .unwrap();
         }
-        assert!(
-            fs.locks.lock().unwrap().contains_key(&ino),
-            "追加后应有锁项"
-        );
+        assert!(fs.inodes.contains_key(&ino), "追加后应有锁项");
 
         fs.forget_inode_flush(ino);
 
         assert!(
-            !fs.locks.lock().unwrap().contains_key(&ino),
+            !fs.inodes.contains_key(&ino),
             "forget 后锁项应回收（评审 D1：杜绝锁表无界增长）"
         );
         // 数据未丢：重读追加区间仍得追加内容（forget 先 seal 刷盘再丢弃内存缓冲）。
@@ -1016,20 +1054,22 @@ mod tests {
         let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
         {
             let lock = fs.lock_for(ino);
-            let _g = lock.write().unwrap();
+            let mut g = lock.write().unwrap();
             fs.tails
-                .write_at(store.as_ref(), ino, 0, &base, &fs.params)
+                .write_at_locked(store.as_ref(), ino, &mut g, 0, &base, &fs.params)
                 .unwrap();
-            fs.tails.seal(store.as_ref(), ino, &fs.params).unwrap();
+            fs.tails
+                .seal_locked(store.as_ref(), ino, &mut g, &fs.params)
+                .unwrap();
         }
         store.fsync(ino).unwrap();
         // 经尾缓冲追加（建立 tails 缓冲 + 锁项）。
         let extra = b"appended-session-line\n";
         {
             let lock = fs.lock_for(ino);
-            let _g = lock.write().unwrap();
+            let mut g = lock.write().unwrap();
             fs.tails
-                .write_at(store.as_ref(), ino, cs as u64, extra, &fs.params)
+                .write_at_locked(store.as_ref(), ino, &mut g, cs as u64, extra, &fs.params)
                 .unwrap();
         }
 
@@ -1038,7 +1078,7 @@ mod tests {
         fs.forget_inode_flush(ino);
 
         assert!(
-            fs.locks.lock().unwrap().contains_key(&ino),
+            fs.inodes.contains_key(&ino),
             "flush 失败时锁项须保留（视同 seal 失败、下次重试）"
         );
         // 尾缓冲仍在：read_range 仍读到追加内容（数据未被丢弃）。
@@ -1049,12 +1089,102 @@ mod tests {
         store.set_flush_fail(false);
         fs.forget_inode_flush(ino);
         assert!(
-            !fs.locks.lock().unwrap().contains_key(&ino),
+            !fs.inodes.contains_key(&ino),
             "flush 恢复后重试 forget 应成功回收锁项"
         );
         let got2 = fs.read_range(ino, cs as u64, extra.len() as u32).unwrap();
         assert_eq!(got2, extra, "重试成功后数据仍完整");
         std::mem::forget(dir);
+    }
+
+    /// D4-b 不变量：并发 write + forget 同 ino 不 panic、不丢锁项、不丢 tail。
+    ///
+    /// 旧版 tail 与锁物理分离（`RwLock<()>` + 另一张 Mutex 表），靠注释约定加锁。本测验证重构后
+    /// 锁真正包住 `InodeState`：多线程对同 ino 反复 write，期间穿插 forget（丢弃尾块 + evict 锁项），
+    /// 全程串行化于该 inode 写锁 → 无数据竞争 panic；末轮全静默后 forget 应把该 ino 从 DashMap 移除。
+    #[test]
+    fn 并发_write_与_forget_同_ino_无_panic_且_evict_后表不含该_ino() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::thread;
+
+        let cs = 4096u32;
+        let mem: Arc<dyn Store> = Arc::new(MemStore::new(cs));
+        let attr = Attr {
+            ino: 0,
+            size: 0,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: SystemTime::UNIX_EPOCH,
+            atime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            chunk_size: cs,
+        };
+        let ino = mem.create(ROOT, "f.bin", attr).unwrap();
+        let fs = Arc::new(ZipfsRw::new(mem, Algo::Zstd, 3, cs));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // 4 个写线程：各自反复在文件尾 append（持该 ino 写锁，经 write_at_locked）。
+        for _ in 0..4 {
+            let fs = Arc::clone(&fs);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(AOrd::Relaxed) {
+                    let lock = fs.lock_for(ino);
+                    let mut g = lock.write().unwrap();
+                    // 追加到当前几何尾部（含未封尾块），保持纯 append 快路径。
+                    let off = fs
+                        .tails
+                        .geometry_locked(fs.store.as_ref(), ino, &g)
+                        .map(|(s, _)| s)
+                        .unwrap_or(0);
+                    fs.write_at_locked(ino, &mut g, off, b"x").unwrap();
+                    n += 1;
+                    if n > 2000 {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        // 2 个 forget 线程：穿插丢弃尾块 + evict（与写线程串行于同 ino 写锁，堵 MEDIUM-3 panic 窗口）。
+        for _ in 0..2 {
+            let fs = Arc::clone(&fs);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(AOrd::Relaxed) {
+                    fs.forget_inode_locked(ino);
+                    n += 1;
+                    if n > 2000 {
+                        break;
+                    }
+                }
+            }));
+        }
+
+        // 让线程跑一小段后收尾。
+        thread::sleep(Duration::from_millis(50));
+        stop.store(true, AOrd::Relaxed);
+        for h in handles {
+            h.join()
+                .expect("线程不应 panic（锁包住 InodeState，无数据竞争）");
+        }
+
+        // 终态一致性：读不 panic（读路径持读锁取 InodeState）。
+        let _ = fs.read_range(ino, 0, 16);
+
+        // 末轮 forget：全部线程已停，此后单 forget 应把该 ino 从 DashMap 彻底回收（无活句柄、
+        // strong_count==1）。验证 evict 后表不含该 ino——锁表不泄漏。
+        fs.forget_inode_locked(ino);
+        assert!(
+            !fs.inodes.contains_key(&ino),
+            "末轮 forget 后该 ino 应从 inodes 表移除（evict 不泄漏锁项）"
+        );
     }
 
     // ---- 块缓存集成回归（perf #1）----
@@ -1150,7 +1280,8 @@ mod tests {
             verbatim: bool,
             rawlen: u64,
         ) -> std::io::Result<()> {
-            self.inner.set_head_cache(ino, stored_bytes, verbatim, rawlen)
+            self.inner
+                .set_head_cache(ino, stored_bytes, verbatim, rawlen)
         }
         fn read_head_cache(
             &self,
@@ -1340,8 +1471,8 @@ mod tests {
         {
             // 经 write_at_locked（持写锁、写前无条件失效）改写块 1 内一段。
             let lock = fs.lock_for(ino);
-            let _g = lock.write().unwrap();
-            fs.write_at_locked(ino, b1, &newbytes).unwrap();
+            let mut g = lock.write().unwrap();
+            fs.write_at_locked(ino, &mut g, b1, &newbytes).unwrap();
         }
         let after = fs.read_range(ino, b1, 100).unwrap();
         assert_ne!(after, before, "写后缓存须失效，不得返回陈旧旧值");

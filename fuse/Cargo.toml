@@ -65,6 +65,9 @@ crc32fast = "1.5.0"
 sd-notify = "0.4"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
+# per-inode 分片并发表（D4-b）：locks 表从 Mutex<HashMap> 改 DashMap，锁包住 InodeState 数据，
+# entry/remove_if 在同 key 同 shard 锁内串行 → 与旧 std 版「单活锁」不变量等价，且降全表锁争用。
+dashmap = "6"
 
 [dev-dependencies]
 tempfile = "3"
