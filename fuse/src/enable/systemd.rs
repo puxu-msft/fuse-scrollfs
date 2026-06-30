@@ -137,15 +137,19 @@ impl crate::enable::daemon::Mounter for SystemdMounter {
         let _ = run_systemctl(&systemctl_args("reset-failed", &spec.name));
         // Type=notify：start 阻塞到 main.rs sd_notify READY，比轮询更可靠。
         run_systemctl(&systemctl_args("start", &spec.name))?;
-        // 再校验地面真值（/proc mountinfo）：unit active 不等于挂载就绪。
-        if discovery::is_mounted(&spec.mountpoint) && discovery::endpoint_ok(&spec.mountpoint) {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "systemd start 后挂载点未就绪：{}",
-                spec.mountpoint.display()
-            )))
+        // 再校验地面真值（/proc mountinfo）：unit active 不等于挂载就绪。评审 H3：用短轮询而非
+        // 单次快照——start 返回与地面真值之间守护可能抖动（首挂瞬态），单次快照会误报失败，
+        // 而 systemd Restart=on-failure 几秒后又把它挂上 → 回报与现实不一致。
+        for _ in 0..20 {
+            if discovery::is_mounted(&spec.mountpoint) && discovery::endpoint_ok(&spec.mountpoint) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        Err(std::io::Error::other(format!(
+            "systemd start 后挂载点未就绪：{}",
+            spec.mountpoint.display()
+        )))
     }
 
     fn unmount(&self, name: &str, mountpoint: &std::path::Path) -> std::io::Result<()> {
