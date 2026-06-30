@@ -14,6 +14,16 @@
 use std::io;
 use std::sync::Arc;
 
+/// 单块解压输出上限（256 MiB），防解压炸弹 OOM（评审 H2）。
+///
+/// 诚实数据下单块 ≤ chunk_size（默认 1MiB、封存 8MiB、上限远低于此）；恶意/损坏块声明的解压后
+/// 大小不受块内压缩字节约束，可炸成任意大。per-block CRC 挡随机翻转但不挡蓄意篡改（CRC 可重算），
+/// 故再加一道输出上限把"坏块"从 OOM 降级为 `InvalidData`。256 MiB 远高于任何合理 chunk_size。
+const MAX_DECOMPRESSED_BLOCK: usize = 256 * 1024 * 1024;
+
+/// 解压 window_log 上限（27 = 128 MiB 窗口）：限制解码器内部窗口缓冲分配，挡"巨窗口"帧 DoS。
+const DECOMPRESS_WINDOW_LOG_MAX: u32 = 27;
+
 /// 压缩算法选择。`--algo` 切换，见 §13 已定项。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Algo {
@@ -142,21 +152,23 @@ pub fn decompress_block(
         Algo::Zstd => match dict {
             // 字典路径：streaming Decoder + 预消化 DDict（不重新消化字典）。
             Some(d) => {
-                use std::io::Read;
                 let mut dec = zstd::stream::read::Decoder::with_prepared_dictionary(stored, &d.dec)
                     .map_err(|e| io::Error::other(format!("zstd 字典解压器构造失败：{e}")))?;
-                let mut out = Vec::new();
-                dec.read_to_end(&mut out).map_err(|e| {
+                dec.window_log_max(DECOMPRESS_WINDOW_LOG_MAX)
+                    .map_err(|e| io::Error::other(format!("设 window_log_max 失败：{e}")))?;
+                decode_capped(dec)
+            }
+            None => {
+                let mut dec = zstd::stream::read::Decoder::new(stored).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("zstd 字典解压失败：{e}"),
+                        format!("zstd 解压器构造失败：{e}"),
                     )
                 })?;
-                Ok(out)
+                dec.window_log_max(DECOMPRESS_WINDOW_LOG_MAX)
+                    .map_err(|e| io::Error::other(format!("设 window_log_max 失败：{e}")))?;
+                decode_capped(dec)
             }
-            None => zstd::stream::decode_all(stored).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("zstd 解压失败：{e}"))
-            }),
         },
         Algo::Lz4 => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -166,6 +178,24 @@ pub fn decompress_block(
         // 仍按原样返回（None 不压缩）。
         Algo::None => Ok(stored.to_vec()),
     }
+}
+
+/// 从解码器读出全部明文，但在 [`MAX_DECOMPRESSED_BLOCK`] 处封顶——超限即判定解压炸弹/损坏。
+fn decode_capped(mut dec: impl io::Read) -> io::Result<Vec<u8>> {
+    use io::Read;
+    let mut out = Vec::new();
+    // 至多读 cap+1 字节：若真有 cap+1 字节，说明解压输出超限。
+    dec.by_ref()
+        .take(MAX_DECOMPRESSED_BLOCK as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("zstd 解压失败：{e}")))?;
+    if out.len() > MAX_DECOMPRESSED_BLOCK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "解压输出超上限，疑似解压炸弹或损坏块",
+        ));
+    }
+    Ok(out)
 }
 
 /// 不可压缩判定：`clen >= raw * INCOMPRESSIBLE_RATIO`。
@@ -180,6 +210,24 @@ fn is_incompressible(raw_len: usize, clen: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 解压炸弹_超上限块被拒() {
+        // 评审 H2：构造一个解压后远超 MAX_DECOMPRESSED_BLOCK 的合法 zstd 帧（全零高压缩比），
+        // decompress_block 必须返回 InvalidData 而非 OOM。诚实块（≤ chunk_size）不受影响。
+        let huge = vec![0u8; MAX_DECOMPRESSED_BLOCK + 1024];
+        let stored = zstd::stream::encode_all(&huge[..], 3).unwrap();
+        let res = decompress_block(&stored, Algo::Zstd, false, None);
+        assert!(
+            res.as_ref().map_err(|e| e.kind()) == Err(io::ErrorKind::InvalidData),
+            "超上限解压应 InvalidData，实际：{:?}",
+            res.map(|v| v.len())
+        );
+        // 上限内的诚实块仍正常 round-trip。
+        let ok = vec![7u8; 1024 * 1024];
+        let s = zstd::stream::encode_all(&ok[..], 3).unwrap();
+        assert_eq!(decompress_block(&s, Algo::Zstd, false, None).unwrap(), ok);
+    }
 
     #[test]
     fn zstd_压缩可压缩数据_round_trip() {
