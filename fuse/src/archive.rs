@@ -620,9 +620,27 @@ pub struct ArchiveWriter<W: Write + Seek> {
 }
 
 impl ArchiveWriter<File> {
-    /// 在 `path` 创建新 archive。
+    /// 在 `path` 创建新 archive（覆盖语义：`File::create` = `O_CREAT|O_TRUNC`）。
+    /// 离线 compact/seal 写残留 tmp、fixture 重建、ingest 写 dst 等**期望覆盖既有文件**的
+    /// 调用方走此入口。**在线并发新建**（`ShadowStore::create`）须走 [`create_new`] 排他变体。
+    ///
+    /// [`create_new`]: ArchiveWriter::create_new
     pub fn create(path: &Path, chunk_size: u32) -> io::Result<Self> {
         let file = File::create(path)?;
+        Self::new(file, chunk_size)
+    }
+
+    /// 排他新建（`O_CREAT|O_EXCL`，阶段 D3）：目标已存在则返回 `AlreadyExists`（映射 EEXIST），
+    /// **绝不截断既有文件**。`ShadowStore::create` 专用——两个并发同名 create 时内核保证恰一个
+    /// 成功建出文件、其余 EEXIST，杜绝「双成功 + 后者 O_TRUNC 截断前者」的损坏。覆盖语义的其余
+    /// 调用方仍走 [`create`]（见其文档）。
+    ///
+    /// [`create`]: ArchiveWriter::create
+    pub fn create_new(path: &Path, chunk_size: u32) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
         Self::new(file, chunk_size)
     }
 }

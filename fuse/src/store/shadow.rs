@@ -108,6 +108,15 @@ pub struct ShadowStore {
     /// 内核自动释放，故第二个守护 open 同一 backing 必失败，杜绝双守护并发覆盖。
     /// 锁文件是 backing 外的 sibling `<backing>.zipfs.lock`，不进 readdir/写路径。
     _lock: std::fs::File,
+    /// 命名空间锁（阶段 D3）：**仅** create/mkdir/unlink/rmdir/rename/symlink 在方法最开头
+    /// 全程持有，把「查存在 → syscall → 改 inodes/sessions/readers 三表」整段串行化为原子。
+    /// 数据路径（get_block/put_block/lookup/getattr/readdir/append_tail/seal/flush 等 by-ino、
+    /// 不改命名空间）**不取** ns，故高频 get_block 不被慢目录 syscall 串行化。
+    ///
+    /// **锁序（严格遵守，防死锁）**：`ns < inodes < sessions < readers`。即持 ns 时才可再取
+    /// 细锁；任何细锁路径**不得**反过来取 ns（数据路径不取 ns，自然满足）。目录方法持 ns 期间
+    /// 调用的辅助（`rel_of`/`abs_of_ino`/`invalidate_reader` 等）只取细锁，与锁序一致。
+    ns: Mutex<()>,
     inodes: Mutex<InodeMap>,
     /// per-inode 写会话表。键为 ino，值为挂起的脏块缓冲。fsync/flush 落盘后移除。
     sessions: Mutex<HashMap<u64, WriteSession>>,
@@ -170,6 +179,7 @@ impl ShadowStore {
         Ok(Self {
             backing,
             _lock: lock,
+            ns: Mutex::new(()),
             inodes: Mutex::new(InodeMap::new()),
             sessions: Mutex::new(HashMap::new()),
             readers: Mutex::new(HashMap::new()),
@@ -400,6 +410,8 @@ impl Store for ShadowStore {
     }
 
     fn create(&self, parent: Ino, name: &str, attr: Attr) -> io::Result<Ino> {
+        // ns 锁全程持有：使「O_EXCL 建文件 → fsync → 改 inodes 表」对同目录并发原子（阶段 D3）。
+        let _ns = self.ns.lock().unwrap();
         super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
@@ -412,7 +424,9 @@ impl Store for ShadowStore {
         } else {
             attr.chunk_size
         };
-        let w = ArchiveWriter::create(&abs, chunk_size)?;
+        // O_EXCL 排他新建（阶段 D3）：并发同名 create 时内核保证恰一个成功、其余 AlreadyExists
+        // （映射 EEXIST），绝不「双成功 + 后者 O_TRUNC 截断前者」。覆盖语义的离线工具仍走 create。
+        let w = ArchiveWriter::create_new(&abs, chunk_size)?;
         let f = w.finish()?;
         f.sync_all()?;
         // 评审 A2：fsync 文件本身不保证 dentry durable，崩溃后新文件可能整体消失（后续
@@ -427,6 +441,7 @@ impl Store for ShadowStore {
     }
 
     fn mkdir(&self, parent: Ino, name: &str, attr: Attr) -> io::Result<Ino> {
+        let _ns = self.ns.lock().unwrap();
         super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
@@ -442,6 +457,8 @@ impl Store for ShadowStore {
     }
 
     fn unlink(&self, parent: Ino, name: &str) -> io::Result<()> {
+        // ns 锁全程持有：使「remove_file → 清 sessions/readers/inodes 三表」原子（阶段 D3）。
+        let _ns = self.ns.lock().unwrap();
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
@@ -458,6 +475,7 @@ impl Store for ShadowStore {
     }
 
     fn rmdir(&self, parent: Ino, name: &str) -> io::Result<()> {
+        let _ns = self.ns.lock().unwrap();
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
@@ -469,6 +487,9 @@ impl Store for ShadowStore {
     }
 
     fn rename(&self, old: (Ino, &str), new: (Ino, &str)) -> io::Result<()> {
+        // ns 锁全程持有：overwritten_ino 快照与 fs::rename 同临界区取得（消除快照过期），
+        // 「失效 victim 三表 → rename_path」整段原子（阶段 D3）。
+        let _ns = self.ns.lock().unwrap();
         super::validate_name(old.1)?;
         super::validate_name(new.1)?;
         let old_parent_rel = self
@@ -530,6 +551,7 @@ impl Store for ShadowStore {
     }
 
     fn symlink(&self, parent: Ino, name: &str, target: &Path) -> io::Result<Attr> {
+        let _ns = self.ns.lock().unwrap();
         super::validate_name(name)?;
         let parent_rel = self
             .rel_of(parent)
@@ -1237,6 +1259,164 @@ mod tests {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();
         assert_eq!(got.as_secs(), 1_750_740_420);
+    }
+
+    // ----- 阶段 D3：目录操作并发原子性（ns 锁 + create O_EXCL） -----
+
+    use std::sync::Barrier;
+    use std::thread;
+
+    /// 一个普通文件 Attr（测试便捷）。
+    fn reg_attr(chunk_size: u32) -> Attr {
+        Attr {
+            ino: 0,
+            size: 0,
+            kind: fuser::FileType::RegularFile,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            atime: std::time::SystemTime::UNIX_EPOCH,
+            ctime: std::time::SystemTime::UNIX_EPOCH,
+            chunk_size,
+        }
+    }
+
+    /// 在空 backing 上建 ShadowStore（无预置文件）。
+    fn empty_store(chunk_size: u32) -> (Arc<ShadowStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), chunk_size).unwrap();
+        (Arc::new(store), dir)
+    }
+
+    /// inodes 三/双向表自洽断言：by_ino 与 by_path 互为逆，无悬挂项。
+    fn assert_inode_map_consistent(store: &ShadowStore) {
+        let m = store.inodes.lock().unwrap();
+        for (ino, path) in m.by_ino.iter() {
+            assert_eq!(
+                m.by_path.get(path).copied(),
+                Some(*ino),
+                "by_ino[{ino}]={path:?} 在 by_path 中应反向映射回 {ino}"
+            );
+        }
+        for (path, ino) in m.by_path.iter() {
+            assert_eq!(
+                m.by_ino.get(ino).cloned(),
+                Some(path.clone()),
+                "by_path[{path:?}]={ino} 在 by_ino 中应反向映射回 {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 并发同名_create_只一个文件_不互相截断() {
+        // 缺陷：create 无 O_EXCL（底层 File::create = O_TRUNC），两个并发同名 create
+        // 双成功且第二个截断第一个。加 O_EXCL 后：底层只一个文件被建出，恰一个 create 成功，
+        // 其余得 AlreadyExists；且 by_ino/by_path 双向一致。
+        let n = 8usize;
+        let iters = 40usize;
+        for it in 0..iters {
+            let (store, _dir) = empty_store(64);
+            let name = format!("c{it}.bin");
+            let barrier = Arc::new(Barrier::new(n));
+            let mut handles = Vec::new();
+            for _ in 0..n {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let name = name.clone();
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    store.create(ROOT_INO, &name, reg_attr(64))
+                }));
+            }
+            let mut ok = 0usize;
+            let mut eexist = 0usize;
+            for h in handles {
+                match h.join().unwrap() {
+                    Ok(_) => ok += 1,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => eexist += 1,
+                    Err(e) => panic!("意外错误：{e}"),
+                }
+            }
+            assert_eq!(ok, 1, "并发同名 create 应恰一个成功（O_EXCL）");
+            assert_eq!(eexist, n - 1, "其余应得 AlreadyExists");
+            assert_inode_map_consistent(&store);
+        }
+    }
+
+    #[test]
+    fn 并发_create_与_unlink_同名_inode表无悬挂() {
+        // 缺陷：unlink 的「查 ino → remove_file → 清 sessions/readers/inodes」跨多次独立加锁、
+        // syscall 夹在中间，与并发 create 交错会留孤儿映射 / 双向失配。ns 锁覆盖整段后表恒自洽。
+        let iters = 60usize;
+        for it in 0..iters {
+            let (store, _dir) = empty_store(64);
+            let name = format!("u{it}.bin");
+            let barrier = Arc::new(Barrier::new(2));
+            let s1 = Arc::clone(&store);
+            let s2 = Arc::clone(&store);
+            let b1 = Arc::clone(&barrier);
+            let b2 = Arc::clone(&barrier);
+            let n1 = name.clone();
+            let n2 = name.clone();
+            let hc = thread::spawn(move || {
+                b1.wait();
+                let _ = s1.create(ROOT_INO, &n1, reg_attr(64));
+            });
+            let hu = thread::spawn(move || {
+                b2.wait();
+                let _ = s2.unlink(ROOT_INO, &n2);
+            });
+            hc.join().unwrap();
+            hu.join().unwrap();
+            // 不论交错先后，inodes 双向表必自洽（无悬挂 ino / 无失配 path）。
+            assert_inode_map_consistent(&store);
+        }
+    }
+
+    #[test]
+    fn 并发_rename_覆盖_inode表无悬挂_无孤儿会话() {
+        // 缺陷：rename 的 overwritten_ino 快照在 fs::rename 之前、与并发 create 交错可能漏失效，
+        // 且清 victim 三表与 rename_path 跨多次加锁非原子。ns 锁内一气呵成后表自洽、无孤儿会话。
+        let iters = 50usize;
+        for it in 0..iters {
+            let (store, _dir) = empty_store(64);
+            let src = format!("s{it}.bin");
+            let dst = format!("d{it}.bin");
+            store.create(ROOT_INO, &src, reg_attr(64)).unwrap();
+            store.create(ROOT_INO, &dst, reg_attr(64)).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let s1 = Arc::clone(&store);
+            let s2 = Arc::clone(&store);
+            let b1 = Arc::clone(&barrier);
+            let b2 = Arc::clone(&barrier);
+            let src1 = src.clone();
+            let dst1 = dst.clone();
+            let dst2 = dst.clone();
+            // 线程 A：rename src -> dst（覆盖 dst）。线程 B：并发往 dst 写会话后再 unlink。
+            let ha = thread::spawn(move || {
+                b1.wait();
+                let _ = s1.rename((ROOT_INO, &src1), (ROOT_INO, &dst1));
+            });
+            let hb = thread::spawn(move || {
+                b2.wait();
+                let _ = s2.unlink(ROOT_INO, &dst2);
+            });
+            ha.join().unwrap();
+            hb.join().unwrap();
+            assert_inode_map_consistent(&store);
+            // 残存映射项对应的 ino 不应留有孤儿写会话（被清/被覆盖的 ino 不得悬挂在 sessions）。
+            let live: std::collections::HashSet<u64> =
+                store.inodes.lock().unwrap().by_ino.keys().copied().collect();
+            let sess: Vec<u64> = store.sessions.lock().unwrap().keys().copied().collect();
+            for ino in sess {
+                assert!(
+                    live.contains(&ino),
+                    "sessions 中的 ino={ino} 应仍在 inodes 表（无孤儿会话）"
+                );
+            }
+        }
     }
 
     #[test]
