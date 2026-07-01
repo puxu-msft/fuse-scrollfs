@@ -26,7 +26,6 @@
 //! 未 flush 的尾块在内存（与 page cache 未刷一致）；fsync/flush 必须先 `seal` 把尾块封块
 //! 落 Store，再由 Store 持久化，符合 POSIX fsync 契约（§10）。
 
-use parking_lot::Mutex;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,13 +59,13 @@ pub(crate) struct InodeState {
     tail: Option<Tail>,
 }
 
-/// 全局尾块缓冲策略：持开关 + 计数。**生产路径（rwfs）的 per-inode `Tail` 已搬进 [`InodeState`]**，
-/// 由 rwfs 的 `DashMap<u64, Arc<RwLock<InodeState>>>` 托管——改 tail 必须持 `RwLock` 写锁，由类型
-/// （`*_locked` 方法签名 `&mut InodeState`）强制（D4-b）。
+/// 全局尾块缓冲策略：**只持**开关 `enabled` + 计数 `seal_count` 的无状态配置。per-inode 的开放
+/// 尾块（[`InodeState`]）**一律由调用方持有**——生产路径（rwfs）放进 `DashMap<u64, Arc<RwLock<InodeState>>>`，
+/// 单线程驱动者（compact / append-bench / 集成测试）用 [`WriteSession`] 内联持有；无论哪条路径，
+/// 改 tail 都必须传入 `&mut InodeState`，由类型（`*_locked` 方法签名）强制持锁（D4-b）。
 ///
-/// 另持一张 `legacy_states: Mutex<HashMap<u64, InodeState>>`，**仅供** compact / append-bench 等
-/// 独立驱动者用的便捷 API（`write_at/seal/geometry/...` 旧签名）：它们单线程顺序驱动单 inode、不经
-/// rwfs 锁。生产读写路径**绝不**碰这张表（rwfs 只调 `*_locked`），故类型强制的加锁纪律不被削弱。
+/// D4-b 收尾：原先为便捷 API 保留的 `legacy_states: Mutex<HashMap<u64, InodeState>>` 内部表已**消解**，
+/// 不再有任何绕过「调用方持 `&mut InodeState`」的写路径——加锁纪律 100% 由类型系统强制。
 ///
 /// `enabled=false` 时所有写/读/封块都直通旧的无状态 `rmw` 路径（`--no-tail-buffer` 基准对照）。
 pub struct TailSessions {
@@ -74,8 +73,6 @@ pub struct TailSessions {
     enabled: bool,
     /// 累计封块次数（含每次「把尾块压缩落 Store」），基准量化重压次数用。
     seal_count: AtomicU64,
-    /// 便捷 API 专用 per-inode 状态（compact/bench 单线程驱动；生产 rwfs 不用——见结构体文档）。
-    legacy_states: Mutex<std::collections::HashMap<u64, InodeState>>,
 }
 
 impl TailSessions {
@@ -84,7 +81,6 @@ impl TailSessions {
         Self {
             enabled,
             seal_count: AtomicU64::new(0),
-            legacy_states: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -96,42 +92,6 @@ impl TailSessions {
     /// 是否启用了尾块缓冲优化。
     pub fn enabled(&self) -> bool {
         self.enabled
-    }
-
-    // ---- 便捷 API（旧签名）：仅供 compact / append-bench 等独立单线程驱动者 ----
-    // 内部用 legacy_states 表锁取出该 inode 的 InodeState 并委托给 *_locked 核心。生产 rwfs 路径
-    // 不走这些方法（它持 RwLock<InodeState> 调 *_locked），故类型强制的加锁纪律不受影响。
-
-    /// 便捷 API：取逻辑几何（含未封尾块）。见 [`Self::geometry_locked`]。
-    pub fn geometry(&self, store: &dyn Store, ino: u64) -> Option<(u64, u32)> {
-        let states = self.legacy_states.lock();
-        match states.get(&ino) {
-            // 有缓冲项：经核心读其 file_size（含未封尾块）。
-            Some(s) => self.geometry_locked(store, ino, s),
-            // 无缓冲项：等价于空 InodeState，直接回落 Store 几何。
-            None => store.block_geometry(ino),
-        }
-    }
-
-    /// 便捷 API：在 `offset` 写入 `data`。见 [`Self::write_at_locked`]。
-    pub fn write_at(
-        &self,
-        store: &dyn Store,
-        ino: u64,
-        offset: u64,
-        data: &[u8],
-        params: &CodecParams,
-    ) -> io::Result<usize> {
-        let mut states = self.legacy_states.lock();
-        let state = states.entry(ino).or_default();
-        self.write_at_locked(store, ino, state, offset, data, params)
-    }
-
-    /// 便捷 API：fsync 封尾（保留缓冲）。见 [`Self::seal_locked`]。
-    pub fn seal(&self, store: &dyn Store, ino: u64, params: &CodecParams) -> io::Result<()> {
-        let mut states = self.legacy_states.lock();
-        let state = states.entry(ino).or_default();
-        self.seal_locked(store, ino, state, params)
     }
 
     /// 取逻辑几何 `(size, chunk_size)`，**含未封尾块**。无开放尾块则回落 Store 几何。
@@ -433,6 +393,88 @@ impl TailSessions {
     /// 调用方持该 inode 写锁（`&mut InodeState`）。
     pub(crate) fn forget_locked(&self, state: &mut InodeState) {
         state.tail = None;
+    }
+}
+
+/// **单 inode、单线程顺序驱动器**：把「一个 [`InodeState`] + 一份 [`TailSessions`] 配置」内联绑在
+/// 一起，直接对**自有** `state` 调 `*_locked` 核心——无需任何表锁。
+///
+/// 生产 rwfs **不用**此类型：它把 per-inode `InodeState` 放进 `DashMap<u64, Arc<RwLock<InodeState>>>`
+/// 自持锁并调 `*_locked`。`WriteSession` 是给 **compact / append-bench / 集成测试**等单线程顺序驱动
+/// 单 inode 的场景用的公开 API——替代 D4-b 之前 `TailSessions` 内部那张 `legacy_states` 便捷表：
+/// 状态被本实例**独占持有**，改 tail 依旧要 `&mut self`，加锁纪律由类型强制，不再有旁路表。
+///
+/// 需要跨线程共享时（如镜像 rwfs 的并发读/写测试），把整个 `WriteSession` 放进 `Mutex`/`RwLock`
+/// 即可：读走 `&self`、写走 `&mut self`，与生产 `Arc<RwLock<InodeState>>` 的互斥语义一致。
+pub struct WriteSession {
+    sessions: TailSessions,
+    state: InodeState,
+}
+
+impl WriteSession {
+    /// 新建（`enabled` 透传给内部 [`TailSessions`]，控制是否启用尾块缓冲优化）。
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            sessions: TailSessions::new(enabled),
+            state: InodeState::default(),
+        }
+    }
+
+    /// 取逻辑几何 `(size, chunk_size)`，**含未封尾块**。见 [`TailSessions::geometry_locked`]。
+    pub fn geometry(&self, store: &dyn Store, ino: u64) -> Option<(u64, u32)> {
+        self.sessions.geometry_locked(store, ino, &self.state)
+    }
+
+    /// 读第 `idx` 块的**未压缩**尾块字节：命中开放尾块返回 `Some(plain)`，否则 `None`
+    /// （调用方回落 `Store::get_block`）。见 [`TailSessions::read_tail_block`]。
+    pub fn read_tail_block(&self, idx: u64) -> Option<Vec<u8>> {
+        self.sessions.read_tail_block(&self.state, idx)
+    }
+
+    /// 在 `offset` 写入 `data`。见 [`TailSessions::write_at_locked`]。
+    pub fn write_at(
+        &mut self,
+        store: &dyn Store,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+        params: &CodecParams,
+    ) -> io::Result<usize> {
+        self.sessions
+            .write_at_locked(store, ino, &mut self.state, offset, data, params)
+    }
+
+    /// fsync 封尾（保留缓冲，尾块仍开放可续 append）。见 [`TailSessions::seal_locked`]。
+    pub fn seal(&mut self, store: &dyn Store, ino: u64, params: &CodecParams) -> io::Result<()> {
+        self.sessions
+            .seal_locked(store, ino, &mut self.state, params)
+    }
+
+    /// 截断（或零填充扩展）到 `new_size`。见 [`TailSessions::truncate_locked`]。
+    pub fn truncate(
+        &mut self,
+        store: &dyn Store,
+        ino: u64,
+        new_size: u64,
+        params: &CodecParams,
+    ) -> io::Result<()> {
+        self.sessions
+            .truncate_locked(store, ino, &mut self.state, new_size, params)
+    }
+
+    /// 丢弃开放尾块**不封块**（unlink/rename 覆盖）。见 [`TailSessions::forget_locked`]。
+    pub fn forget(&mut self) {
+        self.sessions.forget_locked(&mut self.state);
+    }
+
+    /// 累计封块次数（基准埋点）。
+    pub fn seal_count(&self) -> u64 {
+        self.sessions.seal_count()
+    }
+
+    /// 是否启用了尾块缓冲优化。
+    pub fn enabled(&self) -> bool {
+        self.sessions.enabled()
     }
 }
 

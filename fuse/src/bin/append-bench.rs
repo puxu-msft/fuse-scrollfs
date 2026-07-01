@@ -9,7 +9,7 @@
 //!   尾块整块重压一遍（重压次数 ≈ append 次数）；开启时仅满块封一次（≈ 满块数）。
 //! - **最终压缩比**（逻辑字节 / 后端物理字节）。
 //!
-//! 直接驱动 Core（`TailSessions` + `rmw`）+ Store，不经 FUSE 挂载——优化恰好落在这层，免挂载
+//! 直接驱动 Core（`WriteSession` + `rmw`）+ Store，不经 FUSE 挂载——优化恰好落在这层，免挂载
 //! 噪声，且能读到 `rmw::block_compress_count` 埋点。**默认单次短跑**（用户要求减少测试量），参数可调更长。
 //!
 //! 用法：
@@ -29,7 +29,7 @@ use clap::{Parser, ValueEnum};
 
 use zipfs::core::codec::Algo;
 use zipfs::core::rmw::CodecParams;
-use zipfs::core::wsession::TailSessions;
+use zipfs::core::wsession::WriteSession;
 use zipfs::core::DEFAULT_CHUNK_SIZE;
 use zipfs::store::container::ContainerStore;
 use zipfs::store::shadow::ShadowStore;
@@ -168,7 +168,7 @@ fn run_on_store(
         level: cli.level,
         dict: None,
     };
-    let ws = TailSessions::new(enabled);
+    let mut ws = WriteSession::new(enabled);
     let mut logical_bytes = 0u64;
 
     // 隔离本段的块压缩（重压）计数。

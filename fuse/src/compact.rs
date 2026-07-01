@@ -165,7 +165,7 @@ fn tmp_sibling(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::core::codec::decompress_block;
-    use crate::core::wsession::TailSessions;
+    use crate::core::wsession::WriteSession;
     use crate::store::shadow::ShadowStore;
     use crate::store::Store;
 
@@ -195,7 +195,7 @@ mod tests {
             chunk_size: cs,
         };
         let ino = store.create(1, "t.jsonl", attr).unwrap();
-        let ws = TailSessions::new(true);
+        let mut ws = WriteSession::new(true);
         let mut expected = Vec::new();
         for i in 0..400u32 {
             let line = format!("line {i:04} payload............\n").into_bytes();
@@ -263,7 +263,7 @@ mod tests {
             chunk_size: cs,
         };
         let ino = store.create(1, "t.jsonl", attr).unwrap();
-        let ws = TailSessions::new(true);
+        let mut ws = WriteSession::new(true);
         for i in 0..400u32 {
             let line = format!("line {i:04} payload............\n").into_bytes();
             let off = ws.geometry(&store, ino).unwrap().0;

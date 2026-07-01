@@ -7,7 +7,7 @@
 
 use zipfs::core::codec::{decompress, Algo};
 use zipfs::core::rmw::CodecParams;
-use zipfs::core::wsession::TailSessions;
+use zipfs::core::wsession::WriteSession;
 use zipfs::store::container::ContainerStore;
 use zipfs::store::shadow::ShadowStore;
 use zipfs::store::{Attr, Store};
@@ -39,14 +39,14 @@ fn new_attr() -> Attr {
 }
 
 /// 与 rwfs 读协调一致的整文件读回：尾块走缓冲，其余走 Store 解压，缺块零填充。
-fn read_whole(ws: &TailSessions, store: &dyn Store, ino: u64) -> Vec<u8> {
+fn read_whole(ws: &WriteSession, store: &dyn Store, ino: u64) -> Vec<u8> {
     let (size, cs) = ws.geometry(store, ino).unwrap();
     let mut out = vec![0u8; size as usize];
     let cs = cs as u64;
     let nblocks = size.div_ceil(cs);
     for idx in 0..nblocks {
         let start = (idx * cs) as usize;
-        let plain = if let Some(p) = ws.read_tail_block(ino, idx) {
+        let plain = if let Some(p) = ws.read_tail_block(idx) {
             p
         } else if let Some(b) = store.get_block(ino, idx).unwrap() {
             decompress(&b.bytes, Algo::Zstd, b.stored_verbatim).unwrap()
@@ -62,7 +62,12 @@ fn read_whole(ws: &TailSessions, store: &dyn Store, ino: u64) -> Vec<u8> {
 }
 
 /// 在某后端上跑「逐行 append + 周期 fsync」负载，返回 (期望内容, 封块次数)。
-fn run_append_workload(ws: &TailSessions, store: &dyn Store, ino: u64, lines: usize) -> Vec<u8> {
+fn run_append_workload(
+    ws: &mut WriteSession,
+    store: &dyn Store,
+    ino: u64,
+    lines: usize,
+) -> Vec<u8> {
     let mut expected = Vec::new();
     for i in 0..lines {
         // ~512 字节一行（贴近 transcript 小记录），内容半可压缩。
@@ -88,10 +93,10 @@ fn shadow_append_重压次数远少于行数_且内容正确() {
     let dir = tempfile::tempdir().unwrap();
     let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), CHUNK_SIZE).unwrap();
     let ino = store.create(ROOT_INO, "t.jsonl", new_attr()).unwrap();
-    let ws = TailSessions::new(true);
+    let mut ws = WriteSession::new(true);
 
     let lines = 400usize; // 400 行 × 512B = 200KiB；4096B 块 → 满块约 50 个。
-    let expected = run_append_workload(&ws, &store, ino, lines);
+    let expected = run_append_workload(&mut ws, &store, ino, lines);
 
     assert_eq!(read_whole(&ws, &store, ino), expected, "整文件内容正确");
     let attr = store.lookup(ROOT_INO, "t.jsonl").unwrap();
@@ -112,10 +117,10 @@ fn container_append_重压次数远少于行数_且内容正确() {
     let path = dir.path().join("v.redb");
     let store = ContainerStore::open_with_chunk_size(&path, CHUNK_SIZE).unwrap();
     let ino = store.create(ROOT_INO, "t.jsonl", new_attr()).unwrap();
-    let ws = TailSessions::new(true);
+    let mut ws = WriteSession::new(true);
 
     let lines = 400usize;
-    let expected = run_append_workload(&ws, &store, ino, lines);
+    let expected = run_append_workload(&mut ws, &store, ino, lines);
 
     assert_eq!(read_whole(&ws, &store, ino), expected, "整文件内容正确");
     let seals = ws.seal_count();
@@ -137,7 +142,7 @@ fn 关闭尾块缓冲_每次_append_直接落_store_仍正确() {
     let dir = tempfile::tempdir().unwrap();
     let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), CHUNK_SIZE).unwrap();
     let ino = store.create(ROOT_INO, "t.jsonl", new_attr()).unwrap();
-    let ws = TailSessions::new(false);
+    let mut ws = WriteSession::new(false);
 
     let mut expected = Vec::new();
     for i in 0..120usize {
@@ -169,9 +174,10 @@ fn 并发_读与_seal_无_torn_read() {
     let store: Arc<ShadowStore> =
         Arc::new(ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), CHUNK_SIZE).unwrap());
     let ino = store.create(ROOT_INO, "t.jsonl", new_attr()).unwrap();
-    let ws = Arc::new(TailSessions::new(true));
-    // 镜像 rwfs 的 per-inode 写锁：write/seal/read 都持它（read 持锁是 HIGH-1 的修复）。
-    let lock = Arc::new(Mutex::new(()));
+    // 镜像 rwfs 的 per-inode 写锁：把「配置 + 开放尾块状态」的整个 WriteSession 放进一把 Mutex，
+    // write/seal 走 `&mut`、read 走 `&`，二者互斥于同一把锁（read 持锁是 HIGH-1 的修复；共享的
+    // InodeState 与 seal 缓冲的可变必须锁在同一处，否则重开 torn-read 空窗）。
+    let ws = Arc::new(Mutex::new(WriteSession::new(true)));
 
     // 每行非零内容（用 i 的低 8 位 +1，保证恒非 0），便于断言「读到 0 = torn」。
     let line_byte = |i: usize| -> u8 { ((i % 255) + 1) as u8 };
@@ -183,12 +189,11 @@ fn 并发_读与_seal_无_torn_read() {
     let reader = {
         let store = Arc::clone(&store);
         let ws = Arc::clone(&ws);
-        let lock = Arc::clone(&lock);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let _g = lock.lock().unwrap();
-                let got = read_whole(&ws, store.as_ref(), ino);
+                let g = ws.lock().unwrap();
+                let got = read_whole(&g, store.as_ref(), ino);
                 // 文件由整行写入，长度应是 line_len 的整数倍；任一字节为 0 即 torn read。
                 assert!(
                     got.iter().all(|&b| b != 0),
@@ -202,13 +207,13 @@ fn 并发_读与_seal_无_torn_read() {
     // writer 线程：持锁 append 整行 + 周期 seal/fsync。
     let lines = 2000usize;
     for i in 0..lines {
-        let _g = lock.lock().unwrap();
+        let mut g = ws.lock().unwrap();
         let line = vec![line_byte(i); line_len];
-        let off = ws.geometry(store.as_ref(), ino).unwrap().0;
-        ws.write_at(store.as_ref(), ino, off, &line, &params())
+        let off = g.geometry(store.as_ref(), ino).unwrap().0;
+        g.write_at(store.as_ref(), ino, off, &line, &params())
             .unwrap();
         if i % 20 == 19 {
-            ws.seal(store.as_ref(), ino, &params()).unwrap();
+            g.seal(store.as_ref(), ino, &params()).unwrap();
             store.fsync(ino).unwrap();
         }
     }
@@ -216,10 +221,10 @@ fn 并发_读与_seal_无_torn_read() {
     reader.join().unwrap();
 
     // 收尾一致性。
-    let _g = lock.lock().unwrap();
-    ws.seal(store.as_ref(), ino, &params()).unwrap();
+    let mut g = ws.lock().unwrap();
+    g.seal(store.as_ref(), ino, &params()).unwrap();
     store.fsync(ino).unwrap();
-    let final_len = read_whole(&ws, store.as_ref(), ino).len();
+    let final_len = read_whole(&g, store.as_ref(), ino).len();
     assert_eq!(final_len, lines * line_len, "末态长度正确");
 }
 
@@ -252,7 +257,7 @@ fn shadow_append_run(
     let mut a = new_attr();
     a.chunk_size = chunk_size;
     let ino = store.create(ROOT_INO, "t.jsonl", a).unwrap();
-    let ws = TailSessions::new(true);
+    let mut ws = WriteSession::new(true);
     let mut logical = 0u64;
     for i in 0..lines {
         let line = semi_line(i, line_size);
@@ -307,7 +312,7 @@ fn shadow_remount_journal_重建尾块逐字节一致() {
         let mut a = new_attr();
         a.chunk_size = cs;
         let ino = store.create(ROOT_INO, "t.jsonl", a).unwrap();
-        let ws = TailSessions::new(true);
+        let mut ws = WriteSession::new(true);
         for i in 0..30usize {
             let line = semi_line(i, 200);
             let off = ws.geometry(&store, ino).unwrap().0;
@@ -334,7 +339,7 @@ fn shadow_remount_journal_重建尾块逐字节一致() {
         .expect("get_block 应从 journal 重建尾块");
     let plain = decompress(&blk.bytes, Algo::Zstd, blk.stored_verbatim).unwrap();
     assert_eq!(plain, expected, "remount 后 journal 重建尾块应逐字节一致");
-    assert_eq!(read_whole(&TailSessions::new(true), &store, ino), expected);
+    assert_eq!(read_whole(&WriteSession::new(true), &store, ino), expected);
 }
 
 #[test]
@@ -353,7 +358,7 @@ fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
         let mut a = new_attr();
         a.chunk_size = cs;
         let ino = store.create(ROOT_INO, "t.jsonl", a).unwrap();
-        let ws = TailSessions::new(true);
+        let mut ws = WriteSession::new(true);
         for i in 0..800usize {
             let line = semi_line(i, 300);
             let off = ws.geometry(&store, ino).unwrap().0;
@@ -392,7 +397,7 @@ fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
     {
         let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
         let ino = store.lookup(ROOT_INO, "t.jsonl").unwrap().ino;
-        let ws = TailSessions::new(true);
+        let mut ws = WriteSession::new(true);
         for i in 800..1200usize {
             let line = semi_line(i, 300);
             let off = ws.geometry(&store, ino).unwrap().0;
@@ -430,7 +435,7 @@ fn 大文件_多块_跨块append_逐字节正确() {
     let mut attr = new_attr();
     attr.chunk_size = cs;
     let ino = store.create(ROOT_INO, "big.bin", attr).unwrap();
-    let ws = TailSessions::new(true);
+    let mut ws = WriteSession::new(true);
 
     // 写 5.5 MiB（跨 6 个 1MiB 块，末块部分）——半可压缩内容（确定性，避免依赖 rand）。
     let total = 5_500_000usize;
@@ -485,7 +490,7 @@ fn 大文件_多块_跨块append_逐字节正确() {
 
 /// 读 [off, off+len) 区间（复用 read_whole 的协调逻辑做切片）。
 fn read_range_helper(
-    ws: &TailSessions,
+    ws: &WriteSession,
     store: &dyn Store,
     ino: u64,
     off: u64,
