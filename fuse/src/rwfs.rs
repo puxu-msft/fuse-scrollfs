@@ -784,17 +784,23 @@ impl Filesystem for ZipfsRw {
         reply: ReplyEmpty,
     ) {
         // 持 inode 写锁再封块 + 提交，避免与并发 write/truncate 的 RMW 序列交错（rust-review C1）。
+        // **锁序纪律（notify 重入根治）**：`inval_inode` 是同步内核往返，会取 inode 页缓存锁；若在持
+        // per-inode 写锁时调用，与「持内核页锁、其 FUSE read 又堵在本写锁」的并发读构成跨层 AB-BA。
+        // 故把封块+提交圈在内层作用域、**出锁后再** `invalidate_kernel_cache`。
         let lock = self.lock_for(ino.0);
-        let mut guard = lock.write();
-        self.block_cache.invalidate(ino.0);
-        if let Err(e) = self
-            .tails
-            .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
-        {
-            reply.error(io_to_errno(&e));
-            return;
-        }
-        match self.store.flush(ino.0) {
+        let flush_result = {
+            let mut guard = lock.write();
+            self.block_cache.invalidate(ino.0);
+            if let Err(e) =
+                self.tails
+                    .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
+            {
+                reply.error(io_to_errno(&e));
+                return;
+            }
+            self.store.flush(ino.0)
+        }; // 写锁在此 drop —— 之后再通知内核，绝不持锁跨 inval_inode。
+        match flush_result {
             Ok(()) => {
                 self.invalidate_kernel_cache(ino.0);
                 reply.ok()
@@ -813,17 +819,21 @@ impl Filesystem for ZipfsRw {
     ) {
         // 持 inode 写锁再封块 + 提交（rust-review C1）：fsync 须先把开放尾块封块落 Store，
         // 再让 Store 持久化，符合 POSIX fsync 契约（§10），且不能与同 inode 的 RMW 交错。
+        // **锁序纪律（notify 重入根治，同 flush）**：出锁作用域后再 `invalidate_kernel_cache`。
         let lock = self.lock_for(ino.0);
-        let mut guard = lock.write();
-        self.block_cache.invalidate(ino.0);
-        if let Err(e) = self
-            .tails
-            .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
-        {
-            reply.error(io_to_errno(&e));
-            return;
-        }
-        match self.store.fsync(ino.0) {
+        let fsync_result = {
+            let mut guard = lock.write();
+            self.block_cache.invalidate(ino.0);
+            if let Err(e) =
+                self.tails
+                    .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
+            {
+                reply.error(io_to_errno(&e));
+                return;
+            }
+            self.store.fsync(ino.0)
+        }; // 写锁在此 drop —— 之后再通知内核。
+        match fsync_result {
             Ok(()) => {
                 self.invalidate_kernel_cache(ino.0);
                 reply.ok()

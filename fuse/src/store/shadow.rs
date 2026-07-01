@@ -208,11 +208,18 @@ impl ShadowStore {
     fn attr_from_meta(&self, ino: Ino, meta: &fs::Metadata, abs: &Path) -> Attr {
         let kind = filetype_from_meta(meta);
         let (size, chunk_size) = if kind == fuser::FileType::RegularFile {
-            // 脏会话优先（写后读一致）。
-            if let Some(s) = self.sessions.lock().get(&ino) {
-                (s.size, s.chunk_size)
-            } else {
-                read_footer_geometry(abs).unwrap_or_else(|| (meta.size(), self.default_chunk_size))
+            // 脏会话优先（写后读一致）。**先快照再放锁**：绝不在持 `sessions` 时调
+            // `read_footer_geometry`（含 `ArchiveReader::open` 阻塞 IO）——否则每次冷元数据读都
+            // 把全局 `sessions` 锁按住一次 archive 解析，饿死所有并发写者。
+            let dirty = self
+                .sessions
+                .lock()
+                .get(&ino)
+                .map(|s| (s.size, s.chunk_size));
+            match dirty {
+                Some(geom) => geom,
+                None => read_footer_geometry(abs)
+                    .unwrap_or_else(|| (meta.size(), self.default_chunk_size)),
             }
         } else {
             (meta.size(), self.default_chunk_size)
@@ -233,27 +240,31 @@ impl ShadowStore {
     }
 
     /// 确保某 ino 有写会话，没有则从 archive footer 初始化（懒建）。返回该会话的可变借用守卫。
+    /// 确保某 ino 有写会话，没有则从 archive footer 初始化（懒建）。返回该会话的可变借用守卫。
+    ///
+    /// **锁序纪律（死锁根治）**：本函数**不再自取 `inodes` 锁**——`abs` 由调用方在锁 `sessions`
+    /// **之前**算好传入。否则「持 `sessions` 经 `abs_of_ino→rel_of` 取 `inodes`」会与 `unlink`
+    /// 的「持 `inodes` 取 `sessions`」构成 AB-BA 死锁（`inodes` 是所有 lookup/getattr/readdir 必经，
+    /// 锁死即整挂载 wedge）。不变量：**绝不同时持有两把 store 锁**（`inodes`/`sessions`/`readers`）。
     fn ensure_session<'a>(
-        &'a self,
+        &self,
         ino: Ino,
         sessions: &'a mut HashMap<u64, WriteSession>,
-    ) -> io::Result<&'a mut WriteSession> {
+        abs: &Path,
+    ) -> &'a mut WriteSession {
         use std::collections::hash_map::Entry;
         match sessions.entry(ino) {
-            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(slot) => {
-                let abs = self
-                    .abs_of_ino(ino)
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
                 let (size, chunk_size) =
-                    read_footer_geometry(&abs).unwrap_or((0, self.default_chunk_size));
-                Ok(slot.insert(WriteSession {
+                    read_footer_geometry(abs).unwrap_or((0, self.default_chunk_size));
+                slot.insert(WriteSession {
                     dirty: HashMap::new(),
                     size,
                     chunk_size,
                     truncate_to: None,
                     head_cache: None,
-                }))
+                })
             }
         }
     }
@@ -467,7 +478,10 @@ impl Store for ShadowStore {
         let abs = self.abs_of(&child_rel);
         fs::remove_file(&abs)?;
         // 丢弃可能残留的写会话 + 缓存 reader + 映射项。
-        if let Some(ino) = self.inodes.lock().by_path.get(&child_rel).copied() {
+        // **锁序纪律**：把 `by_path` 查询绑到 `let`，令 `inodes` 守卫在语句末即 drop——绝不在持
+        // `inodes` 时取 `sessions`（否则与数据路径 put_block 的 sessions→inodes 构成 AB-BA）。
+        let victim = self.inodes.lock().by_path.get(&child_rel).copied();
+        if let Some(ino) = victim {
             self.sessions.lock().remove(&ino);
             self.invalidate_reader(ino);
         }
@@ -631,16 +645,23 @@ impl Store for ShadowStore {
     }
 
     fn put_block(&self, ino: Ino, idx: u64, blk: StoredBlock, new_size: u64) -> io::Result<()> {
+        // 锁序：先算 abs（内部锁/放 `inodes`），再锁 `sessions`——绝不持 `sessions` 取 `inodes`。
+        let abs = self
+            .abs_of_ino(ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
         let mut sessions = self.sessions.lock();
-        let s = self.ensure_session(ino, &mut sessions)?;
+        let s = self.ensure_session(ino, &mut sessions, &abs);
         s.dirty.insert(idx, blk);
         s.size = new_size;
         Ok(())
     }
 
     fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> io::Result<()> {
+        let abs = self
+            .abs_of_ino(ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
         let mut sessions = self.sessions.lock();
-        let s = self.ensure_session(ino, &mut sessions)?;
+        let s = self.ensure_session(ino, &mut sessions, &abs);
         // 丢弃脏块中 >= keep_from 的，并记录截断点（提交时一并应用到底层）。
         s.dirty.retain(|&i, _| i < keep_from);
         s.truncate_to = Some(match s.truncate_to {
@@ -698,8 +719,11 @@ impl Store for ShadowStore {
         verbatim: bool,
         rawlen: u64,
     ) -> io::Result<()> {
+        let abs = self
+            .abs_of_ino(ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
         let mut sessions = self.sessions.lock();
-        let s = self.ensure_session(ino, &mut sessions)?;
+        let s = self.ensure_session(ino, &mut sessions, &abs);
         s.head_cache = Some((stored_bytes, verbatim, rawlen));
         Ok(())
     }
