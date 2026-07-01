@@ -78,6 +78,19 @@ tempfile = "3"
 # 集成测试断言 errno（如 hardlink → ENOTSUP）；tests/ 是独立 crate，不继承主依赖。
 libc = "0.2"
 
+# 并发模型检验器（D6）：用 loom 自己的原语穷举线程交错，证明双缓冲提交与锁表引用计数
+# 两个算法的并发骨架正确。仅在 `RUSTFLAGS="--cfg loom"` 下编译（cfg(loom) 门控），
+# 平时 cargo test / 发布构建均不拉取、不编译，零运行期成本。loom 无法插桩
+# parking_lot/DashMap/redb，故 tests/loom_*.rs 用 loom 原语忠实复刻被验证算法骨架，
+# 验证的是算法；生产实现的端到端正确由 D1/D4-b 的确定性回归测试覆盖。
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# 让 rustc 认识 `--cfg loom`（D6 loom 测试用），消除 unexpected_cfgs 警告。
+# 平时不传该 cfg，仅 `RUSTFLAGS="--cfg loom"` 时生效；不影响发布构建。
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 # 发布构建优化（perf #3）：compress/decompress 是纯 CPU 热点，lto + 单 codegen-unit 让跨
 # crate 内联/优化生效。**不设 panic="abort"**：守护进程中单个 FUSE worker panic 不应 abort
 # 整个挂载，保留 unwind。代价是 release 编译变慢（单 crate 构建可接受）。
