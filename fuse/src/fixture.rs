@@ -40,6 +40,9 @@ pub fn write_archive_from_bytes(
 
     let file = writer.finish()?;
     file.sync_all()?;
+    // C-7：sync_all 只保证文件内容落盘，不保证新建 dentry durable——崩溃后新 archive
+    // 可能整体消失。fsync 父目录使「文件存在性」持久（与 shadow create 一致）。
+    crate::core::fsync_dir_of(dst);
     Ok(())
 }
 

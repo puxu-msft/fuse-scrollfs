@@ -320,6 +320,9 @@ fn ingest_file(
         src_bytes += n as u64;
     }
     writer.finish()?.sync_all()?;
+    // C-7：sync_all 不保证新建 dentry durable——崩溃后新 archive 可能整体消失。
+    // fsync 父目录使「文件存在性」持久（与 shadow create 一致）。
+    crate::core::fsync_dir_of(dst);
     // Bug D：保留源文件 mtime/atime 到 dst archive 文件。shadow getattr 由底层文件 fs
     // metadata 取时间真值，不设则挂载点文件时间退化为注入时刻、打乱按时间排序的会话列表。
     // 诚实标注：这是**冷会话近似**——首次 append 写入即被改回 now（写会话提交重写
