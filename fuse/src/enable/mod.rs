@@ -10,6 +10,7 @@ pub mod autostart;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
+pub(crate) mod hang_free;
 pub mod lifecycle;
 pub mod model;
 pub mod systemd;
