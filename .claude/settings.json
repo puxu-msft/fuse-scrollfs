@@ -3,6 +3,7 @@
     "allow": [
       "Read(//**)",
       "Bash",
+      "Bash(*)",
       "Skill"
     ],
     "additionalDirectories": [
