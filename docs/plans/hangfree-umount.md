@@ -654,12 +654,14 @@ git commit -m "feat(force_umount): 分档卸载引擎 clean/lazy/abort/auto + �
 - Test: `fuse/tests/enable.rs` 或 `fuse/src/main.rs` 无法直接单测 clap → 由 Task 6 集成覆盖；本任务加一个 `#[cfg(test)]` 的 clap 解析测试到 main.rs。
 
 **Interfaces:**
-- Consumes: `zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::model::{Paths, validate_name}`、`zipfs::enable::systemd::systemd_unescape`。
-- Produces: 顶层子命令 `zipfs umount --name <String> [--level <UmountLevel>]`；`umount-managed` 支持 `--level`（默认 `Auto`）。
+- Consumes: `zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::model::{Paths, validate_name}`、`zipfs::enable::systemd::{systemd_unescape, systemd_escape}`。
+- Produces: 顶层子命令 `zipfs umount --name <raw-project-name> [--level <UmountLevel>]`；`umount-managed` 支持 `--level`（默认 `Auto`）。
+
+> **命名约定（关键，勿混淆）**：`systemd_unescape` 对**裸 `-` 会解成 `/`**（有损），故只有 systemd 传的 **escaped `%i`**（形如 `\x2dhome\x2dxp\x2dsrc\x2dfoo`）才可 unescape。与既有 `enable apply/restore/status` 一致，**面向用户的 `zipfs umount --name` 收的是 RAW project 名**（如 `-home-xp-src-foo`，即 projects 目录名），**不 unescape**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 须 `allow_hyphen_values`。仅 `umount-managed`（systemd ExecStop 用，收 escaped `%i`）才 `systemd_unescape`。C1 提示里的 systemd 单元名用 `systemd_escape(raw)` 反算。
 
 - [ ] **Step 1: 写失败测试**
 
-在 `main.rs` 末尾 `#[cfg(test)] mod cli_tests` 加（clap 解析冒烟）：
+在 `main.rs` 末尾 `#[cfg(test)] mod cli_tests` 加（clap 解析冒烟；raw 名以 `-` 开头需 allow_hyphen_values）：
 
 ```rust
 #[cfg(test)]
@@ -669,6 +671,7 @@ mod cli_tests {
 
     #[test]
     fn parses_umount_with_default_level() {
+        // 面向用户：RAW project 名（以 - 开头，来自 projects 目录名）；默认档 auto。
         let cli = Cli::parse_from(["zipfs", "umount", "--name", "-home-xp-src-foo"]);
         match cli.command {
             Some(Command::Umount(a)) => {
@@ -681,7 +684,10 @@ mod cli_tests {
 
     #[test]
     fn parses_umount_managed_with_level() {
-        let cli = Cli::parse_from(["zipfs", "umount-managed", "--name", "x", "--level", "abort"]);
+        // systemd ExecStop：escaped %i（无前导 -）+ 显式档。
+        let cli = Cli::parse_from([
+            "zipfs", "umount-managed", "--name", "\\x2dhome\\x2dxp", "--level", "abort",
+        ]);
         match cli.command {
             Some(Command::UmountManaged(a)) => {
                 assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Abort);
@@ -699,7 +705,7 @@ Expected: 编译失败（`Command::Umount` 不存在、`MountManagedArgs` 无 `l
 
 - [ ] **Step 3: 写实现**
 
-改 `MountManagedArgs`（`main.rs:98`）加 `level` 字段：
+改 `MountManagedArgs`（按内容定位，非行号）加 `level` 字段：
 
 ```rust
 #[derive(clap::Args, Debug)]
@@ -716,9 +722,9 @@ struct MountManagedArgs {
 新增 `UmountArgs` 与 `Command::Umount`（在 `Command` enum 内 `UmountManaged` 之后）：
 
 ```rust
-    /// 按档位卸载某托管实例（hang-free）：clean/lazy/abort/auto。见 docs/07。
+    /// 按档位卸载某项目挂载（hang-free）：clean/lazy/abort/auto。见 docs/07。
     ///
-    /// 用法：`zipfs umount --name <inst> [--level clean|lazy|abort|auto]`。
+    /// 用法：`zipfs umount --name <项目名> [--level clean|lazy|abort|auto]`。
     Umount(UmountArgs),
 ```
 
@@ -726,8 +732,9 @@ struct MountManagedArgs {
 /// `umount` 子命令参数。
 #[derive(clap::Args, Debug)]
 struct UmountArgs {
-    /// systemd 实例字符串或 path-encoded 项目名。
-    #[arg(long)]
+    /// RAW project 名（projects 目录名，如 `-home-xp-src-foo`）。与 enable 一致，不 unescape。
+    /// 名以 `-` 开头，故 `allow_hyphen_values` 让 clap 接受前导短横值。
+    #[arg(long, allow_hyphen_values = true)]
     name: String,
     /// 卸载档位，默认 auto（clean→lazy→abort 升级）。
     #[arg(long, value_enum, default_value = "auto")]
@@ -741,10 +748,10 @@ struct UmountArgs {
         Some(Command::Umount(args)) => run_umount(args),
 ```
 
-改 `run_umount_managed`（`main.rs:252`）切引擎，并加 `run_umount`：
+改 `run_umount_managed`（按内容定位）切引擎，并加 `run_umount`：
 
 ```rust
-/// systemd 托管卸载（ExecStop）：unescape 实例名 → 按 --level 走 hang-free 引擎。
+/// systemd 托管卸载（ExecStop）：unescape escaped `%i` → 按 --level 走 hang-free 引擎。
 fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
@@ -769,17 +776,17 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 面向用户的按档位卸载。`name` 应传 systemd escaped 实例名（勿传 path-encoded 原名）。
+/// 面向用户的按档位卸载。`name` 是 RAW project 名（与 enable 一致，不 unescape）。
 fn run_umount(args: UmountArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
-    let name = zipfs::enable::systemd::systemd_unescape(&args.name);
-    zipfs::enable::model::validate_name(&name)?;
-    let mp = paths.mountpoint(&name);
+    let name = &args.name;
+    zipfs::enable::model::validate_name(name)?;
+    let mp = paths.mountpoint(name);
     // C1：本命令不 systemctl stop；托管实例（Restart=on-failure）直卸可能与自动重挂竞态。
     eprintln!(
-        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}`；\
+        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}.service`；\
          本命令仅作强制兜底。",
-        args.name
+        zipfs::enable::systemd::systemd_escape(name)
     );
     let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
     info!(

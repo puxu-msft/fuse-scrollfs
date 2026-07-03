@@ -110,9 +110,9 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 - `umount-managed`（`ExecStop` 用，内部）改为接受可选 `--level`（默认 `auto`），复用同一引擎；`run_umount_managed` 从 `RealMounter.unmount` 切到 `force_umount::umount(mp, level)`，并对错误 `.map_err` 附 `%i`/解码名上下文（与 `run_mount_managed` 一致，便于 ExecStop 失败日志定位实例）。
 - `Mounter::unmount` trait 与其 `RealMounter`/`SystemdMounter` 实现**本次不动**（仍供 lifecycle 的 restore/remount/compact/reingest/seal 调用）；见 §9 已知债务。
 
-**`--name` 约定**：接受 systemd **escaped 实例名**（模板 `%i` 形态）；经 `systemd_unescape` 解码（与 `mount-managed` 同款、有损：裸 `-`→`/`）。用户应传 escaped 名，勿传 path-encoded 原名，否则解码漂移可能算错挂载点（此时 `was_mounted=false` 直接 no-op 返回，不误伤别处）。
+**`--name` 约定**：与既有 `enable apply/restore/status` 一致，`zipfs umount --name` 收 **RAW project 名**（projects 目录名，如 `-home-xp-src-foo`），**不 `systemd_unescape`**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 用 `allow_hyphen_values` 让 clap 接受前导短横值。（`systemd_unescape` 对裸 `-` 有损——解成 `/`——故绝不能拿它处理 raw 名；只有 `umount-managed` 收 systemd 的 escaped `%i` 才 unescape。）
 
-**托管实例警告（C1）**：`zipfs umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop zipfs@<esc>`；`zipfs umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
+**托管实例警告（C1）**：`zipfs umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop zipfs@<esc>.service`（`<esc>` 由 `systemd_escape(raw)` 反算）；`zipfs umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
 
 ### 4.4 systemd 模板 `fuse/src/enable/autostart.rs`
 
