@@ -158,10 +158,12 @@ impl crate::enable::daemon::Mounter for SystemdMounter {
         mountpoint: &std::path::Path,
         level: crate::enable::force_umount::UmountLevel,
     ) -> std::io::Result<()> {
-        // 优先 systemctl stop（压住 Restart=on-failure，避免与卸载抢挂；systemd 会 ExecStop
-        // 走 `umount-managed --level auto`，再 SIGTERM/SIGKILL 守护本体 → 守护必死、backing 静默，
-        // 对维护操作安全，故此路径不看 `level`）。但若该项目实际由 RealMounter 裸守护挂载
-        // （unit 不存在 / 未 active），stop 报错——回退经 hang-free 引擎按 `level` 卸载，避免
+        // 优先 systemctl stop（压住 Restart=on-failure，避免与卸载抢挂）。stop 会 ExecStop 走
+        // `umount-managed --level auto`，再按单元默认 KillMode=control-group 对整个 cgroup
+        // SIGTERM→SIGKILL 并阻塞到 cgroup 空 → 守护退出、backing 静默，故对维护操作安全、此路径不看
+        // `level`。（依赖默认 KillMode；若守护陷 D 睡眠无法被 SIGKILL 收割，stop job 会超时报错，
+        // 但该病态由调用方 `wait_daemon_exit` 兜底 fail-closed。）但若该项目实际由 RealMounter 裸守护
+        // 挂载（unit 不存在 / 未 active），stop 报错——回退经 hang-free 引擎按 `level` 卸载，避免
         // mounter 漂移（apply 走 Real、restore 走 Systemd）导致 restore 卡在卸载（评审 H4）。
         match run_systemctl(&systemctl_args("stop", name)) {
             Ok(()) => Ok(()),

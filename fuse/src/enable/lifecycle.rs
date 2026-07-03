@@ -854,26 +854,37 @@ mod tests {
     fn unmount_level_contract_maintenance_clean_revert_auto() {
         // 安全契约：改写 backing 的维护操作（compact/reingest）须请求 Clean（要求守护干净退出，
         // 决不 lazy/abort 一个仍在写 backing 的活守护）；还原类请求 Auto（wedge 也能摘除、无损坏）。
+        // 逐操作精确断言各自记录的档位（而非仅"存在某次 Clean"）。
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
         make_project(&paths, "demo", "a.jsonl", b"line\n".repeat(2000).as_slice());
         let m = FakeMounter::default();
         apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
 
+        // compact：卸载→op→重挂。其卸载是本序列首个 unmount，必须 Clean。
         compact(&paths, "demo", &m).unwrap();
-        assert!(
-            m.unmount_calls
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, lvl)| *lvl == UmountLevel::Clean),
-            "维护操作（compact）必须以 Clean 卸载：{:?}",
+        assert_eq!(
+            m.unmount_calls.lock().unwrap().first().map(|(_, l)| *l),
+            Some(UmountLevel::Clean),
+            "compact 必须以 Clean 卸载：{:?}",
             m.unmount_calls.lock().unwrap()
         );
 
+        // reingest（另一改写 backing 路径）：其卸载也必须 Clean。记录本次调用前的长度以隔离。
+        let before = m.unmount_calls.lock().unwrap().len();
+        reingest(&paths, "demo", false, &m).unwrap();
+        let calls = m.unmount_calls.lock().unwrap();
+        assert!(
+            calls[before..].iter().all(|(_, l)| *l == UmountLevel::Clean),
+            "reingest 必须以 Clean 卸载：{:?}",
+            &calls[before..]
+        );
+        drop(calls);
+
+        // restore：不改写 backing → Auto。它是最后一次卸载。
         restore(&paths, "demo", &m).unwrap();
         assert_eq!(
-            m.unmount_calls.lock().unwrap().last().map(|(_, lvl)| *lvl),
+            m.unmount_calls.lock().unwrap().last().map(|(_, l)| *l),
             Some(UmountLevel::Auto),
             "还原（restore）应以 Auto 卸载：{:?}",
             m.unmount_calls.lock().unwrap()
