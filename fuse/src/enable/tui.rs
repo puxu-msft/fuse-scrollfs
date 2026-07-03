@@ -199,7 +199,7 @@ fn run_pending(paths: &Paths, p: Pending, opts: ApplyOptions, m: &dyn Mounter) -
                 // 与单项 restore 的可还原集合保持一致，绝不静默跳过最该处理的项目。
                 if matches!(
                     info.status,
-                    ProjectStatus::Active | ProjectStatus::Stopped | ProjectStatus::Broken
+                    ProjectStatus::Active | ProjectStatus::Stopped | ProjectStatus::Broken | ProjectStatus::Hung
                 ) {
                     match lifecycle::restore(paths, &info.name, m) {
                         Ok(()) => ok += 1,
@@ -311,7 +311,7 @@ fn start_restore(app: &mut App) {
     };
     if !matches!(
         info.status,
-        ProjectStatus::Active | ProjectStatus::Stopped | ProjectStatus::Broken
+        ProjectStatus::Active | ProjectStatus::Stopped | ProjectStatus::Broken | ProjectStatus::Hung
     ) {
         app.status = format!("{} 未切换，无需还原", info.name);
         return;
@@ -429,6 +429,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 ProjectStatus::Active => Color::Green,
                 ProjectStatus::Stopped => Color::Yellow,
                 ProjectStatus::Broken => Color::Red,
+                ProjectStatus::Hung => Color::Magenta, // 卡死：与 Broken(红,僵尸/半灌) 视觉区分
             };
             let ratio = info
                 .meta

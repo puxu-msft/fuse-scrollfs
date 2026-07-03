@@ -127,8 +127,11 @@ pub enum ProjectStatus {
     Active,
     /// 已切换但守护已停（backing 已提交，可安全 remount）。
     Stopped,
-    /// 半状态需人工：stale endpoint 或 backing 未提交（半灌）。续 restore 或 re-ingest。
+    /// 半状态需人工：stale endpoint（ENOTCONN，daemon 死）或 backing 未提交（半灌）。续 restore 或 re-ingest。
     Broken,
+    /// daemon 无响应（wedge/卡死）：endpoint 探测超时，挂载条目可能仍在。区别于 Broken（僵尸/半灌），
+    /// 卡死可能只是 daemon 暂时无响应，也可能真死——需卸载（`Auto` 档必要时 abort）修复。
+    Hung,
 }
 
 impl ProjectStatus {
@@ -139,42 +142,52 @@ impl ProjectStatus {
             ProjectStatus::Active => "ZIPFS",
             ProjectStatus::Stopped => "STOPPED",
             ProjectStatus::Broken => "BROKEN",
+            ProjectStatus::Hung => "HUNG",
         }
     }
 }
 
+/// 挂载点 endpoint 的健康三态（`discovery` 探测，喂 `classify` 区分「僵尸」与「卡死」）。
+/// 只关心「健康与否」的消费点用 `endpoint_ok` 薄封装即可；此三态仅供分类/展示层区分故障成因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointHealth {
+    /// 可 stat：daemon 活着并响应。
+    Healthy,
+    /// ENOTCONN：daemon 已死，挂载是僵尸 stale endpoint。
+    Stale,
+    /// 探测超时（或熔断缓存命中）：daemon 无响应（wedge/卡死）。
+    Hung,
+}
+
 /// 纯状态分类（评审 C2：以 `backing_committed` 区分「守护死可重挂」与「半灌需人工」）。
 ///
-/// 输入全是布尔事实（由 `discovery.rs` 探测）：
+/// 输入全是探测事实（由 `discovery.rs` 提供）：
 /// - `orig_exists`：`P.zipfs-orig` 备份是否在（= 是否被 apply 过/切换中）。
-/// - `mounted`：`P` 是否为活的 zipfs 挂载点（mountinfo 命中 **且** endpoint 可用）。
-/// - `endpoint_ok`：`P` 可 stat（非 ENOTCONN）。stale endpoint 时 `mounted` 传 false、本项 false。
+/// - `mounted`：`P` 是否为活的 zipfs 挂载点（mountinfo 命中 **且** endpoint 健康）。
+/// - `health`：`P` 的 endpoint 健康三态。`mounted` 已蕴含 `Healthy`（探测端 `matches!(health,Healthy) && is_mounted`），
+///   故 `Stale`/`Hung` 只可能落 `(true,false)` 分支：`Hung → Hung`、`Stale → Broken`。
 /// - `backing_committed`：backing 内 sidecar 存在且 `committed=1`。
 pub fn classify(
     orig_exists: bool,
     mounted: bool,
-    endpoint_ok: bool,
+    health: EndpointHealth,
     backing_committed: bool,
 ) -> ProjectStatus {
     match (orig_exists, mounted) {
         // 未切换：无备份且未挂载 → 普通目录。
         (false, _) => ProjectStatus::Plain,
-        // 已切换且在挂：endpoint 正常才算 Active，否则 stale → Broken。
-        (true, true) => {
-            if endpoint_ok {
-                ProjectStatus::Active
-            } else {
-                ProjectStatus::Broken
-            }
-        }
-        // 已切换但未挂载：backing 提交完整才可安全重挂，否则半灌需人工。
-        (true, false) => {
-            if backing_committed && endpoint_ok {
-                ProjectStatus::Stopped
-            } else {
-                ProjectStatus::Broken
-            }
-        }
+        // 已切换且在挂：mounted 蕴含 Healthy → Active（防御性对非 Healthy 归 Broken，实际不可达）。
+        (true, true) => match health {
+            EndpointHealth::Healthy => ProjectStatus::Active,
+            EndpointHealth::Hung => ProjectStatus::Hung,
+            EndpointHealth::Stale => ProjectStatus::Broken,
+        },
+        // 已切换但未挂载：卡死优先标 Hung；否则 backing 提交完整且健康才可安全重挂，其余半灌/stale → Broken。
+        (true, false) => match health {
+            EndpointHealth::Hung => ProjectStatus::Hung,
+            EndpointHealth::Healthy if backing_committed => ProjectStatus::Stopped,
+            _ => ProjectStatus::Broken,
+        },
     }
 }
 
@@ -274,14 +287,15 @@ impl Activity {
 mod tests {
     use super::*;
 
-    // 真值表：classify 四态全覆盖（评审 C2 核心）。
+    // 真值表：classify 全态覆盖（评审 C2 核心 + 阶段 A 的 Hung 分离）。
     #[test]
     fn classify_plain_when_no_backup() {
-        // 无备份 → 永远 Plain，与挂载/提交无关。
+        // 无备份 → 永远 Plain，与挂载/健康/提交无关。
+        use EndpointHealth::*;
         for &m in &[true, false] {
-            for &e in &[true, false] {
+            for &h in &[Healthy, Stale, Hung] {
                 for &c in &[true, false] {
-                    assert_eq!(classify(false, m, e, c), ProjectStatus::Plain);
+                    assert_eq!(classify(false, m, h, c), ProjectStatus::Plain);
                 }
             }
         }
@@ -289,27 +303,59 @@ mod tests {
 
     #[test]
     fn classify_active_when_mounted_and_endpoint_ok() {
-        assert_eq!(classify(true, true, true, true), ProjectStatus::Active);
-        assert_eq!(classify(true, true, true, false), ProjectStatus::Active);
+        assert_eq!(
+            classify(true, true, EndpointHealth::Healthy, true),
+            ProjectStatus::Active
+        );
+        assert_eq!(
+            classify(true, true, EndpointHealth::Healthy, false),
+            ProjectStatus::Active
+        );
     }
 
     #[test]
     fn classify_broken_when_mounted_but_stale_endpoint() {
-        // 挂载条目在但 endpoint ENOTCONN → 半状态。
-        assert_eq!(classify(true, true, false, true), ProjectStatus::Broken);
+        // 挂载条目在但 endpoint ENOTCONN（stale）→ 半状态（防御分支，实际 mounted 蕴含 Healthy）。
+        assert_eq!(
+            classify(true, true, EndpointHealth::Stale, true),
+            ProjectStatus::Broken
+        );
     }
 
     #[test]
     fn classify_stopped_when_committed_and_unmounted() {
-        assert_eq!(classify(true, false, true, true), ProjectStatus::Stopped);
+        assert_eq!(
+            classify(true, false, EndpointHealth::Healthy, true),
+            ProjectStatus::Stopped
+        );
     }
 
     #[test]
     fn classify_broken_when_uncommitted_backing() {
         // 半灌 backing（无 committed）即便未挂载也不可自动重挂。
-        assert_eq!(classify(true, false, true, false), ProjectStatus::Broken);
-        // endpoint 异常同样 Broken。
-        assert_eq!(classify(true, false, false, true), ProjectStatus::Broken);
+        assert_eq!(
+            classify(true, false, EndpointHealth::Healthy, false),
+            ProjectStatus::Broken
+        );
+        // stale endpoint 同样 Broken（僵尸）。
+        assert_eq!(
+            classify(true, false, EndpointHealth::Stale, true),
+            ProjectStatus::Broken
+        );
+    }
+
+    #[test]
+    fn classify_hung_when_endpoint_probe_times_out() {
+        // 阶段 A：endpoint 探测超时（daemon 无响应/wedge）→ Hung，区别于 Broken（stale/半灌）。
+        // 卡死优先：即便 backing 未提交也标 Hung（先解卡死才谈重挂）。
+        assert_eq!(
+            classify(true, false, EndpointHealth::Hung, true),
+            ProjectStatus::Hung
+        );
+        assert_eq!(
+            classify(true, false, EndpointHealth::Hung, false),
+            ProjectStatus::Hung
+        );
     }
 
     #[test]

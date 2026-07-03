@@ -9,7 +9,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use crate::enable::model::{
-    classify, Activity, ApplyOptions, Backend, Paths, ProjectStatus, ACTIVITY_MTIME_SECS,
+    classify, Activity, ApplyOptions, Backend, EndpointHealth, Paths, ProjectStatus,
+    ACTIVITY_MTIME_SECS,
 };
 
 use super::hang_free::{with_timeout, with_timeout_memo, PROBE_TIMEOUT};
@@ -166,11 +167,11 @@ pub fn scan(paths: &Paths) -> io::Result<Vec<ProjectInfo>> {
 pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
     let mp = paths.mountpoint(name);
     let orig_exists = paths.orig(name).exists();
-    let endpoint_ok = endpoint_ok(&mp);
-    let mounted = endpoint_ok && is_mounted(&mp);
+    let health = endpoint_health(&mp);
+    let mounted = matches!(health, EndpointHealth::Healthy) && is_mounted(&mp);
     let meta = read_meta(&paths.meta_path(name)).ok().flatten();
     let committed = meta.as_ref().map(|m| m.committed).unwrap_or(false);
-    let status = classify(orig_exists, mounted, endpoint_ok, committed);
+    let status = classify(orig_exists, mounted, health, committed);
     ProjectInfo {
         name: name.to_string(),
         status,
@@ -178,16 +179,24 @@ pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
     }
 }
 
-/// 挂载点是否可 stat（stale FUSE endpoint → ENOTCONN → false；hung → 超时 → false）。
-/// 经 `with_timeout_memo` 熔断：近期已判卡死的挂载直接返回 false，不重复起线程（键用原始
-/// 挂载路径，与消费点一致；仅此一处 memo，`canonicalized_target`/活跃扫描保持裸 `with_timeout`）。
-pub fn endpoint_ok(path: &Path) -> bool {
+/// 挂载点 endpoint 健康三态。经 `with_timeout_memo` 熔断：近期已判卡死的挂载直接判 `Hung`，不重复
+/// 起线程（键用原始挂载路径，与消费点一致；仅此一处 memo，`canonicalized_target`/活跃扫描保持裸
+/// `with_timeout`）。`ENOTCONN → Stale`（daemon 死僵尸）；超时/熔断命中 `→ Hung`（daemon 无响应）；
+/// 其余（可 stat 或非 ENOTCONN 错误）`→ Healthy`（原语义：非 ENOTCONN 不算坏）。
+pub fn endpoint_health(path: &Path) -> EndpointHealth {
     let p = path.to_path_buf();
     match with_timeout_memo(path, PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
-        Some(Ok(_)) => true,
-        Some(Err(e)) => e.raw_os_error() != Some(libc::ENOTCONN),
-        None => false, // 超时=hung 或熔断命中 → 视为不健康。
+        Some(Ok(_)) => EndpointHealth::Healthy,
+        Some(Err(e)) if e.raw_os_error() == Some(libc::ENOTCONN) => EndpointHealth::Stale,
+        Some(Err(_)) => EndpointHealth::Healthy,
+        None => EndpointHealth::Hung,
     }
+}
+
+/// 挂载点是否健康（可 stat）的薄封装。只关心「健康与否」的消费点（readiness poll、remount 守卫、
+/// abort 守卫）沿用此 bool——stale 或 hung 都算不健康（`false`），与升级为三态前语义一致、零改动。
+pub fn endpoint_ok(path: &Path) -> bool {
+    matches!(endpoint_health(path), EndpointHealth::Healthy)
 }
 
 /// `path` 是否为活的 fuse 挂载点：解析 `/proc/self/mountinfo`，精确匹配挂载点且 fstype=fuse。
@@ -674,6 +683,15 @@ mod tests {
     #[test]
     fn endpoint_ok_true_for_normal_dir() {
         let dir = tempfile::tempdir().unwrap();
+        assert!(endpoint_ok(dir.path()));
+    }
+
+    #[test]
+    fn endpoint_health_healthy_for_normal_dir() {
+        // 正常目录可 stat → Healthy；薄封装 endpoint_ok 与之一致。
+        // Stale(ENOTCONN)/Hung(超时) 分支需真 wedge/僵尸挂载，靠集成/手测覆盖。
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(endpoint_health(dir.path()), EndpointHealth::Healthy);
         assert!(endpoint_ok(dir.path()));
     }
 
