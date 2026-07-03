@@ -32,6 +32,10 @@ pub struct Metrics {
     fuse_fsync_ops: AtomicU64,
     /// counter：FUSE read/write/fsync/flush 返回错误次数。
     fuse_errors: AtomicU64,
+    /// counter：read_range 内部块查 block_cache 命中（免整块解压）次数。
+    blockcache_hits: AtomicU64,
+    /// counter：read_range 内部块查 block_cache 未命中（走 Store + 解压）次数。
+    blockcache_misses: AtomicU64,
 }
 
 impl Metrics {
@@ -83,6 +87,18 @@ impl Metrics {
     #[inline]
     pub fn record_fuse_error(&self) {
         self.fuse_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次 block_cache 命中（read_range 内部块免整块解压）。
+    #[inline]
+    pub fn record_cache_hit(&self) {
+        self.blockcache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次 block_cache 未命中（read_range 内部块走 Store + 解压）。
+    #[inline]
+    pub fn record_cache_miss(&self) {
+        self.blockcache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 序列化为 Prometheus text 追加进 `out`。
@@ -164,6 +180,20 @@ impl Metrics {
             "counter",
             "read/write/fsync/flush 返回错误次数",
             self.fuse_errors.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_blockcache_hits_total",
+            "counter",
+            "block_cache 命中（read_range 内部块免整块解压）次数",
+            self.blockcache_hits.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_blockcache_misses_total",
+            "counter",
+            "block_cache 未命中（read_range 内部块走 Store + 解压）次数",
+            self.blockcache_misses.load(Ordering::Relaxed),
         );
     }
 }
@@ -275,6 +305,31 @@ mod tests {
             out.contains("zipfs_fuse_write_bytes_total 12"),
             "write bytes 5+7=12：\n{out}"
         );
+    }
+
+    #[test]
+    fn write_prometheus_reflects_blockcache_hit_rate_counters() {
+        let m = Metrics::new();
+        m.record_cache_hit();
+        m.record_cache_hit();
+        m.record_cache_miss();
+
+        let mut out = String::new();
+        m.write_prometheus(&mut out);
+
+        assert!(
+            out.contains("zipfs_blockcache_hits_total 2"),
+            "命中计数应为 2：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_blockcache_misses_total 1"),
+            "未命中计数应为 1：\n{out}"
+        );
+        // 命中率由 Prometheus 侧 hits/(hits+misses) 算，进程内不算，只暴露两个 counter。
+        assert!(out.contains("# TYPE zipfs_blockcache_hits_total counter"));
+        assert!(out.contains("# TYPE zipfs_blockcache_misses_total counter"));
+        assert!(out.contains("# HELP zipfs_blockcache_hits_total"));
+        assert!(out.contains("# HELP zipfs_blockcache_misses_total"));
     }
 
     #[test]

@@ -351,8 +351,10 @@ impl ZipfsRw {
             // 块缓存：命中免整块解压（顺序读放大的主因）。未命中走 Store + 解压，仅严格内部块
             // （idx < tail_idx）回填缓存。空洞块（get_block=None）零填充、不缓存。
             let plain: std::sync::Arc<[u8]> = if let Some(cached) = self.block_cache.get(ino, idx) {
+                self.metrics.record_cache_hit();
                 cached
             } else {
+                self.metrics.record_cache_miss();
                 let stored = match self
                     .store
                     .get_block(ino, idx)
@@ -1524,5 +1526,46 @@ mod tests {
         assert_ne!(after, before, "写后缓存须失效，不得返回陈旧旧值");
         assert_eq!(after, newbytes, "读到新写入字节");
         let _ = store;
+    }
+
+    #[test]
+    fn 块缓存_命中未命中计数进指标() {
+        let cs = 4096u32;
+        // 4 满块 + 100B 尾块 → tail_idx=4，块 0..3 为可缓存内部块。
+        let (fs, _store, _data, ino) = fs_counting(cs, 4 * cs as usize + 100, 1 << 20);
+        let b1 = cs as u64; // 内部块 1 起点。
+
+        fn read_metrics(fs: &ZipfsRw) -> String {
+            let mut out = String::new();
+            fs.metrics.write_prometheus(&mut out);
+            out
+        }
+        fn counter(out: &str, name: &str) -> u64 {
+            out.lines()
+                .find_map(|l| l.strip_prefix(name).and_then(|r| r.trim().parse().ok()))
+                .unwrap_or_else(|| panic!("找不到指标 {name}：\n{out}"))
+        }
+
+        // 首读块 1：块缓存未命中（走 Store + 解压 + 回填）。
+        let _ = fs.read_range(ino, b1, 100).unwrap();
+        let after_first = read_metrics(&fs);
+        let miss1 = counter(&after_first, "zipfs_blockcache_misses_total");
+        let hit1 = counter(&after_first, "zipfs_blockcache_hits_total");
+        assert_eq!(miss1, 1, "首读同一内部块记一次未命中：\n{after_first}");
+        assert_eq!(hit1, 0, "首读无命中：\n{after_first}");
+
+        // 第二遍读同一内部块：命中计数上升、未命中不变。
+        let _ = fs.read_range(ino, b1 + 100, 100).unwrap();
+        let after_second = read_metrics(&fs);
+        assert_eq!(
+            counter(&after_second, "zipfs_blockcache_hits_total"),
+            1,
+            "第二遍读同块命中计数上升：\n{after_second}"
+        );
+        assert_eq!(
+            counter(&after_second, "zipfs_blockcache_misses_total"),
+            1,
+            "命中不再增未命中：\n{after_second}"
+        );
     }
 }
