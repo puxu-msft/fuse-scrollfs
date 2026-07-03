@@ -144,6 +144,10 @@ pub struct ShadowStore {
     reader_epoch: AtomicU64,
     /// 新建文件采用的默认 chunk_size。
     default_chunk_size: u32,
+    /// 统一指标注册表（全 crate 共享 `Arc`）。默认自建私有实例；`with_metrics` 注入共享实例，
+    /// `run_mount` 用其把 shadow 后端埋点接进统一 `.prom` 出口。埋点均为无锁 `Relaxed` 自增，
+    /// 不参与任何锁序、不改控制流，与死锁不变量正交（见结构体各锁注释）。
+    metrics: Arc<crate::core::metrics::Metrics>,
     /// 故障注入（docs/05 §4 / 任务 2.6，仅 test/feature）：置位则下次 `commit_session` 走 `FaultIo`
     /// 并令末尾 `up.sync()` 返 EIO，验证「`invalidate_reader` 先于 `up.sync()`」不变量在 sync 失败时
     /// 仍成立。
@@ -186,9 +190,17 @@ impl ShadowStore {
             readers: Mutex::new(HashMap::new()),
             reader_epoch: AtomicU64::new(0),
             default_chunk_size,
+            metrics: crate::core::metrics::Metrics::new(),
             #[cfg(any(test, feature = "fault-injection"))]
             fault_commit_sync: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 链式注入共享指标注册表（全 crate 单一 `Arc<Metrics>`）。默认自建私有实例，
+    /// `run_mount` 用本方法把 shadow 后端埋点接进统一 `.prom` 出口（与 container 对称）。
+    pub fn with_metrics(mut self, m: Arc<crate::core::metrics::Metrics>) -> Self {
+        self.metrics = m;
+        self
     }
 
     fn abs_of(&self, rel: &Path) -> PathBuf {
@@ -304,8 +316,12 @@ impl ShadowStore {
     /// pread 保证读到自洽旧版本字节）。
     fn cached_reader(&self, ino: Ino) -> io::Result<Option<Arc<ArchiveReader>>> {
         if let Some(r) = self.readers.lock().get(&ino) {
+            self.metrics.record_reader_hit();
             return Ok(Some(r.clone()));
         }
+        // 未命中：即将打开并解析一个新 reader。记 miss 落在 readers 锁作用域**之外**（上面 if 块
+        // 已随其守卫 drop 释放锁），与「埋点不落持锁段」纪律一致——虽原子自增本身 lock-free。
+        self.metrics.record_reader_miss();
         let epoch_before = self.reader_epoch.load(Ordering::Acquire);
         let Some(abs) = self.abs_of_ino(ino) else {
             return Ok(None);
@@ -399,6 +415,10 @@ impl ShadowStore {
             up.set_head_cache(bytes, verbatim, rawlen);
         }
         up.commit()?;
+        // 一个脏会话已真正提交（commit 内部 barrier 已落新 footer/index）。埋点放在 commit 成功之后、
+        // invalidate_reader 之前——纯 Relaxed 原子自增，不改锁序、不改控制流，绝不影响
+        // 「invalidate_reader 先于 up.sync()」这一 durability 不变量的相对顺序。
+        self.metrics.record_shadow_commit();
         // 底层 archive 已变更（commit 内部已 sync 落新 footer/index）。在 up.sync() 之前就失效缓存：
         // 即便随后的 sync() 失败提前返回，盘上已是新版本，缓存也不会残留旧 reader（rust-review L3）。
         self.invalidate_reader(ino);
@@ -707,6 +727,7 @@ impl Store for ShadowStore {
         up.set_size(new_size);
         up.commit_journal()?;
         self.invalidate_reader(ino);
+        self.metrics.record_tail_append();
         Ok(())
     }
 
@@ -1475,5 +1496,56 @@ mod tests {
         let abs = store.abs_of_ino(ino).unwrap();
         let backing_secs = fs::metadata(&abs).unwrap().mtime();
         assert_eq!(backing_secs, 1_750_740_420);
+    }
+
+    // ----- 后端级可观测指标：commit / reader 缓存命中率 / 尾日志追加（走共享 Metrics 注册表）-----
+
+    #[test]
+    fn shadow_backend_metrics_record_commit_reader_hit_and_tail_append() {
+        use crate::core::metrics::Metrics;
+        let cs = 8u32;
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Metrics::new();
+        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs)
+            .unwrap()
+            .with_metrics(metrics.clone());
+        let ino = store.create(ROOT_INO, "f.bin", reg_attr(cs)).unwrap();
+
+        // 写块0 + fsync：一次真正的脏会话提交 → record_shadow_commit。
+        store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
+        store.fsync(ino).unwrap();
+
+        // 首次 get_block：reader 缓存未命中（打开并解析新 reader）→ record_reader_miss。
+        assert_eq!(
+            read_plain(&store, ino, 0).as_deref(),
+            Some(&b"AAAAAAAA"[..])
+        );
+        // 第二次 get_block：命中已缓存 reader → record_reader_hit。
+        assert_eq!(
+            read_plain(&store, ino, 0).as_deref(),
+            Some(&b"AAAAAAAA"[..])
+        );
+
+        // 尾日志增量追加 → record_tail_append（绕开脏会话直接落尾日志）。
+        store.append_tail(ino, b"tail-delta", 8 + 10).unwrap();
+
+        let mut out = String::new();
+        metrics.write_prometheus(&mut out);
+        assert!(
+            out.contains("zipfs_shadow_commits_total 1"),
+            "一次 fsync 提交应记 1 次 shadow_commit：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_shadow_reader_hits_total 1"),
+            "第二次读应命中缓存记 1 次 hit：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_shadow_reader_misses_total 1"),
+            "首次读应未命中记 1 次 miss：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_shadow_tail_appends_total 1"),
+            "一次 append_tail 应记 1 次 tail_append：\n{out}"
+        );
     }
 }

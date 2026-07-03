@@ -38,6 +38,14 @@ pub struct Metrics {
     blockcache_misses: AtomicU64,
     /// counter：尾块封块/重压落后端次数（wsession seal/materialize 每次把尾块压缩落 Store 记一次）。
     seals: AtomicU64,
+    /// counter：ShadowStore（布局 S）提交一个脏会话（commit_session 经 ArchiveUpdater 落 archive）次数。
+    shadow_commits: AtomicU64,
+    /// counter：ShadowStore ArchiveReader 缓存命中（复用已解析 reader，免重解析 footer/index）次数。
+    shadow_reader_hits: AtomicU64,
+    /// counter：ShadowStore ArchiveReader 缓存未命中（打开并解析新 reader）次数。
+    shadow_reader_misses: AtomicU64,
+    /// counter：ShadowStore 尾日志增量追加（append_tail）次数。
+    shadow_tail_appends: AtomicU64,
 }
 
 impl Metrics {
@@ -112,6 +120,30 @@ impl Metrics {
     /// 读累计封块次数（供 [`crate::core::wsession`] 的 `seal_count()` 委托，保其 API 与语义不变）。
     pub fn seals(&self) -> u64 {
         self.seals.load(Ordering::Relaxed)
+    }
+
+    /// 记一次 ShadowStore 脏会话提交（commit_session 经 ArchiveUpdater 落 archive）。
+    #[inline]
+    pub fn record_shadow_commit(&self) {
+        self.shadow_commits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次 ShadowStore ArchiveReader 缓存命中（复用已解析 reader）。
+    #[inline]
+    pub fn record_reader_hit(&self) {
+        self.shadow_reader_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次 ShadowStore ArchiveReader 缓存未命中（打开并解析新 reader）。
+    #[inline]
+    pub fn record_reader_miss(&self) {
+        self.shadow_reader_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次 ShadowStore 尾日志增量追加（append_tail）。
+    #[inline]
+    pub fn record_tail_append(&self) {
+        self.shadow_tail_appends.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 序列化为 Prometheus text 追加进 `out`。
@@ -214,6 +246,34 @@ impl Metrics {
             "counter",
             "尾块封块/重压落后端次数",
             self.seals.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_shadow_commits_total",
+            "counter",
+            "ShadowStore（布局 S）脏会话提交次数",
+            self.shadow_commits.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_shadow_reader_hits_total",
+            "counter",
+            "ShadowStore ArchiveReader 缓存命中（免重解析 footer/index）次数",
+            self.shadow_reader_hits.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_shadow_reader_misses_total",
+            "counter",
+            "ShadowStore ArchiveReader 缓存未命中（打开并解析新 reader）次数",
+            self.shadow_reader_misses.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_shadow_tail_appends_total",
+            "counter",
+            "ShadowStore 尾日志增量追加（append_tail）次数",
+            self.shadow_tail_appends.load(Ordering::Relaxed),
         );
     }
 }
@@ -384,5 +444,43 @@ mod tests {
             out.contains("zipfs_blocks_flushed_total 7"),
             "块数累加 2+5=7：\n{out}"
         );
+    }
+
+    #[test]
+    fn write_prometheus_reflects_shadow_backend_counters() {
+        let m = Metrics::new();
+        m.record_shadow_commit();
+        m.record_shadow_commit();
+        m.record_reader_hit();
+        m.record_reader_hit();
+        m.record_reader_hit();
+        m.record_reader_miss();
+        m.record_tail_append();
+
+        let mut out = String::new();
+        m.write_prometheus(&mut out);
+
+        assert!(
+            out.contains("zipfs_shadow_commits_total 2"),
+            "shadow 提交计数应为 2：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_shadow_reader_hits_total 3"),
+            "reader 命中应为 3：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_shadow_reader_misses_total 1"),
+            "reader 未命中应为 1：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_shadow_tail_appends_total 1"),
+            "尾日志追加应为 1：\n{out}"
+        );
+        // 类型/HELP 行齐备（均为 counter）。
+        assert!(out.contains("# TYPE zipfs_shadow_commits_total counter"));
+        assert!(out.contains("# TYPE zipfs_shadow_reader_hits_total counter"));
+        assert!(out.contains("# TYPE zipfs_shadow_reader_misses_total counter"));
+        assert!(out.contains("# TYPE zipfs_shadow_tail_appends_total counter"));
+        assert!(out.contains("# HELP zipfs_shadow_commits_total"));
     }
 }

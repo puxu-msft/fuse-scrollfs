@@ -660,8 +660,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
     let tail_buffer = !args.no_tail_buffer;
     // 加载共享字典（若 --dict 给定）：读原始字节 → 用挂载等级预消化 CDict/DDict。
     let dict = load_dict(args.dict.as_deref(), args.level)?;
-    // 统一指标注册表：全 crate 单一 Arc。container 分支注入 store 用于 commit 埋点；
-    // 两个读写分支都把同一 clone 传给 serve_rw 作 .prom 出口（shadow 暂无埋点但格式一致）。
+    // 统一指标注册表：全 crate 单一 Arc。shadow/container 分支各把同一 clone 注入 store 作后端埋点
+    // （commit / reader 缓存命中率 / 尾日志追加 等），并把同一 clone 传给 serve_rw 作 .prom 出口。
     let metrics = zipfs::core::metrics::Metrics::new();
     // 写 PID 文件（自挂载脚本/systemd 监控用），退出时尽力删除。SIGKILL/panic 下 remove 不可达
     // → PID 文件可能残留；监控方须校验 PID 存活，勿仅凭文件存在判定守护活着。
@@ -676,8 +676,10 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
         }
         Backend::Shadow => {
             let backing = canonicalize_dir(&backing)?;
-            let store: Arc<dyn Store> =
-                Arc::new(ShadowStore::open_with_chunk_size(backing, args.chunk_size)?);
+            let store: Arc<dyn Store> = Arc::new(
+                ShadowStore::open_with_chunk_size(backing, args.chunk_size)?
+                    .with_metrics(metrics.clone()),
+            );
             let fs = ZipfsRw::with_tail_buffer(
                 store,
                 Algo::Zstd,
