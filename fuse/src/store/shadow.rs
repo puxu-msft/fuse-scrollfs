@@ -240,7 +240,7 @@ impl ShadowStore {
     }
 
     /// 确保某 ino 有写会话，没有则从 archive footer 初始化（懒建）。返回该会话的可变借用守卫。
-    /// 确保某 ino 有写会话，没有则从 archive footer 初始化（懒建）。返回该会话的可变借用守卫。
+    /// 一般经 [`Self::with_session`] 的慢路径调用（`abs` 由调用方在锁 `sessions` **之前**算好传入）。
     ///
     /// **锁序纪律（死锁根治）**：本函数**不再自取 `inodes` 锁**——`abs` 由调用方在锁 `sessions`
     /// **之前**算好传入。否则「持 `sessions` 经 `abs_of_ino→rel_of` 取 `inodes`」会与 `unlink`
@@ -267,6 +267,31 @@ impl ShadowStore {
                 })
             }
         }
+    }
+
+    /// 取 `ino` 写会话的可变引用并执行 `f`，返回其结果。**双检懒建**（性能）：会话已存在——
+    /// 即热路径主体（文件首次写后会话一直在，直到 fsync/commit 清空）——时只锁一次 `sessions`，
+    /// **不碰 `inodes`、不算 `abs`、不堆分配**；仅首次写（Vacant）才付 `abs`：放 `sessions` 后取
+    /// `inodes` 算好，再重锁 `sessions` 用 `entry` 懒建（处理并发插入竞态）。
+    ///
+    /// **锁序纪律**：慢路径先释 `sessions` 再取 `inodes`（算 abs），全程绝不同持两把 store 锁
+    /// （死锁不变量，见 [`Self::ensure_session`]）。`f` 只做内存脏缓冲改动，**绝不在其内做 IO /
+    /// 取其它锁**（它在持 `sessions` 时运行）。
+    fn with_session<R>(&self, ino: Ino, f: impl FnOnce(&mut WriteSession) -> R) -> io::Result<R> {
+        // 快路径：会话已存在，单锁 sessions，零 inodes 流量、零分配。
+        {
+            let mut sessions = self.sessions.lock();
+            if let Some(s) = sessions.get_mut(&ino) {
+                return Ok(f(s));
+            }
+        }
+        // 慢路径（首次写）：sessions 已释，算 abs（inodes 锁），再重锁 sessions 懒建。
+        let abs = self
+            .abs_of_ino(ino)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
+        let mut sessions = self.sessions.lock();
+        let s = self.ensure_session(ino, &mut sessions, &abs);
+        Ok(f(s))
     }
 
     /// 取该 ino 的缓存 `ArchiveReader`；未缓存则打开+解析一次并存入。`NotFound`（文件不存在）
@@ -645,31 +670,24 @@ impl Store for ShadowStore {
     }
 
     fn put_block(&self, ino: Ino, idx: u64, blk: StoredBlock, new_size: u64) -> io::Result<()> {
-        // 锁序：先算 abs（内部锁/放 `inodes`），再锁 `sessions`——绝不持 `sessions` 取 `inodes`。
-        let abs = self
-            .abs_of_ino(ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
-        let mut sessions = self.sessions.lock();
-        let s = self.ensure_session(ino, &mut sessions, &abs);
-        s.dirty.insert(idx, blk);
-        s.size = new_size;
-        Ok(())
+        // 双检懒建（性能）：会话已存在则单锁 sessions；仅首次写才付 abs（inodes 锁）。
+        // 锁序：绝不持 `sessions` 取 `inodes`（见 with_session）。
+        self.with_session(ino, |s| {
+            s.dirty.insert(idx, blk);
+            s.size = new_size;
+        })
     }
 
     fn truncate_blocks(&self, ino: Ino, keep_from: u64, new_size: u64) -> io::Result<()> {
-        let abs = self
-            .abs_of_ino(ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
-        let mut sessions = self.sessions.lock();
-        let s = self.ensure_session(ino, &mut sessions, &abs);
-        // 丢弃脏块中 >= keep_from 的，并记录截断点（提交时一并应用到底层）。
-        s.dirty.retain(|&i, _| i < keep_from);
-        s.truncate_to = Some(match s.truncate_to {
-            Some(prev) => prev.min(keep_from),
-            None => keep_from,
-        });
-        s.size = new_size;
-        Ok(())
+        self.with_session(ino, |s| {
+            // 丢弃脏块中 >= keep_from 的，并记录截断点（提交时一并应用到底层）。
+            s.dirty.retain(|&i, _| i < keep_from);
+            s.truncate_to = Some(match s.truncate_to {
+                Some(prev) => prev.min(keep_from),
+                None => keep_from,
+            });
+            s.size = new_size;
+        })
     }
 
     // ---- in-archive 尾日志（写放大根治，docs/04 §8.4）----
@@ -719,13 +737,9 @@ impl Store for ShadowStore {
         verbatim: bool,
         rawlen: u64,
     ) -> io::Result<()> {
-        let abs = self
-            .abs_of_ino(ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
-        let mut sessions = self.sessions.lock();
-        let s = self.ensure_session(ino, &mut sessions, &abs);
-        s.head_cache = Some((stored_bytes, verbatim, rawlen));
-        Ok(())
+        self.with_session(ino, |s| {
+            s.head_cache = Some((stored_bytes, verbatim, rawlen));
+        })
     }
 
     fn read_head_cache(&self, ino: Ino, off: u64, len: u64) -> io::Result<Option<(Vec<u8>, bool)>> {
