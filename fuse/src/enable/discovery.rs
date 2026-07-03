@@ -12,6 +12,8 @@ use crate::enable::model::{
     classify, Activity, ApplyOptions, Backend, Paths, ProjectStatus, ACTIVITY_MTIME_SECS,
 };
 
+use super::hang_free::{with_timeout, PROBE_TIMEOUT};
+
 /// 单个项目的探测快照（list/TUI 一行）。
 #[derive(Debug, Clone)]
 pub struct ProjectInfo {
@@ -173,11 +175,13 @@ pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
     }
 }
 
-/// 挂载点是否可 stat（stale FUSE endpoint 返回 ENOTCONN → false）。其他错误不算 stale。
+/// 挂载点是否可 stat（stale FUSE endpoint → ENOTCONN → false；hung → 超时 → false）。
 pub fn endpoint_ok(path: &Path) -> bool {
-    match fs::symlink_metadata(path) {
-        Ok(_) => true,
-        Err(e) => e.raw_os_error() != Some(libc::ENOTCONN),
+    let p = path.to_path_buf();
+    match with_timeout(PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
+        Some(Ok(_)) => true,
+        Some(Err(e)) => e.raw_os_error() != Some(libc::ENOTCONN),
+        None => false, // 超时=hung → 视为不健康。
     }
 }
 
@@ -199,15 +203,13 @@ pub fn is_mounted(path: &Path) -> bool {
     mounted
 }
 
-/// 规范化挂载点用于与 mountinfo（内核规范路径）精确比对。整路径 `canonicalize` 失败时
-/// （如 stale ENOTCONN endpoint，挂载点自身已无法 stat），退而规范化**父目录**再拼回末段——
-/// 父目录通常仍可解析，避免回退到未规范化原路径导致与 mountinfo 失配、漏判已挂载（评审 A4/C2）。
+/// 规范化挂载点用于与 mountinfo（内核规范路径）精确比对。**不对叶子 canonicalize**
+/// （hung FUSE 下 stat 叶子会 D 睡眠永阻塞）；仅规范化父目录再拼回末段，父目录也 wedge 的
+/// 极端情形由超时兜底回退未规范化原路径（宁可偶发漏判也不 hang）。
 fn canonicalized_target(path: &Path) -> std::path::PathBuf {
-    if let Ok(p) = fs::canonicalize(path) {
-        return p;
-    }
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
-        if let Ok(cp) = fs::canonicalize(parent) {
+        let parent = parent.to_path_buf();
+        if let Some(Ok(cp)) = with_timeout(PROBE_TIMEOUT, move || fs::canonicalize(&parent)) {
             return cp.join(name);
         }
     }
@@ -227,6 +229,45 @@ fn parse_mountinfo_line(line: &str) -> Option<(String, bool)> {
     let fstype = fields.get(sep + 1)?;
     let is_fuse = fstype.starts_with("fuse");
     Some((mountpoint, is_fuse))
+}
+
+/// 从 mountinfo 文本取 `target` 对应 fuse 挂载的连接号（`major:minor` 的 minor，即
+/// `/sys/fs/fuse/connections/<minor>`）。overmount 取末条；非 fuse / 无匹配 → None。
+/// 纯函数（无 IO）以便单测。
+pub(crate) fn parse_connection_id(mountinfo: &str, target: &Path) -> Option<u64> {
+    let mut found = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let Some(sep) = fields.iter().position(|&f| f == "-") else {
+            continue;
+        };
+        let Some(fstype) = fields.get(sep + 1) else {
+            continue;
+        };
+        if !fstype.starts_with("fuse") {
+            continue;
+        }
+        if Path::new(&unescape_octal(fields[4])) != target {
+            continue;
+        }
+        // 字段 2 = `major:minor`；fuse 的 minor 即连接号。
+        if let Some((_, minor)) = fields[2].split_once(':') {
+            if let Ok(id) = minor.parse::<u64>() {
+                found = Some(id); // 不 break：overmount 取末条。
+            }
+        }
+    }
+    found
+}
+
+/// 读 `/proc/self/mountinfo` 取挂载点的 fuse 连接号。不 stat 挂载点叶子。
+pub fn mount_connection_id(path: &Path) -> Option<u64> {
+    let target = canonicalized_target(path);
+    let content = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    parse_connection_id(&content, &target)
 }
 
 /// 反转义 mountinfo 的八进制转义（空格 \040、tab \011、换行 \012、反斜杠 \134）。
@@ -580,6 +621,23 @@ mod tests {
     }
 
     #[test]
+    fn canonicalized_target_does_not_stat_leaf_segment() {
+        // 末段是坏 symlink（指向不存在目标）：整路径 canonicalize 会失败，但本函数只规范化父目录，
+        // 故仍返回 canonicalize(父)/末段，且不因坏 symlink 报错。
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let leaf = parent.join("mnt");
+        std::os::unix::fs::symlink("/no/such/target/anywhere", &leaf).unwrap();
+        let got = canonicalized_target(&leaf);
+        let want = std::fs::canonicalize(&parent).unwrap().join("mnt");
+        assert_eq!(
+            got, want,
+            "应仅规范化父目录、原样拼回末段，不解析/stat 末段"
+        );
+    }
+
+    #[test]
     fn parse_meta_tolerates_legacy_sidecar_without_new_fields() {
         // 升级路径：apply 增挂载选项前写的旧 sidecar 没有 dict/threads/writeback/max_write 行。
         // 解析须容忍缺失（留 Default），新字段不得污染旧值，committed 仍可信。
@@ -633,6 +691,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("s.jsonl"), b"{}\n").unwrap(); // 新建 → mtime=now → 活跃
         assert!(detect_activity(dir.path()).is_active());
+    }
+
+    #[test]
+    fn parse_connection_id_takes_minor_from_fuse_line() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi =
+            "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.zipfs-shadow zipfs rw,user_id=1000\n";
+        assert_eq!(parse_connection_id(mi, target), Some(44));
+    }
+
+    #[test]
+    fn parse_connection_id_none_for_non_fuse() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi = "36 35 0:44 / /mnt/x rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(parse_connection_id(mi, target), None);
+    }
+
+    #[test]
+    fn parse_connection_id_overmount_takes_last() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi = "36 35 0:44 / /mnt/x rw - fuse.zipfs-shadow z rw\n\
+                  37 35 0:55 / /mnt/x rw - fuse.zipfs-shadow z rw\n";
+        assert_eq!(parse_connection_id(mi, target), Some(55));
+    }
+
+    #[test]
+    fn parse_connection_id_handles_octal_escaped_path() {
+        let target = std::path::Path::new("/mnt/a b"); // 含空格
+        let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse zipfs rw\n";
+        assert_eq!(parse_connection_id(mi, target), Some(44));
     }
 
     #[test]

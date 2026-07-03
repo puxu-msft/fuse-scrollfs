@@ -92,6 +92,11 @@ enum Command {
 
     /// systemd 托管卸载（内部子命令，供 `zipfs@<inst>.service` 的 ExecStop 调用）。
     UmountManaged(MountManagedArgs),
+
+    /// 按档位卸载某项目挂载（hang-free）：clean/lazy/abort/auto。见 docs/07。
+    ///
+    /// 用法：`zipfs umount --name <项目名> [--level clean|lazy|abort|auto]`。
+    Umount(UmountArgs),
 }
 
 /// `mount-managed` / `umount-managed` 子命令参数。
@@ -100,6 +105,21 @@ struct MountManagedArgs {
     /// systemd 实例字符串（escaped 形态，即模板里的 `%i`）。
     #[arg(long)]
     name: String,
+    /// 卸载档位（仅 umount-managed 用；mount-managed 忽略）。默认 auto。
+    #[arg(long, value_enum, default_value = "auto")]
+    level: zipfs::enable::force_umount::UmountLevel,
+}
+
+/// `umount` 子命令参数。
+#[derive(clap::Args, Debug)]
+struct UmountArgs {
+    /// RAW project 名（projects 目录名，如 `-home-xp-src-foo`）。与 enable 一致，不 unescape。
+    /// 名以 `-` 开头，故 `allow_hyphen_values` 让 clap 接受前导短横值。
+    #[arg(long, allow_hyphen_values = true)]
+    name: String,
+    /// 卸载档位，默认 auto（clean→lazy→abort 升级）。
+    #[arg(long, value_enum, default_value = "auto")]
+    level: zipfs::enable::force_umount::UmountLevel,
 }
 
 /// `enable` 子命令参数：无子动作 → TUI。
@@ -216,6 +236,7 @@ fn main() -> std::io::Result<()> {
         }
         Some(Command::MountManaged(args)) => run_mount_managed(args),
         Some(Command::UmountManaged(args)) => run_umount_managed(args),
+        Some(Command::Umount(args)) => run_umount(args),
         None => run_mount(cli.mount),
     }
 }
@@ -248,9 +269,8 @@ fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     run_mount(mount_args_from_spec(&spec))
 }
 
-/// systemd 托管卸载（ExecStop）：unescape 实例名 → 卸载其挂载点。
+/// systemd 托管卸载（ExecStop）：unescape escaped `%i` → 按 --level 走 hang-free 引擎。
 fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
-    use zipfs::enable::daemon::Mounter;
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
     zipfs::enable::model::validate_name(&name).map_err(|e| {
@@ -259,7 +279,39 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
             format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
         )
     })?;
-    zipfs::enable::daemon::RealMounter.unmount(&name, &paths.mountpoint(&name))
+    let mp = paths.mountpoint(&name);
+    // 引擎错误也附 %i/解码名上下文，便于 ExecStop 失败日志定位实例（与 run_mount_managed 对齐）。
+    let report = zipfs::enable::force_umount::umount(&mp, args.level).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
+        )
+    })?;
+    info!(
+        "umount-managed: name={name} level={:?} reached={:?} aborted={} unmounted={}",
+        args.level, report.level_reached, report.aborted, report.unmounted
+    );
+    Ok(())
+}
+
+/// 面向用户的按档位卸载。`name` 是 RAW project 名（与 enable 一致，不 unescape）。
+fn run_umount(args: UmountArgs) -> std::io::Result<()> {
+    let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
+    let name = &args.name;
+    zipfs::enable::model::validate_name(name)?;
+    let mp = paths.mountpoint(name);
+    // C1：本命令不 systemctl stop；托管实例（Restart=on-failure）直卸可能与自动重挂竞态。
+    eprintln!(
+        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}.service`；\
+         本命令仅作强制兜底。",
+        zipfs::enable::systemd::systemd_escape(name)
+    );
+    let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
+    info!(
+        "umount: name={name} level={:?} reached={:?} aborted={} unmounted={}",
+        args.level, report.level_reached, report.aborted, report.unmounted
+    );
+    Ok(())
 }
 
 /// 由 `MountSpec` 构造等价的 `MountArgs`，让 managed 挂载复用 `run_mount` 全部 FUSE 装配逻辑。
@@ -821,4 +873,42 @@ fn canonicalize_dir(path: &PathBuf) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(abs)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_umount_with_default_level() {
+        // 面向用户：RAW project 名（以 - 开头，来自 projects 目录名）；默认档 auto。
+        let cli = Cli::parse_from(["zipfs", "umount", "--name", "-home-xp-src-foo"]);
+        match cli.command {
+            Some(Command::Umount(a)) => {
+                assert_eq!(a.name, "-home-xp-src-foo");
+                assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Auto);
+            }
+            _ => panic!("应解析为 Umount 子命令"),
+        }
+    }
+
+    #[test]
+    fn parses_umount_managed_with_level() {
+        // systemd ExecStop：escaped %i（无前导 -）+ 显式档。
+        let cli = Cli::parse_from([
+            "zipfs",
+            "umount-managed",
+            "--name",
+            "\\x2dhome\\x2dxp",
+            "--level",
+            "abort",
+        ]);
+        match cli.command {
+            Some(Command::UmountManaged(a)) => {
+                assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Abort);
+            }
+            _ => panic!("应解析为 UmountManaged"),
+        }
+    }
 }

@@ -22,9 +22,10 @@
 
 ## File Structure
 
-- `fuse/src/enable/discovery.rs`（改）：新增 mountinfo → fuse 连接号解析（纯函数 + reader）；`canonicalized_target` 的 `canonicalize(parent)` 加超时。
+- `fuse/src/enable/hang_free.rs`（建）：通用 hang-free 原语 `with_timeout` + `PROBE_TIMEOUT`（供 discovery/force_umount 共用）。
+- `fuse/src/enable/discovery.rs`（改）：新增 mountinfo → fuse 连接号解析（Task 1，已完成）；硬化 `endpoint_ok`/`canonicalized_target` 为 hang-free（Task 2）。
 - `fuse/src/enable/force_umount.rs`（建）：`UmountLevel`、`UmountReport`、`umount()` 分档引擎、`abort_connection()`、带超时的 `run_fusermount()`。
-- `fuse/src/enable/mod.rs`（改）：`pub mod force_umount;`。
+- `fuse/src/enable/mod.rs`（改）：`pub(crate) mod hang_free;` + `pub mod force_umount;`。
 - `fuse/src/main.rs`（改）：`Umount` 顶层子命令；`umount-managed` 加 `--level`；`run_umount_managed` 切到引擎。
 - `fuse/src/enable/autostart.rs`（改）：`ExecStop` 加 `--level auto` + 更新单测断言。
 - `fuse/tests/umount_levels.rs`（建）：真挂载集成——clean/lazy/abort/auto + wedge。
@@ -142,49 +143,115 @@ git commit -m "feat(discovery): mountinfo 解析 fuse 连接号（hang-free 取�
 
 ---
 
-## Task 2: `canonicalized_target` 的 parent-canonicalize 超时硬化
+## Task 2: hang-free 探测基础（`hang_free.rs` 模块 + 硬化 `endpoint_ok`/`canonicalized_target`）
+
+> **背景（实施者必读）**：已提交基线的 `discovery.rs` **不是** hang-free：`endpoint_ok` 是裸 `fs::symlink_metadata`（无超时，wedge 下 D 睡眠永阻塞）；`canonicalized_target` 先对整叶子 `fs::canonicalize(path)`（stat 叶子，wedge 下 hang）。基线**没有** `with_timeout`/`PROBE_TIMEOUT`。本任务建立 hang-free 探测基础，供后续 Task 4 的 abort 守卫（`endpoint_ok`）与 `is_mounted`（经 `canonicalized_target`）安全使用。
 
 **Files:**
-- Modify: `fuse/src/enable/discovery.rs:237`（`canonicalized_target`）
-- Test: `fuse/src/enable/discovery.rs`（`#[cfg(test)]` 内）
+- Create: `fuse/src/enable/hang_free.rs`
+- Modify: `fuse/src/enable/mod.rs`（加 `pub(crate) mod hang_free;`，在 `pub mod discovery;` 之前）
+- Modify: `fuse/src/enable/discovery.rs`（硬化 `endpoint_ok`、`canonicalized_target`；顶部加 `use`）
+- Test: `fuse/src/enable/hang_free.rs` 与 `fuse/src/enable/discovery.rs`（各自 `#[cfg(test)]`）
 
 **Interfaces:**
-- Consumes: 既有 `with_timeout(Duration, FnOnce) -> Option<T>`、`PROBE_TIMEOUT`。
-- Produces: `canonicalized_target` 签名不变；行为增加「`canonicalize(parent)` 超时则回退未规范化父路径」。
+- Produces:
+  - `pub(crate) const PROBE_TIMEOUT: std::time::Duration`（800ms）
+  - `pub(crate) fn with_timeout<T, F>(dur: Duration, f: F) -> Option<T> where T: Send + 'static, F: FnOnce() -> T + Send + 'static`
+  - `endpoint_ok`/`canonicalized_target` 签名不变，语义不变（wedge 下由「阻塞」变「快速失败/回退」）。
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写 `hang_free.rs` + 失败测试**
+
+新建 `fuse/src/enable/hang_free.rs`：
 
 ```rust
-#[test]
-fn canonicalized_target_falls_back_when_parent_canonicalize_times_out() {
-    // 无法真造 hung 父目录，改为验证正常父目录仍规范化（回归），并断言实现经由 with_timeout：
-    // 正常父目录快返回，结果 == canonicalize(parent)/leaf。
-    let tmp = tempfile::tempdir().unwrap();
-    let parent = tmp.path().join("p");
-    std::fs::create_dir(&parent).unwrap();
-    let leaf = parent.join("mnt");
-    let got = canonicalized_target(&leaf);
-    let want = std::fs::canonicalize(&parent).unwrap().join("mnt");
-    assert_eq!(got, want);
+//! Hang-free 原语：把可能在 wedge FUSE 上永久阻塞（D 睡眠）的调用包进带超时的工作线程。
+//! wedged 挂载下 stat/canonicalize/opendir 会不可中断阻塞；本模块提供统一的超时逃逸，
+//! 供 discovery 探测与 force_umount 卸载引擎共用。
+
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// 探测类操作（stat/canonicalize）的默认超时上界。超时即视为「不可达/卡死」。
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// 在独立线程运行 `f`，最多等 `dur`。超时返回 `None`。
+///
+/// 取舍：超时时工作线程可能仍卡在 D 睡眠里无法回收（线程泄漏），这是刻意的——
+/// 宁可泄漏一个短命进程里的线程，也绝不让主线程被 hung FUSE 永久拖住。
+pub(crate) fn with_timeout<T, F>(dur: Duration, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(dur).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_timeout_returns_none_when_closure_exceeds_deadline() {
+        let got = with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(5));
+            42u32
+        });
+        assert_eq!(got, None, "超时应返回 None");
+    }
+
+    #[test]
+    fn with_timeout_returns_some_when_closure_finishes_in_time() {
+        assert_eq!(with_timeout(Duration::from_secs(5), || 7u32), Some(7));
+    }
 }
 ```
 
-> 说明：hung 父目录无法在单测里确定性构造；本测试锁定「正常路径行为不回退」这一回归面。超时分支的真实覆盖由 Task 6 的 wedge 集成测试与代码审查共同保证。
-
-- [ ] **Step 2: 运行确认失败/通过基线**
-
-Run: `cd fuse && cargo test --lib canonicalized_target_falls_back`
-Expected: 先失败（函数体未改前该测试名不存在 → 编译错误）；加测试后应即 PASS（正常路径本就成立）。这一步确认测试可运行。
-
-- [ ] **Step 3: 改实现加超时**
-
-将 `canonicalized_target` 改为：
+在 `fuse/src/enable/mod.rs` 加模块声明（在 `pub mod discovery;` 之前，保持字母序不强制）：
 
 ```rust
+pub(crate) mod hang_free;
+```
+
+- [ ] **Step 2: 运行确认新模块测试**
+
+Run: `cd fuse && cargo test --lib hang_free`
+Expected: 2 测试 PASS（首次 fresh worktree 全量编译，较慢，正常）。
+
+- [ ] **Step 3: 硬化 `discovery.rs` 的 `endpoint_ok` 与 `canonicalized_target`**
+
+在 `discovery.rs` 顶部 `use` 区加：
+
+```rust
+use super::hang_free::{with_timeout, PROBE_TIMEOUT};
+```
+
+把 `endpoint_ok` 改为（超时包裹 `symlink_metadata`）：
+
+```rust
+/// 挂载点是否可 stat（stale FUSE endpoint → ENOTCONN → false；hung → 超时 → false）。
+pub fn endpoint_ok(path: &Path) -> bool {
+    let p = path.to_path_buf();
+    match with_timeout(PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
+        Some(Ok(_)) => true,
+        Some(Err(e)) => e.raw_os_error() != Some(libc::ENOTCONN),
+        None => false, // 超时=hung → 视为不健康。
+    }
+}
+```
+
+把 `canonicalized_target` 改为（**不再 stat 叶子**；仅超时包裹 `canonicalize(parent)`）：
+
+```rust
+/// 规范化挂载点用于与 mountinfo（内核规范路径）精确比对。**不对叶子 canonicalize**
+/// （hung FUSE 下 stat 叶子会 D 睡眠永阻塞）；仅规范化父目录再拼回末段，父目录也 wedge 的
+/// 极端情形由超时兜底回退未规范化原路径（宁可偶发漏判也不 hang）。
 fn canonicalized_target(path: &Path) -> std::path::PathBuf {
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
         let parent = parent.to_path_buf();
-        // 祖先本身也是 wedge 挂载的极端情形下 canonicalize 会阻塞 → 超时回退未规范化父路径。
         if let Some(Ok(cp)) = with_timeout(PROBE_TIMEOUT, move || fs::canonicalize(&parent)) {
             return cp.join(name);
         }
@@ -193,16 +260,38 @@ fn canonicalized_target(path: &Path) -> std::path::PathBuf {
 }
 ```
 
-- [ ] **Step 4: 运行全量 discovery 测试确认无回归**
+- [ ] **Step 4: 加「不 stat 叶子」回归测试**
 
-Run: `cd fuse && cargo test --lib discovery`（或 `cargo test --lib canonicalized_target`）
-Expected: 既有 `canonicalized_target_*` 测试全 PASS。
+在 `discovery.rs` 的 `#[cfg(test)] mod tests` 加（锁定叶子坏 symlink 也不报错、不 stat）：
 
-- [ ] **Step 5: 提交**
+```rust
+#[test]
+fn canonicalized_target_does_not_stat_leaf_segment() {
+    // 末段是坏 symlink（指向不存在目标）：整路径 canonicalize 会失败，但本函数只规范化父目录，
+    // 故仍返回 canonicalize(父)/末段，且不因坏 symlink 报错。
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    let leaf = parent.join("mnt");
+    std::os::unix::fs::symlink("/no/such/target/anywhere", &leaf).unwrap();
+    let got = canonicalized_target(&leaf);
+    let want = std::fs::canonicalize(&parent).unwrap().join("mnt");
+    assert_eq!(got, want, "应仅规范化父目录、原样拼回末段，不解析/stat 末段");
+}
+```
+
+- [ ] **Step 5: 全量 discovery 测试确认无回归**
+
+Run: `cd fuse && cargo test --lib discovery && cargo test --lib hang_free`
+Expected: 既有 `canonicalized_target_*`/`endpoint_ok_*` + 新增全 PASS。`cargo clippy --lib -- -D warnings` 与 `cargo fmt` 干净。
+
+> 说明：`endpoint_ok`/`canonicalized_target` 的**超时分支**无法在单测里确定性构造 hung 挂载；`with_timeout` 的超时语义已由 Step 1 两测直接覆盖，wedge 下的端到端行为由 Task 7 集成 + 审查兜底。
+
+- [ ] **Step 6: 提交**
 
 ```bash
-git add fuse/src/enable/discovery.rs
-git commit -m "fix(discovery): parent-canonicalize 加超时，杜绝祖先 wedge 挂载拖挂探测"
+git add fuse/src/enable/hang_free.rs fuse/src/enable/mod.rs fuse/src/enable/discovery.rs
+git commit -m "feat(discovery): hang-free 探测基础（hang_free 模块 + 超时化 endpoint_ok/canonicalized_target）"
 ```
 
 ---
@@ -565,12 +654,14 @@ git commit -m "feat(force_umount): 分档卸载引擎 clean/lazy/abort/auto + �
 - Test: `fuse/tests/enable.rs` 或 `fuse/src/main.rs` 无法直接单测 clap → 由 Task 6 集成覆盖；本任务加一个 `#[cfg(test)]` 的 clap 解析测试到 main.rs。
 
 **Interfaces:**
-- Consumes: `zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::model::{Paths, validate_name}`、`zipfs::enable::systemd::systemd_unescape`。
-- Produces: 顶层子命令 `zipfs umount --name <String> [--level <UmountLevel>]`；`umount-managed` 支持 `--level`（默认 `Auto`）。
+- Consumes: `zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::model::{Paths, validate_name}`、`zipfs::enable::systemd::{systemd_unescape, systemd_escape}`。
+- Produces: 顶层子命令 `zipfs umount --name <raw-project-name> [--level <UmountLevel>]`；`umount-managed` 支持 `--level`（默认 `Auto`）。
+
+> **命名约定（关键，勿混淆）**：`systemd_unescape` 对**裸 `-` 会解成 `/`**（有损），故只有 systemd 传的 **escaped `%i`**（形如 `\x2dhome\x2dxp\x2dsrc\x2dfoo`）才可 unescape。与既有 `enable apply/restore/status` 一致，**面向用户的 `zipfs umount --name` 收的是 RAW project 名**（如 `-home-xp-src-foo`，即 projects 目录名），**不 unescape**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 须 `allow_hyphen_values`。仅 `umount-managed`（systemd ExecStop 用，收 escaped `%i`）才 `systemd_unescape`。C1 提示里的 systemd 单元名用 `systemd_escape(raw)` 反算。
 
 - [ ] **Step 1: 写失败测试**
 
-在 `main.rs` 末尾 `#[cfg(test)] mod cli_tests` 加（clap 解析冒烟）：
+在 `main.rs` 末尾 `#[cfg(test)] mod cli_tests` 加（clap 解析冒烟；raw 名以 `-` 开头需 allow_hyphen_values）：
 
 ```rust
 #[cfg(test)]
@@ -580,6 +671,7 @@ mod cli_tests {
 
     #[test]
     fn parses_umount_with_default_level() {
+        // 面向用户：RAW project 名（以 - 开头，来自 projects 目录名）；默认档 auto。
         let cli = Cli::parse_from(["zipfs", "umount", "--name", "-home-xp-src-foo"]);
         match cli.command {
             Some(Command::Umount(a)) => {
@@ -592,7 +684,10 @@ mod cli_tests {
 
     #[test]
     fn parses_umount_managed_with_level() {
-        let cli = Cli::parse_from(["zipfs", "umount-managed", "--name", "x", "--level", "abort"]);
+        // systemd ExecStop：escaped %i（无前导 -）+ 显式档。
+        let cli = Cli::parse_from([
+            "zipfs", "umount-managed", "--name", "\\x2dhome\\x2dxp", "--level", "abort",
+        ]);
         match cli.command {
             Some(Command::UmountManaged(a)) => {
                 assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Abort);
@@ -610,7 +705,7 @@ Expected: 编译失败（`Command::Umount` 不存在、`MountManagedArgs` 无 `l
 
 - [ ] **Step 3: 写实现**
 
-改 `MountManagedArgs`（`main.rs:98`）加 `level` 字段：
+改 `MountManagedArgs`（按内容定位，非行号）加 `level` 字段：
 
 ```rust
 #[derive(clap::Args, Debug)]
@@ -627,9 +722,9 @@ struct MountManagedArgs {
 新增 `UmountArgs` 与 `Command::Umount`（在 `Command` enum 内 `UmountManaged` 之后）：
 
 ```rust
-    /// 按档位卸载某托管实例（hang-free）：clean/lazy/abort/auto。见 docs/07。
+    /// 按档位卸载某项目挂载（hang-free）：clean/lazy/abort/auto。见 docs/07。
     ///
-    /// 用法：`zipfs umount --name <inst> [--level clean|lazy|abort|auto]`。
+    /// 用法：`zipfs umount --name <项目名> [--level clean|lazy|abort|auto]`。
     Umount(UmountArgs),
 ```
 
@@ -637,8 +732,9 @@ struct MountManagedArgs {
 /// `umount` 子命令参数。
 #[derive(clap::Args, Debug)]
 struct UmountArgs {
-    /// systemd 实例字符串或 path-encoded 项目名。
-    #[arg(long)]
+    /// RAW project 名（projects 目录名，如 `-home-xp-src-foo`）。与 enable 一致，不 unescape。
+    /// 名以 `-` 开头，故 `allow_hyphen_values` 让 clap 接受前导短横值。
+    #[arg(long, allow_hyphen_values = true)]
     name: String,
     /// 卸载档位，默认 auto（clean→lazy→abort 升级）。
     #[arg(long, value_enum, default_value = "auto")]
@@ -652,10 +748,10 @@ struct UmountArgs {
         Some(Command::Umount(args)) => run_umount(args),
 ```
 
-改 `run_umount_managed`（`main.rs:252`）切引擎，并加 `run_umount`：
+改 `run_umount_managed`（按内容定位）切引擎，并加 `run_umount`：
 
 ```rust
-/// systemd 托管卸载（ExecStop）：unescape 实例名 → 按 --level 走 hang-free 引擎。
+/// systemd 托管卸载（ExecStop）：unescape escaped `%i` → 按 --level 走 hang-free 引擎。
 fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
@@ -680,17 +776,17 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 面向用户的按档位卸载。`name` 应传 systemd escaped 实例名（勿传 path-encoded 原名）。
+/// 面向用户的按档位卸载。`name` 是 RAW project 名（与 enable 一致，不 unescape）。
 fn run_umount(args: UmountArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
-    let name = zipfs::enable::systemd::systemd_unescape(&args.name);
-    zipfs::enable::model::validate_name(&name)?;
-    let mp = paths.mountpoint(&name);
+    let name = &args.name;
+    zipfs::enable::model::validate_name(name)?;
+    let mp = paths.mountpoint(name);
     // C1：本命令不 systemctl stop；托管实例（Restart=on-failure）直卸可能与自动重挂竞态。
     eprintln!(
-        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}`；\
+        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}.service`；\
          本命令仅作强制兜底。",
-        args.name
+        zipfs::enable::systemd::systemd_escape(name)
     );
     let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
     info!(

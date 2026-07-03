@@ -8,13 +8,19 @@
 
 ### 1.1 根因（经代码核对，纠正初判）
 
-初判「`is_mounted()` 会 stat 挂载点导致 hang」**不成立**：`discovery::canonicalized_target` 只 `canonicalize(parent)` 后拼回叶子名，**不 stat 叶子**（有测试 `canonicalized_target_does_not_stat_leaf_segment` 佐证）。`is_mounted()` 纯读 `/proc/self/mountinfo` 做字符串比对，本身已 hang-free。
+初判「`is_mounted()` 会 stat 挂载点导致 hang」曾被误认为「已 hang-free」——**两者都不准**，起因是规划时读到了另一并发会话对 `discovery.rs` 的**未提交** WIP、误当已提交现状。核对**已提交基线**（本分支 checkout 的干净提交）后：
 
-真实缺口收敛为三条：
+- `discovery::endpoint_ok` 是裸 `fs::symlink_metadata(path)`，**无超时 → 在 wedge FUSE 上会永久阻塞（D 睡眠）**。
+- `discovery::canonicalized_target` **先对整叶子 `fs::canonicalize(path)`**（stat 叶子），wedge 下同样 hang；`is_mounted()` 经它间接**并非** hang-free。
+- 已提交基线里**没有** `with_timeout`/`PROBE_TIMEOUT`。
+
+真实缺口收敛为四条（前三是卸载路径，第四是探测基础）：
 
 1. **无 lazy、无 abort。** `daemon::unmount_path` 只尝试非-lazy 的 `fusermount3 -u` / `fusermount -u`；busy/broken 时返回失败（这次 status=1 的直接原因），既不 `-z` 懒卸载，也不先 abort FUSE 连接。
 2. **外部子进程无超时兜底。** `unmount_path` 调用 `fusermount` 用 `.status()` 同步等待；当 daemon 带在飞请求 wedge 时，非-lazy `umount2` 可在内核侧阻塞，卸载命令自身即可能 hang。
-3. **parent-canonicalize 的极端 hang。** `canonicalize(parent)` 仅在**祖先目录本身也是 wedge 挂载**的极端情形才阻塞；用超时包一层即可（belt-and-suspenders）。
+3. **探测本身会 hang。** `endpoint_ok`（无超时）与 `canonicalized_target`（stat 叶子）在 wedge 下阻塞——而本特性的 abort 守卫依赖 `endpoint_ok`、`is_mounted` 依赖 `canonicalized_target`，**探测不 hang-free 则整个引擎不成立**。故本特性须先建立 hang-free 探测基础（§4.2）。
+
+> **并发说明**：另一会话正在 `discovery.rs` 未提交 WIP 里独立做同样的探测硬化（`with_timeout`/`PROBE_TIMEOUT` + 超时化 `endpoint_ok`/`canonicalized_target`）。本分支自建同契约的干净实现（模块化到 `hang_free.rs`），两者合入时 `endpoint_ok`/`canonicalized_target` 函数体会冲突，属预期的「并行重复硬化」合并点，见 §9。
 
 ## 2. 目标 / 非目标
 
@@ -29,7 +35,7 @@
 
 - 不改挂载/写入路径的耐久性协议（尾日志、崩溃提交等另有文档 04）。
 - 不引入新的 systemd 单元模板（决定：CLI 原语复用到现有 `ExecStop`，不新建 oneshot 单元）。
-- 不改 `is_mounted()` 的语义，只做超时硬化。
+- 不改 `is_mounted()`/`endpoint_ok()` 的**语义**，只做超时硬化（返回值含义不变，仅在 wedge 下由「阻塞」变「快速失败」）。
 
 ## 3. 卸载档位（升级梯）
 
@@ -86,9 +92,17 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 - `endpoint_ok(mountpoint) -> bool`（复用 `discovery`）：daemon 存活探测，`auto` 升 abort 的守卫（见 §3.1）。
 - `still_mounted(mountpoint) -> bool`：复用 `discovery::is_mounted`（hang-free）。
 
-### 4.2 探测硬化 `fuse/src/enable/discovery.rs`
+### 4.2 hang-free 探测基础 `fuse/src/enable/hang_free.rs`（新模块）+ `discovery.rs` 硬化
 
-`canonicalized_target` 的 `fs::canonicalize(parent)` 包进现有 `with_timeout(PROBE_TIMEOUT, ...)`；超时则回退未规范化父路径（宁可偶发漏判也不 hang）。`is_mounted` 语义不变。
+新增小模块 `hang_free.rs`（单一职责，~40 行）承载通用 hang-free 原语，供 `discovery` 与 `force_umount` 共用：
+
+- `pub(crate) const PROBE_TIMEOUT: Duration = 800ms`。
+- `pub(crate) fn with_timeout<T,F>(dur, f) -> Option<T>`：独立线程跑 `f`，`recv_timeout(dur)` 逃逸；超时返回 None（工作线程可能仍卡 D 睡眠泄漏，刻意取舍——主线程绝不被 hung FUSE 拖住）。
+
+`discovery.rs` 硬化（用上述原语）：
+
+- `endpoint_ok`：`with_timeout(PROBE_TIMEOUT, || symlink_metadata(path))`；`Some(Ok)`→true，`Some(Err(ENOTCONN))`→false，`None`（超时=hung）→false。
+- `canonicalized_target`：**不再对叶子 `canonicalize`**；仅 `with_timeout` 包 `canonicalize(parent)` 再拼回叶子名，超时/失败回退未规范化原路径。`is_mounted` 经它间接 hang-free；语义不变（现有 `canonicalized_target_*` 测试保持绿）。
 
 ### 4.3 CLI `fuse/src/main.rs`
 
@@ -96,9 +110,9 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 - `umount-managed`（`ExecStop` 用，内部）改为接受可选 `--level`（默认 `auto`），复用同一引擎；`run_umount_managed` 从 `RealMounter.unmount` 切到 `force_umount::umount(mp, level)`，并对错误 `.map_err` 附 `%i`/解码名上下文（与 `run_mount_managed` 一致，便于 ExecStop 失败日志定位实例）。
 - `Mounter::unmount` trait 与其 `RealMounter`/`SystemdMounter` 实现**本次不动**（仍供 lifecycle 的 restore/remount/compact/reingest/seal 调用）；见 §9 已知债务。
 
-**`--name` 约定**：接受 systemd **escaped 实例名**（模板 `%i` 形态）；经 `systemd_unescape` 解码（与 `mount-managed` 同款、有损：裸 `-`→`/`）。用户应传 escaped 名，勿传 path-encoded 原名，否则解码漂移可能算错挂载点（此时 `was_mounted=false` 直接 no-op 返回，不误伤别处）。
+**`--name` 约定**：与既有 `enable apply/restore/status` 一致，`zipfs umount --name` 收 **RAW project 名**（projects 目录名，如 `-home-xp-src-foo`），**不 `systemd_unescape`**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 用 `allow_hyphen_values` 让 clap 接受前导短横值。（`systemd_unescape` 对裸 `-` 有损——解成 `/`——故绝不能拿它处理 raw 名；只有 `umount-managed` 收 systemd 的 escaped `%i` 才 unescape。）
 
-**托管实例警告（C1）**：`zipfs umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop zipfs@<esc>`；`zipfs umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
+**托管实例警告（C1）**：`zipfs umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop zipfs@<esc>.service`（`<esc>` 由 `systemd_escape(raw)` 反算）；`zipfs umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
 
 ### 4.4 systemd 模板 `fuse/src/enable/autostart.rs`
 
@@ -159,6 +173,8 @@ systemd 路径 `umount-managed --name %i --level auto` 走同一引擎。
 
 ## 9. 交付边界与已知债务
 
-**本次交付** — 新增：`force_umount.rs` + `tests/umount_levels.rs`。改动：`main.rs`（`Umount` 子命令 + `umount-managed --level` + `%i` 错误上下文）、`autostart.rs`（ExecStop `--level auto`）、`discovery.rs`（连接号解析 + canonicalize 超时）。不动挂载/写入耐久性协议。
+**本次交付** — 新增：`hang_free.rs`（with_timeout/PROBE_TIMEOUT）+ `force_umount.rs` + `tests/umount_levels.rs`。改动：`discovery.rs`（连接号解析 + 硬化 endpoint_ok/canonicalized_target）、`main.rs`（`Umount` 子命令 + `umount-managed --level` + `%i` 错误上下文）、`autostart.rs`（ExecStop `--level auto`）、`mod.rs`（模块声明）。不动挂载/写入耐久性协议。
 
-**已知债务（本次不收敛，显式记录）** — `Mounter::unmount`（`daemon.rs`）及 `RealMounter`/`SystemdMounter` 实现仍走**可 hang 的旧路径**（`unmount_path` 的非-lazy `fusermount -u` + `.status()` 同步等待，无超时/无 abort），被 `lifecycle.rs` 的 restore/remount/compact/reingest/seal 共 5 处调用。即本次只修好了 `ExecStop`/用户 `umount`，`enable restore` 等 lifecycle 操作对 wedge 挂载仍可能卡死。后续任务应把这些回退分支收敛到 `force_umount::umount(mp, Clean)`（restore 语义=耐久卸载）以消除双路径漂移；不在本 plan 内，避免扩大爆炸半径、破坏 `FakeMounter` 单测契约。
+**并发合并点（已知）** — 另一会话在 `discovery.rs` 未提交 WIP 里独立硬化 `endpoint_ok`/`canonicalized_target` 并内联加了 `with_timeout`/`PROBE_TIMEOUT`。本分支把原语模块化到 `hang_free.rs` 并硬化同两函数；合入 main 时两函数体冲突、且可能出现两份 `with_timeout`（对方内联于 discovery、本方在 hang_free）。解冲突策略：保留 `hang_free.rs` 单份原语，删对方内联副本，两函数体取任一等价实现即可（契约一致）。这是并行重复硬化的固有冲突，非设计缺陷。
+
+**后续债务（本次不收敛）** — `Mounter::unmount`（`daemon.rs`）及 `RealMounter`/`SystemdMounter` 实现仍走**可 hang 的旧路径**（`unmount_path` 的非-lazy `fusermount -u` + `.status()` 同步等待，无超时/无 abort），被 `lifecycle.rs` 的 restore/remount/compact/reingest/seal 共 5 处调用。用户可见后果是：经 `enable restore/remount/compact/reingest/seal` 触达的 wedge 挂载仍会无限期 hang（这些路径走 `daemon.rs` 的 `unmount_path`＝非-lazy `fusermount -u` + `.status()`，无超时/无 abort），直到人工清理；本轮只修好了事故路径（systemd `ExecStop` + `zipfs umount`）。本次只修好 `ExecStop`/用户 `umount`；后续应把这些回退分支收敛到 `force_umount::umount(mp, Clean)` 消除双路径漂移。
