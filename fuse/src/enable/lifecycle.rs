@@ -11,6 +11,7 @@ use std::path::Path;
 
 use crate::enable::daemon::{MountSpec, Mounter};
 use crate::enable::discovery::{self, now_unix, Meta};
+use crate::enable::force_umount::UmountLevel;
 use crate::enable::model::{ApplyOptions, Backend, Paths};
 
 /// apply 成功汇总（CLI/TUI 回显）。
@@ -180,7 +181,7 @@ pub fn apply(
     // 状态为 STOPPED（orig 在、未挂载、committed），用户 `enable remount` 直接复用，无需重灌。
     let spec = mount_spec(paths, name, &opts);
     if let Err(e) = mounter.spawn(&spec) {
-        let _ = mounter.unmount(name, &mp); // 清理可能残留的半挂载 endpoint
+        let _ = mounter.unmount(name, &mp, UmountLevel::Auto); // 清理可能残留的半挂载 endpoint
         return Err(err(format!(
             "挂载失败：{e}；backing 已提交、数据完好（未删除），状态置为 STOPPED。\
              运行 `enable remount {name}` 重挂，或 `enable restore {name}` 回到 Plain"
@@ -210,7 +211,8 @@ pub fn restore(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
     if !orig.exists() {
         return Err(err(format!("无备份 {}，无法还原", orig.display())));
     }
-    mounter.unmount(name, &mp)?;
+    // Auto：还原只 mv orig 回项目路径、不改写 backing，故 wedge 可 lazy/abort 摘除、无损坏风险。
+    mounter.unmount(name, &mp, UmountLevel::Auto)?;
     // 删空挂载点目录（apply 时建的空 dir；仍非空 = 仍挂载）。崩溃后已删则跳过（幂等续做）。
     match fs::remove_dir(&mp) {
         Ok(()) => {}
@@ -245,7 +247,7 @@ pub fn remount(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
     }
     if !discovery::endpoint_ok(&mp) {
         // 清 stale endpoint。卸载失败仅 warn（dead 挂载 fusermount 常返错，不一定是真失败）。
-        if let Err(e) = mounter.unmount(name, &mp) {
+        if let Err(e) = mounter.unmount(name, &mp, UmountLevel::Auto) {
             log::warn!("remount：清 {name} stale endpoint 失败：{e}");
         }
         // 评审 M1：复核实际挂载态——若挂载点仍被占（stale 未清除），spawn 必撞已占用挂载点，
@@ -418,7 +420,8 @@ pub fn reingest(
     //    （与 maintain 对 container 的守卫同理；shadow flock 有同样的退出依赖）。
     let mp = paths.mountpoint(name);
     if mounter.is_mounted(&mp) {
-        mounter.unmount(name, &mp)?;
+        // Clean：reingest 换 backing，必须守护干净退出释放 flock；决不 lazy/abort 一个仍在写的活守护。
+        mounter.unmount(name, &mp, UmountLevel::Clean)?;
     }
     if !wait_daemon_exit(paths, name) {
         let _ = fs::remove_dir_all(&tmp);
@@ -483,7 +486,9 @@ fn maintain(
     let mp = paths.mountpoint(name);
     let was_mounted = mounter.is_mounted(&mp);
     if was_mounted {
-        mounter.unmount(name, &mp)?;
+        // Clean：compact/seal 离线改写 backing，须守护干净退出（释放 redb 锁 / shadow backing）；
+        // lazy/abort 会留活守护并发写 backing → 损坏。fail-closed 由下方 wait_daemon_exit 兜底。
+        mounter.unmount(name, &mp, UmountLevel::Clean)?;
         let exited = wait_daemon_exit(paths, name);
         // 两种后端都须等旧守护退出才动手：container 释放 redb 排他锁，shadow 释放 backing
         // flock（compact/seal 现取同一锁，评审 A3）。未确认退出则不动手，重挂回去（H2）。
@@ -846,6 +851,36 @@ mod tests {
     }
 
     #[test]
+    fn unmount_level_contract_maintenance_clean_revert_auto() {
+        // 安全契约：改写 backing 的维护操作（compact/reingest）须请求 Clean（要求守护干净退出，
+        // 决不 lazy/abort 一个仍在写 backing 的活守护）；还原类请求 Auto（wedge 也能摘除、无损坏）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        make_project(&paths, "demo", "a.jsonl", b"line\n".repeat(2000).as_slice());
+        let m = FakeMounter::default();
+        apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
+
+        compact(&paths, "demo", &m).unwrap();
+        assert!(
+            m.unmount_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, lvl)| *lvl == UmountLevel::Clean),
+            "维护操作（compact）必须以 Clean 卸载：{:?}",
+            m.unmount_calls.lock().unwrap()
+        );
+
+        restore(&paths, "demo", &m).unwrap();
+        assert_eq!(
+            m.unmount_calls.lock().unwrap().last().map(|(_, lvl)| *lvl),
+            Some(UmountLevel::Auto),
+            "还原（restore）应以 Auto 卸载：{:?}",
+            m.unmount_calls.lock().unwrap()
+        );
+    }
+
+    #[test]
     fn apply_rolls_back_to_plain_on_ingest_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
@@ -1060,7 +1095,8 @@ mod tests {
         apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
 
         // 模拟守护死：从 FakeMounter 移除挂载，状态变 STOPPED（备份在 + 已提交）。
-        m.unmount("demo", &paths.mountpoint("demo")).unwrap();
+        m.unmount("demo", &paths.mountpoint("demo"), UmountLevel::Auto)
+            .unwrap();
         assert_eq!(
             discovery::probe(&paths, "demo").status,
             ProjectStatus::Stopped

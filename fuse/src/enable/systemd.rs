@@ -152,19 +152,26 @@ impl crate::enable::daemon::Mounter for SystemdMounter {
         )))
     }
 
-    fn unmount(&self, name: &str, mountpoint: &std::path::Path) -> std::io::Result<()> {
-        // 优先 systemctl stop（压住 Restart=on-failure，避免与卸载抢挂）。但若该项目实际由
-        // RealMounter 裸守护挂载（unit 不存在 / 未 active），stop 报错——回退直接 fusermount -u，
-        // 避免 mounter 漂移（apply 走 Real、restore 走 Systemd）导致 restore 卡在卸载（评审 H4）。
+    fn unmount(
+        &self,
+        name: &str,
+        mountpoint: &std::path::Path,
+        level: crate::enable::force_umount::UmountLevel,
+    ) -> std::io::Result<()> {
+        // 优先 systemctl stop（压住 Restart=on-failure，避免与卸载抢挂；systemd 会 ExecStop
+        // 走 `umount-managed --level auto`，再 SIGTERM/SIGKILL 守护本体 → 守护必死、backing 静默，
+        // 对维护操作安全，故此路径不看 `level`）。但若该项目实际由 RealMounter 裸守护挂载
+        // （unit 不存在 / 未 active），stop 报错——回退经 hang-free 引擎按 `level` 卸载，避免
+        // mounter 漂移（apply 走 Real、restore 走 Systemd）导致 restore 卡在卸载（评审 H4）。
         match run_systemctl(&systemctl_args("stop", name)) {
             Ok(()) => Ok(()),
             Err(e) => {
                 if discovery::is_mounted(mountpoint) {
                     log::warn!(
-                        "systemd stop {name} 失败（{e}），回退 fusermount -u {}",
+                        "systemd stop {name} 失败（{e}），回退 hang-free 卸载（level={level:?}）{}",
                         mountpoint.display()
                     );
-                    crate::enable::daemon::unmount_path(mountpoint)
+                    crate::enable::force_umount::umount(mountpoint, level).map(|_| ())
                 } else {
                     // 已不是挂载点 → 卸载目标已达成（幂等），stop 报错无害。
                     Ok(())

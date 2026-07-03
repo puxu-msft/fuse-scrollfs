@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::enable::discovery;
+use crate::enable::force_umount::{self, UmountLevel};
 
 /// 挂载一个守护所需参数。
 #[derive(Debug, Clone)]
@@ -38,9 +39,12 @@ pub struct MountSpec {
 pub trait Mounter {
     /// 启动 detached 守护并等待挂载就绪；超时/早死 → Err（不留半挂状态）。
     fn spawn(&self, spec: &MountSpec) -> std::io::Result<()>;
-    /// 卸载挂载点（轮询直至卸载完成或超时）。`name` 供 systemd 实现 `systemctl stop` 用，
-    /// `RealMounter`/`FakeMounter` 忽略（直接卸 mountpoint）。
-    fn unmount(&self, name: &str, mountpoint: &Path) -> std::io::Result<()>;
+    /// 卸载挂载点，全程 hang-free（经 `force_umount` 引擎）。`level` 定卸载档：
+    /// 改写 backing 的维护操作（compact/seal/reingest）须传 `Clean`（要求守护干净退出，
+    /// 决不 lazy/abort 一个仍在写 backing 的活守护 → 防损坏）；清理/还原类传 `Auto`
+    /// （wedge 也能摘除，且不改写 backing 故 lazy/abort 无损）。`name` 供 systemd 实现
+    /// `systemctl stop` 用，`RealMounter`/`FakeMounter` 忽略（直接卸 mountpoint）。
+    fn unmount(&self, name: &str, mountpoint: &Path, level: UmountLevel) -> std::io::Result<()>;
     /// 是否为活的 zipfs 挂载点。
     fn is_mounted(&self, mountpoint: &Path) -> bool;
 
@@ -116,18 +120,9 @@ impl Mounter for RealMounter {
         ))
     }
 
-    fn unmount(&self, _name: &str, mountpoint: &Path) -> std::io::Result<()> {
-        unmount_path(mountpoint)?;
-        for _ in 0..POLL_MAX {
-            if !discovery::is_mounted(mountpoint) {
-                return Ok(());
-            }
-            std::thread::sleep(POLL_STEP);
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("卸载超时：{}", mountpoint.display()),
-        ))
+    fn unmount(&self, _name: &str, mountpoint: &Path, level: UmountLevel) -> std::io::Result<()> {
+        // hang-free 分档引擎：外部 fusermount 带超时重试、wedge 可 abort（见 force_umount）。
+        force_umount::umount(mountpoint, level).map(|_| ())
     }
 
     fn is_mounted(&self, mountpoint: &Path) -> bool {
@@ -188,33 +183,6 @@ fn mount_argv(spec: &MountSpec) -> Vec<std::ffi::OsString> {
     v
 }
 
-/// 卸载：先 fusermount3 -u，回退 fusermount -u。两者皆失败返回后者错误。
-pub(crate) fn unmount_path(mountpoint: &Path) -> std::io::Result<()> {
-    for bin in ["fusermount3", "fusermount"] {
-        match Command::new(bin)
-            .arg("-u")
-            .arg(mountpoint)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(s) if s.success() => return Ok(()),
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    // 已经不是挂载点也算成功（幂等）。
-    if !discovery::is_mounted(mountpoint) {
-        return Ok(());
-    }
-    Err(std::io::Error::other(format!(
-        "fusermount3/-u 均失败：{}",
-        mountpoint.display()
-    )))
-}
-
 #[cfg(test)]
 pub(crate) mod fake {
     //! 测试用假挂载器：以 backing 内 marker 文件模拟「已挂载」，无 FUSE。
@@ -232,6 +200,8 @@ pub(crate) mod fake {
         pub autostart_enabled: Mutex<Vec<String>>,
         /// 记录 disable_autostart 被调用的项目名（验证 restore/purge 注销自启）。
         pub autostart_disabled: Mutex<Vec<String>>,
+        /// 记录 unmount 的调用参数（name, level）：验证维护操作传 Clean、清理/还原传 Auto。
+        pub unmount_calls: Mutex<Vec<(String, UmountLevel)>>,
     }
 
     impl Mounter for FakeMounter {
@@ -244,7 +214,11 @@ pub(crate) mod fake {
             self.mounted.lock().unwrap().insert(spec.mountpoint.clone());
             Ok(())
         }
-        fn unmount(&self, _name: &str, mountpoint: &Path) -> std::io::Result<()> {
+        fn unmount(&self, name: &str, mountpoint: &Path, level: UmountLevel) -> std::io::Result<()> {
+            self.unmount_calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), level));
             self.mounted.lock().unwrap().remove(mountpoint);
             Ok(())
         }
