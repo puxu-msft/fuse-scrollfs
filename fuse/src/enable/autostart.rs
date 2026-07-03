@@ -44,7 +44,7 @@ fn template_unit_body(exe: &Path) -> String {
          [Service]\n\
          Type=notify\n\
          ExecStart={exe} mount-managed --name %i\n\
-         ExecStop={exe} umount-managed --name %i\n\
+         ExecStop={exe} umount-managed --name %i --level auto\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          WatchdogSec=30\n\n\
@@ -176,7 +176,7 @@ mod tests {
     fn template_unit_body_has_managed_execstart_and_supervision() {
         let body = template_unit_body(Path::new("/usr/bin/zipfs"));
         assert!(body.contains("ExecStart=/usr/bin/zipfs mount-managed --name %i"));
-        assert!(body.contains("ExecStop=/usr/bin/zipfs umount-managed --name %i"));
+        assert!(body.contains("ExecStop=/usr/bin/zipfs umount-managed --name %i --level auto"));
         assert!(body.contains("Type=notify"));
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("WatchdogSec=30"));
