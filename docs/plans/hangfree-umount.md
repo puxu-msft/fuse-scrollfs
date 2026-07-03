@@ -275,51 +275,78 @@ pub enum CmdOutcome {
     NotFound,
 }
 
-/// 写 `/sys/fs/fuse/connections/<id>/abort` 解除在飞/hung 请求。连接已消失（文件不存在）幂等成功。
+/// 写 `/sys/fs/fuse/connections/<id>/abort` 解除在飞/hung 请求。best-effort：
+/// 连接已消失/无权限/已断开（NotFound/PermissionDenied/NotConnected）均视为非致命。
 pub fn abort_connection(id: u64) -> std::io::Result<()> {
     let path = format!("/sys/fs/fuse/connections/{id}/abort");
     match std::fs::write(&path, b"1") {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::NotConnected
+            ) =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e),
     }
 }
 
 const CMD_POLL: Duration = Duration::from_millis(50);
 
-/// spawn `fusermount3` 回退 `fusermount`，带看门狗超时：超时 kill 子进程返回 `TimedOut`，
-/// 保证外部命令不拖住引擎。二进制缺失（两者皆无）→ `NotFound`。
-pub(crate) fn run_fusermount(args: &[&OsStr], timeout: Duration) -> CmdOutcome {
-    for bin in ["fusermount3", "fusermount"] {
-        let mut child = match Command::new(bin)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(_) => return CmdOutcome::Failed,
-        };
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => return CmdOutcome::Success,
-                Ok(Some(_)) => break, // 非零：换下一 bin 或落 Failed。
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return CmdOutcome::TimedOut;
-                    }
-                    std::thread::sleep(CMD_POLL);
+/// 单次 spawn 一个 fusermount 二进制并等其退出（带看门狗子超时）。
+/// 返回 None 表示该二进制不存在（应换下一个）；Some(outcome) 为已执行的结果。
+fn spawn_once(bin: &str, args: &[&OsStr], deadline: std::time::Instant) -> Option<CmdOutcome> {
+    let mut child = match Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) if e.kind() == ErrorKind::NotFound => return None,
+        Err(_) => return Some(CmdOutcome::Failed),
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Some(CmdOutcome::Success),
+            Ok(Some(_)) => return Some(CmdOutcome::Failed), // 跑过但非零（busy）。
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Some(CmdOutcome::TimedOut);
                 }
-                Err(_) => return CmdOutcome::Failed,
+                std::thread::sleep(CMD_POLL);
             }
+            Err(_) => return Some(CmdOutcome::Failed),
         }
     }
-    CmdOutcome::NotFound
+}
+
+/// spawn `fusermount3` 回退 `fusermount`，在 `timeout` 内**轮询重试**吸收瞬态 EBUSY。
+/// 正确区分：`Success` / `Failed`（跑过但始终非零/超时）/ `NotFound`（两二进制皆缺）。
+pub(crate) fn run_fusermount(args: &[&OsStr], timeout: Duration) -> CmdOutcome {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut ran = false; // 是否至少成功 spawn 过一个二进制（区分 Failed vs NotFound）。
+    loop {
+        for bin in ["fusermount3", "fusermount"] {
+            match spawn_once(bin, args, deadline) {
+                None => continue, // 该二进制缺失，试下一个。
+                Some(CmdOutcome::Success) => return CmdOutcome::Success,
+                Some(_) => {
+                    ran = true; // 跑过但失败/超时 → 重试直到 deadline。
+                    break;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return if ran { CmdOutcome::Failed } else { CmdOutcome::NotFound };
+        }
+        std::thread::sleep(CMD_POLL);
+    }
 }
 ```
 
@@ -353,11 +380,11 @@ git commit -m "feat(force_umount): abort 连接 + 带超时兜底的 fusermount 
 - Test: `fuse/src/enable/force_umount.rs`（`#[cfg(test)]` 内）
 
 **Interfaces:**
-- Consumes: `CmdOutcome`、`abort_connection`、`run_fusermount`（Task 3）；`super::discovery::{is_mounted, mount_connection_id}`（Task 1）。
+- Consumes: `CmdOutcome`、`abort_connection`、`run_fusermount`（Task 3）；`super::discovery::{is_mounted, endpoint_ok, mount_connection_id}`（Task 1 + 既有 `endpoint_ok`）。
 - Produces:
   - `pub enum UmountLevel { Clean, Lazy, Abort, Auto }`（`derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)`）
   - `pub struct UmountReport { was_mounted, connection_id: Option<u64>, level_reached: UmountLevel, aborted: bool, unmounted: bool }`
-  - `pub(crate) fn next_level(cur: UmountLevel) -> Option<UmountLevel>` — auto 升级链的纯决策：Clean→Lazy→Abort→None。
+  - `pub(crate) fn next_level(cur: UmountLevel) -> Option<UmountLevel>` — auto 升级链的纯决策：Clean→Lazy→Abort→None；`Auto` 输入返回 None（不参与升级链，由 `umount()` 展开）。
   - `pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountReport>`
 
 - [ ] **Step 1: 写失败测试**
@@ -368,6 +395,7 @@ fn next_level_escalation_chain() {
     assert_eq!(next_level(UmountLevel::Clean), Some(UmountLevel::Lazy));
     assert_eq!(next_level(UmountLevel::Lazy), Some(UmountLevel::Abort));
     assert_eq!(next_level(UmountLevel::Abort), None);
+    assert_eq!(next_level(UmountLevel::Auto), None); // Auto 不参与升级链决策。
 }
 
 #[test]
@@ -407,7 +435,7 @@ pub enum UmountLevel {
     Lazy,
     /// abort 连接 → fusermount -uz：解耦 daemon 存活，可能丢在飞写。
     Abort,
-    /// clean →(超时)→ lazy →(超时)→ abort。默认。
+    /// clean →(仍挂)→ lazy →(仍挂且 daemon 不存活)→ abort。默认。
     Auto,
 }
 
@@ -421,17 +449,16 @@ pub struct UmountReport {
     pub unmounted: bool,
 }
 
-/// auto 升级链的纯决策：Clean→Lazy→Abort→None。
+/// auto 升级链的纯决策：Clean→Lazy→Abort→None。`Auto` 不参与（由 umount() 展开）。
 pub(crate) fn next_level(cur: UmountLevel) -> Option<UmountLevel> {
     match cur {
         UmountLevel::Clean => Some(UmountLevel::Lazy),
         UmountLevel::Lazy => Some(UmountLevel::Abort),
-        UmountLevel::Abort => None,
-        UmountLevel::Auto => Some(UmountLevel::Clean), // auto 从 clean 起步。
+        UmountLevel::Abort | UmountLevel::Auto => None,
     }
 }
 
-/// 单档超时上界（clean/lazy/abort 各自的摘除等待）。
+/// 单档超时上界（clean/lazy/abort 各自的摘除等待，内含轮询重试）。
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 执行单一档位的一次尝试；返回该档结束后是否已卸载。
@@ -446,7 +473,7 @@ fn attempt(mountpoint: &Path, level: UmountLevel, report: &mut UmountReport) -> 
         }
         UmountLevel::Abort => {
             if let Some(id) = report.connection_id {
-                let _ = abort_connection(id);
+                let _ = abort_connection(id); // best-effort
                 report.aborted = true;
             }
             run_fusermount(&[OsStr::new("-u"), OsStr::new("-z"), mp], STEP_TIMEOUT);
@@ -471,18 +498,26 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
     }
 
     if level == UmountLevel::Auto {
-        // 从 clean 起逐级升级。
-        let mut cur = UmountLevel::Clean;
-        loop {
+        // clean → lazy 逐级；升级到 abort 前必须确证 daemon 死/卡（endpoint_ok 守卫），
+        // 否则健康 busy 挂载会被误 abort 丢在飞写（见 docs/07 §3.1）。
+        for cur in [UmountLevel::Clean, UmountLevel::Lazy] {
             report.level_reached = cur;
             if attempt(mountpoint, cur, &mut report) {
                 report.unmounted = true;
                 return Ok(report);
             }
-            match next_level(cur) {
-                Some(n) => cur = n,
-                None => break,
-            }
+        }
+        // 仍挂：只有 daemon 不存活才允许 abort。
+        if discovery::endpoint_ok(mountpoint) {
+            return Err(std::io::Error::other(format!(
+                "daemon 存活但挂载仍 busy，拒绝 abort（护在飞写）；请释放占用后重试或用 --level abort 强制：{}",
+                mountpoint.display()
+            )));
+        }
+        report.level_reached = UmountLevel::Abort;
+        if attempt(mountpoint, UmountLevel::Abort, &mut report) {
+            report.unmounted = true;
+            return Ok(report);
         }
         return Err(std::io::Error::other(format!(
             "auto 升级至 abort 仍未摘除：{}",
@@ -631,7 +666,13 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
         )
     })?;
     let mp = paths.mountpoint(&name);
-    let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
+    // 引擎错误也附 %i/解码名上下文，便于 ExecStop 失败日志定位实例（与 run_mount_managed 对齐）。
+    let report = zipfs::enable::force_umount::umount(&mp, args.level).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
+        )
+    })?;
     info!(
         "umount-managed: name={name} level={:?} reached={:?} aborted={} unmounted={}",
         args.level, report.level_reached, report.aborted, report.unmounted
@@ -639,12 +680,18 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 面向用户的按档位卸载。`name` 接受 escaped 实例名或 path-encoded 项目名。
+/// 面向用户的按档位卸载。`name` 应传 systemd escaped 实例名（勿传 path-encoded 原名）。
 fn run_umount(args: UmountArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
     zipfs::enable::model::validate_name(&name)?;
     let mp = paths.mountpoint(&name);
+    // C1：本命令不 systemctl stop；托管实例（Restart=on-failure）直卸可能与自动重挂竞态。
+    eprintln!(
+        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}`；\
+         本命令仅作强制兜底。",
+        args.name
+    );
     let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
     info!(
         "umount: name={name} level={:?} reached={:?} aborted={} unmounted={}",
@@ -729,7 +776,7 @@ git commit -m "feat(autostart): ExecStop 默认 --level auto，卡死自动升�
 **Interfaces:**
 - Consumes: 已构建的 `zipfs` 二进制（`env!("CARGO_BIN_EXE_zipfs")`）、`zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::discovery::is_mounted`。
 
-> 起挂载的具体范式**必须照抄** `tests/systemd_mount.rs` / `tests/mount_rw.rs` 里现有 helper（如何 spawn `zipfs mount`、等就绪、tempdir backing）。下面给测试意图与断言；起停样板以现有测试为准，避免重复造轮子。
+> **起挂载 helper 需新写**（现有 `tests/systemd_mount.rs`/`tests/mount_rw.rs` 起挂载**不带 `--pid-file`**，无法取 daemon PID）。新 helper `common::mount_shadow()`：起 `zipfs mount --backend shadow ... --pid-file <tmp>`（起停/等就绪范式照抄 `mount_rw.rs`），返回 `{ mountpoint, daemon_pid, _backing, _tmp }`；`daemon_pid` 从 pid-file 读。`common::sigkill(pid)` 发 `SIGKILL`（`libc::kill` 或 `nix`）。整个测试文件加 `skip_reason()` 门控（`/dev/fuse` 可用 + `fusermount(3)` 在 PATH + `/sys/fs/fuse/connections` 可写），对齐 `systemd_mount.rs` 的 skip 范式；无 FUSE 的 CI 上 skip。
 
 - [ ] **Step 1: 写测试骨架 + clean/lazy 用例**
 
@@ -783,30 +830,46 @@ fn auto_stops_at_clean_for_healthy_mount() {
 Run: `cd fuse && cargo test --test umount_levels auto_stops_at_clean -- --test-threads=1`
 Expected: PASS。
 
-- [ ] **Step 5: 加 wedge 恢复用例（SIGKILL daemon → abort/auto 摘除）**
+- [ ] **Step 5: 加 wedge 恢复用例（SIGKILL daemon → 显式 abort 档 + auto 兜底）**
 
 ```rust
 #[test]
-fn abort_recovers_wedged_mount_after_daemon_killed() {
+fn explicit_abort_recovers_wedged_mount() {
     let m = common::mount_shadow();
-    // SIGKILL 守护 → 留陈旧挂载（daemon 不再应答 FUSE）。
-    common::sigkill(m.daemon_pid);
-    // 挂载点仍在 mountinfo 里（is_mounted=true），但 daemon 已死。
+    common::sigkill(m.daemon_pid); // 守护死 → 留陈旧挂载。
     assert!(is_mounted(&m.mountpoint));
+    // 显式 abort 档：无条件 abort 连接 + lazy，断言 aborted 走过。
+    let r = umount(&m.mountpoint, UmountLevel::Abort).unwrap();
+    assert!(r.unmounted);
+    assert!(r.aborted, "显式 abort 档应写过连接 abort");
+    assert!(!is_mounted(&m.mountpoint));
+}
+
+#[test]
+fn auto_recovers_wedged_mount() {
+    let m = common::mount_shadow();
+    common::sigkill(m.daemon_pid);
+    assert!(is_mounted(&m.mountpoint));
+    // auto 对 wedge：daemon 已死（endpoint_ok=false），守卫放行；
+    // 实际多半 lazy 即摘除（正是真实事故里 fusermount -uz 生效的情形），
+    // 故只断言最终摘除，不锁定停在哪一档（Lazy 或 Abort 皆合法）。
     let r = umount(&m.mountpoint, UmountLevel::Auto).unwrap();
     assert!(r.unmounted);
-    assert_eq!(r.level_reached, UmountLevel::Abort, "wedge 应升级到 abort");
-    assert!(r.aborted);
     assert!(!is_mounted(&m.mountpoint));
+    assert!(
+        matches!(r.level_reached, UmountLevel::Lazy | UmountLevel::Abort),
+        "wedge 恢复应停在 lazy 或 abort，实得 {:?}",
+        r.level_reached
+    );
 }
 ```
 
-> `common::sigkill(pid)` 与 `daemon_pid` 的获取照抄现有测试（`mount` 支持 `--pid-file`，从中读 PID）。
+> `common::sigkill(pid)` 与 `daemon_pid` 由 Step 1 新写的 helper 提供（`mount_shadow()` 用 `--pid-file` 读 PID）。**关键**：daemon 死后 `fusermount -uz`（lazy，MNT_DETACH）通常即可摘除陈旧挂载（真实事故正是如此），所以 `auto` 多半停在 **lazy** 而非 abort——故 abort 档的 `aborted` 断言用**显式 `--level abort`** 驱动；`auto` 用例只验「最终摘除」。健康 busy 挂载（daemon 活、endpoint_ok=true）则被守卫拦在 lazy 之前不 abort（由 `auto_stops_at_clean` 侧证正常关闭不误触）。
 
 - [ ] **Step 6: 运行确认通过**
 
-Run: `cd fuse && cargo test --test umount_levels abort_recovers -- --test-threads=1`
-Expected: PASS（wedge 挂载在超时上界内被 abort+lazy 摘除）。
+Run: `cd fuse && cargo test --test umount_levels _wedged_mount -- --test-threads=1`
+Expected: `explicit_abort_recovers_wedged_mount` 与 `auto_recovers_wedged_mount` 均 PASS。
 
 - [ ] **Step 7: 全量测试 + 提交**
 
@@ -824,16 +887,17 @@ git commit -m "test(umount): 真挂载分档 + wedge 恢复集成"
 
 **Spec coverage（对照 docs/07）：**
 - §3 四档 clean/lazy/abort/auto → Task 4（引擎）+ Task 5（CLI 暴露）。✓
-- §3 升级梯 + STEP_TIMEOUT → Task 4 `next_level`/`attempt`/`umount`。✓
-- §3.1 耐久性权衡（auto 优先 clean、健康不 abort）→ Task 7 `auto_stops_at_clean`。✓
+- §3 升级梯 + STEP_TIMEOUT + clean/lazy 重试吸收瞬态 EBUSY → Task 3 `run_fusermount`/Task 4 `attempt`/`umount`。✓
+- §3.1 abort 守卫（`endpoint_ok`：daemon 活则停 lazy 不 abort，护在飞写）→ Task 4 `umount` auto 分支 + Task 7 `auto_stops_at_clean` / `abort_recovers`（SIGKILL 后 endpoint_ok=false 才 abort）。✓
 - §4.1 force_umount 模块与接口 → Task 3+4。✓
 - §4.1 `mount_connection_id` → Task 1。✓
 - §4.2 探测硬化（canonicalize 超时）→ Task 2。✓
-- §4.3 CLI `umount` + `umount-managed --level` → Task 5。✓
+- §4.3 CLI `umount`（+ C1 托管警告、escaped name 约定）+ `umount-managed --level`（+ %i 错误上下文）→ Task 5。✓
 - §4.4 systemd ExecStop `--level auto` → Task 6。✓
-- §6 错误处理（auto 升级不冒泡、单档如实报错、abort 幂等、validate_name）→ Task 4 + Task 5。✓
-- §7 测试策略（解析单测 + 真挂载 + wedge）→ Task 1/3/4/7。✓
+- §6 错误处理（auto 升级不冒泡、单档如实报错、abort best-effort 多 errno、%i 上下文、validate_name）→ Task 3/4 + Task 5。✓
+- §7 测试策略（解析单测 + 真挂载 + wedge，新写 pid-file helper + skip 门控）→ Task 1/3/4/7。✓
+- §9 已知债务（`Mounter::unmount`/lifecycle 旧路径未收敛）→ 显式不在本 plan 范围，文档标注。✓
 
-**Placeholder scan：** 无 TBD/TODO；每个改码步骤含完整代码。Task 7 的起挂载样板显式指向照抄现有 `tests/mount_rw.rs`/`systemd_mount.rs`——这是复用既有 helper 而非占位（避免重复造轮子）。
+**Placeholder scan：** 无 TBD/TODO；每个改码步骤含完整代码。Task 7 的起挂载 helper 显式标注**需新写**（`--pid-file` 读 PID + skip 门控），非占位、非「照抄」。
 
-**Type consistency：** `UmountLevel`/`UmountReport`/`CmdOutcome` 字段与方法名跨 Task 1/3/4/5/7 一致；`umount(&Path, UmountLevel) -> io::Result<UmountReport>`、`mount_connection_id(&Path) -> Option<u64>`、`parse_connection_id(&str, &Path) -> Option<u64>`、`run_fusermount(&[&OsStr], Duration) -> CmdOutcome`、`abort_connection(u64) -> io::Result<()>`、`next_level(UmountLevel) -> Option<UmountLevel>` 全对齐。
+**Type consistency：** `UmountLevel`/`UmountReport`/`CmdOutcome` 字段与方法名跨 Task 1/3/4/5/7 一致；`umount(&Path, UmountLevel) -> io::Result<UmountReport>`、`mount_connection_id(&Path) -> Option<u64>`、`parse_connection_id(&str, &Path) -> Option<u64>`、`run_fusermount(&[&OsStr], Duration) -> CmdOutcome`、`spawn_once(&str, &[&OsStr], Instant) -> Option<CmdOutcome>`、`abort_connection(u64) -> io::Result<()>`、`next_level(UmountLevel) -> Option<UmountLevel>`（`Auto`→None）全对齐；auto 分支消费既有 `discovery::endpoint_ok(&Path) -> bool`。

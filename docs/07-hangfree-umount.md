@@ -38,13 +38,20 @@
 | `clean` | `fusermount -u`（超时上界内） | daemon 收 DESTROY → flush，**耐久**；busy/wedge 时失败或超时（不 hang） |
 | `lazy` | `fusermount -uz` | 从命名空间摘除即使 busy；不 abort，无额外在飞丢失；已 hang 的读者不保证立即解除 |
 | `abort` | 写 `/sys/fs/fuse/connections/<id>/abort` → `fusermount -uz` | 解除 hung 读者、与 daemon 存活解耦；**可能丢未 flush 的在飞写**，仅用于死/卡 daemon |
-| `auto`（默认） | `clean` →(超时)→ `lazy` →(超时)→ `abort` | 耐久优先 + 保证摘除；正常 stop 走 `clean` flush，仅卡死才逐级升级 |
+| `auto`（默认） | `clean` →(仍挂)→ `lazy` →(仍挂 **且 daemon 不存活**)→ `abort` | 耐久优先 + 保证摘除；正常 stop 走 `clean` flush，仅**确证卡死**才升级到 abort |
 
-档位之间用 hang-free 的 mountinfo 复查 + 短超时（默认 `STEP_TIMEOUT = 3s`）判断是否需要升级。
+档位之间用 hang-free 的 mountinfo 复查 + 短超时（默认 `STEP_TIMEOUT = 3s`）判断是否需要升级。`clean`/`lazy` 的外部 `fusermount` 在 `STEP_TIMEOUT` 内**轮询重试**（对齐 `daemon.rs` 的 `POLL_STEP`/`POLL_MAX` 范式），吸收刚 detach 的瞬态 EBUSY，避免误判需升级。
 
-### 3.1 耐久性权衡（显式）
+### 3.1 耐久性权衡（显式）——`auto` 升 abort 的守卫
 
-`abort` 写连接 `abort` 会让内核错误化所有在飞请求：客户端未 ack 的写返回 EIO（符合语义——未 ack 即无保证）；daemon 自身缓冲但未 flush 的尾状态是否丢失，取决于 daemon 退出路径是否 flush（见文档 04 的尾日志/崩溃提交）。因此 `abort` **只应在无法干净卸载时**触发。`auto` 把这一取舍自动化：能 `clean` 就绝不 `abort`。
+`abort` 写连接 `abort` 会让内核错误化所有在飞请求：客户端未 ack 的写返回 EIO（符合语义——未 ack 即无保证）；daemon 自身缓冲但未 flush 的尾状态是否丢失取决于 daemon 退出路径（见文档 04）。因此 `abort` **只应在 daemon 已死/卡死时**触发。
+
+**关键守卫（防误 abort 健康挂载丢数据）**：`auto` 升级到 `abort` 前，必须叠加 **daemon 存活探测** `discovery::endpoint_ok(mountpoint)`（`with_timeout(PROBE_TIMEOUT)` 包裹的 `symlink_metadata`，hang-free）：
+
+- `endpoint_ok == false`（stat 超时=hung，或 ENOTCONN=stale）→ daemon 死/卡 → 允许升级 `abort`。
+- `endpoint_ok == true`（daemon 存活，只是 busy）→ **禁止 abort**：`auto` 停在 `lazy`。健康 daemon 的挂载即便 busy，也用 `lazy` 从命名空间摘除（引用归零后 daemon 自然收尾 flush），绝不 abort 其在飞写。
+
+这把「能 clean/lazy 就绝不 abort」从口号落到可判定信号上：**只有 `is_mounted && !endpoint_ok` 才是「确证卡死」**，才触发 abort。仅凭 `is_mounted` 不足以区分 busy 与 wedge。
 
 ## 4. 组件与接口
 
@@ -73,9 +80,10 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 
 内部子步骤（均纯 `/proc`、`/sys` 与带超时的外部命令）：
 
-- `mount_connection_id(mountpoint) -> Option<u64>`：读 `/proc/self/mountinfo`，匹配挂载点（复用 `parse_mountinfo_line` 的 octal unescape + overmount 取末条逻辑），从第 3 字段 `major:minor` 取 `minor` 作 fuse 连接号。**不碰挂载点。**
-- `abort_connection(id) -> io::Result<()>`：写 `/sys/fs/fuse/connections/<id>/abort`；文件不存在（连接已消失）视为成功（幂等）。
-- `run_fusermount(args, timeout) -> Outcome`：spawn `fusermount3`/`fusermount`，用看门狗超时 kill 子进程后返回 `TimedOut`，避免外部命令拖住引擎。
+- `mount_connection_id(mountpoint) -> Option<u64>`：读 `/proc/self/mountinfo`，匹配挂载点（复用 `parse_mountinfo_line` 的 octal unescape + overmount 取末条逻辑），从第 3 字段 `major:minor` 取 `minor` 作 fuse 连接号。**不碰挂载点。** 本产品挂载点为单点（`projects_root/name`），无 overmount，故单 id 足够；取末条与 `is_mounted` 一致。
+- `abort_connection(id) -> io::Result<()>`：写 `/sys/fs/fuse/connections/<id>/abort`；连接已消失/无权限/已断开（`NotFound`/`PermissionDenied`/`NotConnected`）均视为非致命（best-effort，调用方亦忽略其错误）。
+- `run_fusermount(args, timeout) -> Outcome`：spawn `fusermount3`/`fusermount`，在 `timeout` 内**轮询重试**（吸收瞬态 EBUSY），子进程各自带看门狗超时 kill；正确区分 `Success`/`Failed`（跑过但非零）/`TimedOut`/`NotFound`（二进制皆缺）。
+- `endpoint_ok(mountpoint) -> bool`（复用 `discovery`）：daemon 存活探测，`auto` 升 abort 的守卫（见 §3.1）。
 - `still_mounted(mountpoint) -> bool`：复用 `discovery::is_mounted`（hang-free）。
 
 ### 4.2 探测硬化 `fuse/src/enable/discovery.rs`
@@ -85,8 +93,12 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 ### 4.3 CLI `fuse/src/main.rs`
 
 - 新增顶层子命令 `Umount(UmountArgs)`：`zipfs umount --name <inst> [--level clean|lazy|abort|auto]`（默认 `auto`）。解析实例名 → `Paths::resolve` 算挂载点 → `force_umount::umount`。面向用户。
-- `umount-managed`（`ExecStop` 用，内部）改为接受可选 `--level`（默认 `auto`），复用同一引擎；`run_umount_managed` 从 `RealMounter.unmount` 切到 `force_umount::umount(mp, level)`。
-- `Mounter::unmount` trait 默认实现相应调整（或保留 `unmount` 走 `clean`，另加 `umount_leveled`）——实现期择一，保持 trait 现有测试（fake mounter）不破。
+- `umount-managed`（`ExecStop` 用，内部）改为接受可选 `--level`（默认 `auto`），复用同一引擎；`run_umount_managed` 从 `RealMounter.unmount` 切到 `force_umount::umount(mp, level)`，并对错误 `.map_err` 附 `%i`/解码名上下文（与 `run_mount_managed` 一致，便于 ExecStop 失败日志定位实例）。
+- `Mounter::unmount` trait 与其 `RealMounter`/`SystemdMounter` 实现**本次不动**（仍供 lifecycle 的 restore/remount/compact/reingest/seal 调用）；见 §9 已知债务。
+
+**`--name` 约定**：接受 systemd **escaped 实例名**（模板 `%i` 形态）；经 `systemd_unescape` 解码（与 `mount-managed` 同款、有损：裸 `-`→`/`）。用户应传 escaped 名，勿传 path-encoded 原名，否则解码漂移可能算错挂载点（此时 `was_mounted=false` 直接 no-op 返回，不误伤别处）。
+
+**托管实例警告（C1）**：`zipfs umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop zipfs@<esc>`；`zipfs umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
 
 ### 4.4 systemd 模板 `fuse/src/enable/autostart.rs`
 
@@ -98,10 +110,12 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 zipfs umount --name X --level auto
   → Paths::resolve → mountpoint(X)
   → force_umount::umount(mp, Auto)
-       ├─ id = mount_connection_id(mp)            # /proc/self/mountinfo
-       ├─ clean: run_fusermount(["-u", mp], 3s)   # 会 flush；超时/失败则↓
-       ├─ (still_mounted?) lazy: run_fusermount(["-u","-z", mp], 3s)
-       ├─ (still_mounted?) abort: abort_connection(id) → run_fusermount(["-u","-z", mp], 3s)
+       ├─ id = mount_connection_id(mp)                  # /proc/self/mountinfo，不碰挂载点
+       ├─ clean: run_fusermount(["-u", mp], 3s 重试)     # 会 flush；仍挂则↓
+       ├─ (still_mounted?) lazy: run_fusermount(["-u","-z", mp], 3s 重试)
+       ├─ (still_mounted? && !endpoint_ok?) abort:       # 仅 daemon 确证死/卡才 abort
+       │     abort_connection(id) → run_fusermount(["-u","-z", mp], 3s)
+       │   (still_mounted && endpoint_ok) → 停在 lazy，不 abort（健康 busy，护在飞写）
        └─ report{ level_reached, aborted, unmounted }
 ```
 
@@ -109,9 +123,10 @@ systemd 路径 `umount-managed --name %i --level auto` 走同一引擎。
 
 ## 6. 错误处理
 
-- 每个外部命令的失败/超时**不冒泡为致命**，而是驱动 `auto` 升级；仅当升级到 `abort` 后仍 `still_mounted` 才返回 `io::Error`。
+- 每个外部命令的失败/超时**不冒泡为致命**，而是驱动 `auto` 升级；`auto` 升级到 `abort` 前先过 `endpoint_ok` 守卫（见 §3.1）；仅当「daemon 死/卡 + abort 后仍 `still_mounted`」才返回 `io::Error`（daemon 存活但 busy 时停在 lazy，返回 Ok 或明确的「健康 busy 未强卸」错误由实现定，不 abort）。
 - 显式单档（`clean`/`lazy`/`abort`）失败**如实返回错误**（不自动升级——用户显式选档即接受其语义）。
-- `abort_connection` 对「连接已不存在」幂等成功。
+- `abort_connection` best-effort：连接已消失/无权限/已断开（`NotFound`/`PermissionDenied`/`NotConnected`）均视为非致命；调用方（`attempt` 的 abort 档）亦忽略其错误。
+- `run_umount_managed` 对引擎错误 `.map_err` 附 `%i`/解码名上下文（与 `run_mount_managed` 对齐）。
 - 实例名经 `model::validate_name` 校验（防 systemd 实例名穿越），沿用现有逻辑。
 
 ## 7. 测试策略（TDD）
@@ -126,7 +141,7 @@ systemd 路径 `umount-managed --name %i --level auto` 走同一引擎。
 
 - 真起一个 zipfs 挂载 → `--level clean` 干净卸载成功、mountinfo 清零。
 - 真挂载 → `--level lazy` 摘除、mountinfo 清零。
-- **wedge 模拟**：挂载后杀 daemon（SIGKILL）留陈旧挂载 → `--level abort`（或 `auto`）在超时上界内摘除、mountinfo 清零、`report.aborted == true`。
+- **wedge 模拟**：挂载后杀 daemon（SIGKILL）留陈旧挂载。**显式 `--level abort`** → 摘除、mountinfo 清零、`report.aborted == true`；**`auto`** → 摘除、mountinfo 清零（daemon 死后 `lazy` 通常即摘除，故 `level_reached ∈ {Lazy, Abort}`，不锁定 abort——真实事故正是 `fusermount -uz` 生效）。**helper 需新写**（现有 `mount_rw.rs`/`systemd_mount.rs` 起挂载不带 pid-file）：起挂载时传 `--pid-file <tmp>`，从中读 daemon PID 供 SIGKILL；加 skip 门控（`/dev/fuse` + fusermount + `/sys/fs/fuse/connections` 可写，对齐 `systemd_mount.rs` 的 `skip_reason`）。
 - `auto` 在健康挂载上停在 `clean`（`level_reached == Clean`，`aborted == false`）——验证正常关闭不误触 abort。
 
 **探测硬化回归（`discovery.rs`）**
@@ -142,6 +157,8 @@ systemd 路径 `umount-managed --name %i --level auto` 走同一引擎。
 - **连接 id 解析漂移**：不同内核 fuse 挂载 `major:minor` 约定若变，解析可能取错号；`abort` best-effort，取号失败退化为 `lazy`（仍能摘除，只是不解除 hung 读者）。
 - **既有单元不自动升级**：模板改动需重装；文档与 `enable autostart install` 输出提示。
 
-## 9. 交付边界
+## 9. 交付边界与已知债务
 
-新增：`force_umount.rs` + `tests/umount_levels.rs`。改动：`main.rs`（`Umount` 子命令 + `umount-managed --level`）、`autostart.rs`（ExecStop `--level auto`）、`discovery.rs`（canonicalize 超时）、`daemon.rs`（`Mounter` 接线）。不动挂载/写入耐久性协议。
+**本次交付** — 新增：`force_umount.rs` + `tests/umount_levels.rs`。改动：`main.rs`（`Umount` 子命令 + `umount-managed --level` + `%i` 错误上下文）、`autostart.rs`（ExecStop `--level auto`）、`discovery.rs`（连接号解析 + canonicalize 超时）。不动挂载/写入耐久性协议。
+
+**已知债务（本次不收敛，显式记录）** — `Mounter::unmount`（`daemon.rs`）及 `RealMounter`/`SystemdMounter` 实现仍走**可 hang 的旧路径**（`unmount_path` 的非-lazy `fusermount -u` + `.status()` 同步等待，无超时/无 abort），被 `lifecycle.rs` 的 restore/remount/compact/reingest/seal 共 5 处调用。即本次只修好了 `ExecStop`/用户 `umount`，`enable restore` 等 lifecycle 操作对 wedge 挂载仍可能卡死。后续任务应把这些回退分支收敛到 `force_umount::umount(mp, Clean)`（restore 语义=耐久卸载）以消除双路径漂移；不在本 plan 内，避免扩大爆炸半径、破坏 `FakeMounter` 单测契约。
