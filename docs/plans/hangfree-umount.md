@@ -1,0 +1,839 @@
+# Hang-free 分档卸载 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 给 zipfs 卸载加上用户可选的分档升级梯（clean/lazy/abort/auto），卸载引擎全程 hang-free，systemd `ExecStop` 默认 `auto`——正常关闭走会 flush 的耐久路径，卡死场景自动升级到强制摘除，不再留陈旧挂载。
+
+**Architecture:** 新增 `force_umount` 模块承载分档引擎与 hang-free 原语（读 `/proc/self/mountinfo` 取 fuse 连接号、写 `/sys/fs/fuse/connections/<id>/abort`、带超时的外部 `fusermount`）。mountinfo 解析合并进 `discovery`（其 octal-unescape/overmount 逻辑所在）。CLI 增 `zipfs umount --name --level`，内部 `umount-managed` 与 systemd `ExecStop` 复用同一引擎。
+
+**Tech Stack:** Rust 2021，clap（`ValueEnum`），std（`process::Command`、`fs`、`mpsc`/`try_wait` 超时），既有 `fuser` FUSE 栈；测试用 `#[cfg(test)]` 单测 + `tests/` 真挂载集成（参照 `tests/systemd_mount.rs`）。
+
+## Global Constraints
+
+- 设计文档：`docs/07-hangfree-umount.md`（本 plan 的唯一真源，冲突以文档为准）。
+- rustfmt 默认（4 空格、100 列）；`cargo clippy -- -D warnings` 必须绿。
+- 不 `unwrap()`/`expect()` 于非测试代码；错误用 `std::io::Result` 冒泡（沿用现有风格，本 crate 不引 anyhow）。
+- **绝不 stat/opendir/realpath 挂载点叶子**——任何可能在 hung FUSE 上阻塞的调用必须有超时上界。
+- 不改挂载/写入耐久性协议（尾日志、崩溃提交，见 `docs/04-crash-safe-commit.md`）。
+- 提交只 `git add` 本任务涉及文件（共享 worktree，禁用 `git add -A`）。
+- 中文 conventional commits；不加 `Co-authored-by`。
+
+---
+
+## File Structure
+
+- `fuse/src/enable/discovery.rs`（改）：新增 mountinfo → fuse 连接号解析（纯函数 + reader）；`canonicalized_target` 的 `canonicalize(parent)` 加超时。
+- `fuse/src/enable/force_umount.rs`（建）：`UmountLevel`、`UmountReport`、`umount()` 分档引擎、`abort_connection()`、带超时的 `run_fusermount()`。
+- `fuse/src/enable/mod.rs`（改）：`pub mod force_umount;`。
+- `fuse/src/main.rs`（改）：`Umount` 顶层子命令；`umount-managed` 加 `--level`；`run_umount_managed` 切到引擎。
+- `fuse/src/enable/autostart.rs`（改）：`ExecStop` 加 `--level auto` + 更新单测断言。
+- `fuse/tests/umount_levels.rs`（建）：真挂载集成——clean/lazy/abort/auto + wedge。
+
+---
+
+## Task 1: mountinfo → fuse 连接号解析（hang-free 取号）
+
+**Files:**
+- Modify: `fuse/src/enable/discovery.rs`（在 `parse_mountinfo_line` 附近加 `parse_connection_id` 纯函数与 `mount_connection_id` reader）
+- Test: `fuse/src/enable/discovery.rs`（`#[cfg(test)]` 内）
+
+**Interfaces:**
+- Consumes: 既有 `unescape_octal(&str) -> String`、`canonicalized_target(&Path) -> PathBuf`（同文件私有，可直接调用）。
+- Produces:
+  - `pub(crate) fn parse_connection_id(mountinfo: &str, target: &Path) -> Option<u64>` — 纯函数，从 mountinfo 文本取 `target` 对应 fuse 挂载的连接号（`major:minor` 的 minor）；overmount 取末条；非 fuse 返回 None。
+  - `pub fn mount_connection_id(path: &Path) -> Option<u64>` — 读 `/proc/self/mountinfo` 后调 `parse_connection_id`，`target` 用 `canonicalized_target(path)`。
+
+- [ ] **Step 1: 写失败测试**
+
+在 `discovery.rs` 的 `#[cfg(test)] mod tests` 里加：
+
+```rust
+#[test]
+fn parse_connection_id_takes_minor_from_fuse_line() {
+    let target = std::path::Path::new("/mnt/x");
+    let mi = "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.zipfs-shadow zipfs rw,user_id=1000\n";
+    assert_eq!(parse_connection_id(mi, target), Some(44));
+}
+
+#[test]
+fn parse_connection_id_none_for_non_fuse() {
+    let target = std::path::Path::new("/mnt/x");
+    let mi = "36 35 0:44 / /mnt/x rw - ext4 /dev/sda1 rw\n";
+    assert_eq!(parse_connection_id(mi, target), None);
+}
+
+#[test]
+fn parse_connection_id_overmount_takes_last() {
+    let target = std::path::Path::new("/mnt/x");
+    let mi = "36 35 0:44 / /mnt/x rw - fuse.zipfs-shadow z rw\n\
+              37 35 0:55 / /mnt/x rw - fuse.zipfs-shadow z rw\n";
+    assert_eq!(parse_connection_id(mi, target), Some(55));
+}
+
+#[test]
+fn parse_connection_id_handles_octal_escaped_path() {
+    let target = std::path::Path::new("/mnt/a b"); // 含空格
+    let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse zipfs rw\n";
+    assert_eq!(parse_connection_id(mi, target), Some(44));
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd fuse && cargo test --lib parse_connection_id`
+Expected: 编译失败 / `cannot find function parse_connection_id`。
+
+- [ ] **Step 3: 写最小实现**
+
+在 `discovery.rs` `parse_mountinfo_line` 之后加：
+
+```rust
+/// 从 mountinfo 文本取 `target` 对应 fuse 挂载的连接号（`major:minor` 的 minor，即
+/// `/sys/fs/fuse/connections/<minor>`）。overmount 取末条；非 fuse / 无匹配 → None。
+/// 纯函数（无 IO）以便单测。
+pub(crate) fn parse_connection_id(mountinfo: &str, target: &Path) -> Option<u64> {
+    let mut found = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let Some(sep) = fields.iter().position(|&f| f == "-") else {
+            continue;
+        };
+        let Some(fstype) = fields.get(sep + 1) else {
+            continue;
+        };
+        if !fstype.starts_with("fuse") {
+            continue;
+        }
+        if Path::new(&unescape_octal(fields[4])) != target {
+            continue;
+        }
+        // 字段 2 = `major:minor`；fuse 的 minor 即连接号。
+        if let Some((_, minor)) = fields[2].split_once(':') {
+            if let Ok(id) = minor.parse::<u64>() {
+                found = Some(id); // 不 break：overmount 取末条。
+            }
+        }
+    }
+    found
+}
+
+/// 读 `/proc/self/mountinfo` 取挂载点的 fuse 连接号。不 stat 挂载点叶子。
+pub fn mount_connection_id(path: &Path) -> Option<u64> {
+    let target = canonicalized_target(path);
+    let content = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    parse_connection_id(&content, &target)
+}
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cd fuse && cargo test --lib parse_connection_id`
+Expected: 4 测试 PASS。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add fuse/src/enable/discovery.rs
+git commit -m "feat(discovery): mountinfo 解析 fuse 连接号（hang-free 取号）"
+```
+
+---
+
+## Task 2: `canonicalized_target` 的 parent-canonicalize 超时硬化
+
+**Files:**
+- Modify: `fuse/src/enable/discovery.rs:237`（`canonicalized_target`）
+- Test: `fuse/src/enable/discovery.rs`（`#[cfg(test)]` 内）
+
+**Interfaces:**
+- Consumes: 既有 `with_timeout(Duration, FnOnce) -> Option<T>`、`PROBE_TIMEOUT`。
+- Produces: `canonicalized_target` 签名不变；行为增加「`canonicalize(parent)` 超时则回退未规范化父路径」。
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn canonicalized_target_falls_back_when_parent_canonicalize_times_out() {
+    // 无法真造 hung 父目录，改为验证正常父目录仍规范化（回归），并断言实现经由 with_timeout：
+    // 正常父目录快返回，结果 == canonicalize(parent)/leaf。
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("p");
+    std::fs::create_dir(&parent).unwrap();
+    let leaf = parent.join("mnt");
+    let got = canonicalized_target(&leaf);
+    let want = std::fs::canonicalize(&parent).unwrap().join("mnt");
+    assert_eq!(got, want);
+}
+```
+
+> 说明：hung 父目录无法在单测里确定性构造；本测试锁定「正常路径行为不回退」这一回归面。超时分支的真实覆盖由 Task 6 的 wedge 集成测试与代码审查共同保证。
+
+- [ ] **Step 2: 运行确认失败/通过基线**
+
+Run: `cd fuse && cargo test --lib canonicalized_target_falls_back`
+Expected: 先失败（函数体未改前该测试名不存在 → 编译错误）；加测试后应即 PASS（正常路径本就成立）。这一步确认测试可运行。
+
+- [ ] **Step 3: 改实现加超时**
+
+将 `canonicalized_target` 改为：
+
+```rust
+fn canonicalized_target(path: &Path) -> std::path::PathBuf {
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let parent = parent.to_path_buf();
+        // 祖先本身也是 wedge 挂载的极端情形下 canonicalize 会阻塞 → 超时回退未规范化父路径。
+        if let Some(Ok(cp)) = with_timeout(PROBE_TIMEOUT, move || fs::canonicalize(&parent)) {
+            return cp.join(name);
+        }
+    }
+    path.to_path_buf()
+}
+```
+
+- [ ] **Step 4: 运行全量 discovery 测试确认无回归**
+
+Run: `cd fuse && cargo test --lib discovery`（或 `cargo test --lib canonicalized_target`）
+Expected: 既有 `canonicalized_target_*` 测试全 PASS。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add fuse/src/enable/discovery.rs
+git commit -m "fix(discovery): parent-canonicalize 加超时，杜绝祖先 wedge 挂载拖挂探测"
+```
+
+---
+
+## Task 3: `force_umount` 原语——abort 连接 + 带超时的 fusermount
+
+**Files:**
+- Create: `fuse/src/enable/force_umount.rs`
+- Modify: `fuse/src/enable/mod.rs`（加 `pub mod force_umount;`，紧接 `pub mod discovery;` 后）
+- Test: `fuse/src/enable/force_umount.rs`（`#[cfg(test)]` 内）
+
+**Interfaces:**
+- Consumes: `super::discovery::{is_mounted, mount_connection_id}`。
+- Produces:
+  - `pub enum CmdOutcome { Success, Failed, TimedOut, NotFound }`
+  - `pub fn abort_connection(id: u64) -> std::io::Result<()>` — 写 `/sys/fs/fuse/connections/<id>/abort`；文件不存在幂等成功。
+  - `pub(crate) fn run_fusermount(args: &[&std::ffi::OsStr], timeout: Duration) -> CmdOutcome` — spawn `fusermount3` 回退 `fusermount`，带看门狗超时 kill。
+
+- [ ] **Step 1: 写失败测试**
+
+新建 `fuse/src/enable/force_umount.rs`，先只放骨架 + 测试：
+
+```rust
+//! Hang-free 分档卸载引擎（见 docs/07-hangfree-umount.md）。
+
+use std::ffi::OsStr;
+use std::path::Path;
+use std::time::Duration;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abort_connection_is_idempotent_for_missing_conn() {
+        // 不存在的连接号 → 视为已消失，Ok。
+        assert!(abort_connection(u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn run_fusermount_notfound_when_binary_absent() {
+        // 用一个不存在的挂载点 + 极短超时；真实 fusermount 会快速失败（非 hang）。
+        // 断言不 panic 且返回可判定的 outcome（Failed / NotFound）。
+        let mp = Path::new("/nonexistent/zipfs/mp");
+        let out = run_fusermount(&[OsStr::new("-u"), mp.as_os_str()], Duration::from_secs(2));
+        assert!(matches!(out, CmdOutcome::Failed | CmdOutcome::NotFound));
+    }
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd fuse && cargo test --lib force_umount`
+Expected: 编译失败（`abort_connection`/`run_fusermount`/`CmdOutcome` 未定义）。
+
+- [ ] **Step 3: 写最小实现**
+
+在 `force_umount.rs`（`mod tests` 之上）加：
+
+```rust
+use std::io::ErrorKind;
+use std::process::{Command, Stdio};
+
+/// 外部卸载命令的结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum CmdOutcome {
+    Success,
+    Failed,
+    TimedOut,
+    NotFound,
+}
+
+/// 写 `/sys/fs/fuse/connections/<id>/abort` 解除在飞/hung 请求。连接已消失（文件不存在）幂等成功。
+pub fn abort_connection(id: u64) -> std::io::Result<()> {
+    let path = format!("/sys/fs/fuse/connections/{id}/abort");
+    match std::fs::write(&path, b"1") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+const CMD_POLL: Duration = Duration::from_millis(50);
+
+/// spawn `fusermount3` 回退 `fusermount`，带看门狗超时：超时 kill 子进程返回 `TimedOut`，
+/// 保证外部命令不拖住引擎。二进制缺失（两者皆无）→ `NotFound`。
+pub(crate) fn run_fusermount(args: &[&OsStr], timeout: Duration) -> CmdOutcome {
+    for bin in ["fusermount3", "fusermount"] {
+        let mut child = match Command::new(bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(_) => return CmdOutcome::Failed,
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return CmdOutcome::Success,
+                Ok(Some(_)) => break, // 非零：换下一 bin 或落 Failed。
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return CmdOutcome::TimedOut;
+                    }
+                    std::thread::sleep(CMD_POLL);
+                }
+                Err(_) => return CmdOutcome::Failed,
+            }
+        }
+    }
+    CmdOutcome::NotFound
+}
+```
+
+在 `mod.rs` 加模块声明：
+
+```rust
+pub mod discovery;
+pub mod force_umount;
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cd fuse && cargo test --lib force_umount`
+Expected: 2 测试 PASS。
+
+> 注：`run_fusermount_notfound_when_binary_absent` 若环境装了 fusermount，则对不存在挂载点返回 `Failed`；未装则 `NotFound`——两者都被断言接受。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add fuse/src/enable/force_umount.rs fuse/src/enable/mod.rs
+git commit -m "feat(force_umount): abort 连接 + 带超时兜底的 fusermount 原语"
+```
+
+---
+
+## Task 4: `force_umount` 分档引擎 + 升级决策
+
+**Files:**
+- Modify: `fuse/src/enable/force_umount.rs`
+- Test: `fuse/src/enable/force_umount.rs`（`#[cfg(test)]` 内）
+
+**Interfaces:**
+- Consumes: `CmdOutcome`、`abort_connection`、`run_fusermount`（Task 3）；`super::discovery::{is_mounted, mount_connection_id}`（Task 1）。
+- Produces:
+  - `pub enum UmountLevel { Clean, Lazy, Abort, Auto }`（`derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)`）
+  - `pub struct UmountReport { was_mounted, connection_id: Option<u64>, level_reached: UmountLevel, aborted: bool, unmounted: bool }`
+  - `pub(crate) fn next_level(cur: UmountLevel) -> Option<UmountLevel>` — auto 升级链的纯决策：Clean→Lazy→Abort→None。
+  - `pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountReport>`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn next_level_escalation_chain() {
+    assert_eq!(next_level(UmountLevel::Clean), Some(UmountLevel::Lazy));
+    assert_eq!(next_level(UmountLevel::Lazy), Some(UmountLevel::Abort));
+    assert_eq!(next_level(UmountLevel::Abort), None);
+}
+
+#[test]
+fn umount_reports_not_mounted_as_success() {
+    // 未挂载的路径：was_mounted=false、unmounted=true、不 abort。
+    let mp = Path::new("/definitely/not/mounted/zipfs");
+    let r = umount(mp, UmountLevel::Auto).unwrap();
+    assert!(!r.was_mounted);
+    assert!(r.unmounted);
+    assert!(!r.aborted);
+}
+
+#[test]
+fn umount_level_parses_from_str() {
+    use clap::ValueEnum;
+    assert_eq!(UmountLevel::from_str("auto", true).unwrap(), UmountLevel::Auto);
+    assert_eq!(UmountLevel::from_str("abort", true).unwrap(), UmountLevel::Abort);
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd fuse && cargo test --lib force_umount`
+Expected: 编译失败（`UmountLevel`/`umount`/`next_level` 未定义）。
+
+- [ ] **Step 3: 写最小实现**
+
+在 `force_umount.rs` 顶部 `use` 补 `use super::discovery;`，并加：
+
+```rust
+/// 卸载档位（CLI `--level` 值）。见 docs/07-hangfree-umount.md §3。
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UmountLevel {
+    /// fusermount -u：daemon flush，耐久；busy 失败。
+    Clean,
+    /// fusermount -uz：懒摘除，无 abort。
+    Lazy,
+    /// abort 连接 → fusermount -uz：解耦 daemon 存活，可能丢在飞写。
+    Abort,
+    /// clean →(超时)→ lazy →(超时)→ abort。默认。
+    Auto,
+}
+
+/// 一次卸载的结果，供日志与测试断言。
+#[derive(Debug, PartialEq, Eq)]
+pub struct UmountReport {
+    pub was_mounted: bool,
+    pub connection_id: Option<u64>,
+    pub level_reached: UmountLevel,
+    pub aborted: bool,
+    pub unmounted: bool,
+}
+
+/// auto 升级链的纯决策：Clean→Lazy→Abort→None。
+pub(crate) fn next_level(cur: UmountLevel) -> Option<UmountLevel> {
+    match cur {
+        UmountLevel::Clean => Some(UmountLevel::Lazy),
+        UmountLevel::Lazy => Some(UmountLevel::Abort),
+        UmountLevel::Abort => None,
+        UmountLevel::Auto => Some(UmountLevel::Clean), // auto 从 clean 起步。
+    }
+}
+
+/// 单档超时上界（clean/lazy/abort 各自的摘除等待）。
+const STEP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 执行单一档位的一次尝试；返回该档结束后是否已卸载。
+fn attempt(mountpoint: &Path, level: UmountLevel, report: &mut UmountReport) -> bool {
+    let mp = mountpoint.as_os_str();
+    match level {
+        UmountLevel::Clean => {
+            run_fusermount(&[OsStr::new("-u"), mp], STEP_TIMEOUT);
+        }
+        UmountLevel::Lazy => {
+            run_fusermount(&[OsStr::new("-u"), OsStr::new("-z"), mp], STEP_TIMEOUT);
+        }
+        UmountLevel::Abort => {
+            if let Some(id) = report.connection_id {
+                let _ = abort_connection(id);
+                report.aborted = true;
+            }
+            run_fusermount(&[OsStr::new("-u"), OsStr::new("-z"), mp], STEP_TIMEOUT);
+        }
+        UmountLevel::Auto => unreachable!("auto 由 umount() 展开为具体档"),
+    }
+    !discovery::is_mounted(mountpoint)
+}
+
+/// 按档位卸载 `mountpoint`。全程 hang-free（外部命令带超时、探测读 /proc）。
+pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountReport> {
+    let mut report = UmountReport {
+        was_mounted: discovery::is_mounted(mountpoint),
+        connection_id: discovery::mount_connection_id(mountpoint),
+        level_reached: level,
+        aborted: false,
+        unmounted: false,
+    };
+    if !report.was_mounted {
+        report.unmounted = true;
+        return Ok(report);
+    }
+
+    if level == UmountLevel::Auto {
+        // 从 clean 起逐级升级。
+        let mut cur = UmountLevel::Clean;
+        loop {
+            report.level_reached = cur;
+            if attempt(mountpoint, cur, &mut report) {
+                report.unmounted = true;
+                return Ok(report);
+            }
+            match next_level(cur) {
+                Some(n) => cur = n,
+                None => break,
+            }
+        }
+        return Err(std::io::Error::other(format!(
+            "auto 升级至 abort 仍未摘除：{}",
+            mountpoint.display()
+        )));
+    }
+
+    // 显式单档：不自动升级，失败如实报错。
+    report.level_reached = level;
+    if attempt(mountpoint, level, &mut report) {
+        report.unmounted = true;
+        Ok(report)
+    } else {
+        Err(std::io::Error::other(format!(
+            "{level:?} 卸载未摘除：{}",
+            mountpoint.display()
+        )))
+    }
+}
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cd fuse && cargo test --lib force_umount`
+Expected: 全部 PASS（Task 3 的 2 个 + 本任务 3 个）。
+
+- [ ] **Step 5: clippy 确认**
+
+Run: `cd fuse && cargo clippy --lib -- -D warnings`
+Expected: 无告警。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add fuse/src/enable/force_umount.rs
+git commit -m "feat(force_umount): 分档卸载引擎 clean/lazy/abort/auto + 升级链"
+```
+
+---
+
+## Task 5: CLI `zipfs umount --level` + `umount-managed --level auto` 接线
+
+**Files:**
+- Modify: `fuse/src/main.rs`（`Command` enum 加 `Umount`；`MountManagedArgs` 加 `--level`；`run_umount_managed` 切引擎；新增 `run_umount`）
+- Test: `fuse/tests/enable.rs` 或 `fuse/src/main.rs` 无法直接单测 clap → 由 Task 6 集成覆盖；本任务加一个 `#[cfg(test)]` 的 clap 解析测试到 main.rs。
+
+**Interfaces:**
+- Consumes: `zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::model::{Paths, validate_name}`、`zipfs::enable::systemd::systemd_unescape`。
+- Produces: 顶层子命令 `zipfs umount --name <String> [--level <UmountLevel>]`；`umount-managed` 支持 `--level`（默认 `Auto`）。
+
+- [ ] **Step 1: 写失败测试**
+
+在 `main.rs` 末尾 `#[cfg(test)] mod cli_tests` 加（clap 解析冒烟）：
+
+```rust
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_umount_with_default_level() {
+        let cli = Cli::parse_from(["zipfs", "umount", "--name", "-home-xp-src-foo"]);
+        match cli.command {
+            Some(Command::Umount(a)) => {
+                assert_eq!(a.name, "-home-xp-src-foo");
+                assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Auto);
+            }
+            _ => panic!("应解析为 Umount 子命令"),
+        }
+    }
+
+    #[test]
+    fn parses_umount_managed_with_level() {
+        let cli = Cli::parse_from(["zipfs", "umount-managed", "--name", "x", "--level", "abort"]);
+        match cli.command {
+            Some(Command::UmountManaged(a)) => {
+                assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Abort);
+            }
+            _ => panic!("应解析为 UmountManaged"),
+        }
+    }
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd fuse && cargo test --bin zipfs cli_tests`
+Expected: 编译失败（`Command::Umount` 不存在、`MountManagedArgs` 无 `level`）。
+
+- [ ] **Step 3: 写实现**
+
+改 `MountManagedArgs`（`main.rs:98`）加 `level` 字段：
+
+```rust
+#[derive(clap::Args, Debug)]
+struct MountManagedArgs {
+    /// systemd 实例字符串（escaped 形态，即模板里的 `%i`）。
+    #[arg(long)]
+    name: String,
+    /// 卸载档位（仅 umount-managed 用；mount-managed 忽略）。默认 auto。
+    #[arg(long, value_enum, default_value = "auto")]
+    level: zipfs::enable::force_umount::UmountLevel,
+}
+```
+
+新增 `UmountArgs` 与 `Command::Umount`（在 `Command` enum 内 `UmountManaged` 之后）：
+
+```rust
+    /// 按档位卸载某托管实例（hang-free）：clean/lazy/abort/auto。见 docs/07。
+    ///
+    /// 用法：`zipfs umount --name <inst> [--level clean|lazy|abort|auto]`。
+    Umount(UmountArgs),
+```
+
+```rust
+/// `umount` 子命令参数。
+#[derive(clap::Args, Debug)]
+struct UmountArgs {
+    /// systemd 实例字符串或 path-encoded 项目名。
+    #[arg(long)]
+    name: String,
+    /// 卸载档位，默认 auto（clean→lazy→abort 升级）。
+    #[arg(long, value_enum, default_value = "auto")]
+    level: zipfs::enable::force_umount::UmountLevel,
+}
+```
+
+`main()` 的 `match` 加分支（在 `UmountManaged` 后）：
+
+```rust
+        Some(Command::Umount(args)) => run_umount(args),
+```
+
+改 `run_umount_managed`（`main.rs:252`）切引擎，并加 `run_umount`：
+
+```rust
+/// systemd 托管卸载（ExecStop）：unescape 实例名 → 按 --level 走 hang-free 引擎。
+fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
+    let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
+    let name = zipfs::enable::systemd::systemd_unescape(&args.name);
+    zipfs::enable::model::validate_name(&name).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
+        )
+    })?;
+    let mp = paths.mountpoint(&name);
+    let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
+    info!(
+        "umount-managed: name={name} level={:?} reached={:?} aborted={} unmounted={}",
+        args.level, report.level_reached, report.aborted, report.unmounted
+    );
+    Ok(())
+}
+
+/// 面向用户的按档位卸载。`name` 接受 escaped 实例名或 path-encoded 项目名。
+fn run_umount(args: UmountArgs) -> std::io::Result<()> {
+    let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
+    let name = zipfs::enable::systemd::systemd_unescape(&args.name);
+    zipfs::enable::model::validate_name(&name)?;
+    let mp = paths.mountpoint(&name);
+    let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
+    info!(
+        "umount: name={name} level={:?} reached={:?} aborted={} unmounted={}",
+        args.level, report.level_reached, report.aborted, report.unmounted
+    );
+    Ok(())
+}
+```
+
+> 删掉 `run_umount_managed` 原来的 `use zipfs::enable::daemon::Mounter;` 与 `RealMounter.unmount` 调用（已被引擎取代）。`mount_args_from_spec`/`run_mount_managed` 不动。
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cd fuse && cargo test --bin zipfs cli_tests`
+Expected: 2 测试 PASS。
+
+- [ ] **Step 5: 全量构建 + clippy**
+
+Run: `cd fuse && cargo build && cargo clippy --bin zipfs -- -D warnings`
+Expected: 构建绿、无告警。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add fuse/src/main.rs
+git commit -m "feat(cli): zipfs umount --level + umount-managed 走分档引擎"
+```
+
+---
+
+## Task 6: systemd `ExecStop` 默认 `--level auto`
+
+**Files:**
+- Modify: `fuse/src/enable/autostart.rs:47`（`ExecStop` 模板）与 `:179`（断言）
+- Test: `fuse/src/enable/autostart.rs`（既有 `#[cfg(test)]` 断言更新）
+
+**Interfaces:**
+- Consumes: 无新增。
+- Produces: 生成的单元 `ExecStop={exe} umount-managed --name %i --level auto`。
+
+- [ ] **Step 1: 改测试断言（先 RED）**
+
+将 `autostart.rs:179` 断言改为：
+
+```rust
+        assert!(body.contains("ExecStop=/usr/bin/zipfs umount-managed --name %i --level auto"));
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cd fuse && cargo test --lib autostart`
+Expected: FAIL（当前模板无 `--level auto`）。
+
+- [ ] **Step 3: 改模板**
+
+`autostart.rs:47` 改为：
+
+```rust
+         ExecStop={exe} umount-managed --name %i --level auto\n\
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cd fuse && cargo test --lib autostart`
+Expected: PASS。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add fuse/src/enable/autostart.rs
+git commit -m "feat(autostart): ExecStop 默认 --level auto，卡死自动升级摘除"
+```
+
+---
+
+## Task 7: 集成测试——真挂载分档 + wedge 恢复
+
+**Files:**
+- Create: `fuse/tests/umount_levels.rs`
+- 参照：`fuse/tests/systemd_mount.rs`、`fuse/tests/mount_rw.rs`（真挂载起停范式）
+
+**Interfaces:**
+- Consumes: 已构建的 `zipfs` 二进制（`env!("CARGO_BIN_EXE_zipfs")`）、`zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::discovery::is_mounted`。
+
+> 起挂载的具体范式**必须照抄** `tests/systemd_mount.rs` / `tests/mount_rw.rs` 里现有 helper（如何 spawn `zipfs mount`、等就绪、tempdir backing）。下面给测试意图与断言；起停样板以现有测试为准，避免重复造轮子。
+
+- [ ] **Step 1: 写测试骨架 + clean/lazy 用例**
+
+```rust
+//! 分档卸载集成：真起 zipfs 挂载，验证各档摘除与 wedge 恢复。见 docs/07。
+mod common; // 若现有 tests 有共享 helper，则复用；否则内联最小起挂载 helper（照抄 mount_rw.rs）。
+
+use std::path::Path;
+use zipfs::enable::discovery::is_mounted;
+use zipfs::enable::force_umount::{umount, UmountLevel};
+
+#[test]
+fn clean_level_unmounts_healthy_mount() {
+    let m = common::mount_shadow(); // 起一个健康 shadow 挂载，返回 { mountpoint, .. }
+    assert!(is_mounted(&m.mountpoint));
+    let r = umount(&m.mountpoint, UmountLevel::Clean).unwrap();
+    assert!(r.unmounted);
+    assert!(!r.aborted);
+    assert!(!is_mounted(&m.mountpoint));
+}
+
+#[test]
+fn lazy_level_unmounts_healthy_mount() {
+    let m = common::mount_shadow();
+    let r = umount(&m.mountpoint, UmountLevel::Lazy).unwrap();
+    assert!(r.unmounted);
+    assert!(!is_mounted(&m.mountpoint));
+}
+```
+
+- [ ] **Step 2: 运行确认（起挂载 helper 就绪后）通过**
+
+Run: `cd fuse && cargo test --test umount_levels clean_level lazy_level -- --test-threads=1`
+Expected: 2 PASS。若 CI 无 FUSE，测试用 `#[ignore]` 标注并在本地跑（照抄 `systemd_mount.rs` 的门控方式）。
+
+- [ ] **Step 3: 加 auto-健康「停在 clean、不误触 abort」用例**
+
+```rust
+#[test]
+fn auto_stops_at_clean_for_healthy_mount() {
+    let m = common::mount_shadow();
+    let r = umount(&m.mountpoint, UmountLevel::Auto).unwrap();
+    assert_eq!(r.level_reached, UmountLevel::Clean);
+    assert!(!r.aborted, "健康挂载不应升级到 abort");
+    assert!(!is_mounted(&m.mountpoint));
+}
+```
+
+- [ ] **Step 4: 运行确认通过**
+
+Run: `cd fuse && cargo test --test umount_levels auto_stops_at_clean -- --test-threads=1`
+Expected: PASS。
+
+- [ ] **Step 5: 加 wedge 恢复用例（SIGKILL daemon → abort/auto 摘除）**
+
+```rust
+#[test]
+fn abort_recovers_wedged_mount_after_daemon_killed() {
+    let m = common::mount_shadow();
+    // SIGKILL 守护 → 留陈旧挂载（daemon 不再应答 FUSE）。
+    common::sigkill(m.daemon_pid);
+    // 挂载点仍在 mountinfo 里（is_mounted=true），但 daemon 已死。
+    assert!(is_mounted(&m.mountpoint));
+    let r = umount(&m.mountpoint, UmountLevel::Auto).unwrap();
+    assert!(r.unmounted);
+    assert_eq!(r.level_reached, UmountLevel::Abort, "wedge 应升级到 abort");
+    assert!(r.aborted);
+    assert!(!is_mounted(&m.mountpoint));
+}
+```
+
+> `common::sigkill(pid)` 与 `daemon_pid` 的获取照抄现有测试（`mount` 支持 `--pid-file`，从中读 PID）。
+
+- [ ] **Step 6: 运行确认通过**
+
+Run: `cd fuse && cargo test --test umount_levels abort_recovers -- --test-threads=1`
+Expected: PASS（wedge 挂载在超时上界内被 abort+lazy 摘除）。
+
+- [ ] **Step 7: 全量测试 + 提交**
+
+Run: `cd fuse && cargo test`
+Expected: 既有 + 新增全绿。
+
+```bash
+git add fuse/tests/umount_levels.rs
+git commit -m "test(umount): 真挂载分档 + wedge 恢复集成"
+```
+
+---
+
+## Self-Review
+
+**Spec coverage（对照 docs/07）：**
+- §3 四档 clean/lazy/abort/auto → Task 4（引擎）+ Task 5（CLI 暴露）。✓
+- §3 升级梯 + STEP_TIMEOUT → Task 4 `next_level`/`attempt`/`umount`。✓
+- §3.1 耐久性权衡（auto 优先 clean、健康不 abort）→ Task 7 `auto_stops_at_clean`。✓
+- §4.1 force_umount 模块与接口 → Task 3+4。✓
+- §4.1 `mount_connection_id` → Task 1。✓
+- §4.2 探测硬化（canonicalize 超时）→ Task 2。✓
+- §4.3 CLI `umount` + `umount-managed --level` → Task 5。✓
+- §4.4 systemd ExecStop `--level auto` → Task 6。✓
+- §6 错误处理（auto 升级不冒泡、单档如实报错、abort 幂等、validate_name）→ Task 4 + Task 5。✓
+- §7 测试策略（解析单测 + 真挂载 + wedge）→ Task 1/3/4/7。✓
+
+**Placeholder scan：** 无 TBD/TODO；每个改码步骤含完整代码。Task 7 的起挂载样板显式指向照抄现有 `tests/mount_rw.rs`/`systemd_mount.rs`——这是复用既有 helper 而非占位（避免重复造轮子）。
+
+**Type consistency：** `UmountLevel`/`UmountReport`/`CmdOutcome` 字段与方法名跨 Task 1/3/4/5/7 一致；`umount(&Path, UmountLevel) -> io::Result<UmountReport>`、`mount_connection_id(&Path) -> Option<u64>`、`parse_connection_id(&str, &Path) -> Option<u64>`、`run_fusermount(&[&OsStr], Duration) -> CmdOutcome`、`abort_connection(u64) -> io::Result<()>`、`next_level(UmountLevel) -> Option<UmountLevel>` 全对齐。
