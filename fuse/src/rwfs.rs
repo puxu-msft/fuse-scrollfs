@@ -252,7 +252,14 @@ impl ZipfsRw {
             gid: a.gid,
             rdev: 0,
             flags: 0,
-            blksize: 4096,
+            // 广告真实最优 IO 单元 = 文件块大小（封顶 1MiB 防应用按 st_blksize 分配巨缓冲），
+            // 非误导的 4KiB——后者让 honor st_blksize 的工具（cat/cp/缓冲读）按 4K 读，每次
+            // 触发整压缩块重解压（chunk/4K 倍放大，全靠 block_cache 兜）。见 docs/08-observability。
+            blksize: if a.chunk_size > 0 {
+                a.chunk_size.min(1 << 20)
+            } else {
+                self.default_chunk_size.min(1 << 20)
+            },
         }
     }
 

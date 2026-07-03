@@ -31,13 +31,28 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 /// 64 MiB 上限远高于任何合理用途，把病态值挡在 CLI 边界（评审：CLI 无 chunk-size 上限）。
 pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 
-/// 校验用户给定的 chunk_size：非 0、不超 [`MAX_CHUNK_SIZE`]。0 在部分路径表"用默认"，
-/// 故仅在 >MAX 时拒绝；调用方对 0 的语义自行处理。
+/// chunk_size 下限（64 KiB）。低于此则压缩被击穿——实测裁决（见 [`DEFAULT_CHUNK_SIZE`]）：
+/// boilerplate 复现间距 p90≈154KiB，64KiB 只逮 p50、真实仅 5.43x；4KiB 之类更是灾难
+/// （远低于任何长程冗余间距，压缩比崩、解压块缓存因块 < 内核读粒度而无从命中、块/索引开销爆炸）。
+/// 64KiB 是「仍算文件系统而非退化」的地板（亦 enable TUI 最小预设），**非**推荐值——推荐 1MiB 默认。
+pub const MIN_CHUNK_SIZE: u32 = 64 * 1024;
+
+/// 校验用户给定的 chunk_size：`0` 表"用默认"（调用方自行处理），非 0 则须落在
+/// `[MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]`。过大块缓冲会 OOM；过小则压缩被击穿（见 [`MIN_CHUNK_SIZE`]）。
 pub fn validate_chunk_size(chunk_size: u32) -> std::io::Result<()> {
     if chunk_size > MAX_CHUNK_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("chunk_size {chunk_size} 超上限 {MAX_CHUNK_SIZE}（64MiB）——过大块缓冲会 OOM"),
+        ));
+    }
+    if chunk_size != 0 && chunk_size < MIN_CHUNK_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "chunk_size {chunk_size} 过小（< {MIN_CHUNK_SIZE}=64KiB）——低于此压缩被击穿、\
+                 解压块缓存失效、块/索引开销爆炸；本项目为会话日志压缩而生，推荐用默认 1MiB"
+            ),
         ));
     }
     Ok(())
@@ -144,6 +159,10 @@ mod tests {
     #[test]
     fn validate_chunk_size_rejects_oversize() {
         assert!(super::validate_chunk_size(0).is_ok(), "0=用默认，放行");
+        assert!(
+            super::validate_chunk_size(super::MIN_CHUNK_SIZE).is_ok(),
+            "64KiB 地板放行"
+        );
         assert!(super::validate_chunk_size(super::DEFAULT_CHUNK_SIZE as u32).is_ok());
         assert!(super::validate_chunk_size(super::MAX_CHUNK_SIZE).is_ok());
         assert!(
@@ -151,6 +170,16 @@ mod tests {
             "超 64MiB 上限须拒绝（防 OOM）"
         );
         assert!(super::validate_chunk_size(u32::MAX).is_err());
+        // 过小须拒绝：4KiB / 8KiB / 63KiB 击穿压缩，不符合会话日志压缩负载（本次修复）。
+        assert!(
+            super::validate_chunk_size(4096).is_err(),
+            "4KiB 须拒绝——压缩被击穿"
+        );
+        assert!(super::validate_chunk_size(8192).is_err(), "8KiB 须拒绝");
+        assert!(
+            super::validate_chunk_size(super::MIN_CHUNK_SIZE - 1).is_err(),
+            "低于 64KiB 地板须拒绝"
+        );
     }
 
     #[test]
