@@ -229,6 +229,45 @@ fn parse_mountinfo_line(line: &str) -> Option<(String, bool)> {
     Some((mountpoint, is_fuse))
 }
 
+/// 从 mountinfo 文本取 `target` 对应 fuse 挂载的连接号（`major:minor` 的 minor，即
+/// `/sys/fs/fuse/connections/<minor>`）。overmount 取末条；非 fuse / 无匹配 → None。
+/// 纯函数（无 IO）以便单测。
+pub(crate) fn parse_connection_id(mountinfo: &str, target: &Path) -> Option<u64> {
+    let mut found = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let Some(sep) = fields.iter().position(|&f| f == "-") else {
+            continue;
+        };
+        let Some(fstype) = fields.get(sep + 1) else {
+            continue;
+        };
+        if !fstype.starts_with("fuse") {
+            continue;
+        }
+        if Path::new(&unescape_octal(fields[4])) != target {
+            continue;
+        }
+        // 字段 2 = `major:minor`；fuse 的 minor 即连接号。
+        if let Some((_, minor)) = fields[2].split_once(':') {
+            if let Ok(id) = minor.parse::<u64>() {
+                found = Some(id); // 不 break：overmount 取末条。
+            }
+        }
+    }
+    found
+}
+
+/// 读 `/proc/self/mountinfo` 取挂载点的 fuse 连接号。不 stat 挂载点叶子。
+pub fn mount_connection_id(path: &Path) -> Option<u64> {
+    let target = canonicalized_target(path);
+    let content = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    parse_connection_id(&content, &target)
+}
+
 /// 反转义 mountinfo 的八进制转义（空格 \040、tab \011、换行 \012、反斜杠 \134）。
 fn unescape_octal(s: &str) -> String {
     let bytes = s.as_bytes();
@@ -633,6 +672,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("s.jsonl"), b"{}\n").unwrap(); // 新建 → mtime=now → 活跃
         assert!(detect_activity(dir.path()).is_active());
+    }
+
+    #[test]
+    fn parse_connection_id_takes_minor_from_fuse_line() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi =
+            "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.zipfs-shadow zipfs rw,user_id=1000\n";
+        assert_eq!(parse_connection_id(mi, target), Some(44));
+    }
+
+    #[test]
+    fn parse_connection_id_none_for_non_fuse() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi = "36 35 0:44 / /mnt/x rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(parse_connection_id(mi, target), None);
+    }
+
+    #[test]
+    fn parse_connection_id_overmount_takes_last() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi = "36 35 0:44 / /mnt/x rw - fuse.zipfs-shadow z rw\n\
+                  37 35 0:55 / /mnt/x rw - fuse.zipfs-shadow z rw\n";
+        assert_eq!(parse_connection_id(mi, target), Some(55));
+    }
+
+    #[test]
+    fn parse_connection_id_handles_octal_escaped_path() {
+        let target = std::path::Path::new("/mnt/a b"); // 含空格
+        let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse zipfs rw\n";
+        assert_eq!(parse_connection_id(mi, target), Some(44));
     }
 
     #[test]
