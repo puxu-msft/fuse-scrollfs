@@ -11,6 +11,7 @@ pub mod blockcache;
 pub mod chunk;
 pub mod codec;
 pub mod inode;
+pub mod metrics;
 pub mod rmw;
 pub mod wsession;
 

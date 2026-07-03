@@ -660,6 +660,9 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
     let tail_buffer = !args.no_tail_buffer;
     // 加载共享字典（若 --dict 给定）：读原始字节 → 用挂载等级预消化 CDict/DDict。
     let dict = load_dict(args.dict.as_deref(), args.level)?;
+    // 统一指标注册表：全 crate 单一 Arc。container 分支注入 store 用于 commit 埋点；
+    // 两个读写分支都把同一 clone 传给 serve_rw 作 .prom 出口（shadow 暂无埋点但格式一致）。
+    let metrics = zipfs::core::metrics::Metrics::new();
     // 写 PID 文件（自挂载脚本/systemd 监控用），退出时尽力删除。SIGKILL/panic 下 remove 不可达
     // → PID 文件可能残留；监控方须校验 PID 存活，勿仅凭文件存在判定守护活着。
     if let Some(pf) = &args.pid_file {
@@ -686,13 +689,13 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             .with_max_write(args.max_write)
             .with_writeback(args.writeback)
             .with_block_cache(args.block_cache_bytes);
-            serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone())
+            serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone(), metrics)
         }
         Backend::Container => {
-            let store: Arc<dyn Store> = Arc::new(ContainerStore::open_with_chunk_size(
-                &backing,
-                args.chunk_size,
-            )?);
+            let store: Arc<dyn Store> = Arc::new(
+                ContainerStore::open_with_chunk_size(&backing, args.chunk_size)?
+                    .with_metrics(metrics.clone()),
+            );
             let fs = ZipfsRw::with_tail_buffer(
                 store,
                 Algo::Zstd,
@@ -704,7 +707,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             .with_max_write(args.max_write)
             .with_writeback(args.writeback)
             .with_block_cache(args.block_cache_bytes);
-            serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone())
+            serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone(), metrics)
         }
     };
     if let Some(pf) = &args.pid_file {
@@ -720,6 +723,7 @@ fn serve_rw(
     mountpoint: &std::path::Path,
     cfg: &fuser::Config,
     metrics_file: Option<PathBuf>,
+    metrics: Arc<zipfs::core::metrics::Metrics>,
 ) -> std::io::Result<()> {
     let slot = fs.notifier_slot();
     let store = fs.store_handle();
@@ -735,26 +739,33 @@ fn serve_rw(
         });
     }
     if let Some(path) = metrics_file {
-        // detached 指标线程：每 15s 写 prometheus textfile（压缩比/字节）。
+        // detached 指标线程：每 15s 写 prometheus textfile。单一装配点——统一注册表计数
+        // （廉价原子）+ compression_stats（昂贵按需 gauge）合并成一份 body，tmp+rename 原子写。
         std::thread::spawn(move || loop {
+            let mut body = String::new();
+            // 注册表计数（commit ok/failed、块数、flushing 峰值）。shadow 分支恒 0，格式一致。
+            metrics.write_prometheus(&mut body);
+            // 压缩比三 gauge（仅 shadow 有意义；container/无数据返回 None 时跳过这三行）。
             if let Some((phys, logical)) = store.compression_stats() {
+                use std::fmt::Write;
                 let ratio = if phys > 0 {
                     logical as f64 / phys as f64
                 } else {
                     0.0
                 };
-                let body = format!(
+                let _ = write!(
+                    body,
                     "# HELP zipfs_logical_bytes 逻辑字节\n# TYPE zipfs_logical_bytes gauge\nzipfs_logical_bytes {logical}\n\
                      # HELP zipfs_physical_bytes 物理字节\n# TYPE zipfs_physical_bytes gauge\nzipfs_physical_bytes {phys}\n\
                      # HELP zipfs_compression_ratio 压缩比\n# TYPE zipfs_compression_ratio gauge\nzipfs_compression_ratio {ratio:.4}\n"
                 );
-                let tmp = path.with_extension("prom.tmp");
-                if std::fs::write(&tmp, &body)
-                    .and_then(|_| std::fs::rename(&tmp, &path))
-                    .is_err()
-                {
-                    eprintln!("[zipfs] 写 metrics 文件失败：{}", path.display());
-                }
+            }
+            let tmp = path.with_extension("prom.tmp");
+            if std::fs::write(&tmp, &body)
+                .and_then(|_| std::fs::rename(&tmp, &path))
+                .is_err()
+            {
+                eprintln!("[zipfs] 写 metrics 文件失败：{}", path.display());
             }
             std::thread::sleep(std::time::Duration::from_secs(15));
         });

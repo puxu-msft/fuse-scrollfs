@@ -14,11 +14,13 @@
 
 use super::{Attr, DirEntry, Store, StoredBlock};
 use crate::core::inode::Ino;
+use crate::core::metrics::Metrics;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -208,6 +210,9 @@ pub struct ContainerStore {
     /// 串行化 commit_pending，与 `inner` 锁分离：IO 期间不阻塞读写并发（D1）。
     commit_lock: Mutex<()>,
     default_chunk_size: u32,
+    /// 统一指标注册表（全 crate 共享 `Arc`）。默认自建一个私有实例；`with_metrics` 注入共享实例，
+    /// 使 `commit_pending` 的成功/失败/落盘块数/flushing 峰值可经统一 Prometheus 出口观测。
+    metrics: Arc<Metrics>,
     /// 故障注入（仅测试）：置位时下一次 commit_pending 的 redb commit 返回 EIO，用于
     /// 确定性复现 lost-update。仿 shadow.rs `fault_commit_sync` 模式。
     #[cfg(test)]
@@ -278,9 +283,17 @@ impl ContainerStore {
             inner: Mutex::new(Inner::default()),
             commit_lock: Mutex::new(()),
             default_chunk_size,
+            metrics: Metrics::new(),
             #[cfg(test)]
             fault_commit: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 链式注入共享指标注册表（全 crate 单一 `Arc<Metrics>`）。默认自建私有实例，
+    /// `run_mount` 用本方法把 container 埋点接进统一 `.prom` 出口。
+    pub fn with_metrics(mut self, m: Arc<Metrics>) -> Self {
+        self.metrics = m;
+        self
     }
 
     fn alloc_ino(&self) -> u64 {
@@ -752,10 +765,17 @@ impl ContainerStore {
             }
         };
 
+        // 埋点：观测本代 flushing 的缓冲字节峰值（Σ 块字节）与块数（成功后计）。仅自增，
+        // 不改双缓冲 swap/merge/存在性检查等控制流。
+        let flushing_bytes: u64 = flushing.blocks.values().map(|b| b.bytes.len() as u64).sum();
+        let flushing_blocks = flushing.blocks.len() as u64;
+        self.metrics.observe_flushing_bytes(flushing_bytes);
+
         match self.flush_to_redb(&flushing) {
             Ok(()) => {
                 // 成功：清空 flushing（其内容已 durable 进 redb）。
                 self.inner.lock().flushing = Pending::default();
+                self.metrics.record_commit_ok(flushing_blocks);
                 Ok(())
             }
             Err(e) => {
@@ -763,6 +783,8 @@ impl ContainerStore {
                 let mut inner = self.inner.lock();
                 let flushing = std::mem::take(&mut inner.flushing);
                 inner.active.merge_from_flushing(flushing);
+                drop(inner);
+                self.metrics.record_commit_failed();
                 Err(e)
             }
         }
@@ -1259,5 +1281,72 @@ mod tests {
             store.get_block(ino, 1).unwrap().is_none(),
             "未写过的块仍 None"
         );
+    }
+
+    // ----- 指标埋点：commit 成功/失败计数经注入的 Metrics 注册表可观测 -----
+
+    /// 注入 `Arc<Metrics>`：put 两块 → fsync（记 commit_ok + 2 块）→ 注入 commit 失败再
+    /// fsync（记 commit_failed）→ 断言注册表计数与序列化输出一致。复用 `fault_next_commit`。
+    #[test]
+    fn commit_metrics_count_ok_and_failed() {
+        use crate::core::metrics::Metrics;
+
+        let cs = 4096u32;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.redb");
+        let metrics = Metrics::new();
+        let store = ContainerStore::open_with_chunk_size(&path, cs)
+            .unwrap()
+            .with_metrics(metrics.clone());
+
+        let ino = new_file(&store, "f.bin", cs);
+        let plain = vec![b'M'; cs as usize];
+        store
+            .put_block(ino, 0, mk_block(&plain), cs as u64)
+            .unwrap();
+        store
+            .put_block(ino, 1, mk_block(&plain), 2 * cs as u64)
+            .unwrap();
+
+        // fsync → commit 成功，记 1 次 commit_ok + 2 块 flushed。
+        store.fsync(ino).unwrap();
+
+        // 再写一块，注入 commit 失败 → 记 1 次 commit_failed（内容合并回 active，不丢）。
+        store
+            .put_block(ino, 2, mk_block(&plain), 3 * cs as u64)
+            .unwrap();
+        store.fault_next_commit();
+        assert!(store.fsync(ino).is_err(), "注入故障后 fsync 应返回 Err");
+
+        let mut out = String::new();
+        metrics.write_prometheus(&mut out);
+        assert!(
+            out.contains("zipfs_commit_ok_total 1"),
+            "应记 1 次成功提交：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_blocks_flushed_total 2"),
+            "应累计 2 块落盘（失败那次不计）：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_commit_failed_total 1"),
+            "应记 1 次失败提交：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_flushing_bytes_peak "),
+            "峰值 gauge 应存在：\n{out}"
+        );
+        // 峰值应反映曾观测到的最大 flushing 字节（>0，两块编码后字节和）。
+        let peak_line = out
+            .lines()
+            .find(|l| l.starts_with("zipfs_flushing_bytes_peak "))
+            .expect("峰值行存在");
+        let peak: u64 = peak_line
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("峰值可解析");
+        assert!(peak > 0, "flushing 峰值应 > 0，实际 {peak}");
     }
 }
