@@ -1,14 +1,16 @@
 //! Hang-free 分档卸载引擎（见 docs/07-hangfree-umount.md）。
 //!
-//! 本模块仅提供卸载原语（abort 连接 + 带超时兜底的 fusermount）；由后续任务
-//! 的分档卸载引擎接线消费，故此处允许暂时未使用的 crate 内部条目。
-#![allow(dead_code)]
+//! 本模块提供卸载原语（abort 连接 + 带超时兜底的 fusermount）以及分档卸载引擎
+//! （clean/lazy/abort/auto 升级链）。
 
 use std::ffi::OsStr;
+use std::path::Path;
 use std::time::Duration;
 
 use std::io::ErrorKind;
 use std::process::{Command, Stdio};
+
+use super::discovery;
 
 /// 外部卸载命令的结果。
 #[derive(Debug, PartialEq, Eq)]
@@ -59,6 +61,8 @@ fn spawn_once(bin: &str, args: &[&OsStr], deadline: std::time::Instant) -> Optio
             Ok(Some(_)) => return Some(CmdOutcome::Failed), // 跑过但非零（busy）。
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
+                    // SIGKILL 无法唤出不可中断睡眠（D 态）的任务；可接受，因 fusermount
+                    // 经验上快速退出，极少陷入 D 态。
                     let _ = child.kill();
                     let _ = child.wait();
                     return Some(CmdOutcome::TimedOut);
@@ -97,6 +101,120 @@ pub(crate) fn run_fusermount(args: &[&OsStr], timeout: Duration) -> CmdOutcome {
     }
 }
 
+/// 卸载档位（CLI `--level` 值）。见 docs/07-hangfree-umount.md §3。
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UmountLevel {
+    /// fusermount -u：daemon flush，耐久；busy 失败。
+    Clean,
+    /// fusermount -uz：懒摘除，无 abort。
+    Lazy,
+    /// abort 连接 → fusermount -uz：解耦 daemon 存活，可能丢在飞写。
+    Abort,
+    /// clean →(仍挂)→ lazy →(仍挂且 daemon 不存活)→ abort。默认。
+    Auto,
+}
+
+/// 一次卸载的结果，供日志与测试断言。
+#[derive(Debug, PartialEq, Eq)]
+pub struct UmountReport {
+    pub was_mounted: bool,
+    pub connection_id: Option<u64>,
+    pub level_reached: UmountLevel,
+    pub aborted: bool,
+    pub unmounted: bool,
+}
+
+/// auto 升级链的纯决策：Clean→Lazy→Abort→None。`Auto` 不参与（由 umount() 展开）。
+// 供后续任务的 CLI 分档接线消费；umount() 目前内联展开升级链，故非测试路径暂未调用。
+#[allow(dead_code)]
+pub(crate) fn next_level(cur: UmountLevel) -> Option<UmountLevel> {
+    match cur {
+        UmountLevel::Clean => Some(UmountLevel::Lazy),
+        UmountLevel::Lazy => Some(UmountLevel::Abort),
+        UmountLevel::Abort | UmountLevel::Auto => None,
+    }
+}
+
+/// 单档超时上界（clean/lazy/abort 各自的摘除等待，内含轮询重试）。
+const STEP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 执行单一档位的一次尝试；返回该档结束后是否已卸载。
+fn attempt(mountpoint: &Path, level: UmountLevel, report: &mut UmountReport) -> bool {
+    let mp = mountpoint.as_os_str();
+    match level {
+        UmountLevel::Clean => {
+            run_fusermount(&[OsStr::new("-u"), mp], STEP_TIMEOUT);
+        }
+        UmountLevel::Lazy => {
+            run_fusermount(&[OsStr::new("-u"), OsStr::new("-z"), mp], STEP_TIMEOUT);
+        }
+        UmountLevel::Abort => {
+            if let Some(id) = report.connection_id {
+                let _ = abort_connection(id); // best-effort
+                report.aborted = true;
+            }
+            run_fusermount(&[OsStr::new("-u"), OsStr::new("-z"), mp], STEP_TIMEOUT);
+        }
+        UmountLevel::Auto => unreachable!("auto 由 umount() 展开为具体档"),
+    }
+    !discovery::is_mounted(mountpoint)
+}
+
+/// 按档位卸载 `mountpoint`。全程 hang-free（外部命令带超时、探测读 /proc）。
+pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountReport> {
+    let mut report = UmountReport {
+        was_mounted: discovery::is_mounted(mountpoint),
+        connection_id: discovery::mount_connection_id(mountpoint),
+        level_reached: level,
+        aborted: false,
+        unmounted: false,
+    };
+    if !report.was_mounted {
+        report.unmounted = true;
+        return Ok(report);
+    }
+
+    if level == UmountLevel::Auto {
+        // clean → lazy 逐级；升级到 abort 前必须确证 daemon 死/卡（endpoint_ok 守卫），
+        // 否则健康 busy 挂载会被误 abort 丢在飞写（见 docs/07 §3.1）。
+        for cur in [UmountLevel::Clean, UmountLevel::Lazy] {
+            report.level_reached = cur;
+            if attempt(mountpoint, cur, &mut report) {
+                report.unmounted = true;
+                return Ok(report);
+            }
+        }
+        // 仍挂：只有 daemon 不存活才允许 abort。
+        if discovery::endpoint_ok(mountpoint) {
+            return Err(std::io::Error::other(format!(
+                "daemon 存活但挂载仍 busy，拒绝 abort（护在飞写）；请释放占用后重试或用 --level abort 强制：{}",
+                mountpoint.display()
+            )));
+        }
+        report.level_reached = UmountLevel::Abort;
+        if attempt(mountpoint, UmountLevel::Abort, &mut report) {
+            report.unmounted = true;
+            return Ok(report);
+        }
+        return Err(std::io::Error::other(format!(
+            "auto 升级至 abort 仍未摘除：{}",
+            mountpoint.display()
+        )));
+    }
+
+    // 显式单档：不自动升级，失败如实报错。
+    report.level_reached = level;
+    if attempt(mountpoint, level, &mut report) {
+        report.unmounted = true;
+        Ok(report)
+    } else {
+        Err(std::io::Error::other(format!(
+            "{level:?} 卸载未摘除：{}",
+            mountpoint.display()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +233,36 @@ mod tests {
         let mp = Path::new("/nonexistent/zipfs/mp");
         let out = run_fusermount(&[OsStr::new("-u"), mp.as_os_str()], Duration::from_secs(2));
         assert!(matches!(out, CmdOutcome::Failed | CmdOutcome::NotFound));
+    }
+
+    #[test]
+    fn next_level_escalation_chain() {
+        assert_eq!(next_level(UmountLevel::Clean), Some(UmountLevel::Lazy));
+        assert_eq!(next_level(UmountLevel::Lazy), Some(UmountLevel::Abort));
+        assert_eq!(next_level(UmountLevel::Abort), None);
+        assert_eq!(next_level(UmountLevel::Auto), None); // Auto 不参与升级链决策。
+    }
+
+    #[test]
+    fn umount_reports_not_mounted_as_success() {
+        // 未挂载的路径：was_mounted=false、unmounted=true、不 abort。
+        let mp = Path::new("/definitely/not/mounted/zipfs");
+        let r = umount(mp, UmountLevel::Auto).unwrap();
+        assert!(!r.was_mounted);
+        assert!(r.unmounted);
+        assert!(!r.aborted);
+    }
+
+    #[test]
+    fn umount_level_parses_from_str() {
+        use clap::ValueEnum;
+        assert_eq!(
+            UmountLevel::from_str("auto", true).unwrap(),
+            UmountLevel::Auto
+        );
+        assert_eq!(
+            UmountLevel::from_str("abort", true).unwrap(),
+            UmountLevel::Abort
+        );
     }
 }
