@@ -214,7 +214,12 @@ pub(crate) mod fake {
             self.mounted.lock().unwrap().insert(spec.mountpoint.clone());
             Ok(())
         }
-        fn unmount(&self, name: &str, mountpoint: &Path, level: UmountLevel) -> std::io::Result<()> {
+        fn unmount(
+            &self,
+            name: &str,
+            mountpoint: &Path,
+            level: UmountLevel,
+        ) -> std::io::Result<()> {
             self.unmount_calls
                 .lock()
                 .unwrap()

@@ -875,7 +875,9 @@ mod tests {
         reingest(&paths, "demo", false, &m).unwrap();
         let calls = m.unmount_calls.lock().unwrap();
         assert!(
-            calls[before..].iter().all(|(_, l)| *l == UmountLevel::Clean),
+            calls[before..]
+                .iter()
+                .all(|(_, l)| *l == UmountLevel::Clean),
             "reingest 必须以 Clean 卸载：{:?}",
             &calls[before..]
         );
