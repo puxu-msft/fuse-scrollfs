@@ -688,7 +688,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             )
             .with_max_write(args.max_write)
             .with_writeback(args.writeback)
-            .with_block_cache(args.block_cache_bytes);
+            .with_block_cache(args.block_cache_bytes)
+            .with_metrics(metrics.clone());
             serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone(), metrics)
         }
         Backend::Container => {
@@ -706,7 +707,8 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
             )
             .with_max_write(args.max_write)
             .with_writeback(args.writeback)
-            .with_block_cache(args.block_cache_bytes);
+            .with_block_cache(args.block_cache_bytes)
+            .with_metrics(metrics.clone());
             serve_rw(fs, &mountpoint, &cfg, args.metrics_file.clone(), metrics)
         }
     };

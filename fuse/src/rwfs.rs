@@ -27,6 +27,7 @@ use log::warn;
 use crate::core::blockcache::BlockCache;
 use crate::core::chunk::block_range;
 use crate::core::codec::{decompress_block, Algo, SharedDict};
+use crate::core::metrics::Metrics;
 use crate::core::rmw::CodecParams;
 use crate::core::wsession::{InodeState, TailSessions};
 use crate::store::{Attr, Store};
@@ -61,6 +62,9 @@ pub struct ZipfsRw {
     /// `idx < tail_idx` 的块（见 [`BlockCache`] 模块文档「杠杆 A」）。失效靠 per-inode 写锁串行
     /// 化：变更路径持写锁调 `invalidate`，读路径持读锁 `get`/`insert`，二者对同 inode 互斥。
     block_cache: BlockCache,
+    /// 统一指标注册表（per-op FUSE 埋点出口）。默认 `Metrics::new()`（空注册表，测试确定），
+    /// main 经 `with_metrics` 注入全 crate 共享的 `Arc`，让 read/write/fsync/flush 计数进 .prom。
+    metrics: Arc<Metrics>,
 }
 
 impl ZipfsRw {
@@ -96,12 +100,20 @@ impl ZipfsRw {
             writeback: false,
             // 默认禁用（cap=0 全 no-op），保持既有单测确定性、零行为变更；main 经 flag 注入。
             block_cache: BlockCache::new(0),
+            // 默认空注册表；main 经 with_metrics 注入全 crate 共享 Arc。
+            metrics: Metrics::new(),
         }
     }
 
     /// 设解压块缓存字节上限（main 据 `--block-cache-bytes` 注入；0 禁用）。返回自身便于链式。
     pub fn with_block_cache(mut self, cap_bytes: usize) -> Self {
         self.block_cache = BlockCache::new(cap_bytes);
+        self
+    }
+
+    /// 注入全 crate 共享的指标注册表（main 据统一 `Arc<Metrics>` 注入）。返回自身便于链式。
+    pub fn with_metrics(mut self, m: Arc<Metrics>) -> Self {
+        self.metrics = m;
         self
     }
 
@@ -518,8 +530,14 @@ impl Filesystem for ZipfsRw {
         reply: ReplyData,
     ) {
         match self.read_range(ino.0, offset, size) {
-            Ok(buf) => reply.data(&buf),
-            Err(e) => reply.error(e),
+            Ok(buf) => {
+                self.metrics.record_read(buf.len() as u64);
+                reply.data(&buf)
+            }
+            Err(e) => {
+                self.metrics.record_fuse_error();
+                reply.error(e)
+            }
         }
     }
 
@@ -537,10 +555,19 @@ impl Filesystem for ZipfsRw {
         reply: ReplyWrite,
     ) {
         let lock = self.lock_for(ino.0);
-        let mut guard = lock.write();
-        match self.write_at_locked(ino.0, &mut guard, offset, data) {
-            Ok(n) => reply.written(n as u32),
-            Err(e) => reply.error(io_to_errno(&e)),
+        let result = {
+            let mut guard = lock.write();
+            self.write_at_locked(ino.0, &mut guard, offset, data)
+        }; // 写锁在此 drop —— 之后再做纯原子埋点，绝不持锁自增。
+        match result {
+            Ok(n) => {
+                self.metrics.record_write(n as u64);
+                reply.written(n as u32)
+            }
+            Err(e) => {
+                self.metrics.record_fuse_error();
+                reply.error(io_to_errno(&e))
+            }
         }
     }
 
@@ -803,9 +830,13 @@ impl Filesystem for ZipfsRw {
         match flush_result {
             Ok(()) => {
                 self.invalidate_kernel_cache(ino.0);
+                self.metrics.record_fsync();
                 reply.ok()
             }
-            Err(e) => reply.error(io_to_errno(&e)),
+            Err(e) => {
+                self.metrics.record_fuse_error();
+                reply.error(io_to_errno(&e))
+            }
         }
     }
 
@@ -836,9 +867,13 @@ impl Filesystem for ZipfsRw {
         match fsync_result {
             Ok(()) => {
                 self.invalidate_kernel_cache(ino.0);
+                self.metrics.record_fsync();
                 reply.ok()
             }
-            Err(e) => reply.error(io_to_errno(&e)),
+            Err(e) => {
+                self.metrics.record_fuse_error();
+                reply.error(io_to_errno(&e))
+            }
         }
     }
 

@@ -20,6 +20,18 @@ pub struct Metrics {
     blocks_flushed: AtomicU64,
     /// gauge：flushing 缓冲字节峰值（`fetch_max` 单调抬高）。
     flushing_bytes_peak: AtomicU64,
+    /// counter：FUSE read 回调成功次数。
+    fuse_read_ops: AtomicU64,
+    /// counter：FUSE read 累计返回字节数。
+    fuse_read_bytes: AtomicU64,
+    /// counter：FUSE write 回调成功次数。
+    fuse_write_ops: AtomicU64,
+    /// counter：FUSE write 累计写入字节数。
+    fuse_write_bytes: AtomicU64,
+    /// counter：FUSE fsync+flush 同步屏障操作成功次数。
+    fuse_fsync_ops: AtomicU64,
+    /// counter：FUSE read/write/fsync/flush 返回错误次数。
+    fuse_errors: AtomicU64,
 }
 
 impl Metrics {
@@ -45,6 +57,32 @@ impl Metrics {
     #[inline]
     pub fn observe_flushing_bytes(&self, bytes: u64) {
         self.flushing_bytes_peak.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// 记一次 FUSE read 成功，并累加本次返回字节数。
+    #[inline]
+    pub fn record_read(&self, bytes: u64) {
+        self.fuse_read_ops.fetch_add(1, Ordering::Relaxed);
+        self.fuse_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 记一次 FUSE write 成功，并累加本次写入字节数。
+    #[inline]
+    pub fn record_write(&self, bytes: u64) {
+        self.fuse_write_ops.fetch_add(1, Ordering::Relaxed);
+        self.fuse_write_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// 记一次 FUSE 同步屏障操作（fsync 与 flush 都调它，语义等价）。
+    #[inline]
+    pub fn record_fsync(&self) {
+        self.fuse_fsync_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次 FUSE read/write/fsync/flush 返回错误。
+    #[inline]
+    pub fn record_fuse_error(&self) {
+        self.fuse_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 序列化为 Prometheus text 追加进 `out`。
@@ -85,6 +123,48 @@ impl Metrics {
             "flushing 缓冲字节峰值",
             self.flushing_bytes_peak.load(Ordering::Relaxed),
         );
+        emit(
+            out,
+            "zipfs_fuse_read_ops_total",
+            "counter",
+            "FUSE read 成功次数",
+            self.fuse_read_ops.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_fuse_read_bytes_total",
+            "counter",
+            "FUSE read 累计返回字节数",
+            self.fuse_read_bytes.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_fuse_write_ops_total",
+            "counter",
+            "FUSE write 成功次数",
+            self.fuse_write_ops.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_fuse_write_bytes_total",
+            "counter",
+            "FUSE write 累计写入字节数",
+            self.fuse_write_bytes.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_fuse_fsync_ops_total",
+            "counter",
+            "fsync+flush 同步操作次数",
+            self.fuse_fsync_ops.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_fuse_errors_total",
+            "counter",
+            "read/write/fsync/flush 返回错误次数",
+            self.fuse_errors.load(Ordering::Relaxed),
+        );
     }
 }
 
@@ -124,6 +204,77 @@ mod tests {
         assert!(out.contains("# TYPE zipfs_commit_ok_total counter"));
         assert!(out.contains("# TYPE zipfs_flushing_bytes_peak gauge"));
         assert!(out.contains("# HELP zipfs_blocks_flushed_total"));
+    }
+
+    #[test]
+    fn write_prometheus_reflects_fuse_per_op_counters() {
+        let m = Metrics::new();
+        m.record_read(100);
+        m.record_write(50);
+        m.record_fsync();
+        m.record_fuse_error();
+
+        let mut out = String::new();
+        m.write_prometheus(&mut out);
+
+        assert!(
+            out.contains("zipfs_fuse_read_ops_total 1"),
+            "read ops 应为 1：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_read_bytes_total 100"),
+            "read bytes 应为 100：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_write_ops_total 1"),
+            "write ops 应为 1：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_write_bytes_total 50"),
+            "write bytes 应为 50：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_fsync_ops_total 1"),
+            "fsync ops 应为 1：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_errors_total 1"),
+            "errors 应为 1：\n{out}"
+        );
+        // 类型行齐备（均为 counter）。
+        assert!(out.contains("# TYPE zipfs_fuse_read_ops_total counter"));
+        assert!(out.contains("# TYPE zipfs_fuse_read_bytes_total counter"));
+        assert!(out.contains("# TYPE zipfs_fuse_write_ops_total counter"));
+        assert!(out.contains("# TYPE zipfs_fuse_write_bytes_total counter"));
+        assert!(out.contains("# TYPE zipfs_fuse_fsync_ops_total counter"));
+        assert!(out.contains("# TYPE zipfs_fuse_errors_total counter"));
+    }
+
+    #[test]
+    fn fuse_read_write_counters_accumulate() {
+        let m = Metrics::new();
+        m.record_read(10);
+        m.record_read(30);
+        m.record_write(5);
+        m.record_write(7);
+        let mut out = String::new();
+        m.write_prometheus(&mut out);
+        assert!(
+            out.contains("zipfs_fuse_read_ops_total 2"),
+            "两次读：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_read_bytes_total 40"),
+            "read bytes 10+30=40：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_write_ops_total 2"),
+            "两次写：\n{out}"
+        );
+        assert!(
+            out.contains("zipfs_fuse_write_bytes_total 12"),
+            "write bytes 5+7=12：\n{out}"
+        );
     }
 
     #[test]
