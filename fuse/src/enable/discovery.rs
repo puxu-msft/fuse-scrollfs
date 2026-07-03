@@ -14,6 +14,9 @@ use crate::enable::model::{
 
 use super::hang_free::{with_timeout, PROBE_TIMEOUT};
 
+/// 遍历挂载点子树（活跃判定）的超时上限。子树某个 read_dir/metadata 撞上 hung FUSE 时兜底。
+const WALK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 单个项目的探测快照（list/TUI 一行）。
 #[derive(Debug, Clone)]
 pub struct ProjectInfo {
@@ -294,7 +297,8 @@ fn unescape_octal(s: &str) -> String {
 /// 活跃判定：扫 `/proc/*/fd` 与 `/cwd` 命中 `P` 子树（catch 任何活跃写者，含当前会话的 claude），
 /// 再辅以 `*.jsonl`/`*.log` 近期 mtime。任一命中即 `Active`（带原因）。
 pub fn detect_activity(path: &Path) -> Activity {
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // 不对挂载点自身 canonicalize（hung 会卡死）；经父目录规范化拼回末段，与 mountinfo 对齐。
+    let target = canonicalized_target(path);
     if let Some(reason) = scan_proc_for_holders(&target) {
         return Activity::Active(reason);
     }
@@ -353,7 +357,12 @@ fn scan_proc_for_holders(target: &Path) -> Option<String> {
 fn recent_log_write(target: &Path) -> Option<String> {
     let now = SystemTime::now();
     let window = Duration::from_secs(ACTIVITY_MTIME_SECS);
-    recent_log_write_rec(target, now, window, 0)
+    let t = target.to_path_buf();
+    // 遍历挂载点子树可能撞上 hung FUSE 的 read_dir/metadata → 超时保护（超时=无法判定近期写入→None）。
+    with_timeout(WALK_TIMEOUT, move || {
+        recent_log_write_rec(&t, now, window, 0)
+    })
+    .flatten()
 }
 
 fn recent_log_write_rec(
@@ -606,14 +615,14 @@ mod tests {
 
     #[test]
     fn canonicalized_target_resolves_symlinked_parent_for_stale_endpoint() {
-        // 评审 A4/C2：挂载点 endpoint 自身不可 stat（stale）时，仍应经父目录解析出规范路径，
+        // 评审 A4/C2：挂载点 endpoint 自身不可 stat（stale 或 hung）时，仍应经父目录解析出规范路径，
         // 而非回退未规范化原路径（会与 mountinfo 失配漏判已挂载）。
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real");
         fs::create_dir(&real).unwrap();
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        // link/ep 不存在（模拟 stale endpoint）：整路径 canonicalize 失败，须经父（link→real）解析。
+        // link/ep 不存在（模拟 stale endpoint）：不 stat 末段，经父（link→real）解析即可。
         let stale = link.join("ep");
         let got = canonicalized_target(&stale);
         let want = fs::canonicalize(&real).unwrap().join("ep");

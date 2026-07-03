@@ -103,7 +103,7 @@ fn mount_shadow() -> MountGuard {
         .arg("--mountpoint")
         .arg(&mountpoint)
         .arg("--chunk-size")
-        .arg("4096")
+        .arg("65536") // MIN_CHUNK_SIZE=64KiB（core::mod 强制下限）；卸载测试与块大小无关，取最小合法值即可。
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("spawn zipfs mount");
