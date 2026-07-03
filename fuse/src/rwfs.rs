@@ -534,13 +534,20 @@ impl Filesystem for ZipfsRw {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
+        // 计时开销 ~数十 ns（两次 Instant::now），可接受——Prometheus 直方图标准做法。
+        let t0 = std::time::Instant::now();
         match self.read_range(ino.0, offset, size) {
             Ok(buf) => {
                 self.metrics.record_read(buf.len() as u64);
+                self.metrics
+                    .observe_read_latency_us(t0.elapsed().as_micros() as u64);
                 reply.data(&buf)
             }
             Err(e) => {
                 self.metrics.record_fuse_error();
+                // 错误路径也观测：失败同样消耗了时间，延迟分布应含错误尾（p99 更真实）。
+                self.metrics
+                    .observe_read_latency_us(t0.elapsed().as_micros() as u64);
                 reply.error(e)
             }
         }
@@ -559,6 +566,8 @@ impl Filesystem for ZipfsRw {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
+        // t0 在取锁前起，量整个 write（含取锁等待 + RMW）。计时开销 ~数十 ns，可接受。
+        let t0 = std::time::Instant::now();
         let lock = self.lock_for(ino.0);
         let result = {
             let mut guard = lock.write();
@@ -567,10 +576,14 @@ impl Filesystem for ZipfsRw {
         match result {
             Ok(n) => {
                 self.metrics.record_write(n as u64);
+                self.metrics
+                    .observe_write_latency_us(t0.elapsed().as_micros() as u64);
                 reply.written(n as u32)
             }
             Err(e) => {
                 self.metrics.record_fuse_error();
+                self.metrics
+                    .observe_write_latency_us(t0.elapsed().as_micros() as u64);
                 reply.error(io_to_errno(&e))
             }
         }
@@ -819,6 +832,8 @@ impl Filesystem for ZipfsRw {
         // **锁序纪律（notify 重入根治）**：`inval_inode` 是同步内核往返，会取 inode 页缓存锁；若在持
         // per-inode 写锁时调用，与「持内核页锁、其 FUSE read 又堵在本写锁」的并发读构成跨层 AB-BA。
         // 故把封块+提交圈在内层作用域、**出锁后再** `invalidate_kernel_cache`。
+        // t0 在取锁前起，量整个 flush handler（含取锁 + seal + store.flush）。计时开销 ~数十 ns，可接受。
+        let t0 = std::time::Instant::now();
         let lock = self.lock_for(ino.0);
         let flush_result = {
             let mut guard = lock.write();
@@ -827,6 +842,10 @@ impl Filesystem for ZipfsRw {
                 self.tails
                     .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
             {
+                // 封块失败早返回：出锁后观测（同样消耗了时间），保延迟分布含此错误路径。
+                drop(guard);
+                self.metrics
+                    .observe_fsync_latency_us(t0.elapsed().as_micros() as u64);
                 reply.error(io_to_errno(&e));
                 return;
             }
@@ -836,10 +855,14 @@ impl Filesystem for ZipfsRw {
             Ok(()) => {
                 self.invalidate_kernel_cache(ino.0);
                 self.metrics.record_fsync();
+                self.metrics
+                    .observe_fsync_latency_us(t0.elapsed().as_micros() as u64);
                 reply.ok()
             }
             Err(e) => {
                 self.metrics.record_fuse_error();
+                self.metrics
+                    .observe_fsync_latency_us(t0.elapsed().as_micros() as u64);
                 reply.error(io_to_errno(&e))
             }
         }
@@ -856,6 +879,8 @@ impl Filesystem for ZipfsRw {
         // 持 inode 写锁再封块 + 提交（rust-review C1）：fsync 须先把开放尾块封块落 Store，
         // 再让 Store 持久化，符合 POSIX fsync 契约（§10），且不能与同 inode 的 RMW 交错。
         // **锁序纪律（notify 重入根治，同 flush）**：出锁作用域后再 `invalidate_kernel_cache`。
+        // t0 在取锁前起，量整个 fsync handler（含取锁 + seal + store.fsync）。计时开销 ~数十 ns，可接受。
+        let t0 = std::time::Instant::now();
         let lock = self.lock_for(ino.0);
         let fsync_result = {
             let mut guard = lock.write();
@@ -864,6 +889,10 @@ impl Filesystem for ZipfsRw {
                 self.tails
                     .seal_locked(self.store.as_ref(), ino.0, &mut guard, &self.params)
             {
+                // 封块失败早返回：出锁后观测，保延迟分布含此错误路径。
+                drop(guard);
+                self.metrics
+                    .observe_fsync_latency_us(t0.elapsed().as_micros() as u64);
                 reply.error(io_to_errno(&e));
                 return;
             }
@@ -873,10 +902,14 @@ impl Filesystem for ZipfsRw {
             Ok(()) => {
                 self.invalidate_kernel_cache(ino.0);
                 self.metrics.record_fsync();
+                self.metrics
+                    .observe_fsync_latency_us(t0.elapsed().as_micros() as u64);
                 reply.ok()
             }
             Err(e) => {
                 self.metrics.record_fuse_error();
+                self.metrics
+                    .observe_fsync_latency_us(t0.elapsed().as_micros() as u64);
                 reply.error(io_to_errno(&e))
             }
         }
