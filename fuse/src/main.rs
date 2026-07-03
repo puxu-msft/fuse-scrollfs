@@ -747,6 +747,17 @@ fn serve_rw(
             let mut body = String::new();
             // 注册表计数（commit ok/failed、块数、flushing 峰值）。shadow 分支恒 0，格式一致。
             metrics.write_prometheus(&mut body);
+            // 重压次数：进程级 static，深在 rmw 自由函数路径（block-level compress），append-bench 靠
+            // reset_block_compress_count 隔离测量，故不塞注册表而由出口按需读（同下方 compression_stats
+            // 「特殊源」模式），append 进同一 body。
+            {
+                use std::fmt::Write;
+                let _ = write!(
+                    body,
+                    "# HELP zipfs_recompressions_total 块级重压次数\n# TYPE zipfs_recompressions_total counter\nzipfs_recompressions_total {}\n",
+                    zipfs::core::rmw::block_compress_count()
+                );
+            }
             // 压缩比三 gauge（仅 shadow 有意义；container/无数据返回 None 时跳过这三行）。
             if let Some((phys, logical)) = store.compression_stats() {
                 use std::fmt::Write;

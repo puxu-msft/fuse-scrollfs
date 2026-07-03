@@ -36,6 +36,8 @@ pub struct Metrics {
     blockcache_hits: AtomicU64,
     /// counter：read_range 内部块查 block_cache 未命中（走 Store + 解压）次数。
     blockcache_misses: AtomicU64,
+    /// counter：尾块封块/重压落后端次数（wsession seal/materialize 每次把尾块压缩落 Store 记一次）。
+    seals: AtomicU64,
 }
 
 impl Metrics {
@@ -99,6 +101,17 @@ impl Metrics {
     #[inline]
     pub fn record_cache_miss(&self) {
         self.blockcache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记一次尾块封块（把一个尾块压缩并落 Store）。wsession 的 seal/materialize 无尾日志路径调它。
+    #[inline]
+    pub fn record_seal(&self) {
+        self.seals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 读累计封块次数（供 [`crate::core::wsession`] 的 `seal_count()` 委托，保其 API 与语义不变）。
+    pub fn seals(&self) -> u64 {
+        self.seals.load(Ordering::Relaxed)
     }
 
     /// 序列化为 Prometheus text 追加进 `out`。
@@ -194,6 +207,13 @@ impl Metrics {
             "counter",
             "block_cache 未命中（read_range 内部块走 Store + 解压）次数",
             self.blockcache_misses.load(Ordering::Relaxed),
+        );
+        emit(
+            out,
+            "zipfs_seals_total",
+            "counter",
+            "尾块封块/重压落后端次数",
+            self.seals.load(Ordering::Relaxed),
         );
     }
 }
@@ -330,6 +350,26 @@ mod tests {
         assert!(out.contains("# TYPE zipfs_blockcache_misses_total counter"));
         assert!(out.contains("# HELP zipfs_blockcache_hits_total"));
         assert!(out.contains("# HELP zipfs_blockcache_misses_total"));
+    }
+
+    #[test]
+    fn write_prometheus_reflects_seal_counter() {
+        let m = Metrics::new();
+        m.record_seal();
+        m.record_seal();
+        m.record_seal();
+
+        assert_eq!(m.seals(), 3, "record_seal ×3 后 seals() 应为 3");
+
+        let mut out = String::new();
+        m.write_prometheus(&mut out);
+
+        assert!(
+            out.contains("zipfs_seals_total 3"),
+            "封块计数应为 3，实际输出：\n{out}"
+        );
+        assert!(out.contains("# TYPE zipfs_seals_total counter"));
+        assert!(out.contains("# HELP zipfs_seals_total"));
     }
 
     #[test]

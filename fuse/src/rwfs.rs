@@ -112,7 +112,10 @@ impl ZipfsRw {
     }
 
     /// 注入全 crate 共享的指标注册表（main 据统一 `Arc<Metrics>` 注入）。返回自身便于链式。
+    /// 除自身 read/write/fsync 计数外，也把同一 `Arc` 注入 `tails`，让尾会话封块（seal）计数进
+    /// 统一 .prom（构造序：with_tail_buffer 先建默认注册表，此处再注入覆盖两者）。
     pub fn with_metrics(mut self, m: Arc<Metrics>) -> Self {
+        self.tails.set_metrics(m.clone());
         self.metrics = m;
         self
     }

@@ -19,16 +19,18 @@
 //! per-inode 的开放尾块 `Tail` 不再独立存一张 `Mutex<HashMap>`；它被搬进 [`InodeState`]，
 //! 由 rwfs 的 `DashMap<u64, Arc<RwLock<InodeState>>>` 持有。改 tail 必须持该 inode 的
 //! `RwLock` 写锁——**编译器强制**（方法签名是 `&mut InodeState`），不再靠注释约定。
-//! [`TailSessions`] 退化为只持全局开关 `enabled` + 计数 `seal_count` 的轻量结构，其每个
-//! tail-touching 方法都接收**调用方已加锁**的 `&InodeState` / `&mut InodeState`，自己不再查表加锁。
+//! [`TailSessions`] 退化为只持全局开关 `enabled` + 共享指标注册表 `metrics`（封块计数进 .prom）的
+//! 轻量结构，其每个 tail-touching 方法都接收**调用方已加锁**的 `&InodeState` / `&mut InodeState`，
+//! 自己不再查表加锁。
 //!
 //! ## durability
 //! 未 flush 的尾块在内存（与 page cache 未刷一致）；fsync/flush 必须先 `seal` 把尾块封块
 //! 落 Store，再由 Store 持久化，符合 POSIX fsync 契约（§10）。
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
+use crate::core::metrics::Metrics;
 use crate::core::rmw::{self, CodecParams};
 use crate::store::Store;
 
@@ -71,22 +73,31 @@ pub(crate) struct InodeState {
 pub struct TailSessions {
     /// 优化开关：false 时退化为旧路径（每次 append 重压尾块）。
     enabled: bool,
-    /// 累计封块次数（含每次「把尾块压缩落 Store」），基准量化重压次数用。
-    seal_count: AtomicU64,
+    /// 共享指标注册表：封块（含每次「把尾块压缩落 Store」）记进 `seals` counter，进 .prom。
+    /// `new` 默认建独立空注册表（保单测/单线程驱动确定性）；生产经 [`Self::set_metrics`] 注入
+    /// 与前端 rwfs 共享的同一 `Arc`，seal 才进统一出口。
+    metrics: Arc<Metrics>,
 }
 
 impl TailSessions {
-    /// 新建（`enabled` 控制是否启用尾块缓冲优化）。
+    /// 新建（`enabled` 控制是否启用尾块缓冲优化）。指标注册表默认独立空实例，生产经
+    /// [`Self::set_metrics`] 注入共享 `Arc`。
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            seal_count: AtomicU64::new(0),
+            metrics: Metrics::new(),
         }
     }
 
+    /// 注入与前端共享的指标注册表（rwfs 的 `with_metrics` 调它，让尾会话封块计数进统一 .prom）。
+    pub(crate) fn set_metrics(&mut self, metrics: Arc<Metrics>) {
+        self.metrics = metrics;
+    }
+
     /// 累计封块次数（基准埋点）。每次把一个尾块压缩并 `put_block` 落 Store 记一次。
+    /// **委托**共享注册表的 `seals()`——API 与语义不变，但生产注入共享 `Arc` 后同时进 .prom。
     pub fn seal_count(&self) -> u64 {
-        self.seal_count.load(Ordering::Relaxed)
+        self.metrics.seals()
     }
 
     /// 是否启用了尾块缓冲优化。
@@ -306,7 +317,7 @@ impl TailSessions {
         }
         // 无尾日志后端：整块重压落 Store，移除缓冲（下次 append 再装入）。
         rmw::store_plain_block(store, ino, t.idx, &t.plain, t.file_size, params)?;
-        self.seal_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_seal();
         state.tail = None;
         Ok(())
     }
@@ -333,7 +344,7 @@ impl TailSessions {
         // seal_plain_block 用 seal_tail_block（支持后端重置 journal；否则 = put_block）。先落 Store
         // 再删缓冲，堵无锁读者 torn-read（rust-review HIGH-1）。
         rmw::seal_plain_block(store, ino, t.idx, &t.plain, t.file_size, params)?;
-        self.seal_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_seal();
         state.tail = None;
         Ok(())
     }
@@ -543,6 +554,10 @@ mod tests {
         fn seal_count(&self) -> u64 {
             self.ws.seal_count()
         }
+
+        fn set_metrics(&mut self, m: Arc<crate::core::metrics::Metrics>) {
+            self.ws.set_metrics(m);
+        }
     }
 
     /// 经 Store 读回某已封块的逻辑字节（解压）。
@@ -694,6 +709,31 @@ mod tests {
             Some(&b"hellowor"[..])
         );
         assert_eq!(sess.seal_count(), 0, "关闭优化时不经 seal 计数");
+    }
+
+    #[test]
+    fn 注入共享_metrics_后封块计数进该注册表() {
+        // 注入前端共享的 Metrics 后，seal 落 Store 应同时进该注册表的 seals counter，
+        // 且 seal_count() 委托它读回同一值（API 语义不变、又进 .prom）。
+        let store = MemStore::new(8);
+        let ino = store.new_file();
+        let mut sess = Session::new(true);
+        let shared = crate::core::metrics::Metrics::new();
+        sess.set_metrics(shared.clone());
+
+        // 写满块0（封1次）+ 写满块1（封1次）= 2 次封块。
+        sess.write_at(&store, ino, 0, b"AAAAAAAA").unwrap();
+        sess.write_at(&store, ino, 8, b"BBBBBBBB").unwrap();
+
+        assert_eq!(shared.seals(), 2, "共享注册表应收到 2 次封块");
+        assert_eq!(
+            sess.seal_count(),
+            2,
+            "seal_count() 委托共享注册表，读回同一值"
+        );
+        let mut out = String::new();
+        shared.write_prometheus(&mut out);
+        assert!(out.contains("zipfs_seals_total 2"), "封块进 .prom：\n{out}");
     }
 
     #[test]
