@@ -22,9 +22,10 @@
 
 ## File Structure
 
-- `fuse/src/enable/discovery.rs`（改）：新增 mountinfo → fuse 连接号解析（纯函数 + reader）；`canonicalized_target` 的 `canonicalize(parent)` 加超时。
+- `fuse/src/enable/hang_free.rs`（建）：通用 hang-free 原语 `with_timeout` + `PROBE_TIMEOUT`（供 discovery/force_umount 共用）。
+- `fuse/src/enable/discovery.rs`（改）：新增 mountinfo → fuse 连接号解析（Task 1，已完成）；硬化 `endpoint_ok`/`canonicalized_target` 为 hang-free（Task 2）。
 - `fuse/src/enable/force_umount.rs`（建）：`UmountLevel`、`UmountReport`、`umount()` 分档引擎、`abort_connection()`、带超时的 `run_fusermount()`。
-- `fuse/src/enable/mod.rs`（改）：`pub mod force_umount;`。
+- `fuse/src/enable/mod.rs`（改）：`pub(crate) mod hang_free;` + `pub mod force_umount;`。
 - `fuse/src/main.rs`（改）：`Umount` 顶层子命令；`umount-managed` 加 `--level`；`run_umount_managed` 切到引擎。
 - `fuse/src/enable/autostart.rs`（改）：`ExecStop` 加 `--level auto` + 更新单测断言。
 - `fuse/tests/umount_levels.rs`（建）：真挂载集成——clean/lazy/abort/auto + wedge。
@@ -142,49 +143,115 @@ git commit -m "feat(discovery): mountinfo 解析 fuse 连接号（hang-free 取�
 
 ---
 
-## Task 2: `canonicalized_target` 的 parent-canonicalize 超时硬化
+## Task 2: hang-free 探测基础（`hang_free.rs` 模块 + 硬化 `endpoint_ok`/`canonicalized_target`）
+
+> **背景（实施者必读）**：已提交基线的 `discovery.rs` **不是** hang-free：`endpoint_ok` 是裸 `fs::symlink_metadata`（无超时，wedge 下 D 睡眠永阻塞）；`canonicalized_target` 先对整叶子 `fs::canonicalize(path)`（stat 叶子，wedge 下 hang）。基线**没有** `with_timeout`/`PROBE_TIMEOUT`。本任务建立 hang-free 探测基础，供后续 Task 4 的 abort 守卫（`endpoint_ok`）与 `is_mounted`（经 `canonicalized_target`）安全使用。
 
 **Files:**
-- Modify: `fuse/src/enable/discovery.rs:237`（`canonicalized_target`）
-- Test: `fuse/src/enable/discovery.rs`（`#[cfg(test)]` 内）
+- Create: `fuse/src/enable/hang_free.rs`
+- Modify: `fuse/src/enable/mod.rs`（加 `pub(crate) mod hang_free;`，在 `pub mod discovery;` 之前）
+- Modify: `fuse/src/enable/discovery.rs`（硬化 `endpoint_ok`、`canonicalized_target`；顶部加 `use`）
+- Test: `fuse/src/enable/hang_free.rs` 与 `fuse/src/enable/discovery.rs`（各自 `#[cfg(test)]`）
 
 **Interfaces:**
-- Consumes: 既有 `with_timeout(Duration, FnOnce) -> Option<T>`、`PROBE_TIMEOUT`。
-- Produces: `canonicalized_target` 签名不变；行为增加「`canonicalize(parent)` 超时则回退未规范化父路径」。
+- Produces:
+  - `pub(crate) const PROBE_TIMEOUT: std::time::Duration`（800ms）
+  - `pub(crate) fn with_timeout<T, F>(dur: Duration, f: F) -> Option<T> where T: Send + 'static, F: FnOnce() -> T + Send + 'static`
+  - `endpoint_ok`/`canonicalized_target` 签名不变，语义不变（wedge 下由「阻塞」变「快速失败/回退」）。
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写 `hang_free.rs` + 失败测试**
+
+新建 `fuse/src/enable/hang_free.rs`：
 
 ```rust
-#[test]
-fn canonicalized_target_falls_back_when_parent_canonicalize_times_out() {
-    // 无法真造 hung 父目录，改为验证正常父目录仍规范化（回归），并断言实现经由 with_timeout：
-    // 正常父目录快返回，结果 == canonicalize(parent)/leaf。
-    let tmp = tempfile::tempdir().unwrap();
-    let parent = tmp.path().join("p");
-    std::fs::create_dir(&parent).unwrap();
-    let leaf = parent.join("mnt");
-    let got = canonicalized_target(&leaf);
-    let want = std::fs::canonicalize(&parent).unwrap().join("mnt");
-    assert_eq!(got, want);
+//! Hang-free 原语：把可能在 wedge FUSE 上永久阻塞（D 睡眠）的调用包进带超时的工作线程。
+//! wedged 挂载下 stat/canonicalize/opendir 会不可中断阻塞；本模块提供统一的超时逃逸，
+//! 供 discovery 探测与 force_umount 卸载引擎共用。
+
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// 探测类操作（stat/canonicalize）的默认超时上界。超时即视为「不可达/卡死」。
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// 在独立线程运行 `f`，最多等 `dur`。超时返回 `None`。
+///
+/// 取舍：超时时工作线程可能仍卡在 D 睡眠里无法回收（线程泄漏），这是刻意的——
+/// 宁可泄漏一个短命进程里的线程，也绝不让主线程被 hung FUSE 永久拖住。
+pub(crate) fn with_timeout<T, F>(dur: Duration, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(dur).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_timeout_returns_none_when_closure_exceeds_deadline() {
+        let got = with_timeout(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(5));
+            42u32
+        });
+        assert_eq!(got, None, "超时应返回 None");
+    }
+
+    #[test]
+    fn with_timeout_returns_some_when_closure_finishes_in_time() {
+        assert_eq!(with_timeout(Duration::from_secs(5), || 7u32), Some(7));
+    }
 }
 ```
 
-> 说明：hung 父目录无法在单测里确定性构造；本测试锁定「正常路径行为不回退」这一回归面。超时分支的真实覆盖由 Task 6 的 wedge 集成测试与代码审查共同保证。
-
-- [ ] **Step 2: 运行确认失败/通过基线**
-
-Run: `cd fuse && cargo test --lib canonicalized_target_falls_back`
-Expected: 先失败（函数体未改前该测试名不存在 → 编译错误）；加测试后应即 PASS（正常路径本就成立）。这一步确认测试可运行。
-
-- [ ] **Step 3: 改实现加超时**
-
-将 `canonicalized_target` 改为：
+在 `fuse/src/enable/mod.rs` 加模块声明（在 `pub mod discovery;` 之前，保持字母序不强制）：
 
 ```rust
+pub(crate) mod hang_free;
+```
+
+- [ ] **Step 2: 运行确认新模块测试**
+
+Run: `cd fuse && cargo test --lib hang_free`
+Expected: 2 测试 PASS（首次 fresh worktree 全量编译，较慢，正常）。
+
+- [ ] **Step 3: 硬化 `discovery.rs` 的 `endpoint_ok` 与 `canonicalized_target`**
+
+在 `discovery.rs` 顶部 `use` 区加：
+
+```rust
+use super::hang_free::{with_timeout, PROBE_TIMEOUT};
+```
+
+把 `endpoint_ok` 改为（超时包裹 `symlink_metadata`）：
+
+```rust
+/// 挂载点是否可 stat（stale FUSE endpoint → ENOTCONN → false；hung → 超时 → false）。
+pub fn endpoint_ok(path: &Path) -> bool {
+    let p = path.to_path_buf();
+    match with_timeout(PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
+        Some(Ok(_)) => true,
+        Some(Err(e)) => e.raw_os_error() != Some(libc::ENOTCONN),
+        None => false, // 超时=hung → 视为不健康。
+    }
+}
+```
+
+把 `canonicalized_target` 改为（**不再 stat 叶子**；仅超时包裹 `canonicalize(parent)`）：
+
+```rust
+/// 规范化挂载点用于与 mountinfo（内核规范路径）精确比对。**不对叶子 canonicalize**
+/// （hung FUSE 下 stat 叶子会 D 睡眠永阻塞）；仅规范化父目录再拼回末段，父目录也 wedge 的
+/// 极端情形由超时兜底回退未规范化原路径（宁可偶发漏判也不 hang）。
 fn canonicalized_target(path: &Path) -> std::path::PathBuf {
     if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
         let parent = parent.to_path_buf();
-        // 祖先本身也是 wedge 挂载的极端情形下 canonicalize 会阻塞 → 超时回退未规范化父路径。
         if let Some(Ok(cp)) = with_timeout(PROBE_TIMEOUT, move || fs::canonicalize(&parent)) {
             return cp.join(name);
         }
@@ -193,16 +260,38 @@ fn canonicalized_target(path: &Path) -> std::path::PathBuf {
 }
 ```
 
-- [ ] **Step 4: 运行全量 discovery 测试确认无回归**
+- [ ] **Step 4: 加「不 stat 叶子」回归测试**
 
-Run: `cd fuse && cargo test --lib discovery`（或 `cargo test --lib canonicalized_target`）
-Expected: 既有 `canonicalized_target_*` 测试全 PASS。
+在 `discovery.rs` 的 `#[cfg(test)] mod tests` 加（锁定叶子坏 symlink 也不报错、不 stat）：
 
-- [ ] **Step 5: 提交**
+```rust
+#[test]
+fn canonicalized_target_does_not_stat_leaf_segment() {
+    // 末段是坏 symlink（指向不存在目标）：整路径 canonicalize 会失败，但本函数只规范化父目录，
+    // 故仍返回 canonicalize(父)/末段，且不因坏 symlink 报错。
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    let leaf = parent.join("mnt");
+    std::os::unix::fs::symlink("/no/such/target/anywhere", &leaf).unwrap();
+    let got = canonicalized_target(&leaf);
+    let want = std::fs::canonicalize(&parent).unwrap().join("mnt");
+    assert_eq!(got, want, "应仅规范化父目录、原样拼回末段，不解析/stat 末段");
+}
+```
+
+- [ ] **Step 5: 全量 discovery 测试确认无回归**
+
+Run: `cd fuse && cargo test --lib discovery && cargo test --lib hang_free`
+Expected: 既有 `canonicalized_target_*`/`endpoint_ok_*` + 新增全 PASS。`cargo clippy --lib -- -D warnings` 与 `cargo fmt` 干净。
+
+> 说明：`endpoint_ok`/`canonicalized_target` 的**超时分支**无法在单测里确定性构造 hung 挂载；`with_timeout` 的超时语义已由 Step 1 两测直接覆盖，wedge 下的端到端行为由 Task 7 集成 + 审查兜底。
+
+- [ ] **Step 6: 提交**
 
 ```bash
-git add fuse/src/enable/discovery.rs
-git commit -m "fix(discovery): parent-canonicalize 加超时，杜绝祖先 wedge 挂载拖挂探测"
+git add fuse/src/enable/hang_free.rs fuse/src/enable/mod.rs fuse/src/enable/discovery.rs
+git commit -m "feat(discovery): hang-free 探测基础（hang_free 模块 + 超时化 endpoint_ok/canonicalized_target）"
 ```
 
 ---
