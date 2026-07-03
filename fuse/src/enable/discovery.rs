@@ -12,7 +12,7 @@ use crate::enable::model::{
     classify, Activity, ApplyOptions, Backend, Paths, ProjectStatus, ACTIVITY_MTIME_SECS,
 };
 
-use super::hang_free::{with_timeout, PROBE_TIMEOUT};
+use super::hang_free::{with_timeout, with_timeout_memo, PROBE_TIMEOUT};
 
 /// 遍历挂载点子树（活跃判定）的超时上限。子树某个 read_dir/metadata 撞上 hung FUSE 时兜底。
 const WALK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -179,12 +179,14 @@ pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
 }
 
 /// 挂载点是否可 stat（stale FUSE endpoint → ENOTCONN → false；hung → 超时 → false）。
+/// 经 `with_timeout_memo` 熔断：近期已判卡死的挂载直接返回 false，不重复起线程（键用原始
+/// 挂载路径，与消费点一致；仅此一处 memo，`canonicalized_target`/活跃扫描保持裸 `with_timeout`）。
 pub fn endpoint_ok(path: &Path) -> bool {
     let p = path.to_path_buf();
-    match with_timeout(PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
+    match with_timeout_memo(path, PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
         Some(Ok(_)) => true,
         Some(Err(e)) => e.raw_os_error() != Some(libc::ENOTCONN),
-        None => false, // 超时=hung → 视为不健康。
+        None => false, // 超时=hung 或熔断命中 → 视为不健康。
     }
 }
 
