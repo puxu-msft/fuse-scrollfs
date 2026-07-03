@@ -56,6 +56,8 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    // 锁仅护 HashMap 的 get/insert/remove（皆不 panic）；被探测闭包 `f` 在 with_timeout 的**独立
+    // 线程**里跑、不持本锁，故其 panic 不会毒化本锁——`unwrap` 实不可达（评审 M3）。
     // 命中且未过 TTL → 直接判卡死，跳过起线程。
     if let Some(&t) = hung_cache().lock().unwrap().get(key) {
         if t.elapsed() < ttl {
@@ -68,10 +70,11 @@ where
             Some(v)
         }
         None => {
-            hung_cache()
-                .lock()
-                .unwrap()
-                .insert(key.to_path_buf(), Instant::now());
+            let mut cache = hung_cache().lock().unwrap();
+            // 顺带清理过期条目，把 map 规模界定为「一个 TTL 窗口内探测过的挂载」，避免长驻 TUI
+            // 反复 scan 时未再探测的旧 key 无界堆积（评审 M1）。
+            cache.retain(|_, t| t.elapsed() < ttl);
+            cache.insert(key.to_path_buf(), Instant::now());
             None
         }
     }
@@ -154,7 +157,11 @@ mod tests {
             7u32
         });
         assert_eq!(r2, Some(7), "TTL 过期后应重跑并拿到结果");
-        assert_eq!(calls.load(Ordering::SeqCst), n1 + 1, "TTL 过期后应重新执行闭包");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            n1 + 1,
+            "TTL 过期后应重新执行闭包"
+        );
     }
 
     #[test]

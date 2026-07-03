@@ -173,7 +173,9 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
                 return Ok(report);
             }
         }
-        // 仍挂：只有 daemon 不存活才允许 abort。
+        // 仍挂：只有 daemon 不存活才允许 abort。endpoint_ok 现经 hung 熔断缓存，但健康探测会清除
+        // 该 key（见 hang_free::memo_with_ttl 成功分支驱逐），故健康但 busy 的 daemon 绝不会被误报
+        // 为 hung 而误 abort——本守卫「不误 abort 健康挂载、护在飞写」的不变式仍成立（评审 M2）。
         if discovery::endpoint_ok(mountpoint) {
             return Err(std::io::Error::other(format!(
                 "daemon 存活但挂载仍 busy，拒绝 abort（护在飞写）；请释放占用后重试或用 --level abort 强制：{}",

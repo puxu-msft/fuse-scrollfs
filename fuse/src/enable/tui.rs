@@ -199,7 +199,10 @@ fn run_pending(paths: &Paths, p: Pending, opts: ApplyOptions, m: &dyn Mounter) -
                 // 与单项 restore 的可还原集合保持一致，绝不静默跳过最该处理的项目。
                 if matches!(
                     info.status,
-                    ProjectStatus::Active | ProjectStatus::Stopped | ProjectStatus::Broken | ProjectStatus::Hung
+                    ProjectStatus::Active
+                        | ProjectStatus::Stopped
+                        | ProjectStatus::Broken
+                        | ProjectStatus::Hung
                 ) {
                     match lifecycle::restore(paths, &info.name, m) {
                         Ok(()) => ok += 1,
@@ -311,7 +314,10 @@ fn start_restore(app: &mut App) {
     };
     if !matches!(
         info.status,
-        ProjectStatus::Active | ProjectStatus::Stopped | ProjectStatus::Broken | ProjectStatus::Hung
+        ProjectStatus::Active
+            | ProjectStatus::Stopped
+            | ProjectStatus::Broken
+            | ProjectStatus::Hung
     ) {
         app.status = format!("{} 未切换，无需还原", info.name);
         return;
