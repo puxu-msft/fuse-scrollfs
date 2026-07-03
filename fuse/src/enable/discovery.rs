@@ -167,8 +167,15 @@ pub fn scan(paths: &Paths) -> io::Result<Vec<ProjectInfo>> {
 pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
     let mp = paths.mountpoint(name);
     let orig_exists = paths.orig(name).exists();
-    let health = endpoint_health(&mp);
-    let mounted = matches!(health, EndpointHealth::Healthy) && is_mounted(&mp);
+    // 编排（阶段 D）：先读 mountinfo（`is_mounted` 永不阻塞）；仅确为 fuse 挂载点才对 endpoint 做
+    // 超时探测（可能 hung，需起线程）；非挂载的普通目录同步 stat，省去无谓起线程。
+    let is_mnt = is_mounted(&mp);
+    let health = if is_mnt {
+        endpoint_health(&mp)
+    } else {
+        health_from_stat(fs::symlink_metadata(&mp))
+    };
+    let mounted = matches!(health, EndpointHealth::Healthy) && is_mnt;
     let meta = read_meta(&paths.meta_path(name)).ok().flatten();
     let committed = meta.as_ref().map(|m| m.committed).unwrap_or(false);
     let status = classify(orig_exists, mounted, health, committed);
@@ -186,10 +193,18 @@ pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
 pub fn endpoint_health(path: &Path) -> EndpointHealth {
     let p = path.to_path_buf();
     match with_timeout_memo(path, PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
-        Some(Ok(_)) => EndpointHealth::Healthy,
-        Some(Err(e)) if e.raw_os_error() == Some(libc::ENOTCONN) => EndpointHealth::Stale,
-        Some(Err(_)) => EndpointHealth::Healthy,
-        None => EndpointHealth::Hung,
+        Some(res) => health_from_stat(res),
+        None => EndpointHealth::Hung, // 超时/熔断命中 → daemon 无响应
+    }
+}
+
+/// `stat` 结果 → 健康态映射：`ENOTCONN`=stale（僵尸 endpoint）；其余（成功或非 ENOTCONN 错误）=Healthy。
+/// `endpoint_health`（异步超时探测）与 `probe` 非挂载分支（同步 stat）共用，杜绝两处映射漂移。
+fn health_from_stat(res: io::Result<fs::Metadata>) -> EndpointHealth {
+    match res {
+        Ok(_) => EndpointHealth::Healthy,
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => EndpointHealth::Stale,
+        Err(_) => EndpointHealth::Healthy,
     }
 }
 
@@ -693,6 +708,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(endpoint_health(dir.path()), EndpointHealth::Healthy);
         assert!(endpoint_ok(dir.path()));
+    }
+
+    #[test]
+    fn health_from_stat_maps_enotconn_to_stale() {
+        // 纯映射单测（阶段 D 抽出，供 endpoint_health 异步 + probe 同步分支共用）：
+        // ENOTCONN → Stale（僵尸），其余错误/成功 → Healthy（非 ENOTCONN 不算坏）。
+        assert_eq!(
+            health_from_stat(Err(io::Error::from_raw_os_error(libc::ENOTCONN))),
+            EndpointHealth::Stale
+        );
+        assert_eq!(
+            health_from_stat(Err(io::Error::from_raw_os_error(libc::EACCES))),
+            EndpointHealth::Healthy
+        );
+        let md = fs::symlink_metadata(".").unwrap();
+        assert_eq!(health_from_stat(Ok(md)), EndpointHealth::Healthy);
     }
 
     #[test]
