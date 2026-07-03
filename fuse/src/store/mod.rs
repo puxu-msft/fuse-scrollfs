@@ -230,7 +230,9 @@ mod validate_tests {
     fn shadow_create_mkdir_reject_path_traversal() {
         // 评审 E1：绕过内核（ingest 直喂 read_dir 名）时，后端须自挡 `..`/`/`，否则 join 逃出 backing。
         let dir = tempfile::tempdir().unwrap();
-        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), 4096).unwrap();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let store = ShadowStore::open_with_chunk_size(backing, 4096).unwrap();
         let mk = |kind| Attr {
             ino: 0,
             size: 0,

@@ -247,7 +247,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let small_chunk = 64 * 1024;
         let content = redundant_content(50_000); // 约数 MB，多个 64KiB 块
-        let backing = dir.path().to_path_buf();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
         {
             let store = ShadowStore::open_with_chunk_size(backing.clone(), small_chunk).unwrap();
             write_file(&store, "t.jsonl", &content, small_chunk);
@@ -284,7 +285,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let small_chunk = 64 * 1024;
         let content = redundant_content(50_000);
-        let backing = dir.path().to_path_buf();
+        // backing 用 tempdir 内子目录：`.zipfs.lock` 落 tempdir 内（唯一+随清理），避免
+        // backing=tempdir 时 lock 落共享 temp 根被并发测试碰撞（测试隔离缺陷，非生产 bug）。
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
         {
             let store = ShadowStore::open_with_chunk_size(backing.clone(), small_chunk).unwrap();
             write_file(&store, "t.jsonl", &content, small_chunk);
@@ -303,7 +307,8 @@ mod tests {
     #[test]
     fn 已是大块的文件被跳过_幂等() {
         let dir = tempfile::tempdir().unwrap();
-        let backing = dir.path().to_path_buf();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
         let content = redundant_content(1000);
         {
             let store = ShadowStore::open_with_chunk_size(backing.clone(), 1024 * 1024).unwrap();
@@ -318,8 +323,10 @@ mod tests {
     #[test]
     fn 非archive文件被安全跳过() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("not-an-archive.txt"), b"hello world").unwrap();
-        let stats = seal_shadow_tree(dir.path(), 1024 * 1024, 19).unwrap();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        std::fs::write(backing.join("not-an-archive.txt"), b"hello world").unwrap();
+        let stats = seal_shadow_tree(&backing, 1024 * 1024, 19).unwrap();
         assert_eq!(stats.sealed, 0);
         assert_eq!(stats.skipped, 1);
         assert!(stats.errors.is_empty());
@@ -359,7 +366,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let small_chunk = 1024 * 1024; // 1MiB 活跃块
         let content = long_range_dup_content();
-        let backing = dir.path().to_path_buf();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
         {
             let store = ShadowStore::open_with_chunk_size(backing.clone(), small_chunk).unwrap();
             write_file(&store, "big.jsonl", &content, small_chunk);

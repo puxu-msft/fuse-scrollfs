@@ -180,8 +180,12 @@ mod tests {
     #[test]
     fn 压实回收频繁fsync空洞_内容一致() {
         let dir = tempfile::tempdir().unwrap();
+        // backing 用 tempdir 内子目录，令 `.zipfs.lock` 落 tempdir 内（唯一+随清理），
+        // 避免 backing=tempdir 时 lock 落共享 temp 根被并发测试碰撞（测试隔离缺陷）。
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
         let cs = 4096u32;
-        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
+        let store = ShadowStore::open_with_chunk_size(backing.clone(), cs).unwrap();
         let attr = crate::store::Attr {
             ino: 0,
             size: 0,
@@ -205,10 +209,10 @@ mod tests {
             ws.seal(&store, ino, &params()).unwrap(); // 每行 fsync → 膨胀
             store.fsync(ino).unwrap();
         }
-        let path = dir.path().join("t.jsonl");
+        let path = backing.join("t.jsonl");
         let before = std::fs::metadata(&path).unwrap().len();
         drop(store); // 评审 A3：compact 需 backing 锁，先释放活守护（= 卸载守护）
-        let stats = compact_shadow_tree(dir.path(), 3).unwrap();
+        let stats = compact_shadow_tree(&backing, 3).unwrap();
         assert_eq!(stats.compacted, 1, "应压实 1 文件：{:?}", stats.errors);
         let after = std::fs::metadata(&path).unwrap().len();
         assert!(after < before, "压实后更小：{before}->{after}");
@@ -232,8 +236,10 @@ mod tests {
         // 评审 A3：离线 compact 必须与活守护互斥，否则 temp+rename 覆盖守护刚写的版本
         // （Bug A 在维护路径复发）。活守护 = 一个仍持有 backing flock 的 ShadowStore。
         let dir = tempfile::tempdir().unwrap();
-        let _live = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), 4096).unwrap();
-        let res = compact_shadow_tree(dir.path(), 3);
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let _live = ShadowStore::open_with_chunk_size(backing.clone(), 4096).unwrap();
+        let res = compact_shadow_tree(&backing, 3);
         assert!(
             matches!(
                 res.as_ref().map_err(|e| e.kind()),
@@ -248,8 +254,13 @@ mod tests {
         // Bug D 延伸：compact 重写 archive（temp+rename）会把文件 mtime 重置为 now，
         // 与 ingest/seal 同样打乱按时间排序的会话列表。压实后须保留原 archive 文件 mtime。
         let dir = tempfile::tempdir().unwrap();
+        // backing 用 tempdir 内子目录：`.zipfs.lock`（backing 的 sibling）随之落 tempdir 内、
+        // 随清理且路径唯一。若 backing=tempdir，lock 落共享 temp 根，既残留又与其它测试
+        // （tempfile 名复用）碰撞同一 flock → 偶发 WouldBlock（测试隔离缺陷，非生产 bug）。
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
         let cs = 4096u32;
-        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap();
+        let store = ShadowStore::open_with_chunk_size(backing.clone(), cs).unwrap();
         let attr = crate::store::Attr {
             ino: 0,
             size: 0,
@@ -271,13 +282,13 @@ mod tests {
             ws.seal(&store, ino, &params()).unwrap(); // 每行 fsync → 膨胀，制造空洞
             store.fsync(ino).unwrap();
         }
-        let path = dir.path().join("t.jsonl");
+        let path = backing.join("t.jsonl");
         // 盖一个已知的过去 mtime（模拟真实会话文件已被 ingest 保留的源时间）。
         let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
         crate::core::set_file_times(&path, past, past).unwrap();
 
         drop(store); // 评审 A3：compact 需 backing 锁，先释放活守护
-        let stats = compact_shadow_tree(dir.path(), 3).unwrap();
+        let stats = compact_shadow_tree(&backing, 3).unwrap();
         assert_eq!(stats.compacted, 1, "应压实 1 文件：{:?}", stats.errors);
 
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();

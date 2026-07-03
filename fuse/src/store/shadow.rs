@@ -922,8 +922,9 @@ mod tests {
     /// 在临时 backing 下建一个 ShadowStore + 一个普通文件，返回 (store, tmpdir, ino)。
     fn store_with_file(chunk_size: u32) -> (ShadowStore, tempfile::TempDir, u64) {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), chunk_size).unwrap();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let store = ShadowStore::open_with_chunk_size(backing, chunk_size).unwrap();
         let attr = Attr {
             ino: 0,
             size: 0,
@@ -1342,8 +1343,9 @@ mod tests {
     /// 在空 backing 上建 ShadowStore（无预置文件）。
     fn empty_store(chunk_size: u32) -> (Arc<ShadowStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), chunk_size).unwrap();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let store = ShadowStore::open_with_chunk_size(backing, chunk_size).unwrap();
         (Arc::new(store), dir)
     }
 
@@ -1505,8 +1507,10 @@ mod tests {
         use crate::core::metrics::Metrics;
         let cs = 8u32;
         let dir = tempfile::tempdir().unwrap();
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
         let metrics = Metrics::new();
-        let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs)
+        let store = ShadowStore::open_with_chunk_size(backing, cs)
             .unwrap()
             .with_metrics(metrics.clone());
         let ino = store.create(ROOT_INO, "f.bin", reg_attr(cs)).unwrap();

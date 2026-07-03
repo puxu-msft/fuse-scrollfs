@@ -1012,8 +1012,9 @@ mod tests {
     fn fs_with_head_cache() -> (ZipfsRw, Vec<u8>, u64) {
         let dir = tempfile::tempdir().unwrap();
         let cs = 128 * 1024u32;
-        let store =
-            Arc::new(ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap());
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let store = Arc::new(ShadowStore::open_with_chunk_size(backing, cs).unwrap());
         let attr = Attr {
             ino: 0,
             size: 0,
@@ -1062,8 +1063,9 @@ mod tests {
         // 无界增长。forget 须回收锁/尾缓冲，且先封尾再丢弃、绝不丢未落盘数据。
         let dir = tempfile::tempdir().unwrap();
         let cs = 65536u32;
-        let store =
-            Arc::new(ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap());
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let store = Arc::new(ShadowStore::open_with_chunk_size(backing, cs).unwrap());
         let attr = Attr {
             ino: 0,
             size: 0,
@@ -1122,8 +1124,9 @@ mod tests {
     fn forget_flush_failure_preserves_tail_and_lock_no_data_loss() {
         let dir = tempfile::tempdir().unwrap();
         let cs = 65536u32;
-        let inner =
-            Arc::new(ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), cs).unwrap());
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let inner = Arc::new(ShadowStore::open_with_chunk_size(backing, cs).unwrap());
         let attr = Attr {
             ino: 0,
             size: 0,
