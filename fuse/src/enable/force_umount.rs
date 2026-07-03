@@ -124,17 +124,6 @@ pub struct UmountReport {
     pub unmounted: bool,
 }
 
-/// auto 升级链的纯决策：Clean→Lazy→Abort→None。`Auto` 不参与（由 umount() 展开）。
-// 供后续任务的 CLI 分档接线消费；umount() 目前内联展开升级链，故非测试路径暂未调用。
-#[allow(dead_code)]
-pub(crate) fn next_level(cur: UmountLevel) -> Option<UmountLevel> {
-    match cur {
-        UmountLevel::Clean => Some(UmountLevel::Lazy),
-        UmountLevel::Lazy => Some(UmountLevel::Abort),
-        UmountLevel::Abort | UmountLevel::Auto => None,
-    }
-}
-
 /// 单档超时上界（clean/lazy/abort 各自的摘除等待，内含轮询重试）。
 const STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -233,14 +222,6 @@ mod tests {
         let mp = Path::new("/nonexistent/zipfs/mp");
         let out = run_fusermount(&[OsStr::new("-u"), mp.as_os_str()], Duration::from_secs(2));
         assert!(matches!(out, CmdOutcome::Failed | CmdOutcome::NotFound));
-    }
-
-    #[test]
-    fn next_level_escalation_chain() {
-        assert_eq!(next_level(UmountLevel::Clean), Some(UmountLevel::Lazy));
-        assert_eq!(next_level(UmountLevel::Lazy), Some(UmountLevel::Abort));
-        assert_eq!(next_level(UmountLevel::Abort), None);
-        assert_eq!(next_level(UmountLevel::Auto), None); // Auto 不参与升级链决策。
     }
 
     #[test]
