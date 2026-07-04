@@ -680,7 +680,8 @@ pub fn reconcile_subagents_dir(
 ///   → 同名不重复；crc32 碰撞异内容 → 序号消歧不覆盖），canonical 原版原样不动。
 ///
 /// 全部安置且校验后：把 underlay 整目录 relocate 到 `stash_dir`（rename，跨卷回落递归拷+删；保全审计/回滚
-/// 底本）并 fsync 目录链，再在 underlay 原位复原指向 `symlink_target` 的 symlink（fsync 父目录）。underlay
+/// 底本）并 fsync 目录链，令 underlay 侧 **无任何 memory 残留**（**绝不复原 symlink**——`memory` symlink 已
+/// 存于 backing、挂载时透明服务；underlay 若留目录或 symlink 即成 fall-through 残留，永久 wedge 重挂）。underlay
 /// 目录不存在/已是 symlink（已恢复/无回落）→ 幂等返回。相对 `symlink_target` 按 symlink 所在目录（而非进程
 /// CWD）解析。返回逐步骤 notes（审计）。
 pub fn passthrough_restore_memory(
@@ -776,34 +777,31 @@ pub fn passthrough_restore_memory(
     // 安置每个 underlay 文件到 canonical target（新增/冲突/幂等）。
     place_memory_files(underlay_dir, underlay_dir, &canon_target, &mut notes)?;
 
-    // 全部安置后：underlay 整目录 relocate 到 stash（保全底本），再复原 symlink。
-    // 崩溃持久化纪律（评审 M3）：relocate 后 fsync stash 父目录记 rename dirent，复原 symlink 后 fsync
-    // underlay 父目录记新 symlink dirent（均传播错误，与本文件其余落盘链一致）。
+    // 全部安置后：underlay 整目录 relocate 到 stash（保全底本），underlay memory 目录随之整体消失。
+    // **绝不在 underlay 复原任何 symlink**（评审 final BREACH 2）：`memory` symlink 已存于 backing、挂载
+    // 时透明服务；underlay 侧必须以**无 memory 条目**收场——否则顶层 `memory`（目录或复原的 symlink）
+    // 都是非白名单条目，令 `underlay_has_fallthrough` 永真、`ensure_underlay_empty` 永久拒挂（wedge）。
+    // 崩溃持久化纪律（评审 M3）：relocate 后 fsync stash 父目录记 rename dirent，再 fsync underlay 父目录
+    // 记 underlay memory 目录移除后的 dirent（均传播错误，与本文件其余落盘链一致）。
     relocate_dir(underlay_dir, stash_dir)?;
     if let Some(parent) = stash_dir.parent() {
         fsync_dir(parent)?;
     }
-    notes.push(format!(
-        "underlay memory relocate 到 stash：{}",
-        stash_dir.display()
-    ));
-    std::os::unix::fs::symlink(symlink_target, underlay_dir)?;
     if let Some(parent) = underlay_dir.parent() {
         fsync_dir(parent)?;
     }
     notes.push(format!(
-        "symlink 复原：{} → {}",
-        underlay_dir.display(),
-        symlink_target.display()
+        "underlay memory relocate 到 stash 并从 underlay 移除（不复原 symlink，挂载由 backing/memory 服务）：{}",
+        stash_dir.display()
     ));
     Ok(notes)
 }
 
 /// 据 `passthrough_restore_memory` 的 notes 归纳 `EntryReport.action`（评审 M4，如实反映结果）：
-/// 含「symlink 复原」→ `memory-restored`；含「幂等跳过/已恢复/不存在」→ `memory-noop`；否则
-///（路径安全闸拦截、underlay 未动）→ `memory-deferred`（待人工）。
+/// 含「从 underlay 移除」→ `memory-restored`（成功 relocate、underlay 无残留）；含「幂等跳过/已恢复/
+/// 不存在」→ `memory-noop`；否则（路径安全闸拦截、underlay 未动）→ `memory-deferred`（待人工）。
 fn passthrough_action(notes: &[String]) -> &'static str {
-    if notes.iter().any(|n| n.contains("symlink 复原")) {
+    if notes.iter().any(|n| n.contains("从 underlay 移除")) {
         "memory-restored"
     } else if notes
         .iter()
@@ -1187,6 +1185,61 @@ fn finish_delete(
 
 // ── 顶层 reconcile 编排（Task 9） ──────────────────────────────────────────────
 
+/// 逐条目 apply 后**自底向上**剪除 underlay 里已抽干的空目录（评审 final BREACH 1）。
+///
+/// `finish_delete` 只 `remove_file`、从不 rmdir，故嵌套条目（如 `<uuid>/subagents/*.jsonl`）全抽干后
+/// 空目录 `<uuid>/subagents/`、`<uuid>/` 仍留存 underlay；顶层 `<uuid>/` 令 `underlay_has_fallthrough`
+/// 永真、`ensure_underlay_empty` 永久拒挂（wedge 重挂）。此函数自底向上遍历，凡「仅含 `is_harmless`
+/// 白名单项（或全空）」的目录即 rmdir。
+///
+/// 保守规则（零丢失）：仍存留任一**非白名单条目**（用户 Skip/KeepBoth、`delete_permitted` 未过留下的
+/// 文件，或 fifo/socket 等特殊文件）的目录**保留不删**——该项目正确地维持 NEEDS-RECONCILE，绝不强删非
+/// 空目录。**绝不删 `mp` 本身**（FUSE 挂载点必须留存，只可能删其后代空目录）。`mp` 不存在视为无事可做。
+fn prune_empty_underlay_dirs(mp: &Path) -> io::Result<()> {
+    // mp 自身永不被删（只有父目录会对子目录调 remove_dir，而 mp 无父层参与此遍历）；返回值忽略。
+    let _ = prune_dir_bottom_up(mp)?;
+    Ok(())
+}
+
+/// `prune_empty_underlay_dirs` 的递归实现：先递归子目录（自底向上），再对「已抽干」的子目录 rmdir。
+/// 返回 `dir` 剪枝后是否「无非白名单条目」（供父层判定是否可删 `dir`）。
+fn prune_dir_bottom_up(dir: &Path) -> io::Result<bool> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    let mut has_kept = false;
+    let mut removed_any = false;
+    for dent in rd {
+        let dent = dent?;
+        if is_harmless(&dent.file_name()) {
+            continue;
+        }
+        let ft = dent.file_type()?;
+        if !ft.is_dir() {
+            // 非目录、非白名单（常规文件 / fifo / socket 等）→ 该目录须保留（fail-closed）。
+            has_kept = true;
+            continue;
+        }
+        if prune_dir_bottom_up(&dent.path())? {
+            match std::fs::remove_dir(dent.path()) {
+                Ok(()) => removed_any = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // 竞态/意外非空兜底：删不掉即视为保留，不传播（best-effort 剪枝，绝不误伤数据）。
+                Err(_) => has_kept = true,
+            }
+        } else {
+            has_kept = true;
+        }
+    }
+    if removed_any {
+        // 持久化本目录内子目录移除的 dirent（best-effort，与本文件其余落盘链一致，失败不阻断剪枝）。
+        let _ = fsync_dir(dir);
+    }
+    Ok(!has_kept)
+}
+
 /// 逐条目的人工确认决定（`ReconcileOptions::confirm` 回调返回）。策略 B：本 driver 只按此裁决，
 /// **不自动执行**——交互式提示留 CLI（Task 10），非交互驱动由调用方给恒定策略实现（如全 Accept）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1300,6 +1353,22 @@ pub fn reconcile(
             },
         };
         entries.push(report);
+    }
+
+    // 逐条 apply 后剪除已抽干的空 underlay 子目录（评审 final BREACH 1）：finish_delete 只删文件不
+    // rmdir，`<uuid>/subagents/*.jsonl` 抽干后空 `<uuid>/` 仍是顶层非白名单条目，令下面的 drained 复扫
+    // 永假、`ensure_underlay_empty` 永久拒挂。自底向上、只删「仅含白名单/全空」目录，仍存 Skip/KeepBoth/
+    // 未删条目的目录保留。best-effort：剪枝报错绝不阻断收尾（非数据安全，数据已抽干），与下面 meta
+    // finalize 同为「失败仅记 warn、不 wedge」——否则清标记被跳过、reconciling 标记永久卡住把维护拦死。
+    if let Err(e) = prune_empty_underlay_dirs(&mp) {
+        entries.push(EntryReport {
+            name: format!("<prune {name}>"),
+            decision: "prune-empty-dirs".into(),
+            action: "warn".into(),
+            notes: vec![format!(
+                "剪除空 underlay 子目录失败（仅影响重挂门禁，非数据安全）：{e}"
+            )],
+        });
     }
 
     // 4. underlay 清空且非 rebuild → meta 字节数收尾（rebuild 由 reingest 自写 meta，不重复）。
@@ -2212,7 +2281,7 @@ mod tests {
     // ── memory 透传恢复（例外规则） ─────────────────────────────────────────
 
     #[test]
-    fn passthrough_restores_new_memory_file_into_target_and_relinks() {
+    fn passthrough_restores_new_memory_file_into_target_and_removes_underlay() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("shared-memory");
         std::fs::create_dir_all(&target).unwrap();
@@ -2227,17 +2296,12 @@ mod tests {
         assert_eq!(std::fs::read(target.join("NEW.md")).unwrap(), b"fresh\n");
         // underlay memory relocate 到 stash（底本保全）。
         assert_eq!(std::fs::read(stash.join("NEW.md")).unwrap(), b"fresh\n");
-        // underlay 原位复原为指向 target 的 symlink。
+        // underlay 侧 memory 条目彻底消失（**不复原 symlink**）——否则顶层 memory 残留会 wedge 重挂。
         assert!(
-            underlay
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "应复原 symlink"
+            underlay.symlink_metadata().is_err(),
+            "underlay memory 必须无残留（无目录、无复原 symlink）"
         );
-        assert_eq!(std::fs::read_link(&underlay).unwrap(), target);
-        assert!(notes.iter().any(|n| n.contains("symlink 复原")));
+        assert!(notes.iter().any(|n| n.contains("从 underlay 移除")));
     }
 
     #[test]
@@ -2269,7 +2333,7 @@ mod tests {
         assert_eq!(std::fs::read(&variant).unwrap(), b"UNDERLAY-VERSION\n");
 
         // 幂等：重建同内容 underlay 再跑 → 同 hash 同名，不新增第二份。
-        std::fs::remove_file(&underlay).unwrap(); // 移除上轮复原的 symlink
+        // （首轮已把 underlay memory 整目录 relocate 走、未复原 symlink，故此处直接重建目录即可。）
         std::fs::create_dir_all(&underlay).unwrap();
         std::fs::write(underlay.join("MEMORY.md"), b"UNDERLAY-VERSION\n").unwrap();
         let stash2 = tmp.path().join("q2").join("memory");
@@ -2394,13 +2458,11 @@ mod tests {
             std::fs::read(target.join("NOTES.md")).unwrap(),
             b"note-body\n"
         );
-        // underlay memory 复原为 symlink。
-        assert!(mp
-            .join("memory")
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        // underlay memory 侧无残留（**不复原 symlink**；挂载由 backing/memory 服务）。
+        assert!(
+            mp.join("memory").symlink_metadata().is_err(),
+            "underlay memory 应无残留（无目录、无复原 symlink）"
+        );
     }
 
     #[test]
@@ -2430,17 +2492,15 @@ mod tests {
         let r2 = apply_entry(&paths, "demo", &e2, &EntryPlan::KeepSeparate, &mp, "0").unwrap();
         assert_eq!(r2.action, "memory-noop", "次条应如实报 noop");
         assert!(
-            r2.notes.iter().any(|n| n.contains("幂等跳过")),
-            "次条应幂等跳过：{:?}",
+            r2.notes.iter().any(|n| n.contains("不存在")),
+            "次条应因 underlay memory 已整目录 relocate 移除而 noop：{:?}",
             r2.notes
         );
-        // memory 仍是 symlink（未被再次 relocate 破坏）。
-        assert!(mp
-            .join("memory")
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        // memory 侧无残留（首条已 relocate 整目录、未复原 symlink，次条不再触碰）。
+        assert!(
+            mp.join("memory").symlink_metadata().is_err(),
+            "underlay memory 应无残留"
+        );
     }
 
     #[test]
@@ -2926,6 +2986,111 @@ mod tests {
             report.entries.iter().any(|e| e.action == "warn"),
             "应记 meta 收尾 warn 条目：{:?}",
             report.entries
+        );
+    }
+
+    #[test]
+    fn reconcile_prunes_drained_subdirs_and_removes_memory_symlink_so_remount_unblocked() {
+        // 整分支收尾评审两处集成缝 bug（BREACH 1 + BREACH 2）：reconcile 抽干 underlay 后必须让
+        // `underlay_has_fallthrough` 归假（= `ensure_underlay_empty` 放行 → 重挂解锁），且零丢失。
+        //   (a) 嵌套 `<uuid>/subagents/x.jsonl` 抽干后空目录 `<uuid>/subagents/`、`<uuid>/` 若不剪除，
+        //       顶层 `<uuid>/` 令 fall-through 永真（BREACH 1）。
+        //   (b) memory 分裂脑：backing/memory 是指向树外 target 的 symlink，underlay/memory 是含真实
+        //       文件的目录。透传若在 underlay 复原 memory symlink，顶层 memory 条目令 fall-through 永真
+        //       （BREACH 2）。underlay 侧必须无任何 memory 残留（挂载由 backing/memory 服务）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        // (a) 嵌套子代理 fall-through 文件（orig 无 → New；subagents 路由强制并集）。
+        let sub_rel = "sess-uuid/subagents/agent.jsonl";
+        let sub_body = b"{\"type\":\"assistant\",\"uuid\":\"sa1\",\"parentUuid\":null}\n";
+        write_underlay(&mp, sub_rel, sub_body);
+
+        // (b) memory 分裂脑：树外 target + backing/memory symlink → target + underlay/memory 真实目录含文件。
+        let target = tmp.path().join("external-memory"); // 移出 projects 树
+        std::fs::create_dir_all(&target).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+        std::os::unix::fs::symlink(&target, backing.join("memory")).unwrap();
+        let mem_body = b"# NOTES\nrelocated-body\n";
+        write_underlay(&mp, "memory/NOTE.md", mem_body);
+
+        // 挂载前顶层确有 fall-through（<uuid>/ 与 memory/ 两个顶层条目）。
+        assert!(
+            underlay_has_fallthrough(&mp).unwrap(),
+            "前提：reconcile 前 underlay 顶层含 fall-through"
+        );
+
+        let m = FakeMounter::default();
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+
+        // ── 核心断言：underlay 顶层归空 → ensure_underlay_empty 放行 → 重挂解锁（两 breach 均已修）。
+        assert!(
+            !crate::reconcile::guard::underlay_has_fallthrough(&mp).unwrap(),
+            "抽干后 underlay 顶层必须无 fall-through（否则重挂永久 wedge）：{:?}",
+            report.entries
+        );
+        crate::reconcile::guard::ensure_underlay_empty(&mp).unwrap();
+
+        // BREACH 1：抽干的空子目录被剪除（顶层 <uuid>/ 无残留）。
+        assert!(
+            mp.join("sess-uuid").symlink_metadata().is_err(),
+            "抽干的空 <uuid>/ 目录应被剪除"
+        );
+        // BREACH 2：underlay 侧 memory 无任何残留（既非目录也非复原的 symlink）。
+        assert!(
+            mp.join("memory").symlink_metadata().is_err(),
+            "underlay memory 必须无残留（不复原 symlink）"
+        );
+
+        // ── 零丢失（a）：子代理会话内容落 orig 且已重灌 backing。
+        let orig_sub = paths.orig("demo").join(sub_rel);
+        assert_eq!(
+            std::fs::read(&orig_sub).unwrap(),
+            sub_body,
+            "子代理会话内容应无损落 orig"
+        );
+        let backing_sub = backing.join(sub_rel);
+        assert_eq!(
+            read_archive(&backing_sub),
+            sub_body,
+            "子代理会话内容应重灌进 backing"
+        );
+
+        // ── 零丢失（b）：memory 文件被安置到 canonical target（挂载时 backing/memory symlink 服务）。
+        assert_eq!(
+            std::fs::read(target.join("NOTE.md")).unwrap(),
+            mem_body,
+            "memory 文件应安置到 canonical target"
+        );
+
+        // 无静默丢弃：报告含子代理 underlay-removed 与 memory-restored。
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.action.contains("underlay-removed") && e.decision.contains("subagents")),
+            "应有 subagents underlay-removed 条目：{:?}",
+            report.entries
+        );
+        assert!(
+            report.entries.iter().any(|e| e.action == "memory-restored"),
+            "应有 memory-restored 条目：{:?}",
+            report.entries
+        );
+        // reconciling 标记正常清（不 wedge）。
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "收尾应清 reconciling 标记"
         );
     }
 }
