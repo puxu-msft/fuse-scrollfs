@@ -13,6 +13,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::enable::daemon::Mounter;
 use crate::enable::discovery::{self, detect_activity};
 use crate::enable::model::{validate_name, ApplyOptions, Backend, Paths};
 use crate::reconcile::advisor::{recommend, Action, Confidence, Recommendation};
@@ -628,13 +629,14 @@ pub fn reconcile_subagents_dir(
     name: &str,
     snap_entry: &EntrySnapshot,
     mp: &Path,
+    ts: &str,
 ) -> io::Result<EntryReport> {
     validate_name(name)?;
     let rel = snap_entry.rel.clone();
     let orig_file = paths.orig(name).join(&rel);
     let mut notes: Vec<String> = vec!["subagents：强制无损并集（绝不按 mtime 取舍）".into()];
 
-    stash_orig_preimage(paths, name, &rel, &mut notes)?;
+    stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
     if let Some(parent) = orig_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -992,12 +994,17 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> io::Result<()> {
 /// memory 透传（backing 顶层段是 symlink）→ `passthrough_restore_memory`（例外规则）。
 /// Identical 无需改 orig/backing，直接过 `delete_permitted`（ByteEqual）删 underlay。
 /// KeepSeparate → `quarantine_reuse` 隔离（base 不动，ByteEqual 删除门）。仅 KeepBoth 仍 deferred。
+///
+/// `ts` 是**贯穿整个 reconcile run 的单一时间戳**（Task7 Minor2）：orig 前镜像 stash、quarantine、
+/// passthrough stash 全用同一 `ts`，令一次 reconcile 的所有落盘落同一代次目录（而非每条目各自
+/// `now_unix_secs`）。由 `reconcile` 从 `UnderlaySnapshot::ts` 传入。
 pub fn apply_entry(
     paths: &Paths,
     name: &str,
     snap_entry: &EntrySnapshot,
     plan: &EntryPlan,
     mp: &Path,
+    ts: &str,
 ) -> io::Result<EntryReport> {
     validate_name(name)?;
     let rel = snap_entry.rel.clone();
@@ -1006,16 +1013,15 @@ pub fn apply_entry(
 
     // 优先路由：subagents 子会话一律无损并集，绕过 plan（防 SuspectReuse 误隔离子会话）。
     if is_subagents_entry(&rel) {
-        return reconcile_subagents_dir(paths, name, snap_entry, mp);
+        return reconcile_subagents_dir(paths, name, snap_entry, mp, ts);
     }
 
     // 优先路由：memory 透传。backing 顶层段是 symlink → 该条目属外链 memory 的物化回落写。
     // （plan_entries 目前不产 Passthrough；据 backing symlink 判定，兼容显式 Passthrough plan。）
     if matches!(plan, EntryPlan::Passthrough) || is_passthrough_entry(paths, name, &rel) {
         if let Some((top, target)) = passthrough_top_symlink(paths, name, &rel)? {
-            let ts = now_unix_secs();
             let underlay_dir = mp.join(&top);
-            let stash_dir = paths.quarantine(name, &ts).join(&top);
+            let stash_dir = paths.quarantine(name, ts).join(&top);
             let notes = passthrough_restore_memory(&underlay_dir, &target, &stash_dir)?;
             // 据结果如实报 action（评审 M4）：路径安全闸未过时 underlay 未动，不能谎报 restored。
             let action = passthrough_action(&notes);
@@ -1030,7 +1036,7 @@ pub fn apply_entry(
 
     match plan {
         EntryPlan::Union => {
-            stash_orig_preimage(paths, name, &rel, &mut notes)?;
+            stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
             let base_bytes = std::fs::read(&orig_file)?;
             let base_str = String::from_utf8_lossy(&base_bytes);
             let inc_str = String::from_utf8_lossy(&snap_entry.bytes);
@@ -1048,7 +1054,7 @@ pub fn apply_entry(
             )
         }
         EntryPlan::New => {
-            stash_orig_preimage(paths, name, &rel, &mut notes)?;
+            stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
             if let Some(parent) = orig_file.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -1085,8 +1091,7 @@ pub fn apply_entry(
         }
         EntryPlan::KeepSeparate => {
             // 疑 reuse：隔离 underlay 那份到 quarantine（移出树、保 UUID），base 不动，ByteEqual 删除门。
-            let ts = now_unix_secs();
-            let q = quarantine_reuse(paths, name, &ts, snap_entry, mp)?;
+            let q = quarantine_reuse(paths, name, ts, snap_entry, mp)?;
             notes.push(format!("quarantine={}", q.display()));
             finish_delete(
                 snap_entry,
@@ -1113,10 +1118,15 @@ pub fn apply_entry(
 
 /// 把当前 `orig/<rel>` 拷进 `reconcile_stash(name,ts)/orig/<rel>` 并 fsync（评审 I-3，改 orig 前留底）。
 /// orig 不存在（New 条目）→ 无前镜像可 stash，记 note 后返回。stash 路径记入 `notes`（回滚定位）。
+///
+/// `ts` 是**贯穿整个 reconcile run 的单一时间戳**（= `UnderlaySnapshot::ts`，Task7 Minor2）：一次
+/// reconcile 内所有条目的前镜像与快照落同一 `reconcile_stash(name,ts)` 代次，便于审计/回滚定位，
+/// 不再每条目各自 `now_unix_secs`（会散落到多个代次目录）。
 fn stash_orig_preimage(
     paths: &Paths,
     name: &str,
     rel: &str,
+    ts: &str,
     notes: &mut Vec<String>,
 ) -> io::Result<()> {
     let orig_file = paths.orig(name).join(rel);
@@ -1124,8 +1134,7 @@ fn stash_orig_preimage(
         notes.push(format!("orig/{rel} 不存在，无前镜像可 stash（New 条目）"));
         return Ok(());
     }
-    let ts = now_unix_secs();
-    let stash_root = paths.reconcile_stash(name, &ts);
+    let stash_root = paths.reconcile_stash(name, ts);
     let dst = stash_root.join("orig").join(rel);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1176,9 +1185,199 @@ fn finish_delete(
     })
 }
 
+// ── 顶层 reconcile 编排（Task 9） ──────────────────────────────────────────────
+
+/// 逐条目的人工确认决定（`ReconcileOptions::confirm` 回调返回）。策略 B：本 driver 只按此裁决，
+/// **不自动执行**——交互式提示留 CLI（Task 10），非交互驱动由调用方给恒定策略实现（如全 Accept）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    /// 采纳建议：按 plan 落盘（Union/New/Identical/KeepSeparate/subagents/passthrough）。
+    Accept,
+    /// 两份都留：不删 base、underlay 保留（据现有 KeepBoth handler；快照 stash 已留副本）。
+    KeepBoth,
+    /// 跳过此条：underlay 原样保留、orig 不动。
+    Skip,
+}
+
+/// 逐条目裁决回调类型（rel + 建议 → `Confirm`）。策略 B：driver 只据此裁决，交互实现留调用方。
+pub type ConfirmFn = dyn Fn(&str, &Recommendation) -> Confirm;
+
+/// reconcile 运行选项。`confirm` 是逐条目裁决回调（rel + 建议 → `Confirm`）。
+pub struct ReconcileOptions {
+    /// 只出建议单、**零改动**（不 set_reconciling、不 apply）。
+    pub dry_run: bool,
+    /// 跳过活跃门禁（人工确认空闲后）。
+    pub force: bool,
+    /// 全量重建：逐条落盘后清 reconciling 标记，委托 `lifecycle::reingest` 从 orig 全量重建 backing。
+    pub rebuild: bool,
+    /// 逐条目裁决回调。
+    pub confirm: Box<ConfirmFn>,
+}
+
+/// 顶层 reconcile 主循环（把 Task 1-8 的 handler 串成端到端 driver）：
+///
+/// 1. 读 meta 取 backend（无 meta / 非 shadow → 拒）；`check_preconditions` 取串行锁 + underlay 快照。
+/// 2. `dry_run` → 只 `plan_entries` 出建议单、构建报告返回，**零改动**（不 set_reconciling、不 apply）。
+/// 3. 否则 `set_reconciling(true)` → 对每条目 `plan_entries` 给 (rel,plan,rec) → `confirm` 裁决：
+///    `Accept`→`apply_entry`；`KeepBoth`→按 KeepBoth handler（不删 base、underlay 保留）；`Skip`→跳过。
+/// 4. 逐条处置后：underlay 已清空且非 rebuild → meta 字节数收尾（重扫 backing/orig，committed 不变）；
+///    随后 `set_reconciling(false)` 关闭半改写窗口。
+/// 5. `rebuild` → 委托 `lifecycle::reingest`（从 orig 全量重建 backing、重挂、自写 meta）。
+///
+/// **run ts 单一**（Task7 Minor2）：`snapshot.ts` 贯穿整个 run，所有 stash（快照 + 各条目 orig 前
+/// 镜像 + quarantine）落同一 `reconcile_stash(name,ts)` 代次。
+///
+/// **零丢失**：dry_run 绝不动盘；`apply_entry` 的唯一删除门（durable 超集 + live 未变）逐条把关；
+/// 崩溃续跑幂等（reconciling 标记在→重跑安全，合并是并集不动点、已删条目不在新快照里故不复现）。
+///
+/// **rebuild 崩溃恢复**：若在清标记后、`reingest` 中途崩溃，此时 underlay 已清空 → 再跑 reconcile
+/// 会被前置门禁拒（无 fall-through）；但 orig 是已 fsync 的权威源、`reingest` 会回滚 backing 并留
+/// `.reingest-bak`，故无数据丢失，恢复走 `enable remount` / 手动 `enable reingest` 而非重跑 reconcile。
+pub fn reconcile(
+    paths: &Paths,
+    name: &str,
+    opts: ReconcileOptions,
+    mounter: &dyn Mounter,
+) -> io::Result<ReconcileReport> {
+    validate_name(name)?;
+
+    // backend 从 meta 读（无 meta 拒——未 apply）。非 shadow 由 check_preconditions 拒。
+    let meta = discovery::read_meta(&paths.meta_path(name))?.ok_or_else(|| {
+        io::Error::other(format!(
+            "{name} 无提交标记 meta，无法 reconcile（未 apply？）"
+        ))
+    })?;
+    let backend = meta.backend;
+
+    // 1. 门禁 + 快照（取串行锁；backend 非 shadow 在此拒）。锁随 `pre` 存活到函数末。
+    let pre = check_preconditions(paths, name, backend, opts.force)?;
+    let ts = pre.snapshot.ts.clone();
+    let stash_dir = paths.reconcile_stash(name, &ts);
+    let mp = paths.mountpoint(name);
+
+    // 2. dry_run：只 plan、零改动。
+    if opts.dry_run {
+        let plans = plan_entries(paths, name, &pre.snapshot)?;
+        let entries = plans
+            .into_iter()
+            .map(|(rel, plan, rec)| EntryReport {
+                name: rel,
+                decision: format!("{plan:?}"),
+                action: "dry-run".into(),
+                notes: vec![rec.rationale],
+            })
+            .collect();
+        return Ok(ReconcileReport { entries, stash_dir });
+    }
+
+    // 3. 进行中标记（半改写 orig 窗口开）→ 逐条裁决落盘。
+    set_reconciling(paths, name, true)?;
+    let plans = plan_entries(paths, name, &pre.snapshot)?;
+    let mut entries = Vec::with_capacity(plans.len());
+    for (rel, plan, rec) in plans {
+        // plan 的 rel 恒来自快照；找回对应 EntrySnapshot 供 apply（快照是合并/删除唯一基准）。
+        let Some(snap_entry) = pre.snapshot.entries.iter().find(|e| e.rel == rel) else {
+            // 理论不可达（plan 源自快照）；防御地记一条审计条目而非静默跳过，绝不动盘。
+            entries.push(EntryReport {
+                name: rel,
+                decision: "skip".into(),
+                action: "unmatched-snapshot".into(),
+                notes: vec!["plan 条目在快照中无对应项（不可达），防御跳过、underlay 不动".into()],
+            });
+            continue;
+        };
+        let report = match (opts.confirm)(&rel, &rec) {
+            Confirm::Accept => apply_entry(paths, name, snap_entry, &plan, &mp, &ts)?,
+            // KeepBoth：按现有 KeepBoth handler（不删 base、underlay 保留；快照 stash 已存副本）。
+            Confirm::KeepBoth => {
+                apply_entry(paths, name, snap_entry, &EntryPlan::KeepBoth, &mp, &ts)?
+            }
+            Confirm::Skip => EntryReport {
+                name: rel,
+                decision: "skip".into(),
+                action: "skipped+underlay-kept".into(),
+                notes: vec!["用户跳过此条：underlay 原样保留、orig 不动".into()],
+            },
+        };
+        entries.push(report);
+    }
+
+    // 4. underlay 清空且非 rebuild → meta 字节数收尾（rebuild 由 reingest 自写 meta，不重复）。
+    //    收尾是**纯 list 显示**（非数据安全），失败绝不能阻断下面的 set_reconciling(false)——否则
+    //    underlay 已清空、下轮 reconcile 会在前置门禁因「无 fall-through」被拒（永远走不到清标记），
+    //    reconciling 标记就永久卡住、把所有生命周期维护经 bail_if_reconciling 拦死。与 reingest 的
+    //    「meta 写失败 warn-not-fail」一致：best-effort，失败只记 warn 条目。
+    //    同理 underlay 复扫用 unwrap_or(true)（探测出错→保守视为未清空、跳过收尾），绝不因复扫报错
+    //    而阻断清标记。
+    let drained = !underlay_has_fallthrough(&mp).unwrap_or(true);
+    if !opts.rebuild && drained {
+        if let Err(e) = finalize_meta_bytes(paths, name, &meta) {
+            entries.push(EntryReport {
+                name: format!("<meta {name}>"),
+                decision: "meta-finalize".into(),
+                action: "warn".into(),
+                notes: vec![format!(
+                    "meta 字节数收尾失败（仅影响 list 显示，非数据安全）：{e}"
+                )],
+            });
+        }
+    }
+    // 关闭半改写窗口：逐条 apply 已各自原子完成，orig 处于一致态。崩溃续跑靠「标记在→重跑幂等」，
+    // 故仅在正常收尾时清标记（中途崩溃则标记留存，让生命周期维护让路、下次 reconcile 续做）。
+    set_reconciling(paths, name, false)?;
+
+    // 5. rebuild：清标记后委托 reingest 从 orig 全量重建 backing + 重挂（committed 全程不变满足其前提）。
+    if opts.rebuild {
+        let msg = crate::enable::lifecycle::reingest(paths, name, opts.force, mounter)?;
+        entries.push(EntryReport {
+            name: format!("<rebuild {name}>"),
+            decision: "rebuild".into(),
+            action: "reingest-delegated".into(),
+            notes: vec![msg],
+        });
+    }
+
+    Ok(ReconcileReport { entries, stash_dir })
+}
+
+/// meta 字节数收尾（**非数据安全，仅 list 显示**）：重扫 backing 求 `bytes_archive`、扫 orig 求
+/// `bytes_src`，据原 meta 选项重写 committed meta（committed 保持 true，仅字节数/applied_at 更新）。
+fn finalize_meta_bytes(paths: &Paths, name: &str, meta: &discovery::Meta) -> io::Result<()> {
+    let bytes_src = dir_file_bytes(&paths.orig(name))?;
+    let bytes_archive = dir_file_bytes(&paths.backing(name, Backend::Shadow))?;
+    let new_meta = discovery::Meta::from_apply(
+        &meta.options(),
+        bytes_src,
+        bytes_archive,
+        discovery::now_unix(),
+    );
+    discovery::write_meta(&paths.meta_path(name), &new_meta)
+}
+
+/// 递归求目录下所有常规文件字节数之和（meta 字节收尾用）。目录不存在 → 0；symlink/特殊文件不计。
+fn dir_file_bytes(dir: &Path) -> io::Result<u64> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut total = 0u64;
+    for dent in rd {
+        let dent = dent?;
+        let ft = dent.file_type()?;
+        if ft.is_dir() {
+            total = total.saturating_add(dir_file_bytes(&dent.path())?);
+        } else if ft.is_file() {
+            total = total.saturating_add(dent.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enable::daemon::fake::FakeMounter;
     use crate::enable::model::{Backend, Paths};
     use std::path::Path;
 
@@ -1578,7 +1777,15 @@ mod tests {
         let plans = plan_entries(&paths, "demo", &snap).unwrap();
         assert_eq!(plans[0].1, EntryPlan::Union);
 
-        let report = apply_entry(&paths, "demo", &snap.entries[0], &EntryPlan::Union, &mp).unwrap();
+        let report = apply_entry(
+            &paths,
+            "demo",
+            &snap.entries[0],
+            &EntryPlan::Union,
+            &mp,
+            "0",
+        )
+        .unwrap();
 
         // orig 现含合并结果：base(u1/old) 全留 + incoming(new/mode) 并入。
         let merged = std::fs::read_to_string(&orig_file).unwrap();
@@ -1616,7 +1823,7 @@ mod tests {
         let orig_file = write_orig(&paths, "demo", rel, BASE_LOG.as_bytes());
         let snap_e = snap_entry_of(&mp, rel, INCOMING_LOG.as_bytes());
 
-        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Union, &mp).unwrap();
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Union, &mp, "0").unwrap();
 
         // orig 已被合并改写（≠ base）。
         assert_ne!(std::fs::read(&orig_file).unwrap(), BASE_LOG.as_bytes());
@@ -1661,7 +1868,7 @@ mod tests {
         f.sync_all().unwrap();
         drop(f);
 
-        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Union, &mp).unwrap();
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Union, &mp, "0").unwrap();
         assert!(
             mp.join(rel).exists(),
             "live 已变 → underlay 必须保留（防丢尾）"
@@ -1701,7 +1908,8 @@ mod tests {
         let plans = plan_entries(&paths, "demo", &snap).unwrap();
         assert_eq!(plans[0].1, EntryPlan::New);
 
-        let report = apply_entry(&paths, "demo", &snap.entries[0], &EntryPlan::New, &mp).unwrap();
+        let report =
+            apply_entry(&paths, "demo", &snap.entries[0], &EntryPlan::New, &mp, "0").unwrap();
 
         let orig_file = paths.orig("demo").join(rel);
         assert_eq!(std::fs::read(&orig_file).unwrap(), incoming);
@@ -1735,8 +1943,15 @@ mod tests {
         let plans = plan_entries(&paths, "demo", &snap).unwrap();
         assert_eq!(plans[0].1, EntryPlan::Identical);
 
-        let report =
-            apply_entry(&paths, "demo", &snap.entries[0], &EntryPlan::Identical, &mp).unwrap();
+        let report = apply_entry(
+            &paths,
+            "demo",
+            &snap.entries[0],
+            &EntryPlan::Identical,
+            &mp,
+            "0",
+        )
+        .unwrap();
         assert!(!mp.join(rel).exists(), "Identical 应直接删 underlay");
         // orig / backing 均未改。
         assert_eq!(std::fs::read(&orig_file).unwrap(), content);
@@ -1762,7 +1977,7 @@ mod tests {
         assert!(!backing_file.exists(), "前提：backing 缺失");
 
         let snap_e = snap_entry_of(&mp, rel, content);
-        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Identical, &mp).unwrap();
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Identical, &mp, "0").unwrap();
 
         // 降级 reingest：backing 被补齐为 orig 内容。
         assert_eq!(
@@ -1805,7 +2020,7 @@ mod tests {
         let orig_file = write_orig(&paths, "demo", rel, base.as_bytes());
         let snap_e = snap_entry_of(&mp, rel, incoming.as_bytes());
 
-        let report = reconcile_subagents_dir(&paths, "demo", &snap_e, &mp).unwrap();
+        let report = reconcile_subagents_dir(&paths, "demo", &snap_e, &mp, "0").unwrap();
 
         // orig 现含两侧 uuid（并集，无一方被丢）。
         let merged = std::fs::read_to_string(&orig_file).unwrap();
@@ -1841,7 +2056,8 @@ mod tests {
         let snap_e = snap_entry_of(&mp, rel, incoming.as_bytes());
 
         // 传 KeepSeparate plan，但路由据 subagents 路径改走并集。
-        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        let report =
+            apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp, "0").unwrap();
         assert!(
             report.decision.contains("subagents"),
             "应优先走 subagents 并集：{}",
@@ -1871,7 +2087,7 @@ mod tests {
         let rel = "u/subagents/fresh.jsonl";
         let incoming = b"{\"type\":\"summary\",\"summary\":\"s\"}\n";
         let snap_e = snap_entry_of(&mp, rel, incoming);
-        let report = reconcile_subagents_dir(&paths, "demo", &snap_e, &mp).unwrap();
+        let report = reconcile_subagents_dir(&paths, "demo", &snap_e, &mp, "0").unwrap();
         let orig_file = paths.orig("demo").join(rel);
         assert_eq!(std::fs::read(&orig_file).unwrap(), incoming);
         assert!(!mp.join(rel).exists());
@@ -1918,6 +2134,7 @@ mod tests {
             &snap.entries[0],
             &EntryPlan::KeepSeparate,
             &mp,
+            "0",
         )
         .unwrap();
 
@@ -1987,7 +2204,7 @@ mod tests {
         std::fs::create_dir_all(&mp).unwrap();
         let rel = "kb.jsonl";
         let snap_e = snap_entry_of(&mp, rel, b"{\"a\":1}\n");
-        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepBoth, &mp).unwrap();
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepBoth, &mp, "0").unwrap();
         assert_eq!(report.action, "deferred");
         assert!(mp.join(rel).exists(), "deferred 计划不得删 underlay");
     }
@@ -2169,7 +2386,8 @@ mod tests {
         let snap_e = snap_entry_of(&mp, rel, b"note-body\n");
 
         // 传 KeepSeparate（模拟 plan_entries 对非 jsonl 的保守判定），路由应改走透传。
-        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        let report =
+            apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp, "0").unwrap();
         assert_eq!(report.decision, "passthrough", "应路由到透传");
         // 文件送进 target。
         assert_eq!(
@@ -2203,13 +2421,13 @@ mod tests {
         let e1 = snap_entry_of(&mp, "memory/A.md", b"aaa\n");
         let e2 = snap_entry_of(&mp, "memory/B.md", b"bbb\n");
 
-        let r1 = apply_entry(&paths, "demo", &e1, &EntryPlan::KeepSeparate, &mp).unwrap();
+        let r1 = apply_entry(&paths, "demo", &e1, &EntryPlan::KeepSeparate, &mp, "0").unwrap();
         assert_eq!(r1.action, "memory-restored");
         // 首条已把整目录 relocate 并复原 symlink；A、B 都进了 target。
         assert_eq!(std::fs::read(target.join("A.md")).unwrap(), b"aaa\n");
         assert_eq!(std::fs::read(target.join("B.md")).unwrap(), b"bbb\n");
 
-        let r2 = apply_entry(&paths, "demo", &e2, &EntryPlan::KeepSeparate, &mp).unwrap();
+        let r2 = apply_entry(&paths, "demo", &e2, &EntryPlan::KeepSeparate, &mp, "0").unwrap();
         assert_eq!(r2.action, "memory-noop", "次条应如实报 noop");
         assert!(
             r2.notes.iter().any(|n| n.contains("幂等跳过")),
@@ -2239,7 +2457,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("gone-mem"), backing.join("memory")).unwrap();
         let e = snap_entry_of(&mp, "memory/N.md", b"n\n");
 
-        let report = apply_entry(&paths, "demo", &e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        let report = apply_entry(&paths, "demo", &e, &EntryPlan::KeepSeparate, &mp, "0").unwrap();
         assert_eq!(report.decision, "passthrough");
         assert_eq!(report.action, "memory-deferred", "悬空 → 不能谎报 restored");
         // underlay 文件保留（未动）。
@@ -2277,5 +2495,437 @@ mod tests {
         assert_eq!(std::fs::read(&disambig).unwrap(), b"UNDER-A\n");
         // canonical 不动。
         assert_eq!(std::fs::read(target.join("M.md")).unwrap(), b"CANON\n");
+    }
+
+    // ── 顶层 reconcile 编排（Task 9） ─────────────────────────────────────────
+
+    /// 把 `bytes` 写成 `mp/rel` 的 live underlay 回落写文件（含子目录建链）。
+    fn write_underlay(mp: &Path, rel: &str, bytes: &[u8]) {
+        let p = mp.join(rel);
+        if let Some(par) = p.parent() {
+            std::fs::create_dir_all(par).unwrap();
+        }
+        std::fs::write(&p, bytes).unwrap();
+    }
+
+    /// 构造一个「已 apply」态可 reconcile 项目：committed meta + orig/<rel>=base + backing 灌好。
+    fn setup_committed(paths: &Paths, name: &str, rel: &str, base: &[u8]) -> PathBuf {
+        write_committed_meta(paths, name);
+        std::fs::create_dir_all(paths.mountpoint(name)).unwrap();
+        let orig_file = write_orig(paths, name, rel, base);
+        reingest_one_file(paths, name, rel).unwrap();
+        orig_file
+    }
+
+    fn accept_all() -> Box<ConfirmFn> {
+        Box::new(|_, _| Confirm::Accept)
+    }
+
+    #[test]
+    fn reconcile_dry_run_reports_without_mutating() {
+        // dry_run：只出建议单，orig/underlay/backing/marker 全不变。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        let orig_file = setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        let backing_before = read_archive(&backing_file);
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let underlay_before = std::fs::read(mp.join(rel)).unwrap();
+        let m = FakeMounter::default();
+
+        let opts = ReconcileOptions {
+            dry_run: true,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+
+        assert!(!report.entries.is_empty(), "dry_run 应出建议单");
+        assert!(
+            report.entries.iter().all(|e| e.action == "dry-run"),
+            "dry_run 条目动作应标 dry-run：{:?}",
+            report.entries
+        );
+        // 零改动。
+        assert_eq!(
+            std::fs::read(&orig_file).unwrap(),
+            BASE_LOG.as_bytes(),
+            "orig 不变"
+        );
+        assert_eq!(
+            std::fs::read(mp.join(rel)).unwrap(),
+            underlay_before,
+            "underlay 不变"
+        );
+        assert_eq!(read_archive(&backing_file), backing_before, "backing 不变");
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "dry_run 不落 reconciling 标记"
+        );
+    }
+
+    #[test]
+    fn reconcile_full_flow_accept_drains_underlay_and_updates_meta() {
+        // 全流程 Accept：门禁→set_reconciling(true)→逐条 apply→underlay 清空→meta 更新→清标记。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        let orig_file = setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+
+        // underlay 清空（结束态可挂：ensure_underlay_empty 放行）。
+        assert!(
+            !underlay_has_fallthrough(&mp).unwrap(),
+            "Accept 全流程后 underlay 应清空"
+        );
+        assert!(!mp.join(rel).exists());
+        crate::reconcile::guard::ensure_underlay_empty(&mp).unwrap();
+        // orig 合并 incoming。
+        let merged = std::fs::read_to_string(&orig_file).unwrap();
+        for needle in ["u1", "old", "new", "\"mode\""] {
+            assert!(
+                merged.contains(needle),
+                "orig 应含合并结果 {needle}：{merged}"
+            );
+        }
+        // backing 重灌为合并结果。
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        assert_eq!(read_archive(&backing_file), merged.as_bytes());
+        // reconciling 标记已清。
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "收尾应清 reconciling 标记"
+        );
+        // meta 字节数收尾，committed 全程不变。
+        let meta = discovery::read_meta(&paths.meta_path("demo"))
+            .unwrap()
+            .unwrap();
+        assert!(meta.committed, "committed 全程不变");
+        assert_eq!(
+            meta.bytes_src,
+            dir_file_bytes(&paths.orig("demo")).unwrap(),
+            "bytes_src 应重扫 orig"
+        );
+        assert_eq!(
+            meta.bytes_archive,
+            dir_file_bytes(&paths.backing("demo", Backend::Shadow)).unwrap(),
+            "bytes_archive 应重扫 backing"
+        );
+        assert!(meta.bytes_src > 0 && meta.bytes_archive > 0);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|e| e.action.contains("underlay-removed")),
+            "应有条目报 underlay-removed：{:?}",
+            report.entries
+        );
+    }
+
+    #[test]
+    fn reconcile_skip_keeps_that_underlay_entry_and_clears_marker() {
+        // 中途 Skip 某条：该 underlay 保留、orig 不落该条；其余 Accept 落盘。收尾清 reconciling 标记。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        // 两条全新 fall-through（orig 无 → New）。
+        write_underlay(
+            &mp,
+            "a.jsonl",
+            b"{\"type\":\"summary\",\"summary\":\"a\"}\n",
+        );
+        write_underlay(
+            &mp,
+            "b.jsonl",
+            b"{\"type\":\"summary\",\"summary\":\"b\"}\n",
+        );
+        let m = FakeMounter::default();
+
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: Box::new(|rel, _| {
+                if rel == "a.jsonl" {
+                    Confirm::Skip
+                } else {
+                    Confirm::Accept
+                }
+            }),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+
+        // Skip 的 a：underlay 保留、orig 未落。
+        assert!(mp.join("a.jsonl").exists(), "Skip 的条目 underlay 应保留");
+        assert!(
+            !paths.orig("demo").join("a.jsonl").exists(),
+            "Skip 的条目不应落 orig"
+        );
+        // Accept 的 b：underlay 删除、orig 落盘。
+        assert!(
+            !mp.join("b.jsonl").exists(),
+            "Accept 的条目 underlay 应删除"
+        );
+        assert!(
+            paths.orig("demo").join("b.jsonl").exists(),
+            "Accept 的条目应落 orig"
+        );
+        // reconciling 标记已清（半改写窗口正常关闭）。
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "收尾应清 reconciling 标记"
+        );
+        assert!(
+            report.entries.iter().any(|e| e.decision == "skip"),
+            "报告应含 skip 条目：{:?}",
+            report.entries
+        );
+    }
+
+    #[test]
+    fn reconcile_crash_resume_is_idempotent() {
+        // 崩溃续跑幂等：同一 incoming 重现在 underlay（上次崩溃在删 underlay 前）→ 重跑收敛，
+        // orig 不放大（并集不动点）、underlay 再次清空、不重复删。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        let orig_file = setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+
+        let opts1 = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        reconcile(&paths, "demo", opts1, &m).unwrap();
+        let merged1 = std::fs::read(&orig_file).unwrap();
+        assert!(!mp.join(rel).exists(), "首轮后 underlay 清空");
+
+        // 模拟崩溃续跑：同一 incoming 再次出现。
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let opts2 = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        reconcile(&paths, "demo", opts2, &m).unwrap();
+        let merged2 = std::fs::read(&orig_file).unwrap();
+
+        assert_eq!(merged1, merged2, "重跑不放大 orig（并集不动点）");
+        assert!(!mp.join(rel).exists(), "重跑收敛：underlay 再次清空");
+    }
+
+    #[test]
+    fn reconcile_rebuild_delegates_to_reingest_and_remounts() {
+        // rebuild：逐条 apply 后清标记，委托 reingest 从 orig 全量重建 backing + 重挂；旧 backing 留底。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: true,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+
+        assert!(
+            !mp.join(rel).exists(),
+            "rebuild 前逐条 apply 应先清 underlay"
+        );
+        // reingest 重挂 → FakeMounter 记挂载。
+        assert!(m.is_mounted(&mp), "rebuild 委托 reingest 后应重挂");
+        // reingest 特征：旧 backing 留底 .reingest-bak。
+        let bak = {
+            let mut s = paths.backing("demo", Backend::Shadow).into_os_string();
+            s.push(".reingest-bak");
+            PathBuf::from(s)
+        };
+        assert!(bak.is_dir(), "reingest 应留旧 backing 底本");
+        // 报告含 rebuild 委托项，标记已清。
+        assert!(
+            report.entries.iter().any(|e| e.decision == "rebuild"),
+            "报告应含 rebuild 委托项：{:?}",
+            report.entries
+        );
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "rebuild 前须清 reconciling 标记"
+        );
+        // backing 读回合并结果（reingest 从 orig 重建）。
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        assert_eq!(
+            read_archive(&backing_file),
+            std::fs::read(paths.orig("demo").join(rel)).unwrap()
+        );
+    }
+
+    #[test]
+    fn reconcile_single_run_ts_all_stash_in_one_generation() {
+        // Task7 Minor2：一次 reconcile 所有 stash（快照 underlay + 各条目 orig 前镜像）落同一 ts 代次。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        // 两条 Union（orig 有 base、underlay 有 incoming）。
+        for rel in ["a.jsonl", "b.jsonl"] {
+            write_orig(&paths, "demo", rel, BASE_LOG.as_bytes());
+            reingest_one_file(&paths, "demo", rel).unwrap();
+            write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        }
+        let m = FakeMounter::default();
+
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+
+        // 只有一个 ts 代次目录。
+        let gen_root = paths.zipfs_home.join("reconcile-stash").join("demo");
+        let ts_dirs: Vec<PathBuf> = std::fs::read_dir(&gen_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(
+            ts_dirs.len(),
+            1,
+            "一次 reconcile 所有 stash 应落同一 ts 代次：{ts_dirs:?}"
+        );
+        // report.stash_dir 即该唯一代次，且快照 + 两条前镜像全在其下。
+        assert_eq!(report.stash_dir, ts_dirs[0]);
+        assert!(report.stash_dir.join("underlay/a.jsonl").exists(), "a 快照");
+        assert!(report.stash_dir.join("underlay/b.jsonl").exists(), "b 快照");
+        assert!(
+            report.stash_dir.join("orig/a.jsonl").exists(),
+            "a orig 前镜像"
+        );
+        assert!(
+            report.stash_dir.join("orig/b.jsonl").exists(),
+            "b orig 前镜像"
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_without_committed_meta() {
+        // 无 meta（未 apply）→ 拒绝。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        write_underlay(&mp, "s.jsonl", b"{}\n");
+        let m = FakeMounter::default();
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let e = reconcile(&paths, "demo", opts, &m).unwrap_err();
+        assert!(e.to_string().contains("meta"), "无 meta 应拒绝：{e}");
+    }
+
+    #[test]
+    fn reconcile_rejects_container_backend() {
+        // meta 记 container 后端 → check_preconditions 拒（无 fall-through 语义）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        write_underlay(&mp, "s.jsonl", b"{}\n");
+        std::fs::create_dir_all(paths.back_root()).unwrap();
+        let meta = discovery::Meta::from_apply(
+            &ApplyOptions {
+                backend: Backend::Container,
+                ..ApplyOptions::default()
+            },
+            0,
+            0,
+            0,
+        );
+        discovery::write_meta(&paths.meta_path("demo"), &meta).unwrap();
+        let m = FakeMounter::default();
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let e = reconcile(&paths, "demo", opts, &m).unwrap_err();
+        assert!(e.to_string().contains("shadow"), "container 应拒绝：{e}");
+    }
+
+    #[test]
+    fn reconcile_meta_finalize_failure_still_clears_marker_no_wedge() {
+        // 评审 HIGH：meta 字节收尾（纯 list 显示）失败绝不能阻断 set_reconciling(false)——否则
+        // underlay 已清空、下轮 reconcile 被前置门禁拒、标记永久卡住把维护全拦死。best-effort 验证。
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root 无视权限位，注入不成立 → 跳过。
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        // 注入 finalize 失败：orig 下放一个不可读子目录 → dir_file_bytes 递归 read_dir 失败。
+        // back_root 保持可写（set_reconciling(false) 仍能删标记，隔离出「收尾失败 ≠ 清标记失败」）。
+        let blocked = paths.orig("demo").join("blocked-sub");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("x"), b"y").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let m = FakeMounter::default();
+
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+        // 恢复权限便于 tempdir 清理。
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // underlay 已清空，但标记必须已清（不 wedge）。
+        assert!(!mp.join(rel).exists(), "underlay 应已清空");
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "收尾 meta 失败也须清 reconciling 标记（不 wedge）"
+        );
+        // 报告如实记 meta-finalize warn。
+        assert!(
+            report.entries.iter().any(|e| e.action == "warn"),
+            "应记 meta 收尾 warn 条目：{:?}",
+            report.entries
+        );
     }
 }
