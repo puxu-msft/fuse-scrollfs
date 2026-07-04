@@ -94,10 +94,13 @@ pub fn session_merge(base: &str, incoming: &str) -> MergeResult {
     let mut truncated = 0usize;
     let mut ord = 0usize;
 
+    // 评审 I-1：last_ts 必须跨 base→incoming 两次 ingest 保持，否则 incoming 前导无 ts 记录
+    // 会重置为 None、被天然序 hoist 到文件头、越过 base 真实 transcript。声明在闭包外 =
+    // incoming 前导无 ts 记录继承 base 末尾 ts（append 续写语义），排在其后。
+    let mut last_ts: Option<String> = None;
     let mut ingest = |recs: &[(RawRecord, RecordKind)]| {
         // 评审 I-2：无 timestamp 的记录（日志/元数据/坏行）继承**前一条**记录的 ts，避免 Option::None
         // 天然序把它们整体 hoist 到文件头、破坏交织。稳定全序 = (继承后的 ts, 全局序号)。
-        let mut last_ts: Option<String> = None;
         for (r, k) in recs {
             let own_ts = r
                 .json
@@ -335,6 +338,33 @@ mod tests {
             .position(|l| l.contains(r#""mode""#))
             .unwrap();
         assert!(i_mode > i_u1, "mode 应留在 u1 之后，而非被 hoist 到头部");
+    }
+
+    #[test]
+    fn incoming_leading_no_ts_record_not_hoisted_across_seam() {
+        // 评审 I-1：incoming 前导无 ts 记录必须继承 base **末尾** ts（append 续写语义），
+        // 排在 base 真实 transcript 之后，而非被 Option::None < Some hoist 到文件头。
+        let base = format!(
+            "{}\n{}\n",
+            ts("u1", "2026-06-30T10:00:00.000Z"),
+            ts("u2", "2026-06-30T10:05:00.000Z")
+        );
+        let incoming = format!("{}\n", r#"{"type":"mode","mode":"normal"}"#); // 无 ts
+        let r = session_merge(&base, &incoming);
+        let i_u2 = r
+            .merged_lines
+            .iter()
+            .position(|l| l.contains("u2"))
+            .unwrap();
+        let i_mode = r
+            .merged_lines
+            .iter()
+            .position(|l| l.contains(r#""mode""#))
+            .unwrap();
+        assert!(
+            i_mode > i_u2,
+            "incoming 前导无 ts 记录应继承 base 末尾 ts、排在其后，而非 hoist 到头部"
+        );
     }
 
     #[test]
