@@ -14,6 +14,17 @@ pub const PID_SUFFIX: &str = ".zipfs.pid";
 /// 提交标记 sidecar 文件后缀（评审 C2：committed=1 才算灌入完成、可挂载）。后端无关，
 /// 位于 `back/<name>.zipfs.meta`（与 backing 同级），故 container 的 redb 文件外也有提交点。
 pub const META_SUFFIX: &str = ".zipfs.meta";
+/// NEEDS-RECONCILE sentinel 后缀（Task 12）：guard-check 检出 underlay 非空时落
+/// `back_root/<name>.needs-reconcile`，给脚本/人明确信号「自动挂载已被阻止、需人工 reconcile」。
+pub const NEEDS_RECONCILE_SUFFIX: &str = ".needs-reconcile";
+
+/// guard-check 检出 underlay 非空（需人工 reconcile）时的独特退出码（Task 12）。
+///
+/// systemd 单元配 `RestartPreventExitStatus=75` 拦住它：underlay 非空是「需人工介入」的**稳定态**，
+/// 重启无益，若不拦会与 `Restart=on-failure` 组成 crash-loop 风暴。取 75（sysexits.h `EX_TEMPFAIL`
+/// 的数值）只为一个不易与通用失败（`1`）混淆的独特码，语义由本项目定义（= 需人工 reconcile）。
+pub const GUARD_CHECK_NEEDS_RECONCILE_EXIT: i32 = 75;
+
 /// 近期写入活跃判定窗口（秒）：jsonl/log 在此窗口内被改 → 视为活跃会话。
 ///
 /// 取 5min 偏保守：主防线是 `/proc` 打开 fd 扫描（catch 任何持有该子树 fd 的写者），但 Claude
@@ -112,6 +123,16 @@ impl Paths {
     /// 绝不改 `Meta.committed`（committed 语义是「backing 已灌入完成、可挂载」，与 reconcile 正交）。
     pub fn reconciling_marker(&self, name: &str) -> PathBuf {
         self.back_root().join(format!("{name}.reconciling"))
+    }
+
+    /// NEEDS-RECONCILE sentinel = `back_root/<name>.needs-reconcile`（Task 12）。
+    ///
+    /// guard-check 检出挂载点 underlay 含停用期回落写时落此文件：给脚本/人明确信号「该项目自动挂载
+    /// 已被阻止，需 `zipfs enable reconcile <name>` 重合并」。underlay 清空后由下次 guard-check 通过
+    /// 时自愈清除。**独立于** `.reconciling`（那是半改写维护互斥）与 `.zipfs.meta`（提交标记）。
+    pub fn needs_reconcile_sentinel(&self, name: &str) -> PathBuf {
+        self.back_root()
+            .join(format!("{name}{NEEDS_RECONCILE_SUFFIX}"))
     }
 }
 
@@ -422,6 +443,10 @@ mod tests {
         assert_eq!(
             p.pid_file("proj-x"),
             Path::new("/home/u/.claude/projects/proj-x.zipfs.pid")
+        );
+        assert_eq!(
+            p.needs_reconcile_sentinel("proj-x"),
+            Path::new("/home/u/.claude-zip/back/proj-x.needs-reconcile")
         );
         if let Some(v) = prev_p {
             std::env::set_var("CLAUDE_PROJECTS", v);

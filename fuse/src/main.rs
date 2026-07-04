@@ -266,15 +266,13 @@ fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
         "systemd 托管挂载：name={name} backing={}",
         spec.backing.display()
     );
-    // 评审 C1：systemd 开机自启（`ExecStart=zipfs mount-managed --name %i`）由 systemd 直接拉起本
-    // 进程，**不经** `SystemdMounter::spawn`，故守卫必须在此真正挂载前兜底，否则自启路径会静默盖住
-    // 停用期回落写（主威胁面）。underlay 含非白名单 fall-through → 拒挂载，指向 `enable reconcile`。
-    zipfs::reconcile::guard::ensure_underlay_empty(&spec.mountpoint).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
-        )
-    })?;
+    // 评审 C1 + Task 12：systemd 开机自启（`ExecStart=zipfs mount-managed --name %i`）由 systemd 直接
+    // 拉起本进程，**不经** `SystemdMounter::spawn`，故守卫必须在此真正挂载前兜底，否则自启路径会静默
+    // 盖住停用期回落写（主威胁面）。underlay 含非白名单 fall-through → 落 NEEDS-RECONCILE sentinel +
+    // 明确 stderr + 以独特码 75 退出（**不返回 Err/exit 1**）。这是主进程路径，单元 `RestartPreventExitStatus=75`
+    // 对主进程有效 → 拦住 Restart 不 crash-loop；同时覆盖 `ExecCondition` guard-check 通过后到此处之间
+    // underlay 又生回落写的 TOCTOU 窗口（guard-check 是 ExecCondition，防不到该窗口）。
+    zipfs::enable::guard_underlay_or_exit(&paths, &name)?;
     run_mount(mount_args_from_spec(&spec))
 }
 
@@ -918,6 +916,28 @@ mod cli_tests {
                 assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Abort);
             }
             _ => panic!("应解析为 UmountManaged"),
+        }
+    }
+
+    #[test]
+    fn parses_enable_guard_check_hidden_subcommand() {
+        // Task 12：隐藏子命令 `enable guard-check --name %i`（systemd ExecCondition 调用）。
+        // hide 只隐藏 help，仍可解析。%i 为 escaped 实例串（无前导 -）。
+        let cli = Cli::parse_from([
+            "zipfs",
+            "enable",
+            "guard-check",
+            "--name",
+            "\\x2dhome\\x2dxp\\x2dsrc\\x2dfoo",
+        ]);
+        match cli.command {
+            Some(Command::Enable(a)) => match a.action {
+                Some(zipfs::enable::EnableAction::GuardCheck { name }) => {
+                    assert_eq!(name, "\\x2dhome\\x2dxp\\x2dsrc\\x2dfoo");
+                }
+                _ => panic!("应解析为 EnableAction::GuardCheck"),
+            },
+            _ => panic!("应解析为 Enable 子命令"),
         }
     }
 }

@@ -137,6 +137,17 @@ pub enum EnableAction {
         #[command(subcommand)]
         cmd: AutostartCmd,
     },
+    /// 【内部】systemd `ExecCondition` 自启前守卫（防 crash-loop）：检查挂载点 underlay 是否含停用期
+    /// 回落写。空 → exit 0（条件通过、ExecStart 继续）；非空 → 落 NEEDS-RECONCILE sentinel + 明确 stderr +
+    /// 以独特退出码 75 退出。`ExecCondition` 语义：控制进程以 1–254 退出使 unit **skipped（非 failed）**，
+    /// 故 `Restart=on-failure` 不触发——正确防 crash-loop（`RestartPreventExitStatus` 只作用主进程，对
+    /// `ExecStartPre`/`ExecCondition` 控制进程无效，见 systemd.service(5)）。`--name` 取 systemd **实例
+    /// 字符串**（escaped `%i`，同 mount-managed），Rust 侧 unescape 回原名。
+    #[command(hide = true)]
+    GuardCheck {
+        #[arg(long)]
+        name: String,
+    },
 }
 
 /// 默认配置子动作。
@@ -243,6 +254,7 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
         }) => cmd_seal(&paths, &name, seal_chunk, level),
         Some(EnableAction::Config { cmd }) => config::run(&paths, cmd),
         Some(EnableAction::Autostart { cmd }) => autostart::run(&home, cmd),
+        Some(EnableAction::GuardCheck { name }) => cmd_underlay_guard(&paths, &name),
     }
 }
 
@@ -571,6 +583,94 @@ fn print_reconcile_report(report: &ReconcileReport, dry_run: bool) {
     }
 }
 
+/// underlay 自启守卫的结果：underlay 空放行，或非空需人工 reconcile（已落 sentinel）。抽成枚举让
+/// 判定逻辑与「退出码/进程退出」解耦，便于纯单测（测试拿 `GuardOutcome`，调用方才映射退出码）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardOutcome {
+    /// underlay 空（或仅无害隐藏项）→ 放行挂载。
+    Pass,
+    /// underlay 含停用期回落写 → 已落 NEEDS-RECONCILE sentinel，须阻止自动挂载。
+    NeedsReconcile,
+}
+
+/// systemd `ExecCondition` 守卫入口（`enable guard-check --name %i`）：unescape 实例名 →
+/// `underlay_guard` → 映射退出码。underlay 空 → `Ok(())`（exit 0，`ExecCondition` 通过、ExecStart 继续）；
+/// 非空 → 以独特码 75 退出。**`ExecCondition` 语义**：控制进程以 1–254 退出使 unit **skipped（非 failed）**，
+/// 故 `Restart=on-failure` 不触发——这才是防 crash-loop 的正确 systemd 原语（`RestartPreventExitStatus`
+/// 只作用于主进程，对 `ExecStartPre`/`ExecCondition` 控制进程无效，见 systemd.service(5)）。
+/// `escaped_name` 是 systemd `%i`（escaped，同 mount-managed），故先 unescape。
+fn cmd_underlay_guard(paths: &Paths, escaped_name: &str) -> std::io::Result<()> {
+    let name = crate::enable::systemd::systemd_unescape(escaped_name);
+    // unescape 有损（裸 `-`→`/`），出错时附原始实例名便于反查（对齐 run_mount_managed）。
+    model::validate_name(&name).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("{e}（systemd 实例 %i={escaped_name:?}）"))
+    })?;
+    guard_underlay_or_exit(paths, &name)
+}
+
+/// 跑 underlay 守卫，非空则以独特码 75 退出（fail-closed），空则 `Ok(())`。
+///
+/// 两个调用点共用：`ExecCondition`（`cmd_underlay_guard`，exit 75 → unit skipped 不重启）与
+/// **主进程** `ExecStart`（`run_mount_managed`，覆盖 ExecCondition 通过后到真正挂载之间 underlay
+/// 又生回落写的 TOCTOU 窗口；该处 exit 75 由 `RestartPreventExitStatus=75` 拦住不重启——主进程适用）。
+/// `std::process::exit` 返回 `!`，与 `Pass` 臂的 `()` 在 match 处协调。
+pub fn guard_underlay_or_exit(paths: &Paths, name: &str) -> std::io::Result<()> {
+    match underlay_guard(paths, name)? {
+        GuardOutcome::Pass => Ok(()),
+        GuardOutcome::NeedsReconcile => std::process::exit(model::GUARD_CHECK_NEEDS_RECONCILE_EXIT),
+    }
+}
+
+/// underlay 守卫判定逻辑（纯一点，便于单测）：`name` 为 unescape 后的原始项目名。
+///
+/// underlay 含停用期 fall-through 回落写（`underlay_has_fallthrough`）时落 NEEDS-RECONCILE sentinel
+/// 并打明确 stderr，返回 `NeedsReconcile`（调用方以码 75 退出，阻止自动挂载）。underlay 空时顺带
+/// 自愈清除可能残留的 sentinel（上次非空、经人工 reconcile 清空后自愈），返回 `Pass`。真正的读目录
+/// IO 错误（非 NotFound）向上传播（exit 1，仍可 Restart，区别于稳定的「需人工」态）。
+pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome> {
+    let mp = paths.mountpoint(name);
+    if !crate::reconcile::guard::underlay_has_fallthrough(&mp)? {
+        // 放行前自愈：underlay 已空则清除可能残留的 sentinel（best-effort，缺失/失败不影响放行）。
+        let sentinel = paths.needs_reconcile_sentinel(name);
+        if let Err(e) = std::fs::remove_file(&sentinel) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "清除 NEEDS-RECONCILE sentinel 失败 {}：{e}",
+                    sentinel.display()
+                );
+            }
+        }
+        return Ok(GuardOutcome::Pass);
+    }
+    // 非空 → 落 sentinel（best-effort：即便写失败也 fail-closed 返回 NeedsReconcile，务必阻止挂载）。
+    let sentinel = paths.needs_reconcile_sentinel(name);
+    if let Err(e) = write_needs_reconcile_sentinel(&sentinel, name) {
+        eprintln!(
+            "[zipfs] 警告：写 NEEDS-RECONCILE sentinel 失败 {}：{e}（仍阻止自动挂载）",
+            sentinel.display()
+        );
+    }
+    eprintln!(
+        "[zipfs] {name}: 挂载点 underlay 含停用期回落写，已阻止自动挂载（避免静默盖住）。\
+         需人工 `zipfs enable reconcile {name}` 重合并后方可自动挂载。"
+    );
+    Ok(GuardOutcome::NeedsReconcile)
+}
+
+/// 落 NEEDS-RECONCILE sentinel（best-effort 前先建 back_root）。内容含项目名 + 提示，便于人工排查。
+fn write_needs_reconcile_sentinel(sentinel: &std::path::Path, name: &str) -> std::io::Result<()> {
+    if let Some(parent) = sentinel.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        sentinel,
+        format!(
+            "{name}: 挂载点 underlay 含停用期回落写，自动挂载已被 guard-check 阻止。\n\
+             请 `zipfs enable reconcile {name}` 重合并；清空后自动挂载会自愈。\n"
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +719,80 @@ mod tests {
             rationale: "x".into(),
         };
         assert_eq!(confirm("s.jsonl", &rec), Confirm::Skip);
+    }
+
+    /// 建一个隔离 tempdir 的 Paths（projects/zip 分离），并建好 back_root。
+    fn temp_paths() -> (tempfile::TempDir, Paths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        std::fs::create_dir_all(paths.back_root()).unwrap();
+        (tmp, paths)
+    }
+
+    #[test]
+    fn guard_check_passes_when_underlay_empty() {
+        // 空 underlay（挂载点目录存在但无回落写）→ Pass，不落 sentinel。
+        let (_tmp, paths) = temp_paths();
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
+        assert!(
+            !paths.needs_reconcile_sentinel("demo").exists(),
+            "空 underlay 不应落 sentinel"
+        );
+    }
+
+    #[test]
+    fn guard_check_passes_when_mountpoint_missing() {
+        // 挂载点目录不存在（NotFound）视为空 → Pass（underlay_has_fallthrough 语义）。
+        let (_tmp, paths) = temp_paths();
+        assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
+    }
+
+    #[test]
+    fn guard_check_needs_reconcile_and_drops_sentinel_when_underlay_has_fallthrough() {
+        // 非空 underlay（jsonl 回落写）→ NeedsReconcile 且落 sentinel（含项目名+reconcile 提示）。
+        let (_tmp, paths) = temp_paths();
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        std::fs::write(mp.join("s.jsonl"), b"{}").unwrap();
+        assert_eq!(
+            underlay_guard(&paths, "demo").unwrap(),
+            GuardOutcome::NeedsReconcile
+        );
+        let sentinel = paths.needs_reconcile_sentinel("demo");
+        assert!(
+            sentinel.exists(),
+            "非空 underlay 应落 NEEDS-RECONCILE sentinel"
+        );
+        let body = std::fs::read_to_string(&sentinel).unwrap();
+        assert!(body.contains("reconcile"), "sentinel 内容应指向 reconcile");
+    }
+
+    #[test]
+    fn guard_check_selfheals_stale_sentinel_on_pass() {
+        // 上次非空落了 sentinel，人工 reconcile 清空 underlay 后，下次 guard-check 通过时自愈清除。
+        let (_tmp, paths) = temp_paths();
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        let sentinel = paths.needs_reconcile_sentinel("demo");
+        std::fs::write(&sentinel, b"stale").unwrap();
+        assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
+        assert!(
+            !sentinel.exists(),
+            "空 underlay 通过时应自愈清除残留 sentinel"
+        );
+    }
+
+    #[test]
+    fn guard_check_harmless_hidden_still_passes() {
+        // 仅无害隐藏项（.fuse_hidden*）不算回落写 → Pass。
+        let (_tmp, paths) = temp_paths();
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        std::fs::write(mp.join(".fuse_hidden0001"), b"").unwrap();
+        assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
+        assert!(!paths.needs_reconcile_sentinel("demo").exists());
     }
 }
