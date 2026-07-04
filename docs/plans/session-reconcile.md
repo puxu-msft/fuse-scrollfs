@@ -36,7 +36,7 @@
 | `reconcile/orchestrator.rs` | IO 编排：前置门禁、stash/快照、逐条目 handler、超集删除许可、报告 |
 | `reconcile/paths.rs` | quarantine/stash/reconcile.lock/sentinel 路径（或并入 `enable/model.rs::Paths`） |
 
-修改：`fuse/src/lib.rs`（挂 `mod reconcile`）、`enable/systemd.rs`（`resolve_managed_spec` 调 guard）、`enable/daemon.rs`（`spawn` 前调 guard）、`enable/lifecycle.rs`（`remount` 调 guard）、`enable/autostart.rs`（ExecStartPre sentinel）、`enable/discovery.rs`（NEEDS-RECONCILE）、`enable/mod.rs` + `main.rs`（`enable reconcile` 子命令）。
+修改：`fuse/src/lib.rs`（挂 `mod reconcile`）、`ingest.rs`（`ingest_file` 提 `pub(crate)`）、`enable/daemon.rs` + `enable/systemd.rs`（`Mounter::spawn` 单点调 guard，覆盖 systemd 自启）、`enable/lifecycle.rs`（`restore`/`reingest` 等见 `reconciling` 标记让路）、`enable/autostart.rs`（ExecStartPre sentinel）、`enable/discovery.rs`（NEEDS-RECONCILE / Reconciling 态）、`enable/model.rs`（reconcile 路径 + `reconciling` 标记）、`enable/mod.rs` + `main.rs`（`enable reconcile` + 隐藏 `guard-check` 子命令）。
 
 ---
 
@@ -57,6 +57,7 @@
   - `fn parse_lines(content: &str) -> Vec<(RawRecord, RecordKind)>`
   - `fn is_compact_summary(v: &serde_json::Value) -> bool`
   - `fn record_uuid(v: &serde_json::Value) -> Option<&str>`（取 `uuid` 字段字符串）
+  - `fn record_parent_uuid(v: &serde_json::Value) -> Option<&str>`（取 `parentUuid` 字段字符串，供 merge 校验 compaction 桥 `parentUuid∈base`）
   - `fn record_timestamp(v: &serde_json::Value) -> Option<&str>`
 
 - [ ] **Step 1: 建模块骨架**
@@ -144,6 +145,10 @@ pub enum RecordKind {
 
 pub fn record_uuid(v: &serde_json::Value) -> Option<&str> {
     v.get("uuid").and_then(|u| u.as_str())
+}
+
+pub fn record_parent_uuid(v: &serde_json::Value) -> Option<&str> {
+    v.get("parentUuid").and_then(|u| u.as_str())
 }
 
 pub fn record_timestamp(v: &serde_json::Value) -> Option<&str> {
@@ -293,6 +298,19 @@ mod tests {
     }
 
     #[test]
+    fn no_uuid_record_not_hoisted_to_front() {
+        // 评审 I-2：无 ts 的日志记录继承前一条 transcript 的 ts，不被 Option::None 天然序提到文件头。
+        let base = format!("{}\n{}\n{}\n",
+            ts("u1", "2026-06-30T10:00:00.000Z"),
+            r#"{"type":"mode","mode":"normal"}"#,
+            ts("u2", "2026-06-30T10:05:00.000Z"));
+        let r = session_merge(&base, "");
+        let i_u1 = r.merged_lines.iter().position(|l| l.contains("u1")).unwrap();
+        let i_mode = r.merged_lines.iter().position(|l| l.contains(r#""mode""#)).unwrap();
+        assert!(i_mode > i_u1, "mode 应留在 u1 之后，而非被 hoist 到头部");
+    }
+
+    #[test]
     fn same_uuid_conflict_takes_longer_complete() {
         // 崩溃截断：同 uuid，一份完整一份短 → 取完整更长者 + 记 conflict。
         let full = r#"{"type":"assistant","uuid":"u1","timestamp":"2026-06-30T10:00:00.000Z","message":"complete"}"#;
@@ -319,7 +337,7 @@ Expected: 编译失败（`session_merge` 未定义）。
 
 use std::collections::BTreeMap;
 use crate::reconcile::record::{
-    classify_record, is_compact_summary, record_timestamp, RawRecord, RecordKind,
+    classify_record, is_compact_summary, record_parent_uuid, record_timestamp, RawRecord, RecordKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,7 +396,13 @@ pub fn session_merge(base: &str, incoming: &str) -> MergeResult {
         inc_recs.iter().filter_map(|(_, k)| uuid_of(k)).collect();
     let overlap = base_uuids.intersection(&inc_uuids).count();
 
-    let has_bridge = inc_recs.iter().any(|(r, _)| r.json.as_ref().map(is_compact_summary).unwrap_or(false));
+    let has_bridge = inc_recs.iter().any(|(r, _)| {
+        r.json.as_ref().map_or(false, |v| {
+            // 桥 = isCompactSummary 且 parentUuid 指向 base 的某记录（评审 I-5：仅布尔会误并无关重用会话）。
+            is_compact_summary(v)
+                && record_parent_uuid(v).map_or(false, |p| base_uuids.contains(p))
+        })
+    });
     let inc_only_transcript = inc_uuids.difference(&base_uuids).count();
 
     // ── 无损并集：uuid 去重（同 uuid 取完整更长者），无 uuid 整行去重，坏行 verbatim ──
@@ -390,8 +414,15 @@ pub fn session_merge(base: &str, incoming: &str) -> MergeResult {
     let mut ord = 0usize;
 
     let mut ingest = |recs: &[(RawRecord, RecordKind)]| {
+        // 评审 I-2：无 timestamp 的记录（日志/元数据/坏行）继承**前一条**记录的 ts，避免 Option::None
+        // 天然序把它们整体 hoist 到文件头、破坏交织。稳定全序 = (继承后的 ts, 全局序号)。
+        let mut last_ts: Option<String> = None;
         for (r, k) in recs {
-            let ts = r.json.as_ref().and_then(|v| record_timestamp(v).map(|s| s.to_string()));
+            let own_ts = r.json.as_ref().and_then(|v| record_timestamp(v).map(|s| s.to_string()));
+            if own_ts.is_some() {
+                last_ts = own_ts.clone();
+            }
+            let ts = own_ts.or_else(|| last_ts.clone());
             match k {
                 RecordKind::Transcript { uuid } => {
                     match by_uuid.get(uuid) {
@@ -584,8 +615,8 @@ git commit -m "feat(reconcile): advisor.rs 决策推荐（复用 Evidence，置�
 **Files:**
 - Create: `fuse/src/reconcile/guard.rs`
 - Modify: `fuse/src/reconcile/mod.rs`
-- Modify: `fuse/src/enable/lifecycle.rs`（`remount` spawn 前调用）
-- Modify: `fuse/src/enable/systemd.rs`（`resolve_managed_spec` 内调用）
+- Modify: `fuse/src/enable/daemon.rs`（`RealMounter::spawn` 内、真正 mount 前调用 —— 单点）
+- Modify: `fuse/src/enable/systemd.rs`（`SystemdMounter::spawn` 内同样调用；覆盖 systemd 自启 `mount-managed` 经 `resolve_managed_spec` 建 spec 后经 spawn 挂载的路径）
 
 **Interfaces:**
 - Produces:
@@ -667,21 +698,17 @@ pub fn ensure_underlay_empty(mp: &Path) -> io::Result<()> {
 ```
 `mod.rs` 加 `pub mod guard;`。
 
-- [ ] **Step 4: 接入 remount**
+- [ ] **Step 4: 接入 `Mounter::spawn` 单点（评审 I-6）**
 
-`fuse/src/enable/lifecycle.rs` 的 `remount`：在 `mount_spec` 构造后、`mounter.spawn(&spec)` 前插入：
-```rust
-    crate::reconcile::guard::ensure_underlay_empty(&mp)?;
-```
-（`remount` 里 `mp` 已定义；此处 mp 是挂载点，非空 fall-through 即拒。）
-
-- [ ] **Step 5: 接入 systemd 自启入口**
-
-`fuse/src/enable/systemd.rs` 的 `resolve_managed_spec`：在返回 spec **之前**、确定挂载点后加：
+守卫下沉到**真正执行挂载的唯一函数** `RealMounter::spawn`（`daemon.rs`）与 `SystemdMounter::spawn`（`systemd.rs`），而非各调用点，杜绝漂移。在各 `spawn` 内、拼 `mount_argv` / 起 mount server **之前**插入：
 ```rust
     crate::reconcile::guard::ensure_underlay_empty(&spec.mountpoint)?;
 ```
-（确认 `resolve_managed_spec` 返回类型为 `io::Result<MountSpec>`；若签名不返回 Result，改为在其唯一调用点 `mount-managed` handler 挂载前调用。实施时 grep `resolve_managed_spec` 确认签名。）
+天然放行的场景（无误拒）：`apply` 此刻 mp 是 rename 后新建的空目录；干净 remount 的 underlay 也已空。只有含 fall-through 回落写的 underlay 被拒——正是目标。`FakeMounter::spawn`（测试用）**不**加守卫，保持既有单测不受影响。
+
+- [ ] **Step 5: 覆盖 systemd 自启路径确认**
+
+systemd 自启 `ExecStart=zipfs mount-managed --name %i` → `resolve_managed_spec`（`systemd.rs`）建 spec → 经 `SystemdMounter::spawn` 挂载。Step 4 已在 `SystemdMounter::spawn` 内加守卫 → 自启路径被覆盖（评审 C1，主威胁）。grep 确认 `mount-managed` handler 确实经 `SystemdMounter::spawn`（而非绕过直接 `run_mount`）；若绕过，则守卫改加在该直接挂载点前。
 
 - [ ] **Step 6: 运行 + 全量测试 + fmt/clippy**
 
@@ -690,8 +717,8 @@ Expected: 新测试 PASS；既有 enable 测试不回归。
 
 - [ ] **Step 7: 提交**
 ```bash
-git add fuse/src/reconcile/guard.rs fuse/src/reconcile/mod.rs fuse/src/enable/lifecycle.rs fuse/src/enable/systemd.rs
-git commit -m "feat(reconcile): 挂载前 underlay 守卫接入 remount + systemd 自启入口（C1）"
+git add fuse/src/reconcile/guard.rs fuse/src/reconcile/mod.rs fuse/src/enable/daemon.rs fuse/src/enable/systemd.rs
+git commit -m "feat(reconcile): 挂载前 underlay 守卫下沉 Mounter::spawn 单点（含 systemd 自启，C1/I-6）"
 ```
 
 ---
@@ -713,8 +740,12 @@ git commit -m "feat(reconcile): 挂载前 underlay 守卫接入 remount + system
   - `Paths::reconcile_stash(&self, name, ts) -> PathBuf`（`zipfs_home/reconcile-stash/<name>/<ts>`）
   - `Paths::quarantine(&self, name, ts) -> PathBuf`（`zipfs_home/reconcile-quarantine/<name>/<ts>`）
   - `Paths::reconcile_lock(&self, name) -> PathBuf`（`back_root/<name>.reconcile.lock`）
-  - `struct Preconditions { /* 已校验的句柄：flock guard、snapshot 清单 */ }`
-  - `fn check_preconditions(paths:&Paths, name:&str, backend:Backend, force:bool) -> io::Result<Preconditions>`
+  - `const MAX_MERGE_FILE_BYTES: u64`（size cap，spec §5.1；orchestrator 读文件前施加，超限该条目降级 KeepBoth）
+  - `struct EntrySnapshot { rel: String, bytes: Vec<u8>, mtime: SystemTime, size: u64, ino: u64 }`
+  - `struct UnderlaySnapshot { ts: String, entries: Vec<EntrySnapshot> }`（**合并输入与删除比对的唯一基准**，评审 I-7）
+  - `struct Preconditions { _lock: FileLockGuard, snapshot: UnderlaySnapshot }`
+  - `fn check_preconditions(paths:&Paths, name:&str, backend:Backend, force:bool) -> io::Result<Preconditions>`（校验 + 取锁 + 快照 underlay 到 stash）
+  - `fn live_entry_unchanged(mp:&Path, snap:&EntrySnapshot) -> io::Result<bool>`（删前复核：live 文件 mtime/size/ino 与快照一致，评审 C-a）
 
 - [ ] **Step 1: 写失败测试**（路径 + 门禁：container 拒绝 / 活跃拒绝 / 空 underlay 拒绝）
 
@@ -753,21 +784,14 @@ mod tests {
 
 - [ ] **Step 2: 确认失败** — Run: `cd fuse && cargo test -p zipfs reconcile::orchestrator 2>&1 | tail -20`
 
-- [ ] **Step 3: 实现路径 + 门禁**
+- [ ] **Step 3: 实现路径 + 门禁 + 快照**
 
-`enable/model.rs` 的 `impl Paths` 加：
-```rust
-    pub fn reconcile_stash(&self, name: &str, ts: &str) -> PathBuf {
-        self.zipfs_home.join("reconcile-stash").join(name).join(ts)
-    }
-    pub fn quarantine(&self, name: &str, ts: &str) -> PathBuf {
-        self.zipfs_home.join("reconcile-quarantine").join(name).join(ts)
-    }
-    pub fn reconcile_lock(&self, name: &str) -> PathBuf {
-        self.back_root().join(format!("{name}.reconcile.lock"))
-    }
-```
-`orchestrator.rs` 顶部实现 `check_preconditions`：校验 name（`validate_name`）、backend==Shadow 否则 Err、underlay 有 fall-through（复用 `guard::underlay_has_fallthrough`）否则 Err、`!force` 时 `discovery::detect_activity` 空闲否则 Err、取 `reconcile_lock` flock（复用 store 里现有 flock 原语或 `fs2`/`libc::flock`，与 `ingest`/backing 锁一致）。返回持锁 `Preconditions`。
+`enable/model.rs` 的 `impl Paths` 加 `reconcile_stash`/`quarantine`/`reconcile_lock` 三方法（见 Interfaces）。`orchestrator.rs` 实现：
+- `check_preconditions`：`validate_name` → backend==Shadow 否则 Err（含 "shadow"）→ `guard::underlay_has_fallthrough` 为真否则 Err（含 "underlay"）→ `!force` 时 `discovery::detect_activity` 空闲否则 Err → 取 `reconcile_lock` flock（复用 `store::lock::acquire_exclusive`，`pub(crate)`；或退化 `libc::flock`）→ **快照 underlay**（递归读每条 fall-through 文件的 bytes + `metadata` 的 mtime/size/ino）落 `reconcile_stash/<ts>/underlay/` 并 fsync → 返回持锁 `Preconditions{ _lock, snapshot }`。
+- `live_entry_unchanged`：对 `mp/rel` 重新 `symlink_metadata`，比 mtime/size/ino 与快照是否全等（评审 C-a：活跃门禁是时间点检查、jsonl fd 可能轮次间关闭，故删前必须再复核 live 未变）。
+- `const MAX_MERGE_FILE_BYTES: u64 = 256 * 1024 * 1024;`（读文件前 cap，超限降级 KeepBoth 由 Task 7 用）。
+
+> **锁语义澄清（评审 Minor）**：`reconcile_lock` 与 backing `.zipfs.lock` 是**两把不同的锁**。挂载入口并不取 reconcile_lock；reconcile 与挂载的互斥实际靠「underlay-empty 守卫 + reconciling 标记」达成，reconcile_lock 只串行化并发 reconcile 彼此。
 
 - [ ] **Step 4: 确认通过 + fmt/clippy**
 
@@ -785,11 +809,13 @@ git commit -m "feat(reconcile): orchestrator 前置门禁（shadow-only/活跃/u
 - Modify: `fuse/src/reconcile/orchestrator.rs`
 
 **Interfaces:**
+- Consumes: `check_preconditions` 产出的 `EntrySnapshot`、`live_entry_unchanged`（Task 5）
 - Produces:
   - `fn atomic_write(dst:&Path, bytes:&[u8]) -> io::Result<()>`（`<dst>.tmp`→fsync→rename→fsync_dir）
   - `fn durable_superset_ok(receiver:&Path, source_bytes:&[u8], mode: SupersetMode) -> io::Result<bool>`
   - `enum SupersetMode { ByteEqual, LinesSuperset }`
   - `fn readback_eq(path:&Path, bytes:&[u8]) -> io::Result<bool>`
+  - `fn delete_permitted(receiver:&Path, src:&EntrySnapshot, mode:SupersetMode, mp:&Path) -> io::Result<bool>` —— **通用删除许可门（唯一删除入口）**：`durable_superset_ok(receiver, &src.bytes, mode)` **且** `live_entry_unchanged(mp, src)` 同时为真才返 true（评审 C-a：接收方 durable+超集，且 live underlay 自快照以来未被追加）。
 
 - [ ] **Step 1: 写失败测试**
 ```rust
@@ -809,11 +835,31 @@ git commit -m "feat(reconcile): orchestrator 前置门禁（shadow-only/活跃/u
         let ok = durable_superset_ok(&recv, b"a\nb\nc\n", SupersetMode::LinesSuperset).unwrap();
         assert!(!ok, "接收方缺行 → 不许删源");
     }
+
+    #[test]
+    fn delete_blocked_when_live_underlay_changed() {
+        // 评审 C-a：接收方即便超集，若 live underlay 自快照后被追加（mtime/size 变）→ 不许删。
+        let tmp = tempfile::tempdir().unwrap();
+        let mp = tmp.path().join("mp");
+        std::fs::create_dir_all(&mp).unwrap();
+        let live = mp.join("s.jsonl");
+        std::fs::write(&live, b"a\nb\n").unwrap();
+        let md = std::fs::metadata(&live).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let snap = EntrySnapshot { rel: "s.jsonl".into(), bytes: b"a\nb\n".to_vec(),
+            mtime: md.modified().unwrap(), size: md.len(), ino: md.ino() };
+        let recv = tmp.path().join("m.jsonl");
+        atomic_write(&recv, b"a\nb\nc\n").unwrap();       // 接收方是超集
+        // Claude 追加 → live 变。
+        std::fs::write(&live, b"a\nb\nEXTRA\n").unwrap();
+        let ok = delete_permitted(&recv, &snap, SupersetMode::LinesSuperset, &mp).unwrap();
+        assert!(!ok, "live underlay 已变 → 即便接收方超集也不许删（防丢尾）");
+    }
 ```
 
 - [ ] **Step 2: 确认失败**
 
-- [ ] **Step 3: 实现**（`atomic_write` 复用 `lifecycle::fsync_parent` 思路；`LinesSuperset` = source 每行 ∈ receiver 行集合；`ByteEqual` = 逐字节等）。
+- [ ] **Step 3: 实现**（`atomic_write` 复用 `lifecycle::fsync_parent` 思路：写 `<dst>.tmp`→`sync_all`→`rename`→fsync 父目录；`LinesSuperset` = source 每行 ∈ receiver 行集合；`ByteEqual` = 逐字节等；`delete_permitted` = `durable_superset_ok(receiver,&src.bytes,mode)? && live_entry_unchanged(mp,src)?`，作为**唯一删除许可**被 Task 7/8 所有删 underlay 路径调用）。
 
 - [ ] **Step 4: 确认通过 + fmt/clippy**
 
@@ -829,21 +875,27 @@ git commit -am "feat(reconcile): 原子写 + 通用超集删除许可（durable+
 **Files:**
 - Modify: `fuse/src/reconcile/orchestrator.rs`
 - Modify: `fuse/src/reconcile/mod.rs`
+- Modify: `fuse/src/ingest.rs`（把 `fn ingest_file` 提为 `pub(crate)`，供单文件重灌复用；评审 I-1）
+- Modify: `fuse/src/enable/model.rs`（`Paths::reconciling_marker(name) -> back_root/<name>.reconciling`）
+- Modify: `fuse/src/enable/discovery.rs`（`probe`/`classify` 识别 reconciling 标记 → 报 `Reconciling` 而非 Broken）
+- Modify: `fuse/src/enable/lifecycle.rs`（`restore`/`reingest`/`compact`/`seal`/`remount` 见 reconciling 标记即 Err 让路，避免作用在半改写 orig 上；评审 I-4）
 
 **Interfaces:**
-- Consumes: `merge::session_merge`, `advisor::recommend`, `ingest::ingest_file`（或 `ingest_tree` 单文件路径）, Task 6 原语, `discovery::{read_meta, write_meta}`
+- Consumes: `merge::session_merge`, `advisor::recommend`, `ingest::ingest_file`（`pub(crate)` 后），Task 6 `{atomic_write, delete_permitted, SupersetMode}`, Task 5 `UnderlaySnapshot`, `discovery::{read_meta, write_meta}`
 - Produces:
   - `enum EntryPlan { Union, KeepSeparate, New, Passthrough, KeepBoth, Identical }`
   - `struct EntryReport { name:String, decision:String, action:String, notes:Vec<String> }`
   - `struct ReconcileReport { entries:Vec<EntryReport>, stash_dir:PathBuf }`
-  - `fn plan_entries(paths:&Paths, name:&str) -> io::Result<Vec<(String, EntryPlan, Recommendation)>>`（dry-run 建议单）
-  - `fn apply_entry(...) -> io::Result<EntryReport>`（单条：stash→原子写 orig→重灌 backing→超集校验→删 underlay 条目）
-  - `fn set_reconciling(paths:&Paths, name:&str, on:bool) -> io::Result<()>`（切 committed 0/1）
+  - `fn plan_entries(paths:&Paths, name:&str, snap:&UnderlaySnapshot) -> io::Result<Vec<(String, EntryPlan, Recommendation)>>`（**从快照读 incoming**，非 live underlay，评审 I-7；base 取 orig；不动盘）
+  - `fn reingest_one_file(paths, name, rel) -> io::Result<()>`（`ingest_file` 到 `<backing>/<rel>.reconcile-tmp` → `rename` 覆盖 → fsync 父目录；原子替换，评审 I-1/C2）
+  - `fn apply_entry(paths, name, snap_entry, plan, mp) -> io::Result<EntryReport>`（严格顺序：**先 stash orig 前镜像** → 原子写 orig（`atomic_write`）→ `reingest_one_file` → `delete_permitted` 通过才删 underlay 条目；评审 I-3/C-a）
+  - `fn set_reconciling(paths:&Paths, name:&str, on:bool) -> io::Result<()>`（落/删 **独立 `reconciling` sidecar**，**不动 `committed`**；评审 I-4）
 
 - [ ] **Step 1..N（TDD）**：
-  - 测试：log-only 条目 apply 后 orig 含合并结果、underlay 条目已删、backing 该文件重灌、报告记录动作；apply 前若接收方缺行则中止且 underlay 保留。
-  - 测试：`set_reconciling(true)` 后 `discovery::probe` 判 Broken（committed=0），`false` 复位 Stopped/Active。
-  - 实现 `plan_entries`（枚举 underlay 条目、按 §5.3 分类给 EntryPlan+Recommendation，不动盘）与 `apply_entry`（严格落盘顺序 + 超集许可 + reconciling 包裹）。
+  - 测试：log-only 条目 apply 后 orig 含合并结果、underlay 条目已删、backing 该文件重灌（`reingest_one_file` 原子）、报告记录动作；`delete_permitted` 不过（接收方缺行 **或** live underlay 已变）则中止且 underlay 保留。
+  - 测试：apply_entry **先** stash orig 前镜像（改 orig 前 stash 里有旧版），中途放弃可从 stash 回滚 orig（评审 I-3）。
+  - 测试：`set_reconciling(true)` 落独立 `reconciling` sidecar、**不改 `committed`**；`discovery::probe` 报 `Reconciling` 态；`lifecycle::restore`/`reingest` 见标记即 Err 让路；`false` 删标记复位（评审 I-4）。
+  - 实现 `plan_entries`（从 `UnderlaySnapshot` 读 incoming、orig 读 base，按 §5.3 分类给 EntryPlan+Recommendation，超限 `MAX_MERGE_FILE_BYTES` 降级 KeepBoth，不动盘）与 `apply_entry`（严格落盘顺序 + `delete_permitted` 许可 + `reingest_one_file` 原子替换）。
   - 每个语义单元一次提交。
 
 - [ ] **末步提交**
@@ -892,9 +944,10 @@ git commit -am "feat(reconcile): reuse 隔离(保UUID/移出树) + subagents 合
 - [ ] **TDD steps**：
   - 测试：dry_run 只出报告、underlay/orig/backing 零改动。
   - 测试：全流程（FakeMounter）——门禁→快照→`set_reconciling(true)`→逐条 confirm→apply→underlay 清空→`set_reconciling(false)`→meta 字节数更新→结束态可挂。
-  - 测试：中途注入 apply 失败 → orig 已改文件已原子替换、underlay 未删部分保留、committed 仍 0（判 Broken），重跑幂等收敛。
-  - 测试：残留 stash 的发现/GC（超期 stash 可清）。
-  - `--rebuild` 分支：委托 `lifecycle::reingest`（golden ⊕ 已确认合并树），复用现有原语。
+  - 测试：中途注入 apply 失败 → 已处理文件的 orig 已原子替换、未处理 underlay 条目保留、**`reconciling` 标记仍在**（`probe` 报 Reconciling、`restore`/`reingest` 让路），重跑幂等收敛（合并不动点 + 已删条目不再出现）。
+  - 测试：残留 stash 的发现/GC（超期 stash 可清；`reconciling` 标记在则不清当前 stash）。
+  - `--rebuild` 分支：先按已确认计划构建「golden ⊕ 合并树」到 orig（原子），清 `reconciling` 标记后委托 `lifecycle::reingest`（其要求 `committed=1`——本设计 committed 全程不变、故满足；`reingest` 从 orig 全量重建 backing，复用现有原语）。
+  - meta 收尾：per-file reconcile 后重扫 `backing` 求 `bytes_archive`、扫 orig 求 `bytes_src`，`write_meta` 更新（非数据安全、仅 list 显示）。
   - 分语义单元提交。
 
 - [ ] **末步提交**
@@ -928,8 +981,8 @@ git commit -am "feat(cli): enable reconcile 子命令 + 逐条交互确认（策
 - Modify: `fuse/src/enable/mod.rs`（list 列渲染）
 
 - [ ] **TDD/steps**：
-  - `probe` 增字段/标志 `needs_reconcile`（Stopped 且 `guard::underlay_has_fallthrough`）；reconciling 中（committed=0 + reconcile_lock 持有）显示 `reconciling`。
-  - 测试：构造 Stopped + 非空 underlay 的隔离 Paths → list 标 `NEEDS-RECONCILE`。
+  - `probe` 增标志 `needs_reconcile`（Stopped 且 `guard::underlay_has_fallthrough`）；`reconciling` sidecar 存在（Task 7）→ 报 `Reconciling` 态。改 `ProjectInfo`（`discovery.rs`）结构会波及所有构造点，一并更新。
+  - 测试：构造 Stopped + 非空 underlay 的隔离 Paths → list 标 `NEEDS-RECONCILE`；有 `reconciling` 标记 → 标 `RECONCILING`。
   - 提交。
 ```bash
 git commit -am "feat(enable): list 标 NEEDS-RECONCILE / reconciling"
@@ -993,10 +1046,11 @@ Expected: 守卫放行（underlay 已清空）、状态 ZIPFS(Active)。
 
 - [ ] **Step 6: 挂载视图字节一致**
 ```bash
-diff <(cat ~/.claude/projects/-home-xp-src-neighbors/373e2835-*.jsonl) \
-     ~/.claude/projects/-home-xp-src-neighbors.zipfs-orig/373e2835-*.jsonl && echo "BYTE-MATCH"
+F=373e2835-c5a4-4822-a8b9-23d9d3cbd667.jsonl
+diff <(cat ~/.claude/projects/-home-xp-src-neighbors/$F) \
+     ~/.claude/projects/-home-xp-src-neighbors.zipfs-orig/$F && echo "BYTE-MATCH"
 ```
-Expected: `BYTE-MATCH`（挂载点透明服务 == golden）。
+Expected: `BYTE-MATCH`（挂载点透明服务 == golden；用完整 UUID 避免 glob 歧义）。
 
 ---
 
