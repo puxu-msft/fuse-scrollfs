@@ -730,13 +730,34 @@ pub fn passthrough_restore_memory(
         return Ok(notes);
     }
 
-    // underlay 目录不存在 → 已恢复/无回落，幂等返回。
-    if !underlay_dir.exists() {
-        notes.push(format!(
-            "underlay memory 目录 {} 不存在（已恢复或无回落）",
-            underlay_dir.display()
-        ));
-        return Ok(notes);
+    // underlay memory 现状分诊（`symlink_metadata` 不跟随，避免把已复原的 symlink 当目录再处理）：
+    // - 已是 symlink → 上一条目已恢复，幂等跳过（同一 reconcile 多条 memory/* 条目会重复触达）。
+    // - 非目录（异常物化）→ 不动、待人工。
+    // - 不存在 → 已恢复/无回落，幂等返回。
+    match std::fs::symlink_metadata(underlay_dir) {
+        Ok(m) if m.file_type().is_symlink() => {
+            notes.push(format!(
+                "underlay memory {} 已是 symlink（上一条目已恢复），幂等跳过",
+                underlay_dir.display()
+            ));
+            return Ok(notes);
+        }
+        Ok(m) if !m.is_dir() => {
+            notes.push(format!(
+                "underlay memory {} 非目录（异常）→ 不动、待人工",
+                underlay_dir.display()
+            ));
+            return Ok(notes);
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            notes.push(format!(
+                "underlay memory 目录 {} 不存在（已恢复或无回落）",
+                underlay_dir.display()
+            ));
+            return Ok(notes);
+        }
+        Err(e) => return Err(e),
     }
 
     // 安置每个 underlay 文件到 canonical target（新增/冲突/幂等）。
@@ -2072,6 +2093,46 @@ mod tests {
             b"note-body\n"
         );
         // underlay memory 复原为 symlink。
+        assert!(mp
+            .join("memory")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn apply_entry_second_memory_entry_is_idempotent_noop() {
+        // 同一 reconcile 内多条 memory/* 条目：首条复原 symlink 后，次条应幂等跳过（不再 relocate）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let target = tmp.path().join("external-memory");
+        std::fs::create_dir_all(&target).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+        std::os::unix::fs::symlink(&target, backing.join("memory")).unwrap();
+
+        // underlay 物化两个文件。
+        let e1 = snap_entry_of(&mp, "memory/A.md", b"aaa\n");
+        let e2 = snap_entry_of(&mp, "memory/B.md", b"bbb\n");
+
+        let r1 = apply_entry(&paths, "demo", &e1, &EntryPlan::KeepSeparate, &mp).unwrap();
+        assert_eq!(r1.action, "memory-restored");
+        // 首条已把整目录 relocate 并复原 symlink；A、B 都进了 target。
+        assert_eq!(std::fs::read(target.join("A.md")).unwrap(), b"aaa\n");
+        assert_eq!(std::fs::read(target.join("B.md")).unwrap(), b"bbb\n");
+
+        let r2 = apply_entry(&paths, "demo", &e2, &EntryPlan::KeepSeparate, &mp).unwrap();
+        assert_eq!(r2.action, "memory-restored");
+        assert!(
+            r2.notes.iter().any(|n| n.contains("幂等跳过")),
+            "次条应幂等跳过：{:?}",
+            r2.notes
+        );
+        // memory 仍是 symlink（未被再次 relocate 破坏）。
         assert!(mp
             .join("memory")
             .symlink_metadata()
