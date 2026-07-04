@@ -93,7 +93,7 @@
    - sidecar 目录 `<uuid>/`（subagents，**也是 jsonl transcript**）→ **走同一 session_merge**，同名一律并集/keep-both，**绝不按 mtime 删较旧者**。
    - 遮蔽 backing **symlink** 的条目（memory）→ **透传恢复**（§6）。
    - 其他非-jsonl → 内容相同即丢；不同即 keep-both 改名，**mtime 仅作提示、平局/反向一律 keep-both**。
-4. **删 underlay 条目前**：校验**运行时超集不变量**（base transcript uuid 集 ⊆ merged；base 无uuid 行多重集 ⊆ merged；已接受 incoming 项 ⊆ merged）+ readback stash 通过 + 复核 underlay 快照未变（mtime/size/inode）；任一不满足 → 中止、保两份、报告。
+4. **删 underlay 条目前**（通用删除许可，覆盖**所有**接收方路径 —— merged / quarantine 隔离 / new / memory 目标）：校验**运行时超集不变量** —— 该 underlay 条目的接收方已 **durable（fsync + readback）** 且逐字节 **⊇ 或 ==** 该条目内容（merged：base transcript uuid 集 ⊆ merged、base 无uuid 行多重集 ⊆ merged、已接受 incoming 项 ⊆ merged；quarantine/new/memory：接收文件字节 == 源条目，含跨卷 copy 后的 readback）+ 复核 underlay 快照未变（mtime/size/inode）；任一不满足 → 中止、保两份、报告。
 5. 全部处置完、underlay 清空 → 更新 committed meta 字节数（呼应 `reingest` 自写 meta）→ 清陈旧 pid/lock。
 
 **reconciling 中间标记**：改 backing 期间置 `committed=0`（或落 `reconciling` sidecar），使中途崩溃被 `classify` 判为 **Broken/需人工**而非"可自动重挂"，杜绝半 reconcile 的 backing 被当权威挂出。完成才复位 `committed=1`。
@@ -103,7 +103,7 @@
 - 守卫谓词精确：忽略已知无害隐藏项白名单（`.fuse_hidden*`/`.DS_Store`/编辑器锁），只认 fall-through 语义条目，避免残渣永久阻塞挂载。
 - `apply` 的 mount 分支此刻 mp 定义上为空（rename 后 create_dir），**不纳入**守卫（避免误拒正常 apply）。
 
-**5.5 CLI / TUI** —— `zipfs enable reconcile <name> [--dry-run] [--force] [--rebuild]`（`--force` 越过活跃门禁由人确认；`--rebuild` = 全量重灌兜底，backing 可疑时用）。`enable list`：STOPPED 且 underlay 非空 → 标 `NEEDS-RECONCILE`。TUI 同标记 + 逐条建议复核。
+**5.5 CLI / TUI** —— `zipfs enable reconcile <name> [--dry-run] [--force] [--rebuild]`（`--force` 越过活跃门禁由人确认；`--rebuild` = 全量重灌兜底，backing 可疑时用）。`enable list`：STOPPED 且 underlay 非空 → 标 `NEEDS-RECONCILE`；reconcile 进行中因 `committed=0` 会短暂显示 Broken —— 属正常（有 reconcile 锁保护、崩溃本就应判 Broken），list/TUI 对持锁项标注"reconciling"以免误判。TUI 同标记 + 逐条建议复核。
 
 ## 6. memory 透传恢复（例外规则）
 
@@ -118,7 +118,7 @@ memory 本应是**单份透传软链**：ingest 在 backing 按软链重建、sh
 ## 7. 错误处理与数据安全
 
 - **落盘硬顺序**：stash（含①改写的 orig 明文 ②替换的 backing archive ③删除的 underlay 原始字节）落盘 + fsync + readback 校验**成功后**，才动 orig；orig 原子 rename 替换后才重灌 backing；backing 原子替换 + 超集校验后才删 underlay 条目。**绝不先删后写、绝不就地截断金源 orig**。
-- **超集不变量**是删除的唯一许可（§5.3 步 4）——`verify_file` 只证 `backing==orig` 编码保真，**不证内容超集**，故不能仅凭它删 underlay。
+- **超集不变量**是删除的唯一许可（§5.3 步 4），且是**通用门**——凡删 underlay 条目，其接收方（merged / quarantine / new / memory 目标，含跨卷 copy）必须先 durable 且逐字节 ⊇/== 该条目。`verify_file` 只证 `backing==orig` 编码保真，**不证内容超集**，故不能仅凭它删 underlay。
 - **崩溃恢复**：reconciling 标记 → 判 Broken；残留 stash 有发现/GC/**续跑**规则；合并幂等保证重跑不放大损坏；backing 疑损时 playbook 指引 `--rebuild`。
 - 冲突一律 keep-both；截断行单列待确认；坏行 verbatim；reuse 保守（有交集/有 compaction 桥即并入，不拆散）。
 
