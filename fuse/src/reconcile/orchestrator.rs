@@ -13,8 +13,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::enable::discovery::detect_activity;
-use crate::enable::model::{validate_name, Backend, Paths};
+use crate::enable::discovery::{self, detect_activity};
+use crate::enable::model::{validate_name, ApplyOptions, Backend, Paths};
 use crate::reconcile::guard::{is_harmless, underlay_has_fallthrough};
 use crate::store::lock::acquire_exclusive;
 
@@ -329,6 +329,47 @@ pub fn delete_permitted(
     Ok(durable_superset_ok(receiver, &src.bytes, mode)? && live_entry_unchanged(mp, src)?)
 }
 
+/// 单文件原子重灌（评审 I-1/C2）：把 `orig/<rel>` 重新灌成 backing archive，**原子替换**已存在
+/// 的 `<backing>/<rel>`——绝不就地 O_TRUNC 覆盖。
+///
+/// 流程：`ingest_file(orig/<rel> → <backing>/<rel>.reconcile-tmp)`（`verify=true` 逐字节校验）→
+/// `rename(tmp, <backing>/<rel>)` 原子覆盖 → fsync 父目录持久化 dirent。任一步崩溃时 backing
+/// 该条目要么是旧 archive、要么是完整新 archive，绝不半写。仅 shadow 后端（reconcile 前提）。
+///
+/// chunk_size/level 取自提交标记 sidecar（无则回落 `ApplyOptions::default`），与 apply/reingest
+/// 一致，保证重灌 archive 参数不漂移。
+pub fn reingest_one_file(paths: &Paths, name: &str, rel: &str) -> io::Result<()> {
+    validate_name(name)?;
+    let orig_file = paths.orig(name).join(rel);
+    let backing_file = paths.backing(name, Backend::Shadow).join(rel);
+    let opts: ApplyOptions = discovery::read_meta(&paths.meta_path(name))
+        .ok()
+        .flatten()
+        .map(|m| m.options())
+        .unwrap_or_default();
+
+    if let Some(parent) = backing_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut tmp_os = backing_file.as_os_str().to_owned();
+    tmp_os.push(".reconcile-tmp");
+    let tmp = PathBuf::from(tmp_os);
+    // 清理上次崩溃可能残留的临时 archive（ingest_file 的 O_TRUNC create 本身也会截断，但显式清
+    // 更直白且避免误判残留为有效 archive）。
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+
+    // verify=true：灌后逐字节 read-back 校验，确认 archive 与 orig 一致再原子就位（零丢失）。
+    crate::ingest::ingest_file(&orig_file, &tmp, opts.chunk_size, opts.level, true)?;
+    std::fs::rename(&tmp, &backing_file)?;
+    if let Some(parent) = backing_file.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +602,84 @@ mod tests {
         atomic_write(&recv, b"a\nb\n").unwrap(); // 接收方缺 c → 非超集
         let ok = delete_permitted(&recv, &snap, SupersetMode::LinesSuperset, &mp).unwrap();
         assert!(!ok, "接收方非超集 → 即便 live 未变也不许删");
+    }
+
+    /// 写一份 committed 提交标记（供 reingest_one_file 取 chunk_size/level）。
+    fn write_committed_meta(paths: &Paths, name: &str) {
+        let meta = discovery::Meta::from_apply(&ApplyOptions::default(), 0, 0, 0);
+        std::fs::create_dir_all(paths.back_root()).unwrap();
+        discovery::write_meta(&paths.meta_path(name), &meta).unwrap();
+    }
+
+    /// 读回一个 backing archive 文件的完整明文（逐块解压）。
+    fn read_archive(path: &Path) -> Vec<u8> {
+        use crate::core::codec::{decompress_block, Algo};
+        let r = crate::archive::ArchiveReader::open(path).unwrap();
+        let mut got = Vec::new();
+        for i in 0..r.chunk_count() {
+            let (b, e) = r.read_block(i).unwrap().unwrap();
+            got.extend_from_slice(
+                &decompress_block(&b, Algo::Zstd, e.is_verbatim(), None).unwrap(),
+            );
+        }
+        got
+    }
+
+    #[test]
+    fn reingest_one_file_atomically_replaces_backing_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+
+        // orig/<rel>：合并后的权威明文（含子目录，验证 create_dir_all 链）。
+        let rel = "sub/s.jsonl";
+        let orig_file = paths.orig("demo").join(rel);
+        std::fs::create_dir_all(orig_file.parent().unwrap()).unwrap();
+        let content = b"{\"uuid\":\"u1\"}\n{\"uuid\":\"u2\"}\n".repeat(100);
+        std::fs::write(&orig_file, &content).unwrap();
+
+        // 预置一个陈旧 backing archive（内容不同），reingest 须原子替换为 orig 的新内容。
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        std::fs::create_dir_all(backing_file.parent().unwrap()).unwrap();
+        crate::ingest::ingest_file(
+            &{
+                let p = tmp.path().join("stale.src");
+                std::fs::write(&p, b"STALE\n").unwrap();
+                p
+            },
+            &backing_file,
+            65536,
+            3,
+            true,
+        )
+        .unwrap();
+        assert_eq!(read_archive(&backing_file), b"STALE\n");
+
+        reingest_one_file(&paths, "demo", rel).unwrap();
+
+        // backing archive 现读回 orig 的新内容；临时文件已 rename 消失。
+        assert_eq!(read_archive(&backing_file), content);
+        let mut tmp_os = backing_file.as_os_str().to_owned();
+        tmp_os.push(".reconcile-tmp");
+        assert!(
+            !PathBuf::from(tmp_os).exists(),
+            "reconcile-tmp 应已 rename 消失"
+        );
+    }
+
+    #[test]
+    fn reingest_one_file_creates_new_backing_entry() {
+        // New 条目：backing 尚无该 rel（连父目录都缺）→ reingest 须建目录链并落 archive。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let rel = "fresh.jsonl";
+        let orig_file = paths.orig("demo").join(rel);
+        std::fs::create_dir_all(orig_file.parent().unwrap()).unwrap();
+        std::fs::write(&orig_file, b"{\"new\":true}\n").unwrap();
+
+        reingest_one_file(&paths, "demo", rel).unwrap();
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        assert_eq!(read_archive(&backing_file), b"{\"new\":true}\n");
     }
 }

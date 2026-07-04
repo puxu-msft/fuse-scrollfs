@@ -299,7 +299,11 @@ fn ingest_dir(
 
 /// 流式灌一个文件：源只读、按 chunk_size 切块压缩写 dst archive。verify 则比对。返回
 /// (源字节, archive 字节, 是否校验通过)。内存峰值 ~chunk_size。
-fn ingest_file(
+///
+/// 评审 I-1/C2：`pub(crate)` 暴露供 reconcile 单文件重灌复用。内部 `ArchiveWriter::create`
+/// 是 O_TRUNC **就地**写，故调用方（`reconcile::orchestrator::reingest_one_file`）必须写到
+/// 临时路径再原子 rename 覆盖，**绝不**直接就地覆盖已存在的 backing archive（避免半写损坏）。
+pub(crate) fn ingest_file(
     src: &Path,
     dst: &Path,
     chunk_size: u32,
