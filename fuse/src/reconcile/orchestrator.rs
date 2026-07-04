@@ -534,7 +534,39 @@ fn lines_to_bytes(lines: &[String]) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// 逐条目落盘（**严格顺序**，评审 I-3/C-a；本任务只实现 Union/New/Identical）：
+/// keep-separate 隔离（疑 session-id 重用）：把 underlay 的 reuse `.jsonl`（**保留原 UUID 文件名**）
+/// 搬到 `paths.quarantine(name, ts)/<rel>`（**移出 projects 树**，避免下次挂载又被当 fall-through 反复
+/// 触发）并 fsync（文件 + 目录链）。**base（projects 树内 orig/backing）绝不改动**——隔离只把 underlay
+/// 那一份可疑内容原样保全供人工核查，不并入历史（reuse 若误并会污染无关会话）。
+///
+/// 只负责「搬出 + durable」，**不删 underlay**：删除仍由 `apply_entry` 经 `finish_delete`（唯一删除入口，
+/// receiver=隔离副本、`ByteEqual`）统一把关。返回隔离副本路径（供报告/人工定位）。
+///
+/// 隔离区跨目录、可能跨卷；`atomic_write` 以快照 `bytes` 原样写出（保原 UUID 名），配 `ByteEqual` readback
+/// 校验副本逐字节等于源，杜绝隔离 copy 半写就误删 underlay。
+pub fn quarantine_reuse(
+    paths: &Paths,
+    name: &str,
+    ts: &str,
+    snap_entry: &EntrySnapshot,
+    _mp: &Path,
+) -> io::Result<PathBuf> {
+    validate_name(name)?;
+    let quarantine_root = paths.quarantine(name, ts);
+    let dst = quarantine_root.join(&snap_entry.rel);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 原样写快照内容（非再读 live），使隔离副本与快照 bytes 逐字节同源 → ByteEqual 删除门自洽。
+    atomic_write(&dst, &snap_entry.bytes)?;
+    // 补齐 <rel 子目录>/<ts>/<name> 目录链 fsync（atomic_write 只 fsync 了 dst 直接父目录）。
+    if let Some(parent) = dst.parent() {
+        fsync_dir_chain(parent, &quarantine_root)?;
+    }
+    Ok(dst)
+}
+
+/// 逐条目落盘（**严格顺序**，评审 I-3/C-a）：
 /// 1. **先 stash orig 前镜像**（改 orig 前留底，可回滚）。
 /// 2. 计算合并明文（Union：`session_merge` 并集；New：incoming bytes）。
 /// 3. `atomic_write(orig/<rel>)`（全有或全无）。
@@ -542,7 +574,7 @@ fn lines_to_bytes(lines: &[String]) -> Vec<u8> {
 /// 5. `delete_permitted` 通过**才**删 underlay 条目；不过则中止该条目、underlay 保留、notes 记原因。
 ///
 /// Identical 无需改 orig/backing，直接过 `delete_permitted`（ByteEqual）删 underlay。
-/// 其余计划（KeepSeparate/Passthrough/KeepBoth）本任务不落盘、underlay 保留，报告标 deferred。
+/// KeepSeparate → `quarantine_reuse` 隔离（base 不动，ByteEqual 删除门）。仅 KeepBoth 仍 deferred。
 pub fn apply_entry(
     paths: &Paths,
     name: &str,
@@ -610,9 +642,23 @@ pub fn apply_entry(
                 notes,
             )
         }
+        EntryPlan::KeepSeparate => {
+            // 疑 reuse：隔离 underlay 那份到 quarantine（移出树、保 UUID），base 不动，ByteEqual 删除门。
+            let ts = now_unix_secs();
+            let q = quarantine_reuse(paths, name, &ts, snap_entry, mp)?;
+            notes.push(format!("quarantine={}", q.display()));
+            finish_delete(
+                snap_entry,
+                &q,
+                SupersetMode::ByteEqual,
+                mp,
+                "keep-separate",
+                notes,
+            )
+        }
         other => {
             notes.push(format!(
-                "{other:?} 未在 Task 7 实现（KeepSeparate/Passthrough/KeepBoth），underlay 保留待 Task 8"
+                "{other:?} 未在本任务落盘（KeepBoth 待人工/后续），underlay 保留待处理"
             ));
             Ok(EntryReport {
                 name: rel,
@@ -1297,6 +1343,87 @@ mod tests {
     }
 
     #[test]
+    fn keep_separate_quarantines_reuse_preserving_uuid_and_leaves_base() {
+        // SuspectReuse → KeepSeparate：隔离副本保原 <uuid>.jsonl 名、移出 projects 树；base 不动；
+        // underlay 经 ByteEqual 超集校验后删。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        // Claude 会话文件名即 <uuid>.jsonl。
+        let rel = "3f2a-b1c2-uuid.jsonl";
+        let base = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"a1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-24T00:00:00.000Z\"}\n"
+        );
+        let incoming = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"b1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-30T00:00:00.000Z\"}\n"
+        );
+        let orig_file = write_orig(&paths, "demo", rel, base.as_bytes());
+        reingest_one_file(&paths, "demo", rel).unwrap();
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        let backing_before = read_archive(&backing_file);
+
+        let snap_e = snap_entry_of(&mp, rel, incoming.as_bytes());
+        let snap = UnderlaySnapshot {
+            ts: "0".into(),
+            entries: vec![snap_e],
+        };
+        // disjoint uuid、无桥、时间窗不交 → SuspectReuse → KeepSeparate。
+        let plans = plan_entries(&paths, "demo", &snap).unwrap();
+        assert_eq!(plans[0].1, EntryPlan::KeepSeparate);
+
+        let report = apply_entry(
+            &paths,
+            "demo",
+            &snap.entries[0],
+            &EntryPlan::KeepSeparate,
+            &mp,
+        )
+        .unwrap();
+
+        // 隔离副本：quarantine 下出现原 <uuid>.jsonl，内容 == underlay incoming。
+        let q = report
+            .notes
+            .iter()
+            .find_map(|n| n.strip_prefix("quarantine="))
+            .map(PathBuf::from)
+            .expect("应记 quarantine 路径");
+        assert_eq!(
+            q.file_name().unwrap().to_str().unwrap(),
+            rel,
+            "保原 UUID 文件名"
+        );
+        assert_eq!(std::fs::read(&q).unwrap(), incoming.as_bytes());
+        // 隔离区在 projects 树外（zipfs_home 下），不在 projects_root。
+        assert!(
+            q.starts_with(&paths.zipfs_home),
+            "quarantine 应在 zipfs_home 下"
+        );
+        assert!(
+            !q.starts_with(&paths.projects_root),
+            "quarantine 应移出 projects 树"
+        );
+        // base（orig/backing）绝不改动。
+        assert_eq!(
+            std::fs::read(&orig_file).unwrap(),
+            base.as_bytes(),
+            "orig base 不变"
+        );
+        assert_eq!(
+            read_archive(&backing_file),
+            backing_before,
+            "backing base 不变"
+        );
+        // underlay 经 ByteEqual 校验后删。
+        assert!(!mp.join(rel).exists(), "隔离且校验后应删 underlay");
+        assert!(report.action.contains("underlay-removed"));
+    }
+
+    #[test]
     fn plan_entries_downgrades_oversize_to_keep_both() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
@@ -1316,15 +1443,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_deferred_plans_keep_underlay() {
-        // KeepSeparate/Passthrough/KeepBoth 本任务不落盘：underlay 保留、报告标 deferred。
+    fn apply_keep_both_still_deferred_keeps_underlay() {
+        // KeepBoth 仍 deferred：underlay 保留、报告标 deferred（与已实现的 KeepSeparate 区分）。
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
         let mp = paths.mountpoint("demo");
         std::fs::create_dir_all(&mp).unwrap();
-        let rel = "keep.jsonl";
+        let rel = "kb.jsonl";
         let snap_e = snap_entry_of(&mp, rel, b"{\"a\":1}\n");
-        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepBoth, &mp).unwrap();
         assert_eq!(report.action, "deferred");
         assert!(mp.join(rel).exists(), "deferred 计划不得删 underlay");
     }
