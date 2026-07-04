@@ -254,7 +254,7 @@ fn cmd_list(paths: &Paths) -> std::io::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<46} {:<8} {:<10} {:>8}  META",
+        "{:<46} {:<24} {:<10} {:>8}  META",
         "NAME", "STATUS", "BACKEND", "RATIO"
     );
     for info in &infos {
@@ -272,9 +272,9 @@ fn cmd_list(paths: &Paths) -> std::io::Result<()> {
             "-"
         };
         println!(
-            "{:<46} {:<8} {:<10} {:>8}  {}",
+            "{:<46} {:<24} {:<10} {:>8}  {}",
             info.name,
-            info.status.label(),
+            info.status_display(),
             backend,
             ratio,
             note
@@ -287,7 +287,7 @@ fn cmd_list(paths: &Paths) -> std::io::Result<()> {
 fn cmd_status(paths: &Paths, name: &str) -> std::io::Result<()> {
     let info = discovery::probe(paths, name);
     println!("项目: {name}");
-    println!("状态: {}", info.status.label());
+    println!("状态: {}", info.status_display());
     println!("后端: {}", info.backend().flag());
     println!("挂载点: {}", paths.mountpoint(name).display());
     println!("backing: {}", paths.backing(name, info.backend()).display());
