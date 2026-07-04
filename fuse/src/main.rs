@@ -266,6 +266,15 @@ fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
         "systemd 托管挂载：name={name} backing={}",
         spec.backing.display()
     );
+    // 评审 C1：systemd 开机自启（`ExecStart=zipfs mount-managed --name %i`）由 systemd 直接拉起本
+    // 进程，**不经** `SystemdMounter::spawn`，故守卫必须在此真正挂载前兜底，否则自启路径会静默盖住
+    // 停用期回落写（主威胁面）。underlay 含非白名单 fall-through → 拒挂载，指向 `enable reconcile`。
+    zipfs::reconcile::guard::ensure_underlay_empty(&spec.mountpoint).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
+        )
+    })?;
     run_mount(mount_args_from_spec(&spec))
 }
 
