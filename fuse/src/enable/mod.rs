@@ -17,11 +17,16 @@ pub mod model;
 pub mod systemd;
 pub mod tui;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Subcommand;
 
 use crate::enable::systemd::select_mounter;
+use crate::reconcile::advisor::Recommendation;
+use crate::reconcile::orchestrator::{
+    reconcile, Confirm, ConfirmFn, ReconcileOptions, ReconcileReport,
+};
 pub use model::{ApplyOptions, Backend, Paths, ProjectStatus};
 
 /// `zipfs enable` 的子动作。`None`（不给）→ 启动 TUI。
@@ -106,6 +111,22 @@ pub enum EnableAction {
         #[arg(long)]
         level: Option<i32>,
     },
+    /// 停用期回落写重合并（仅 shadow）：把挂载点 underlay 里 Claude 直接写进去的 jsonl 等安全并回
+    /// backing。**须先卸载**——挂载态下读挂载点是 FUSE 视图而非 underlay，reconcile 会误判。逐条
+    /// 交互确认 `[a]ccept/[k]eep-both/[s]kip`；`--dry-run` 只出建议单、零改动；非交互（stdin 非 tty）
+    /// 且非 dry-run → 拒绝（策略 B：绝不自动落盘）。
+    Reconcile {
+        name: String,
+        /// 只出建议单、零改动（不落盘、不交互）。
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// 越过活跃会话门禁（人工确认空闲后）。
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// 逐条落盘后从 orig 全量重建 backing 并重挂。
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
+    },
     /// 查看 / 设置持久化默认选项（ZIPFS_HOME/config，apply 起点）。
     Config {
         #[command(subcommand)]
@@ -154,6 +175,7 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
         | EnableAction::Purge { name, .. }
         | EnableAction::Compact { name }
         | EnableAction::Reingest { name, .. }
+        | EnableAction::Reconcile { name, .. }
         | EnableAction::Seal { name, .. },
     ) = &action
     {
@@ -208,6 +230,12 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
         }
         Some(EnableAction::Compact { name }) => cmd_compact(&paths, &name),
         Some(EnableAction::Reingest { name, force }) => cmd_reingest(&paths, &name, force),
+        Some(EnableAction::Reconcile {
+            name,
+            dry_run,
+            force,
+            rebuild,
+        }) => cmd_reconcile(&paths, &name, dry_run, force, rebuild),
         Some(EnableAction::Seal {
             name,
             seal_chunk,
@@ -427,4 +455,169 @@ fn cmd_seal(
     let report = lifecycle::seal(paths, name, chunk, lvl, select_mounter().as_ref())?;
     println!("seal: {name} — {report}");
     Ok(())
+}
+
+/// `reconcile <name> [--dry-run] [--force] [--rebuild]`：停用期回落写重合并（仅 shadow）。
+///
+/// 前置：**项目必须未挂载**。挂载态下读挂载点返回的是 FUSE 视图（backing 内容），而非 underlay 里
+/// Claude 直接写下的回落文件，reconcile 会把合并后的 backing 内容误当回落写反复处理 → 误判。
+///
+/// 交互策略（策略 B，绝不自动落盘）：
+/// - `--dry-run`：引擎只出建议单、零改动，confirm 回调不会被调用。
+/// - 实跑且 stdin 为 tty：逐条打印 rel + 推荐动作/置信度/理由，从 stdin 读 `[a]ccept/[k]eep-both/[s]kip`。
+/// - 实跑且 stdin 非 tty：拒绝并提示（不自动执行）。
+fn cmd_reconcile(
+    paths: &Paths,
+    name: &str,
+    dry_run: bool,
+    force: bool,
+    rebuild: bool,
+) -> std::io::Result<()> {
+    reconcile_not_mounted_guard(discovery::is_mounted(&paths.mountpoint(name)))?;
+    let confirm = build_confirm(dry_run, std::io::stdin().is_terminal())?;
+    let opts = ReconcileOptions {
+        dry_run,
+        force,
+        rebuild,
+        confirm,
+    };
+    let report = reconcile(paths, name, opts, select_mounter().as_ref())?;
+    print_reconcile_report(&report, dry_run);
+    Ok(())
+}
+
+/// reconcile 前置守卫：项目挂载中则拒（挂载态读挂载点是 FUSE 视图而非 underlay，会误判）。
+fn reconcile_not_mounted_guard(mounted: bool) -> std::io::Result<()> {
+    if mounted {
+        return Err(std::io::Error::other(
+            "项目在挂载中，先卸载/待其停用后再 reconcile（挂载态读挂载点是 FUSE 视图而非 underlay，会误判）",
+        ));
+    }
+    Ok(())
+}
+
+/// 据 `dry_run`/`is_tty` 构造逐条目裁决回调（策略 B）：
+/// - `dry_run` → 占位回调（恒 `Skip`，引擎 dry 分支实际不调用它）。
+/// - 实跑 + tty → 交互回调（逐条读 stdin）。
+/// - 实跑 + 非 tty → `Err`（非交互绝不自动落盘）。
+fn build_confirm(dry_run: bool, is_tty: bool) -> std::io::Result<Box<ConfirmFn>> {
+    if dry_run {
+        return Ok(Box::new(|_, _| Confirm::Skip));
+    }
+    if !is_tty {
+        return Err(std::io::Error::other(
+            "非交互（stdin 非 tty）且非 --dry-run：拒绝自动落盘（策略 B）。请在终端交互运行，或先用 --dry-run 查看建议单",
+        ));
+    }
+    Ok(Box::new(interactive_confirm))
+}
+
+/// 交互裁决单条目：打印 rel + 推荐动作/置信度/理由，循环从 stdin 读直至合法 `a`/`k`/`s`。
+/// EOF/读错 → `Skip`（策略 B 保守：宁可不动也不误落盘）。
+fn interactive_confirm(rel: &str, rec: &Recommendation) -> Confirm {
+    use std::io::Write;
+    println!("\n条目: {rel}");
+    println!(
+        "  推荐: {:?}（置信度 {:?}）— {}",
+        rec.action, rec.confidence, rec.rationale
+    );
+    loop {
+        print!("  采纳？[a]ccept / [k]eep-both / [s]kip > ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => return Confirm::Skip,
+            Ok(_) => match parse_confirm(&line) {
+                Some(c) => return c,
+                None => eprintln!("  无法识别（请输入 a/k/s）"),
+            },
+        }
+    }
+}
+
+/// 把用户一行输入映射到 `Confirm`：取首个非空白字符、大小写不敏感。`a`→Accept、`k`→KeepBoth、
+/// `s`→Skip；空行/无法识别 → `None`（调用方重问）。抽成纯函数便于单测（CLI 交互靠手验）。
+fn parse_confirm(input: &str) -> Option<Confirm> {
+    match input.trim().chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('a') => Some(Confirm::Accept),
+        Some('k') => Some(Confirm::KeepBoth),
+        Some('s') => Some(Confirm::Skip),
+        _ => None,
+    }
+}
+
+/// 打印 `ReconcileReport`：逐条目 decision/action/notes + stash 目录 + 未完成条目的后续提示。
+fn print_reconcile_report(report: &ReconcileReport, dry_run: bool) {
+    if dry_run {
+        println!("reconcile --dry-run 建议单（零改动）：");
+    } else {
+        println!("reconcile 报告：");
+    }
+    for e in &report.entries {
+        println!("  {} [{}] {}", e.name, e.decision, e.action);
+        for note in &e.notes {
+            println!("      - {note}");
+        }
+    }
+    println!("stash 目录: {}", report.stash_dir.display());
+    // 未完成条目提示：underlay 保留 / deferred / 待人工者需人工核查后重试或手动处理。
+    let needs_followup = report.entries.iter().any(|e| {
+        e.action.contains("kept") || e.action.contains("deferred") || e.action.contains("warn")
+    });
+    if needs_followup {
+        println!(
+            "注意: 部分条目未完成（underlay 保留 / deferred）——需人工核查 stash/quarantine 后重跑 reconcile 或手动处理。"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reconcile::advisor::{Action, Confidence};
+
+    #[test]
+    fn parse_confirm_maps_first_char_case_insensitive() {
+        assert_eq!(parse_confirm("a"), Some(Confirm::Accept));
+        assert_eq!(parse_confirm("Accept\n"), Some(Confirm::Accept));
+        assert_eq!(parse_confirm("  k "), Some(Confirm::KeepBoth));
+        assert_eq!(parse_confirm("S"), Some(Confirm::Skip));
+        assert_eq!(parse_confirm("skip\n"), Some(Confirm::Skip));
+        assert_eq!(parse_confirm(""), None);
+        assert_eq!(parse_confirm("x"), None);
+    }
+
+    #[test]
+    fn not_mounted_guard_rejects_mounted_allows_unmounted() {
+        assert!(reconcile_not_mounted_guard(true).is_err());
+        assert!(reconcile_not_mounted_guard(false).is_ok());
+    }
+
+    #[test]
+    fn build_confirm_rejects_non_tty_non_dry_run() {
+        // 策略 B：非交互（非 tty）且非 dry-run → 拒绝，绝不自动落盘。
+        assert!(build_confirm(false, false).is_err());
+    }
+
+    #[test]
+    fn build_confirm_allows_dry_run_without_tty() {
+        assert!(build_confirm(true, false).is_ok());
+    }
+
+    #[test]
+    fn build_confirm_allows_interactive_tty() {
+        assert!(build_confirm(false, true).is_ok());
+    }
+
+    #[test]
+    fn dry_run_placeholder_confirm_never_applies() {
+        // dry_run 占位回调恒 Skip（引擎 dry 分支实际不调它，即使调也不落盘）。
+        let confirm = build_confirm(true, false).unwrap();
+        let rec = Recommendation {
+            action: Action::UnionIntoBase,
+            confidence: Confidence::High,
+            rationale: "x".into(),
+        };
+        assert_eq!(confirm("s.jsonl", &rec), Confirm::Skip);
+    }
 }
