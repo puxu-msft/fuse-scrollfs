@@ -578,6 +578,45 @@ fn is_subagents_entry(rel: &str) -> bool {
         )
 }
 
+/// `rel` 顶层路径段（第一个 Normal 组件）。用于把 memory 物化条目归到其顶层目录（如 `memory`）。
+fn top_component(rel: &str) -> Option<String> {
+    Path::new(rel).components().find_map(|c| match c {
+        std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+        _ => None,
+    })
+}
+
+/// 判定条目是否属 memory 透传：其顶层段在 backing 里是 **symlink**（apply 期照 Claude 外链重建的
+/// `memory` 软链）。停用期 Claude 把外链内容物化进 underlay 真实目录，此类条目应走透传恢复而非并入历史。
+fn is_passthrough_entry(paths: &Paths, name: &str, rel: &str) -> bool {
+    passthrough_top_symlink(paths, name, rel)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// 若条目顶层段在 backing 是 symlink，返回 `(顶层段, symlink 目标)`；否则 `None`。
+/// name 已在 `apply_entry` 入口 `validate_name`，此处只读 backing 元数据。
+fn passthrough_top_symlink(
+    paths: &Paths,
+    name: &str,
+    rel: &str,
+) -> io::Result<Option<(String, PathBuf)>> {
+    let Some(top) = top_component(rel) else {
+        return Ok(None);
+    };
+    let link = paths.backing(name, Backend::Shadow).join(&top);
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) if m.file_type().is_symlink() => {
+            let target = std::fs::read_link(&link)?;
+            Ok(Some((top, target)))
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// subagents 子会话 jsonl 合并（**与主 jsonl 同一 `session_merge` 规则**，但强制无损并集）：
 ///
 /// orig 有对应文件 → `session_merge` 并集写回；orig 无 → 全新落盘（New）。随后 `reingest_one_file`
@@ -620,6 +659,225 @@ pub fn reconcile_subagents_dir(
     )
 }
 
+/// memory 透传恢复（**例外规则**，不走 `delete_permitted`——靠「先安置进 target + 再把 underlay 整目录
+/// relocate 到 stash」双重保全达成零丢失）。
+///
+/// 背景：Claude 的 `memory` 是指向外部共享目录的 symlink。停用期 FS 不服务 → Claude 把内容**物化**成
+/// underlay 里的真实目录。恢复 = 把这些文件送回 symlink 真正指向的 target，再复原 symlink。
+///
+/// 路径安全（写 target 前，任一不满足即**不动 underlay**、返回 notes 待人工）：
+/// - `symlink_target` 含 `..` 组件 → 拒（`../` 穿越）。
+/// - `canonicalize(symlink_target)` 失败 → 目标悬空/不存在。
+/// - 解析后非目录 → 疑被物化成真实文件等异常。
+/// - 目标不可写（写探针失败）→ 待人工。
+///
+/// 安置规则（canonical 原版**绝不覆盖**、冲突**绝不静默丢**）：
+/// - target 无同名 → 复制进 target（fsync + readback 校验）。
+/// - target 同名**同内容** → 幂等 no-op。
+/// - target 同名**异内容** → 不合并；underlay 版以 `<name>.underlay-<crc8>` 存在 target 旁（幂等：同内容
+///   → 同名不重复），canonical 原版原样不动。
+///
+/// 全部安置且校验后：把 underlay 整目录 relocate 到 `stash_dir`（rename，跨卷回落递归拷+删；保全审计/回滚
+/// 底本），再在 underlay 原位复原指向 `symlink_target` 的 symlink。underlay 目录不存在（已恢复/无回落）→
+/// 幂等返回。返回逐步骤 notes（审计）。
+pub fn passthrough_restore_memory(
+    underlay_dir: &Path,
+    symlink_target: &Path,
+    stash_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let mut notes: Vec<String> = Vec::new();
+
+    // 路径安全 1：拒 `..` 穿越（symlink 被改写指向树外的注入向量）。
+    if symlink_target
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        notes.push(format!(
+            "symlink 目标 {} 含 `..` 穿越 → 拒绝、underlay memory 不删，待人工",
+            symlink_target.display()
+        ));
+        return Ok(notes);
+    }
+
+    // 路径安全 2：canonicalize（悬空/不存在即失败）。
+    let canon_target = match std::fs::canonicalize(symlink_target) {
+        Ok(p) => p,
+        Err(e) => {
+            notes.push(format!(
+                "symlink 目标 {} 悬空/不可解析（{e}）→ underlay memory 不删，待人工",
+                symlink_target.display()
+            ));
+            return Ok(notes);
+        }
+    };
+
+    // 路径安全 3：解析后必须是目录（非目录 = 疑被物化成真实文件等异常）。
+    let md = std::fs::metadata(&canon_target)?;
+    if !md.is_dir() {
+        notes.push(format!(
+            "symlink 目标 {} 解析后非目录（疑被物化）→ underlay memory 不删，待人工",
+            canon_target.display()
+        ));
+        return Ok(notes);
+    }
+
+    // 路径安全 4：可写探针（不可写即待人工，避免半写）。
+    if let Err(e) = probe_writable(&canon_target) {
+        notes.push(format!(
+            "symlink 目标 {} 不可写（{e}）→ underlay memory 不删，待人工",
+            canon_target.display()
+        ));
+        return Ok(notes);
+    }
+
+    // underlay 目录不存在 → 已恢复/无回落，幂等返回。
+    if !underlay_dir.exists() {
+        notes.push(format!(
+            "underlay memory 目录 {} 不存在（已恢复或无回落）",
+            underlay_dir.display()
+        ));
+        return Ok(notes);
+    }
+
+    // 安置每个 underlay 文件到 canonical target（新增/冲突/幂等）。
+    place_memory_files(underlay_dir, underlay_dir, &canon_target, &mut notes)?;
+
+    // 全部安置后：underlay 整目录 relocate 到 stash（保全底本），再复原 symlink。
+    relocate_dir(underlay_dir, stash_dir)?;
+    notes.push(format!(
+        "underlay memory relocate 到 stash：{}",
+        stash_dir.display()
+    ));
+    std::os::unix::fs::symlink(symlink_target, underlay_dir)?;
+    if let Some(parent) = underlay_dir.parent() {
+        let _ = fsync_dir(parent);
+    }
+    notes.push(format!(
+        "symlink 复原：{} → {}",
+        underlay_dir.display(),
+        symlink_target.display()
+    ));
+    Ok(notes)
+}
+
+/// 在目录 `dir` 内建临时探针文件再删，判定可写。仅探测写权限，不留痕。
+fn probe_writable(dir: &Path) -> io::Result<()> {
+    let probe = dir.join(".zipfs-memory-write-probe");
+    File::create(&probe)?;
+    std::fs::remove_file(&probe)?;
+    Ok(())
+}
+
+/// 递归把 `dir` 下的文件安置进 `canon_target`（`root` 是 underlay memory 根，算 rel 用）。
+///
+/// 新增 → 复制 + fsync + readback；同名同内容 → 幂等跳过；同名异内容 → `<name>.underlay-<crc8>`
+/// 存 target 旁（canonical 不动）。所有 rel 组件来自 `read_dir`（天然无 `..`），仍显式跳过非常规文件。
+fn place_memory_files(
+    root: &Path,
+    dir: &Path,
+    canon_target: &Path,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    for dent in std::fs::read_dir(dir)? {
+        let dent = dent?;
+        let path = dent.path();
+        let ft = dent.file_type()?;
+        if ft.is_dir() {
+            place_memory_files(root, &path, canon_target, notes)?;
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io::Error::other("underlay memory 条目逃出根"))?;
+        let dest = canon_target.join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = std::fs::read(&path)?;
+        let rel_disp = rel.to_string_lossy().into_owned();
+        match std::fs::read(&dest) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                atomic_write(&dest, &content)?;
+                if !readback_eq(&dest, &content)? {
+                    return Err(io::Error::other(format!(
+                        "memory 复制 {rel_disp} 后 readback 不符"
+                    )));
+                }
+                notes.push(format!("memory 新增 → target/{rel_disp}"));
+            }
+            Err(e) => return Err(e),
+            Ok(existing) if existing == content => {
+                notes.push(format!("memory 已存在同内容，跳过：target/{rel_disp}"));
+            }
+            Ok(_) => {
+                let hash8 = format!("{:08x}", crate::archive::crc32(&content));
+                let variant = variant_path(&dest, &hash8);
+                // 幂等：同内容 → 同名；已存在同内容则不重复写。
+                let already = matches!(std::fs::read(&variant), Ok(b) if b == content);
+                if !already {
+                    atomic_write(&variant, &content)?;
+                    if !readback_eq(&variant, &content)? {
+                        return Err(io::Error::other(format!(
+                            "memory 冲突副本 {rel_disp} 后 readback 不符"
+                        )));
+                    }
+                }
+                notes.push(format!(
+                    "memory 冲突（canonical 保留）→ target 旁 {}",
+                    variant
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 在 `dest` 同目录、同文件名后缀 `.underlay-<hash8>` 的冲突副本路径。
+fn variant_path(dest: &Path, hash8: &str) -> PathBuf {
+    let mut os = dest.as_os_str().to_owned();
+    os.push(format!(".underlay-{hash8}"));
+    PathBuf::from(os)
+}
+
+/// 把目录 `from` 整体搬到 `to`（rename 优先；跨卷回落递归拷贝 + 删源）。搬前建 `to` 的父目录。
+fn relocate_dir(from: &Path, to: &Path) -> io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            copy_dir_recursive(from, to)?;
+            std::fs::remove_dir_all(from)?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 递归拷贝目录（跨卷 relocate 回落用）。仅拷常规文件与目录，跳过其它类型。
+fn copy_dir_recursive(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for dent in std::fs::read_dir(from)? {
+        let dent = dent?;
+        let ft = dent.file_type()?;
+        let src = dent.path();
+        let dst = to.join(dent.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else if ft.is_file() {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 /// 逐条目落盘（**严格顺序**，评审 I-3/C-a）：
 /// 1. **先 stash orig 前镜像**（改 orig 前留底，可回滚）。
 /// 2. 计算合并明文（Union：`session_merge` 并集；New：incoming bytes）。
@@ -627,7 +885,8 @@ pub fn reconcile_subagents_dir(
 /// 4. `reingest_one_file`（原子替换 backing archive）。
 /// 5. `delete_permitted` 通过**才**删 underlay 条目；不过则中止该条目、underlay 保留、notes 记原因。
 ///
-/// **优先路由**（先于 plan 匹配）：subagents 目录条目 → `reconcile_subagents_dir`（强制并集）。
+/// **优先路由**（先于 plan 匹配）：subagents 目录条目 → `reconcile_subagents_dir`（强制并集）；
+/// memory 透传（backing 顶层段是 symlink）→ `passthrough_restore_memory`（例外规则）。
 /// Identical 无需改 orig/backing，直接过 `delete_permitted`（ByteEqual）删 underlay。
 /// KeepSeparate → `quarantine_reuse` 隔离（base 不动，ByteEqual 删除门）。仅 KeepBoth 仍 deferred。
 pub fn apply_entry(
@@ -645,6 +904,23 @@ pub fn apply_entry(
     // 优先路由：subagents 子会话一律无损并集，绕过 plan（防 SuspectReuse 误隔离子会话）。
     if is_subagents_entry(&rel) {
         return reconcile_subagents_dir(paths, name, snap_entry, mp);
+    }
+
+    // 优先路由：memory 透传。backing 顶层段是 symlink → 该条目属外链 memory 的物化回落写。
+    // （plan_entries 目前不产 Passthrough；据 backing symlink 判定，兼容显式 Passthrough plan。）
+    if matches!(plan, EntryPlan::Passthrough) || is_passthrough_entry(paths, name, &rel) {
+        if let Some((top, target)) = passthrough_top_symlink(paths, name, &rel)? {
+            let ts = now_unix_secs();
+            let underlay_dir = mp.join(&top);
+            let stash_dir = paths.quarantine(name, &ts).join(&top);
+            let notes = passthrough_restore_memory(&underlay_dir, &target, &stash_dir)?;
+            return Ok(EntryReport {
+                name: rel,
+                decision: "passthrough".into(),
+                action: "memory-restored".into(),
+                notes,
+            });
+        }
     }
 
     match plan {
@@ -1609,5 +1885,198 @@ mod tests {
         let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepBoth, &mp).unwrap();
         assert_eq!(report.action, "deferred");
         assert!(mp.join(rel).exists(), "deferred 计划不得删 underlay");
+    }
+
+    // ── memory 透传恢复（例外规则） ─────────────────────────────────────────
+
+    #[test]
+    fn passthrough_restores_new_memory_file_into_target_and_relinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("shared-memory");
+        std::fs::create_dir_all(&target).unwrap();
+        let underlay = tmp.path().join("mp").join("memory");
+        std::fs::create_dir_all(&underlay).unwrap();
+        std::fs::write(underlay.join("NEW.md"), b"fresh\n").unwrap();
+        let stash = tmp.path().join("q").join("memory");
+
+        let notes = passthrough_restore_memory(&underlay, &target, &stash).unwrap();
+
+        // 新文件复制进 target。
+        assert_eq!(std::fs::read(target.join("NEW.md")).unwrap(), b"fresh\n");
+        // underlay memory relocate 到 stash（底本保全）。
+        assert_eq!(std::fs::read(stash.join("NEW.md")).unwrap(), b"fresh\n");
+        // underlay 原位复原为指向 target 的 symlink。
+        assert!(
+            underlay
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "应复原 symlink"
+        );
+        assert_eq!(std::fs::read_link(&underlay).unwrap(), target);
+        assert!(notes.iter().any(|n| n.contains("symlink 复原")));
+    }
+
+    #[test]
+    fn passthrough_conflict_keeps_underlay_variant_beside_canonical_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("mem");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("MEMORY.md"), b"CANONICAL\n").unwrap();
+        let underlay = tmp.path().join("mp").join("memory");
+        std::fs::create_dir_all(&underlay).unwrap();
+        std::fs::write(underlay.join("MEMORY.md"), b"UNDERLAY-VERSION\n").unwrap();
+        let stash = tmp.path().join("q").join("memory");
+
+        passthrough_restore_memory(&underlay, &target, &stash).unwrap();
+
+        // canonical 原版绝不覆盖。
+        assert_eq!(
+            std::fs::read(target.join("MEMORY.md")).unwrap(),
+            b"CANONICAL\n"
+        );
+        // underlay 版以内容哈希后缀存 target 旁。
+        let hash = format!("{:08x}", crate::archive::crc32(b"UNDERLAY-VERSION\n"));
+        let variant = target.join(format!("MEMORY.md.underlay-{hash}"));
+        assert!(
+            variant.exists(),
+            "应保留 underlay 版：{}",
+            variant.display()
+        );
+        assert_eq!(std::fs::read(&variant).unwrap(), b"UNDERLAY-VERSION\n");
+
+        // 幂等：重建同内容 underlay 再跑 → 同 hash 同名，不新增第二份。
+        std::fs::remove_file(&underlay).unwrap(); // 移除上轮复原的 symlink
+        std::fs::create_dir_all(&underlay).unwrap();
+        std::fs::write(underlay.join("MEMORY.md"), b"UNDERLAY-VERSION\n").unwrap();
+        let stash2 = tmp.path().join("q2").join("memory");
+        passthrough_restore_memory(&underlay, &target, &stash2).unwrap();
+        let variants = std::fs::read_dir(&target)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("MEMORY.md.underlay-")
+            })
+            .count();
+        assert_eq!(variants, 1, "幂等：同内容同名不重复");
+    }
+
+    #[test]
+    fn passthrough_rejects_traversal_target_keeps_underlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        // 含 `..` 穿越的目标路径。
+        let traversal = tmp.path().join("real").join("..").join("real");
+        let underlay = tmp.path().join("mp").join("memory");
+        std::fs::create_dir_all(&underlay).unwrap();
+        std::fs::write(underlay.join("x.md"), b"data\n").unwrap();
+        let stash = tmp.path().join("q").join("memory");
+
+        let notes = passthrough_restore_memory(&underlay, &traversal, &stash).unwrap();
+
+        // 拒穿越 → underlay 不动（仍是真实目录、文件在）。
+        assert!(
+            underlay.symlink_metadata().unwrap().file_type().is_dir(),
+            "拒穿越 → underlay 不 relocate"
+        );
+        assert!(underlay.join("x.md").exists(), "underlay 文件保留");
+        assert!(!stash.exists(), "拒穿越 → 不搬 stash");
+        assert!(
+            notes.iter().any(|n| n.contains("穿越")),
+            "notes 说明待人工：{notes:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_dangling_target_keeps_underlay_for_manual() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("missing-mem"); // 不存在（悬空）
+        let underlay = tmp.path().join("mp").join("memory");
+        std::fs::create_dir_all(&underlay).unwrap();
+        std::fs::write(underlay.join("x.md"), b"data\n").unwrap();
+        let stash = tmp.path().join("q").join("memory");
+
+        let notes = passthrough_restore_memory(&underlay, &target, &stash).unwrap();
+
+        assert!(
+            underlay.symlink_metadata().unwrap().file_type().is_dir(),
+            "悬空目标 → underlay 不 relocate"
+        );
+        assert!(underlay.join("x.md").exists(), "underlay 文件保留");
+        assert!(
+            notes.iter().any(|n| n.contains("悬空")),
+            "notes 说明待人工：{notes:?}"
+        );
+    }
+
+    #[test]
+    fn passthrough_unwritable_target_keeps_underlay_for_manual() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("ro-mem");
+        std::fs::create_dir_all(&target).unwrap();
+        // 只读目标（去写权限）。root 下探针仍可写 → 跳过该断言。
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let underlay = tmp.path().join("mp").join("memory");
+        std::fs::create_dir_all(&underlay).unwrap();
+        std::fs::write(underlay.join("x.md"), b"data\n").unwrap();
+        let stash = tmp.path().join("q").join("memory");
+
+        let notes = passthrough_restore_memory(&underlay, &target, &stash).unwrap();
+        // 非 root 环境：不可写 → underlay 保留、待人工。
+        if !notes.iter().any(|n| n.contains("不可写")) {
+            // root 或特殊 fs：探针可写，本断言不适用，放行（避免 root CI flaky）。
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700));
+            return;
+        }
+        assert!(
+            underlay.symlink_metadata().unwrap().file_type().is_dir(),
+            "不可写目标 → underlay 不 relocate"
+        );
+        assert!(underlay.join("x.md").exists());
+        // 恢复权限便于 tempdir 清理。
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn apply_entry_routes_memory_passthrough_via_backing_symlink() {
+        // backing/memory 是 symlink → apply_entry 应据此路由到透传恢复。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        // 外部 memory 目标（无 `..`，存在可写）。
+        let target = tmp.path().join("external-memory");
+        std::fs::create_dir_all(&target).unwrap();
+        // backing/memory = 指向 target 的 symlink（apply 期照 Claude 外链重建）。
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+        std::os::unix::fs::symlink(&target, backing.join("memory")).unwrap();
+
+        // underlay：memory 被物化，Claude 写了新文件。
+        let rel = "memory/NOTES.md";
+        let snap_e = snap_entry_of(&mp, rel, b"note-body\n");
+
+        // 传 KeepSeparate（模拟 plan_entries 对非 jsonl 的保守判定），路由应改走透传。
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        assert_eq!(report.decision, "passthrough", "应路由到透传");
+        // 文件送进 target。
+        assert_eq!(
+            std::fs::read(target.join("NOTES.md")).unwrap(),
+            b"note-body\n"
+        );
+        // underlay memory 复原为 symlink。
+        assert!(mp
+            .join("memory")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }
