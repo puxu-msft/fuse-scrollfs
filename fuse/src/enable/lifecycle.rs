@@ -206,6 +206,7 @@ pub fn apply(
 
 /// 还原：卸载 → 删空挂载点 → 还原源备份。幂等、零丢失；backing 保留（另 purge）。
 pub fn restore(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<()> {
+    bail_if_reconciling(paths, name)?;
     let mp = paths.mountpoint(name);
     let orig = paths.orig(name);
     if !orig.exists() {
@@ -241,6 +242,7 @@ pub fn restore(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
 
 /// 重挂（守护崩溃/重启后）。已挂跳过；stale endpoint 先卸载；须 backing 已提交。
 pub fn remount(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<()> {
+    bail_if_reconciling(paths, name)?;
     let mp = paths.mountpoint(name);
     if mounter.is_mounted(&mp) && discovery::endpoint_ok(&mp) {
         return Ok(()); // 幂等。
@@ -289,6 +291,7 @@ pub fn remount_all(
 
 /// 离线压实某项目 backing：卸载（若挂着）→ compact → 恢复挂载。回收空间。
 pub fn compact(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<String> {
+    bail_if_reconciling(paths, name)?;
     let meta = committed_meta(paths, name)?;
     let backing = paths.backing(name, meta.backend);
     maintain(paths, name, &meta, mounter, "compact", move || {
@@ -328,6 +331,7 @@ pub fn seal(
     level: i32,
     mounter: &dyn Mounter,
 ) -> io::Result<String> {
+    bail_if_reconciling(paths, name)?;
     let meta = committed_meta(paths, name)?;
     if meta.backend != Backend::Shadow {
         return Err(err("seal 仅支持 shadow 布局".into()));
@@ -370,6 +374,7 @@ pub fn reingest(
     force: bool,
     mounter: &dyn Mounter,
 ) -> io::Result<String> {
+    bail_if_reconciling(paths, name)?;
     let meta = committed_meta(paths, name)?;
     if meta.backend != Backend::Shadow {
         return Err(err(
@@ -525,6 +530,16 @@ fn committed_meta(paths: &Paths, name: &str) -> io::Result<Meta> {
     discovery::read_meta(&paths.meta_path(name))?
         .filter(|m| m.committed)
         .ok_or_else(|| err(format!("{name} 未切换/未提交，无法维护")))
+}
+
+/// reconcile 进行中让路（评审 I-4）：`back_root/<name>.reconciling` 标记存在即 Err，避免生命周期
+/// 维护（restore/reingest/compact/seal/remount）作用在正被 reconcile 半改写的 orig 上（半改写窗口
+/// 内 orig 可能只并入部分条目，此刻 restore 会把不一致的 orig 还原、reingest 会据半改写重建 backing）。
+fn bail_if_reconciling(paths: &Paths, name: &str) -> io::Result<()> {
+    if paths.reconciling_marker(name).exists() {
+        return Err(err(format!("{name} 正在 reconcile，请稍后重试")));
+    }
+    Ok(())
 }
 
 /// 卸载后等守护进程真正退出（释放 redb 排他锁 / 落盘）。轮询 pid-file 的 pid 直至不存活或超时（≤3s）。
@@ -720,6 +735,42 @@ mod tests {
     use super::*;
     use crate::enable::daemon::fake::FakeMounter;
     use crate::enable::model::ProjectStatus;
+
+    #[test]
+    fn reconciling_marker_blocks_maintenance_then_clears() {
+        // 评审 I-4：reconciling 标记存在时，生命周期维护须让路（Err "正在 reconcile"）；删标记复位。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        make_project(&paths, "demo", "a.jsonl", b"x\n".repeat(300).as_slice());
+        let m = FakeMounter::default();
+        apply(&paths, "demo", ApplyOptions::default(), true, &m).unwrap();
+
+        // 落 reconciling 标记（模拟 reconcile 进行中，半改写 orig 窗口）。
+        crate::reconcile::orchestrator::set_reconciling(&paths, "demo", true).unwrap();
+
+        for res in [
+            restore(&paths, "demo", &m),
+            remount(&paths, "demo", &m),
+            compact(&paths, "demo", &m).map(|_| ()),
+            reingest(&paths, "demo", true, &m).map(|_| ()),
+            seal(&paths, "demo", 1 << 20, 3, &m).map(|_| ()),
+        ] {
+            let e = res.unwrap_err().to_string();
+            assert!(e.contains("正在 reconcile"), "维护应让路：{e}");
+        }
+
+        // 项目未被半途改动：仍挂载、备份在、backing 在。
+        assert!(m.is_mounted(&paths.mountpoint("demo")));
+        assert!(paths.orig("demo").exists());
+
+        // 删标记 → 维护恢复可用（restore 成功还原）。
+        crate::reconcile::orchestrator::set_reconciling(&paths, "demo", false).unwrap();
+        restore(&paths, "demo", &m).unwrap();
+        assert!(
+            !paths.orig("demo").exists(),
+            "标记清除后 restore 应可正常完成"
+        );
+    }
 
     #[test]
     fn rollback_to_plain_reports_incomplete_when_backing_residue() {

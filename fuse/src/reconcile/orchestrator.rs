@@ -370,6 +370,35 @@ pub fn reingest_one_file(paths: &Paths, name: &str, rel: &str) -> io::Result<()>
     Ok(())
 }
 
+/// 落/删 **独立的 reconcile 进行中标记**（评审 I-4，**绝不改 `Meta.committed`**）。
+///
+/// `on=true`：创建 `back_root/<name>.reconciling` 空标记文件并 fsync（文件内容 + 父目录 dirent），
+/// 使「reconcile 进行中」崩溃可见——半改写 orig 期间任何生命周期维护据此让路。
+/// `on=false`：删除标记（已不存在视为成功，幂等）并 fsync 父目录，reconcile 收尾复位。
+pub fn set_reconciling(paths: &Paths, name: &str, on: bool) -> io::Result<()> {
+    validate_name(name)?;
+    let marker = paths.reconciling_marker(name);
+    if on {
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        File::create(&marker)?.sync_all()?;
+        if let Some(parent) = marker.parent() {
+            fsync_dir(parent)?;
+        }
+    } else {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(parent) = marker.parent() {
+            fsync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,5 +710,38 @@ mod tests {
         reingest_one_file(&paths, "demo", rel).unwrap();
         let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
         assert_eq!(read_archive(&backing_file), b"{\"new\":true}\n");
+    }
+
+    #[test]
+    fn set_reconciling_toggles_marker_without_touching_committed() {
+        // 评审 I-4：reconciling 标记独立于 committed。落标记后 committed 必须原样为真；删标记复位。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let marker = paths.reconciling_marker("demo");
+        assert!(!marker.exists(), "初始无标记");
+
+        set_reconciling(&paths, "demo", true).unwrap();
+        assert!(marker.exists(), "on 应落标记文件");
+        // committed 不受影响（仍为真）。
+        assert!(
+            discovery::read_meta(&paths.meta_path("demo"))
+                .unwrap()
+                .is_some_and(|m| m.committed),
+            "set_reconciling 绝不改 committed"
+        );
+
+        // 幂等：重复 off（含标记不存在）不报错。
+        set_reconciling(&paths, "demo", false).unwrap();
+        assert!(!marker.exists(), "off 应删标记");
+        set_reconciling(&paths, "demo", false).unwrap();
+    }
+
+    #[test]
+    fn set_reconciling_rejects_traversal_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let e = set_reconciling(&paths, "../escape", true).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     }
 }

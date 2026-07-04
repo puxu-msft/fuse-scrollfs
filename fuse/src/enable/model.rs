@@ -104,6 +104,15 @@ impl Paths {
     pub fn reconcile_lock(&self, name: &str) -> PathBuf {
         self.back_root().join(format!("{name}.reconcile.lock"))
     }
+
+    /// reconcile 进行中标记 sidecar = `back_root/<name>.reconciling`（评审 I-4）。
+    ///
+    /// **独立于** `committed` 提交标记：reconcile 会原子改写 orig（半改写窗口），此标记存在即示意
+    /// 生命周期维护操作（restore/reingest/compact/seal/remount）让路，避免作用在半改写的 orig 上。
+    /// 绝不改 `Meta.committed`（committed 语义是「backing 已灌入完成、可挂载」，与 reconcile 正交）。
+    pub fn reconciling_marker(&self, name: &str) -> PathBuf {
+        self.back_root().join(format!("{name}.reconciling"))
+    }
 }
 
 /// 校验用户提供的项目 `name` 为 projects_root 下的**单一目录段**，拒绝路径穿越。

@@ -24,6 +24,9 @@ pub struct ProjectInfo {
     pub name: String,
     pub status: ProjectStatus,
     pub meta: Option<Meta>,
+    /// reconcile 进行中标记（`back_root/<name>.reconciling`）存在（评审 I-4）。独立于 `status`：
+    /// 标记存在示意 orig 正被 reconcile 半改写，list 展示（Task 11）与生命周期让路据此判定。
+    pub reconciling: bool,
 }
 
 impl ProjectInfo {
@@ -179,10 +182,12 @@ pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
     let meta = read_meta(&paths.meta_path(name)).ok().flatten();
     let committed = meta.as_ref().map(|m| m.committed).unwrap_or(false);
     let status = classify(orig_exists, mounted, health, committed);
+    let reconciling = paths.reconciling_marker(name).exists();
     ProjectInfo {
         name: name.to_string(),
         status,
         meta,
+        reconciling,
     }
 }
 
@@ -637,6 +642,23 @@ mod tests {
         assert!(read_meta(&dir.path().join("none.zipfs.meta"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn probe_reports_reconciling_when_marker_present() {
+        // 评审 I-4：probe 填充 reconciling 字段（back_root/<name>.reconciling 存在即真）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        // 无标记 → false。
+        assert!(!probe(&paths, "demo").reconciling);
+        // 落标记 → probe 报 reconciling=true（status 仍由 classify 独立决定）。
+        fs::create_dir_all(paths.back_root()).unwrap();
+        fs::write(paths.reconciling_marker("demo"), b"").unwrap();
+        assert!(probe(&paths, "demo").reconciling);
     }
 
     #[test]
