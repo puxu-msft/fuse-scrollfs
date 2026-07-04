@@ -674,12 +674,13 @@ pub fn reconcile_subagents_dir(
 /// 安置规则（canonical 原版**绝不覆盖**、冲突**绝不静默丢**）：
 /// - target 无同名 → 复制进 target（fsync + readback 校验）。
 /// - target 同名**同内容** → 幂等 no-op。
-/// - target 同名**异内容** → 不合并；underlay 版以 `<name>.underlay-<crc8>` 存在 target 旁（幂等：同内容
-///   → 同名不重复），canonical 原版原样不动。
+/// - target 同名**异内容** → 不合并；underlay 版以 `<name>.underlay-<crc32>` 存在 target 旁（幂等：同内容
+///   → 同名不重复；crc32 碰撞异内容 → 序号消歧不覆盖），canonical 原版原样不动。
 ///
 /// 全部安置且校验后：把 underlay 整目录 relocate 到 `stash_dir`（rename，跨卷回落递归拷+删；保全审计/回滚
-/// 底本），再在 underlay 原位复原指向 `symlink_target` 的 symlink。underlay 目录不存在（已恢复/无回落）→
-/// 幂等返回。返回逐步骤 notes（审计）。
+/// 底本）并 fsync 目录链，再在 underlay 原位复原指向 `symlink_target` 的 symlink（fsync 父目录）。underlay
+/// 目录不存在/已是 symlink（已恢复/无回落）→ 幂等返回。相对 `symlink_target` 按 symlink 所在目录（而非进程
+/// CWD）解析。返回逐步骤 notes（审计）。
 pub fn passthrough_restore_memory(
     underlay_dir: &Path,
     symlink_target: &Path,
@@ -699,8 +700,18 @@ pub fn passthrough_restore_memory(
         return Ok(notes);
     }
 
+    // 相对目标按 symlink 所在目录（= underlay_dir 父目录，symlink 将在此复原）解析，而非进程 CWD（评审 M1）。
+    let target_to_resolve: PathBuf = if symlink_target.is_absolute() {
+        symlink_target.to_path_buf()
+    } else {
+        match underlay_dir.parent() {
+            Some(base) => base.join(symlink_target),
+            None => symlink_target.to_path_buf(),
+        }
+    };
+
     // 路径安全 2：canonicalize（悬空/不存在即失败）。
-    let canon_target = match std::fs::canonicalize(symlink_target) {
+    let canon_target = match std::fs::canonicalize(&target_to_resolve) {
         Ok(p) => p,
         Err(e) => {
             notes.push(format!(
@@ -764,14 +775,19 @@ pub fn passthrough_restore_memory(
     place_memory_files(underlay_dir, underlay_dir, &canon_target, &mut notes)?;
 
     // 全部安置后：underlay 整目录 relocate 到 stash（保全底本），再复原 symlink。
+    // 崩溃持久化纪律（评审 M3）：relocate 后 fsync stash 父目录记 rename dirent，复原 symlink 后 fsync
+    // underlay 父目录记新 symlink dirent（均传播错误，与本文件其余落盘链一致）。
     relocate_dir(underlay_dir, stash_dir)?;
+    if let Some(parent) = stash_dir.parent() {
+        fsync_dir(parent)?;
+    }
     notes.push(format!(
         "underlay memory relocate 到 stash：{}",
         stash_dir.display()
     ));
     std::os::unix::fs::symlink(symlink_target, underlay_dir)?;
     if let Some(parent) = underlay_dir.parent() {
-        let _ = fsync_dir(parent);
+        fsync_dir(parent)?;
     }
     notes.push(format!(
         "symlink 复原：{} → {}",
@@ -781,18 +797,47 @@ pub fn passthrough_restore_memory(
     Ok(notes)
 }
 
+/// 据 `passthrough_restore_memory` 的 notes 归纳 `EntryReport.action`（评审 M4，如实反映结果）：
+/// 含「symlink 复原」→ `memory-restored`；含「幂等跳过/已恢复/不存在」→ `memory-noop`；否则
+///（路径安全闸拦截、underlay 未动）→ `memory-deferred`（待人工）。
+fn passthrough_action(notes: &[String]) -> &'static str {
+    if notes.iter().any(|n| n.contains("symlink 复原")) {
+        "memory-restored"
+    } else if notes
+        .iter()
+        .any(|n| n.contains("幂等跳过") || n.contains("已恢复") || n.contains("不存在"))
+    {
+        "memory-noop"
+    } else {
+        "memory-deferred"
+    }
+}
+
 /// 在目录 `dir` 内建临时探针文件再删，判定可写。仅探测写权限，不留痕。
+///
+/// 探针名带 pid + 纳秒（评审 M2）：memory target 常是跨项目共享目录，`reconcile_lock` 只按项目名串行，
+/// 两项目并发时固定探针名会互删致 `remove_file` 撞 `NotFound`。唯一名 + 容忍 `NotFound` 清理 → 不误判。
 fn probe_writable(dir: &Path) -> io::Result<()> {
-    let probe = dir.join(".zipfs-memory-write-probe");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".zipfs-memory-write-probe.{}.{nanos}",
+        std::process::id()
+    ));
     File::create(&probe)?;
-    std::fs::remove_file(&probe)?;
-    Ok(())
+    match std::fs::remove_file(&probe) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// 递归把 `dir` 下的文件安置进 `canon_target`（`root` 是 underlay memory 根，算 rel 用）。
 ///
-/// 新增 → 复制 + fsync + readback；同名同内容 → 幂等跳过；同名异内容 → `<name>.underlay-<crc8>`
-/// 存 target 旁（canonical 不动）。所有 rel 组件来自 `read_dir`（天然无 `..`），仍显式跳过非常规文件。
+/// 新增 → 复制 + fsync + readback；同名同内容 → 幂等跳过；同名异内容 → `<name>.underlay-<crc32>`
+/// 存 target 旁（canonical 不动，crc32 碰撞序号消歧）。所有 rel 组件来自 `read_dir`（天然无 `..`），仍显式跳过非常规文件。
 fn place_memory_files(
     root: &Path,
     dir: &Path,
@@ -834,29 +879,57 @@ fn place_memory_files(
                 notes.push(format!("memory 已存在同内容，跳过：target/{rel_disp}"));
             }
             Ok(_) => {
+                // 冲突：canonical 绝不覆盖。underlay 版以 `<name>.underlay-<crc32>` 存 target 旁。
+                // crc32 碰撞（异内容同摘要）时用递增序号消歧，**绝不覆盖已保留的异内容副本**（评审 H2）。
                 let hash8 = format!("{:08x}", crate::archive::crc32(&content));
-                let variant = variant_path(&dest, &hash8);
-                // 幂等：同内容 → 同名；已存在同内容则不重复写。
-                let already = matches!(std::fs::read(&variant), Ok(b) if b == content);
-                if !already {
-                    atomic_write(&variant, &content)?;
-                    if !readback_eq(&variant, &content)? {
-                        return Err(io::Error::other(format!(
-                            "memory 冲突副本 {rel_disp} 后 readback 不符"
-                        )));
+                match resolve_variant_slot(&dest, &hash8, &content)? {
+                    None => notes.push(format!(
+                        "memory 冲突副本已存在同内容，幂等跳过：target/{rel_disp}"
+                    )),
+                    Some(variant) => {
+                        atomic_write(&variant, &content)?;
+                        if !readback_eq(&variant, &content)? {
+                            return Err(io::Error::other(format!(
+                                "memory 冲突副本 {rel_disp} 后 readback 不符"
+                            )));
+                        }
+                        notes.push(format!(
+                            "memory 冲突（canonical 保留）→ target 旁 {}",
+                            variant
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default()
+                        ));
                     }
                 }
-                notes.push(format!(
-                    "memory 冲突（canonical 保留）→ target 旁 {}",
-                    variant
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                ));
             }
         }
     }
     Ok(())
+}
+
+/// 为冲突 underlay 版求一个不覆盖任何**异内容**副本的落点（评审 H2 抗 crc32 碰撞）。
+///
+/// 先试 `<name>.underlay-<hash8>`：不存在 → 用它；已存在同内容 → `None`（幂等跳过）；已存在异内容
+///（crc32 碰撞）→ 追加 `-1`/`-2`… 序号继续找，直到空槽或同内容槽。返回 `Some(空槽)` 或 `None`（已有同内容）。
+fn resolve_variant_slot(dest: &Path, hash8: &str, content: &[u8]) -> io::Result<Option<PathBuf>> {
+    let base = variant_path(dest, hash8);
+    match std::fs::read(&base) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(base)),
+        Err(e) => return Err(e),
+        Ok(b) if b == content => return Ok(None),
+        Ok(_) => {}
+    }
+    let mut n = 1u32;
+    loop {
+        let cand = variant_path(dest, &format!("{hash8}-{n}"));
+        match std::fs::read(&cand) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(cand)),
+            Err(e) => return Err(e),
+            Ok(b) if b == content => return Ok(None),
+            Ok(_) => n += 1,
+        }
+    }
 }
 
 /// 在 `dest` 同目录、同文件名后缀 `.underlay-<hash8>` 的冲突副本路径。
@@ -882,7 +955,9 @@ fn relocate_dir(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// 递归拷贝目录（跨卷 relocate 回落用）。仅拷常规文件与目录，跳过其它类型。
+/// 递归拷贝目录（跨卷 relocate 回落用）。常规文件 `copy`、目录递归、symlink 照原样重建；遇 FIFO/
+/// socket/设备等**无法安全拷贝的特殊类型直接报错中止**——`relocate_dir` 会因此在 `remove_dir_all`
+/// **之前**失败、保源不删，杜绝「跳过特殊文件 → 删源 → 底本缺该文件」的零丢失破口（评审 H1）。
 fn copy_dir_recursive(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::create_dir_all(to)?;
     for dent in std::fs::read_dir(from)? {
@@ -894,6 +969,13 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> io::Result<()> {
             copy_dir_recursive(&src, &dst)?;
         } else if ft.is_file() {
             std::fs::copy(&src, &dst)?;
+        } else if ft.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+        } else {
+            return Err(io::Error::other(format!(
+                "跨卷 relocate 遇不可拷贝的特殊文件 {}，中止（保源不删，待人工）",
+                src.display()
+            )));
         }
     }
     Ok(())
@@ -935,10 +1017,12 @@ pub fn apply_entry(
             let underlay_dir = mp.join(&top);
             let stash_dir = paths.quarantine(name, &ts).join(&top);
             let notes = passthrough_restore_memory(&underlay_dir, &target, &stash_dir)?;
+            // 据结果如实报 action（评审 M4）：路径安全闸未过时 underlay 未动，不能谎报 restored。
+            let action = passthrough_action(&notes);
             return Ok(EntryReport {
                 name: rel,
                 decision: "passthrough".into(),
-                action: "memory-restored".into(),
+                action: action.into(),
                 notes,
             });
         }
@@ -2126,7 +2210,7 @@ mod tests {
         assert_eq!(std::fs::read(target.join("B.md")).unwrap(), b"bbb\n");
 
         let r2 = apply_entry(&paths, "demo", &e2, &EntryPlan::KeepSeparate, &mp).unwrap();
-        assert_eq!(r2.action, "memory-restored");
+        assert_eq!(r2.action, "memory-noop", "次条应如实报 noop");
         assert!(
             r2.notes.iter().any(|n| n.contains("幂等跳过")),
             "次条应幂等跳过：{:?}",
@@ -2139,5 +2223,59 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn apply_entry_memory_deferred_action_when_target_dangling() {
+        // 评审 M4：路径安全闸拦截（悬空目标）时 underlay 未动，action 必须如实为 memory-deferred。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+        // backing/memory 指向不存在的目标（悬空）。
+        std::os::unix::fs::symlink(tmp.path().join("gone-mem"), backing.join("memory")).unwrap();
+        let e = snap_entry_of(&mp, "memory/N.md", b"n\n");
+
+        let report = apply_entry(&paths, "demo", &e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        assert_eq!(report.decision, "passthrough");
+        assert_eq!(report.action, "memory-deferred", "悬空 → 不能谎报 restored");
+        // underlay 文件保留（未动）。
+        assert!(mp.join("memory/N.md").exists(), "悬空目标 → underlay 保留");
+    }
+
+    #[test]
+    fn passthrough_conflict_crc_collision_disambiguates_without_overwrite() {
+        // 评审 H2：模拟同 crc32 摘要下异内容不覆盖——预置一个占位变体（异内容），跑冲突安置后
+        // 两个异内容变体并存（占位版 + 新序号版），无一被覆盖。
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("mem");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("M.md"), b"CANON\n").unwrap();
+        let underlay = tmp.path().join("mp").join("memory");
+        std::fs::create_dir_all(&underlay).unwrap();
+        std::fs::write(underlay.join("M.md"), b"UNDER-A\n").unwrap();
+        // 预置：占据 <name>.underlay-<crc(UNDER-A)> 槽，但内容不同（模拟碰撞）。
+        let hash = format!("{:08x}", crate::archive::crc32(b"UNDER-A\n"));
+        let squatter = target.join(format!("M.md.underlay-{hash}"));
+        std::fs::write(&squatter, b"COLLISION-OTHER\n").unwrap();
+        let stash = tmp.path().join("q").join("memory");
+
+        passthrough_restore_memory(&underlay, &target, &stash).unwrap();
+
+        // 占位版（异内容）绝不被覆盖。
+        assert_eq!(std::fs::read(&squatter).unwrap(), b"COLLISION-OTHER\n");
+        // UNDER-A 落到序号消歧槽。
+        let disambig = target.join(format!("M.md.underlay-{hash}-1"));
+        assert!(
+            disambig.exists(),
+            "应序号消歧不覆盖：{}",
+            disambig.display()
+        );
+        assert_eq!(std::fs::read(&disambig).unwrap(), b"UNDER-A\n");
+        // canonical 不动。
+        assert_eq!(std::fs::read(target.join("M.md")).unwrap(), b"CANON\n");
     }
 }
