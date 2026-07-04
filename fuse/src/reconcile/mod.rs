@@ -2,4 +2,5 @@
 pub mod advisor;
 pub mod guard;
 pub mod merge;
+pub mod orchestrator;
 pub mod record;

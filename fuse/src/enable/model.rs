@@ -83,6 +83,27 @@ impl Paths {
         p.push(PID_SUFFIX);
         PathBuf::from(p)
     }
+
+    /// reconcile 快照暂存目录 = `zipfs_home/reconcile-stash/<name>/<ts>`。
+    /// underlay 拍下的不可变快照落此处（合并输入与删前复核的唯一基准）；按 `ts` 分代便于审计/清理。
+    pub fn reconcile_stash(&self, name: &str, ts: &str) -> PathBuf {
+        self.zipfs_home.join("reconcile-stash").join(name).join(ts)
+    }
+
+    /// reconcile 隔离区 = `zipfs_home/reconcile-quarantine/<name>/<ts>`。
+    /// 合并冲突/超限降级为 KeepBoth 的条目搬此处保全（绝不静默丢弃），供人工核查。
+    pub fn quarantine(&self, name: &str, ts: &str) -> PathBuf {
+        self.zipfs_home
+            .join("reconcile-quarantine")
+            .join(name)
+            .join(ts)
+    }
+
+    /// reconcile 串行锁 = `back_root/<name>.reconcile.lock`。**独立于** backing `.zipfs.lock`：
+    /// 仅串行化并发 reconcile 彼此，不参与挂载互斥（后者靠 underlay-empty 守卫 + reconciling 标记）。
+    pub fn reconcile_lock(&self, name: &str) -> PathBuf {
+        self.back_root().join(format!("{name}.reconcile.lock"))
+    }
 }
 
 /// 校验用户提供的项目 `name` 为 projects_root 下的**单一目录段**，拒绝路径穿越。
