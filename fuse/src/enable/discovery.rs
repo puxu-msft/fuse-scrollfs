@@ -24,6 +24,13 @@ pub struct ProjectInfo {
     pub name: String,
     pub status: ProjectStatus,
     pub meta: Option<Meta>,
+    /// reconcile 进行中标记（`back_root/<name>.reconciling`）存在（评审 I-4）。独立于 `status`：
+    /// 标记存在示意 orig 正被 reconcile 半改写，list 展示（Task 11）与生命周期让路据此判定。
+    pub reconciling: bool,
+    /// 需重合并：`status == Stopped` 且 underlay 含停用期回落写（fall-through 条目）。示意有 Claude
+    /// 直接写进挂载点 underlay 的 jsonl 等，remount 前须先 `enable reconcile` 合并（否则守卫拒挂）。
+    /// 仅在 Stopped（未挂载，mp 即真实 underlay）时探测；探测出错保守取 false，不阻断 list。
+    pub needs_reconcile: bool,
 }
 
 impl ProjectInfo {
@@ -33,6 +40,19 @@ impl ProjectInfo {
             .as_ref()
             .map(|m| m.backend)
             .unwrap_or(Backend::Shadow)
+    }
+
+    /// STATUS 列显示串：基础状态标签叠加 reconcile 标记。`reconciling`（正在处理中）优先级高于
+    /// `needs_reconcile`（待处理）。抽成纯函数便于单测（list/status 渲染共用，杜绝两处漂移）。
+    pub fn status_display(&self) -> String {
+        let base = self.status.label();
+        if self.reconciling {
+            format!("{base} RECONCILING")
+        } else if self.needs_reconcile {
+            format!("{base} NEEDS-RECONCILE")
+        } else {
+            base.to_string()
+        }
     }
 }
 
@@ -179,10 +199,23 @@ pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
     let meta = read_meta(&paths.meta_path(name)).ok().flatten();
     let committed = meta.as_ref().map(|m| m.committed).unwrap_or(false);
     let status = classify(orig_exists, mounted, health, committed);
+    let reconciling = paths.reconciling_marker(name).exists();
+    // 仅 Stopped（未挂载，mp 即真实 underlay）才探测 fall-through；否则读 mp 是 FUSE 视图会误判，
+    // 且避免对活跃/卡死挂载做多余 read_dir。探测出错保守取 false（不阻断 list），并 warn。
+    let needs_reconcile = status == ProjectStatus::Stopped
+        && match crate::reconcile::guard::underlay_has_fallthrough(&mp) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("探测 {name} underlay 回落写失败（保守视为无需重合并）：{e}");
+                false
+            }
+        };
     ProjectInfo {
         name: name.to_string(),
         status,
         meta,
+        reconciling,
+        needs_reconcile,
     }
 }
 
@@ -637,6 +670,111 @@ mod tests {
         assert!(read_meta(&dir.path().join("none.zipfs.meta"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn probe_reports_reconciling_when_marker_present() {
+        // 评审 I-4：probe 填充 reconciling 字段（back_root/<name>.reconciling 存在即真）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        // 无标记 → false。
+        assert!(!probe(&paths, "demo").reconciling);
+        // 落标记 → probe 报 reconciling=true（status 仍由 classify 独立决定）。
+        fs::create_dir_all(paths.back_root()).unwrap();
+        fs::write(paths.reconciling_marker("demo"), b"").unwrap();
+        assert!(probe(&paths, "demo").reconciling);
+    }
+
+    /// 构造一个 STOPPED 项目（orig 备份存在、未挂载、mp 可 stat、backing committed=1）的隔离 Paths。
+    /// 返回 (tempdir 守卫, paths)；调用方按需往 mp（underlay）里写 fall-through 文件。
+    fn stopped_project(name: &str) -> (tempfile::TempDir, Paths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        fs::create_dir_all(paths.mountpoint(name)).unwrap(); // underlay（未挂载即真实目录）
+        fs::create_dir_all(paths.orig(name)).unwrap(); // orig 备份存在 → 已 apply 过
+        fs::create_dir_all(paths.back_root()).unwrap();
+        let meta = Meta {
+            committed: true,
+            ..Meta::default()
+        };
+        write_meta(&paths.meta_path(name), &meta).unwrap(); // committed=1 → Stopped 而非 Broken
+        (tmp, paths)
+    }
+
+    #[test]
+    fn probe_needs_reconcile_when_stopped_and_underlay_has_fallthrough() {
+        // Task 11：STOPPED 且 underlay 含停用期回落写 → needs_reconcile=true。
+        let (_g, paths) = stopped_project("demo");
+        fs::write(paths.mountpoint("demo").join("s.jsonl"), b"{}\n").unwrap();
+        let info = probe(&paths, "demo");
+        assert_eq!(info.status, ProjectStatus::Stopped, "前置：应为 Stopped");
+        assert!(
+            info.needs_reconcile,
+            "STOPPED + 非空 underlay 应标 needs_reconcile"
+        );
+    }
+
+    #[test]
+    fn probe_no_needs_reconcile_when_underlay_empty_or_only_harmless() {
+        // 空 underlay（或仅无害隐藏项）→ false，即便 Stopped。
+        let (_g, paths) = stopped_project("demo");
+        assert_eq!(probe(&paths, "demo").status, ProjectStatus::Stopped);
+        assert!(
+            !probe(&paths, "demo").needs_reconcile,
+            "空 underlay 不应标记"
+        );
+        // 仅无害隐藏项（.fuse_hidden）也放行。
+        fs::write(paths.mountpoint("demo").join(".fuse_hidden0001"), b"").unwrap();
+        assert!(
+            !probe(&paths, "demo").needs_reconcile,
+            "仅无害隐藏项不应标记"
+        );
+    }
+
+    #[test]
+    fn probe_no_needs_reconcile_when_not_stopped() {
+        // 非 Stopped（如 Plain：无 orig 备份）即便 underlay 非空也不标（仅 Stopped 才探测）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        fs::write(paths.mountpoint("demo").join("s.jsonl"), b"{}\n").unwrap();
+        let info = probe(&paths, "demo");
+        assert_eq!(info.status, ProjectStatus::Plain, "无 orig → Plain");
+        assert!(!info.needs_reconcile, "非 Stopped 不探测 underlay，不标记");
+    }
+
+    #[test]
+    fn status_display_combines_markers_with_reconciling_priority() {
+        // 纯函数：RECONCILING 优先级高于 NEEDS-RECONCILE；二者与基础状态标签组合。
+        let base = ProjectInfo {
+            name: "demo".into(),
+            status: ProjectStatus::Stopped,
+            meta: None,
+            reconciling: false,
+            needs_reconcile: false,
+        };
+        assert_eq!(base.status_display(), "STOPPED");
+        let needs = ProjectInfo {
+            needs_reconcile: true,
+            ..base.clone()
+        };
+        assert_eq!(needs.status_display(), "STOPPED NEEDS-RECONCILE");
+        let reconciling = ProjectInfo {
+            reconciling: true,
+            needs_reconcile: true, // 同时置位时 RECONCILING 胜出
+            ..base.clone()
+        };
+        assert_eq!(reconciling.status_display(), "STOPPED RECONCILING");
     }
 
     #[test]

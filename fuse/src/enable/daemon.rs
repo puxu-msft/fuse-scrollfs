@@ -71,6 +71,9 @@ pub struct RealMounter;
 
 impl Mounter for RealMounter {
     fn spawn(&self, spec: &MountSpec) -> std::io::Result<()> {
+        // 挂载前最后一道守卫：underlay 含停用期 fall-through 回落写即拒（评审 C1/I-6，单点下沉）。
+        crate::reconcile::guard::ensure_underlay_empty(&spec.mountpoint)?;
+
         // 删除任何 stale pid 文件，避免读到陈旧 pid（评审 H3）。
         let _ = std::fs::remove_file(&spec.pid_file);
 

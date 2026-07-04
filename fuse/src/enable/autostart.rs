@@ -30,11 +30,22 @@ pub fn run(home: &Path, cmd: AutostartCmd) -> io::Result<()> {
 }
 
 /// per-project 模板单元 `zipfs@.service` 正文。`%i` = systemd 实例字符串（escaped），
-/// `mount-managed`/`umount-managed` 在 Rust 侧 unescape 回原名。`Type=notify` 依赖守护
+/// `mount-managed`/`umount-managed`/`guard-check` 在 Rust 侧 unescape 回原名。`Type=notify` 依赖守护
 /// 的 sd_notify READY（main.rs serve 路径）；`WatchdogSec` 启用心跳监管；`Restart=on-failure`
 /// 崩溃自愈。
+///
+/// **防 crash-loop 双层守卫（Task 12）**，把「underlay 含停用期回落写」这一需人工的稳定态既 fail-closed
+/// 又不 crash-loop：
+/// - `ExecCondition=... enable guard-check`：在 ExecStart 前显式守卫。underlay 非空时以独特码 75 退出；
+///   `ExecCondition` 控制进程以 1–254 退出使 unit **skipped（非 failed）**，故 `Restart=on-failure` **不触发**
+///   （这是正确的 systemd 原语——`RestartPreventExitStatus` 只作用于**主进程**，对 `ExecStartPre`/`ExecCondition`
+///   控制进程无效，见 systemd.service(5)，故不能用 `ExecStartPre` 承担此职）。
+/// - `RestartPreventExitStatus={guard_exit}`：兜底 **ExecStart 主进程**（`run_mount_managed`）自身的 underlay
+///   守卫——覆盖 `ExecCondition` 通过后到真正挂载之间 underlay 又生回落写的 TOCTOU 窗口；主进程以 75 退出时
+///   本项拦住 Restart（对主进程有效）。两层都指向同一独特码，正确防风暴。
 fn template_unit_body(exe: &Path) -> String {
     let exe = exe.display();
+    let guard_exit = crate::enable::model::GUARD_CHECK_NEEDS_RECONCILE_EXIT;
     format!(
         "# zipfs per-project 托管模板（生成自 `zipfs enable autostart install`）。\n\
          # 实例名 = systemd-escaped 的 Claude 项目目录名；用 `systemctl --user enable zipfs@<esc>` 接管。\n\
@@ -43,10 +54,12 @@ fn template_unit_body(exe: &Path) -> String {
          After=default.target\n\n\
          [Service]\n\
          Type=notify\n\
+         ExecCondition={exe} enable guard-check --name %i\n\
          ExecStart={exe} mount-managed --name %i\n\
          ExecStop={exe} umount-managed --name %i --level auto\n\
          Restart=on-failure\n\
          RestartSec=2\n\
+         RestartPreventExitStatus={guard_exit}\n\
          WatchdogSec=30\n\n\
          [Install]\n\
          WantedBy=default.target\n"
@@ -181,5 +194,29 @@ mod tests {
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("WatchdogSec=30"));
         assert!(body.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn template_unit_body_has_guard_check_execcondition_and_restart_prevent() {
+        // Task 12：ExecCondition 守卫 + RestartPreventExitStatus 防 crash-loop。ExecCondition（非
+        // ExecStartPre）是关键——控制进程 1–254 退出使 unit skipped 不重启，而 RestartPreventExitStatus
+        // 只对主进程有效，故 ExecStartPre 无法防风暴（systemd.service(5)）。
+        let body = template_unit_body(Path::new("/usr/bin/zipfs"));
+        assert!(
+            body.contains("ExecCondition=/usr/bin/zipfs enable guard-check --name %i"),
+            "应含 ExecCondition guard-check（而非 ExecStartPre）"
+        );
+        assert!(
+            !body.contains("ExecStartPre="),
+            "不应用 ExecStartPre（RestartPreventExitStatus 对控制进程无效，会 crash-loop）"
+        );
+        assert!(
+            body.contains("RestartPreventExitStatus=75"),
+            "应含 RestartPreventExitStatus=75 拦住主进程 ExecStart 守卫的退出码"
+        );
+        // ExecCondition 必须排在 ExecStart 之前（systemd 按书写顺序执行前置钩子）。
+        let cond = body.find("ExecCondition=").expect("有 ExecCondition");
+        let start = body.find("ExecStart=").expect("有 ExecStart");
+        assert!(cond < start, "ExecCondition 应排在 ExecStart 之前");
     }
 }

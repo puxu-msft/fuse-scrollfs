@@ -12,6 +12,7 @@ pub mod enable;
 pub mod fixture;
 pub mod ingest;
 pub mod passthrough;
+pub mod reconcile;
 pub mod rwfs;
 pub mod seal;
 pub mod store;

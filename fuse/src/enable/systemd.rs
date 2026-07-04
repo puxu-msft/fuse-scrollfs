@@ -133,6 +133,10 @@ pub struct SystemdMounter;
 
 impl crate::enable::daemon::Mounter for SystemdMounter {
     fn spawn(&self, spec: &crate::enable::daemon::MountSpec) -> std::io::Result<()> {
+        // 挂载前最后一道守卫：underlay 含停用期 fall-through 回落写即拒（评审 C1/I-6）。
+        // 覆盖经 orchestrator 主动 `systemctl start` 的编排路径；systemd 开机自启路径另在
+        // `run_mount_managed` 兜底（该路径不经本函数，见 main.rs 注释）。
+        crate::reconcile::guard::ensure_underlay_empty(&spec.mountpoint)?;
         // 先 reset-failed 清掉上次失败计数，否则触发 start-limit 时 start 直接被拒（评审建议）。
         let _ = run_systemctl(&systemctl_args("reset-failed", &spec.name));
         // Type=notify：start 阻塞到 main.rs sd_notify READY，比轮询更可靠。
