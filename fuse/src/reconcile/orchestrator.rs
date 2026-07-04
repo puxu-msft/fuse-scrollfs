@@ -566,6 +566,60 @@ pub fn quarantine_reuse(
     Ok(dst)
 }
 
+/// 判定快照条目是否属于 subagents 子会话目录（`<uuid>/subagents/*.jsonl`）。
+///
+/// 判据：`rel` 含名为 `subagents` 的普通路径段 **且** 以 `.jsonl` 结尾。此类条目在 `apply_entry`
+/// 里被**优先路由**到 `reconcile_subagents_dir` 强制无损并集，绕过 advisor 的 SuspectReuse→隔离——
+/// 子代理 transcript 天然按子代理分文件、uuid 各自独立，并集安全且不可按 mtime 取舍。
+fn is_subagents_entry(rel: &str) -> bool {
+    rel.ends_with(".jsonl")
+        && Path::new(rel).components().any(
+            |c| matches!(c, std::path::Component::Normal(s) if s.eq_ignore_ascii_case("subagents")),
+        )
+}
+
+/// subagents 子会话 jsonl 合并（**与主 jsonl 同一 `session_merge` 规则**，但强制无损并集）：
+///
+/// orig 有对应文件 → `session_merge` 并集写回；orig 无 → 全新落盘（New）。随后 `reingest_one_file`
+/// 原子重灌 backing，最后经 `finish_delete`（LinesSuperset）删 underlay。**绝不按 mtime 删较旧者**、
+/// 同名异内容一律并集保两侧——子代理 transcript disjoint uuid 是常态（各子代理独立），并入无丢失；
+/// 隔离/取舍反而会丢子会话历史，故 subagents 一律并集。改 orig 前照旧 stash 前镜像（可回滚）。
+pub fn reconcile_subagents_dir(
+    paths: &Paths,
+    name: &str,
+    snap_entry: &EntrySnapshot,
+    mp: &Path,
+) -> io::Result<EntryReport> {
+    validate_name(name)?;
+    let rel = snap_entry.rel.clone();
+    let orig_file = paths.orig(name).join(&rel);
+    let mut notes: Vec<String> = vec!["subagents：强制无损并集（绝不按 mtime 取舍）".into()];
+
+    stash_orig_preimage(paths, name, &rel, &mut notes)?;
+    if let Some(parent) = orig_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let merged_bytes = if orig_file.exists() {
+        let base_bytes = std::fs::read(&orig_file)?;
+        let base_str = String::from_utf8_lossy(&base_bytes);
+        let inc_str = String::from_utf8_lossy(&snap_entry.bytes);
+        let merged = session_merge(base_str.as_ref(), inc_str.as_ref());
+        lines_to_bytes(&merged.merged_lines)
+    } else {
+        snap_entry.bytes.clone()
+    };
+    atomic_write(&orig_file, &merged_bytes)?;
+    reingest_one_file(paths, name, &rel)?;
+    finish_delete(
+        snap_entry,
+        &orig_file,
+        SupersetMode::LinesSuperset,
+        mp,
+        "subagents-union",
+        notes,
+    )
+}
+
 /// 逐条目落盘（**严格顺序**，评审 I-3/C-a）：
 /// 1. **先 stash orig 前镜像**（改 orig 前留底，可回滚）。
 /// 2. 计算合并明文（Union：`session_merge` 并集；New：incoming bytes）。
@@ -573,6 +627,7 @@ pub fn quarantine_reuse(
 /// 4. `reingest_one_file`（原子替换 backing archive）。
 /// 5. `delete_permitted` 通过**才**删 underlay 条目；不过则中止该条目、underlay 保留、notes 记原因。
 ///
+/// **优先路由**（先于 plan 匹配）：subagents 目录条目 → `reconcile_subagents_dir`（强制并集）。
 /// Identical 无需改 orig/backing，直接过 `delete_permitted`（ByteEqual）删 underlay。
 /// KeepSeparate → `quarantine_reuse` 隔离（base 不动，ByteEqual 删除门）。仅 KeepBoth 仍 deferred。
 pub fn apply_entry(
@@ -586,6 +641,11 @@ pub fn apply_entry(
     let rel = snap_entry.rel.clone();
     let orig_file = paths.orig(name).join(&rel);
     let mut notes: Vec<String> = Vec::new();
+
+    // 优先路由：subagents 子会话一律无损并集，绕过 plan（防 SuspectReuse 误隔离子会话）。
+    if is_subagents_entry(&rel) {
+        return reconcile_subagents_dir(paths, name, snap_entry, mp);
+    }
 
     match plan {
         EntryPlan::Union => {
@@ -1340,6 +1400,101 @@ mod tests {
             report.notes
         );
         assert_eq!(std::fs::read(&orig_file).unwrap(), content, "orig 不变");
+    }
+
+    #[test]
+    fn subagents_dir_unions_disjoint_uuids_without_mtime_delete() {
+        // subagents 同名两侧 disjoint uuid（主 jsonl 规则会判 SuspectReuse→隔离），但 subagents
+        // 强制无损并集：两侧 uuid 都保留、无一方被删。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "sess-uuid/subagents/agent-1.jsonl";
+        let base = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"sa1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-24T00:00:00.000Z\"}\n"
+        );
+        let incoming = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"sb1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-30T00:00:00.000Z\"}\n"
+        );
+        let orig_file = write_orig(&paths, "demo", rel, base.as_bytes());
+        let snap_e = snap_entry_of(&mp, rel, incoming.as_bytes());
+
+        let report = reconcile_subagents_dir(&paths, "demo", &snap_e, &mp).unwrap();
+
+        // orig 现含两侧 uuid（并集，无一方被丢）。
+        let merged = std::fs::read_to_string(&orig_file).unwrap();
+        assert!(merged.contains("sa1"), "base uuid 保留：{merged}");
+        assert!(merged.contains("sb1"), "incoming uuid 并入：{merged}");
+        // backing 重灌为并集。
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        assert_eq!(read_archive(&backing_file), merged.as_bytes());
+        // underlay 经 LinesSuperset 校验后删。
+        assert!(!mp.join(rel).exists(), "并集且校验后应删 underlay");
+        assert!(report.action.contains("underlay-removed"));
+        assert!(report.decision.contains("subagents"));
+    }
+
+    #[test]
+    fn apply_entry_routes_subagents_to_union_not_quarantine() {
+        // 即便 plan 判 KeepSeparate（disjoint uuid），subagents 路径必须优先路由到并集而非隔离。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let rel = "s/subagents/a.jsonl";
+        let base = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"x1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-24T00:00:00.000Z\"}\n"
+        );
+        let incoming = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"y1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-30T00:00:00.000Z\"}\n"
+        );
+        write_orig(&paths, "demo", rel, base.as_bytes());
+        let snap_e = snap_entry_of(&mp, rel, incoming.as_bytes());
+
+        // 传 KeepSeparate plan，但路由据 subagents 路径改走并集。
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        assert!(
+            report.decision.contains("subagents"),
+            "应优先走 subagents 并集：{}",
+            report.decision
+        );
+        let orig_file = paths.orig("demo").join(rel);
+        let merged = std::fs::read_to_string(&orig_file).unwrap();
+        assert!(
+            merged.contains("x1") && merged.contains("y1"),
+            "两侧 uuid 并集：{merged}"
+        );
+        // 未落隔离区（quarantine 未记录）。
+        assert!(
+            !report.notes.iter().any(|n| n.starts_with("quarantine=")),
+            "subagents 不应走隔离"
+        );
+    }
+
+    #[test]
+    fn subagents_new_entry_falls_to_new_when_orig_missing() {
+        // orig 无对应 subagents 文件 → New 落盘（不崩），reingest + 删 underlay。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let rel = "u/subagents/fresh.jsonl";
+        let incoming = b"{\"type\":\"summary\",\"summary\":\"s\"}\n";
+        let snap_e = snap_entry_of(&mp, rel, incoming);
+        let report = reconcile_subagents_dir(&paths, "demo", &snap_e, &mp).unwrap();
+        let orig_file = paths.orig("demo").join(rel);
+        assert_eq!(std::fs::read(&orig_file).unwrap(), incoming);
+        assert!(!mp.join(rel).exists());
+        assert!(report.action.contains("underlay-removed"));
     }
 
     #[test]
