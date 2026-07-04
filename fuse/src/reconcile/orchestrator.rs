@@ -590,14 +590,26 @@ pub fn apply_entry(
                 notes,
             )
         }
-        EntryPlan::Identical => finish_delete(
-            snap_entry,
-            &orig_file,
-            SupersetMode::ByteEqual,
-            mp,
-            "identical",
-            notes,
-        ),
+        EntryPlan::Identical => {
+            // Minor1：Identical 前提是 incoming 已在 backing。但「orig 有、backing 缺」时直接删
+            // underlay 会致挂载视图缺该文件（backing 才是被 serve 的一侧）。缺则先从 orig 重灌补齐
+            // backing，再走删除门；orig 不动（已与 incoming 逐字节相同）。
+            let backing_file = paths.backing(name, Backend::Shadow).join(&rel);
+            if !backing_file.exists() {
+                notes.push(format!(
+                    "backing/{rel} 缺失（orig 有 backing 缺）→ 降级 reingest 补齐后再删"
+                ));
+                reingest_one_file(paths, name, &rel)?;
+            }
+            finish_delete(
+                snap_entry,
+                &orig_file,
+                SupersetMode::ByteEqual,
+                mp,
+                "identical",
+                notes,
+            )
+        }
         other => {
             notes.push(format!(
                 "{other:?} 未在 Task 7 实现（KeepSeparate/Passthrough/KeepBoth），underlay 保留待 Task 8"
@@ -1243,6 +1255,45 @@ mod tests {
         assert_eq!(std::fs::read(&orig_file).unwrap(), content);
         assert_eq!(read_archive(&backing_file), backing_before);
         assert!(report.action.contains("underlay-removed"));
+    }
+
+    #[test]
+    fn apply_identical_missing_backing_downgrades_to_reingest() {
+        // Minor1（Task7 遗留）：orig 有、backing 缺时，Identical 直接删 underlay 会致挂载视图缺
+        // 该文件。降级：先 reingest 从 orig 补齐 backing，再走删除门。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "same.jsonl";
+        let content = b"{\"type\":\"x\",\"uuid\":\"z\"}\n";
+        let orig_file = write_orig(&paths, "demo", rel, content);
+        // 关键前提：orig 有、backing 无（不预灌）。
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        assert!(!backing_file.exists(), "前提：backing 缺失");
+
+        let snap_e = snap_entry_of(&mp, rel, content);
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Identical, &mp).unwrap();
+
+        // 降级 reingest：backing 被补齐为 orig 内容。
+        assert_eq!(
+            read_archive(&backing_file),
+            content,
+            "backing 应补齐为 orig 内容"
+        );
+        assert!(!mp.join(rel).exists(), "补齐 backing 后应删 underlay");
+        assert!(report.action.contains("underlay-removed"));
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("backing") && n.contains("reingest")),
+            "notes 应记录降级 reingest：{:?}",
+            report.notes
+        );
+        assert_eq!(std::fs::read(&orig_file).unwrap(), content, "orig 不变");
     }
 
     #[test]
