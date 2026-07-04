@@ -15,7 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::enable::discovery::{self, detect_activity};
 use crate::enable::model::{validate_name, ApplyOptions, Backend, Paths};
+use crate::reconcile::advisor::{recommend, Action, Confidence, Recommendation};
 use crate::reconcile::guard::{is_harmless, underlay_has_fallthrough};
+use crate::reconcile::merge::session_merge;
 use crate::store::lock::acquire_exclusive;
 
 /// 单文件合并读入上限（spec §5.1）。超限条目不整体读进内存，降级 KeepBoth（Task 7 消费）。
@@ -399,6 +401,282 @@ pub fn set_reconciling(paths: &Paths, name: &str, on: bool) -> io::Result<()> {
     Ok(())
 }
 
+// ── 逐条目规划 + 落盘（据快照，非 live） ──────────────────────────────────────
+
+/// 单条目的处置计划（§5.3 分类结果）。本任务只实现 `Union`/`New`/`Identical` 的落盘；
+/// `KeepSeparate`/`Passthrough`/`KeepBoth` 由 `apply_entry` 记为 deferred，留 Task 8。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryPlan {
+    /// jsonl 无损并集并入 orig base。
+    Union,
+    /// 疑 session-id 重用等：另存不并入（Task 8）。
+    KeepSeparate,
+    /// orig 无此条目：全新 fall-through 文件直接落盘。
+    New,
+    /// 透传还原（Task 8）。
+    Passthrough,
+    /// 超限/冲突：两份都留，供人工核查（Task 8）。
+    KeepBoth,
+    /// incoming 与 orig 逐字节相同且已在 backing：直接删 underlay。
+    Identical,
+}
+
+/// 单条目落盘报告（人类可读审计）。`decision`/`action` 是短标签，`notes` 记 stash 路径、
+/// delete_permitted 未通过原因等细节。
+#[derive(Debug, Clone)]
+pub struct EntryReport {
+    pub name: String,
+    pub decision: String,
+    pub action: String,
+    pub notes: Vec<String>,
+}
+
+/// 一次 reconcile 的整体报告：逐条目报告 + 快照 stash 目录（供审计/回滚定位）。
+#[derive(Debug, Clone)]
+pub struct ReconcileReport {
+    pub entries: Vec<EntryReport>,
+    pub stash_dir: PathBuf,
+}
+
+/// 逐条目规划（**从快照读 incoming**，非 live underlay，评审 I-7；base 取 orig；**不动盘**）。
+///
+/// 对每个快照条目：base = `orig/<rel>`（存在则读，不存在 = New），incoming = 快照 `bytes`。
+/// 超 `MAX_MERGE_FILE_BYTES`（快照未整体读入、`bytes` 为空）→ 降级 `KeepBoth`；否则：
+/// orig 缺 → `New`；base 逐字节 == incoming → `Identical`；`.jsonl` → `session_merge` + `recommend`
+/// 按 advisor 动作映射 EntryPlan；非 jsonl 且不同 → 保守 `KeepSeparate`（不做行合并，留 Task 8）。
+pub fn plan_entries(
+    paths: &Paths,
+    name: &str,
+    snap: &UnderlaySnapshot,
+) -> io::Result<Vec<(String, EntryPlan, Recommendation)>> {
+    validate_name(name)?;
+    let orig_root = paths.orig(name);
+    let mut out = Vec::with_capacity(snap.entries.len());
+    for e in &snap.entries {
+        if e.size > MAX_MERGE_FILE_BYTES {
+            out.push((e.rel.clone(), EntryPlan::KeepBoth, oversize_rec()));
+            continue;
+        }
+        let base = match std::fs::read(orig_root.join(&e.rel)) {
+            Ok(b) => Some(b),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+        let (plan, rec) = match base {
+            None => (EntryPlan::New, new_entry_rec()),
+            Some(base_bytes) if base_bytes == e.bytes => (EntryPlan::Identical, identical_rec()),
+            Some(base_bytes) if e.rel.ends_with(".jsonl") => {
+                let base_str = String::from_utf8_lossy(&base_bytes);
+                let inc_str = String::from_utf8_lossy(&e.bytes);
+                let merged = session_merge(base_str.as_ref(), inc_str.as_ref());
+                let rec = recommend(&merged);
+                (plan_from_action(&rec.action), rec)
+            }
+            Some(_) => (EntryPlan::KeepSeparate, non_jsonl_diff_rec()),
+        };
+        out.push((e.rel.clone(), plan, rec));
+    }
+    Ok(out)
+}
+
+/// advisor 动作 → EntryPlan 映射（jsonl 合并路径）。
+fn plan_from_action(a: &Action) -> EntryPlan {
+    match a {
+        Action::UnionIntoBase => EntryPlan::Union,
+        Action::KeepSeparate => EntryPlan::KeepSeparate,
+        Action::PassthroughRestore => EntryPlan::Passthrough,
+        Action::KeepBoth => EntryPlan::KeepBoth,
+    }
+}
+
+fn oversize_rec() -> Recommendation {
+    Recommendation {
+        action: Action::KeepBoth,
+        confidence: Confidence::Low,
+        rationale: format!(
+            "超单文件合并上限 {MAX_MERGE_FILE_BYTES}B，降级 KeepBoth 保两份（不有损合并）"
+        ),
+    }
+}
+
+fn new_entry_rec() -> Recommendation {
+    Recommendation {
+        action: Action::UnionIntoBase,
+        confidence: Confidence::High,
+        rationale: "orig 无此条目，全新 fall-through 文件直接落 orig（无 base 冲突）".into(),
+    }
+}
+
+fn identical_rec() -> Recommendation {
+    Recommendation {
+        action: Action::UnionIntoBase,
+        confidence: Confidence::High,
+        rationale: "incoming 与 orig 逐字节相同，无需改写，直接删 underlay".into(),
+    }
+}
+
+fn non_jsonl_diff_rec() -> Recommendation {
+    Recommendation {
+        action: Action::KeepSeparate,
+        confidence: Confidence::Low,
+        rationale: "非 .jsonl 且与 orig base 不同，不做行合并；留待人工/Task 8 处理".into(),
+    }
+}
+
+/// merged_lines → 字节：以 `\n` 连接并补尾 `\n`（jsonl 行语义），使删除许可的行超集比对含尾
+/// 空行 token 也自洽（incoming 尾 `\n` split 出的空串在 merged 中同样出现）。空则空字节。
+fn lines_to_bytes(lines: &[String]) -> Vec<u8> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s.into_bytes()
+}
+
+/// 逐条目落盘（**严格顺序**，评审 I-3/C-a；本任务只实现 Union/New/Identical）：
+/// 1. **先 stash orig 前镜像**（改 orig 前留底，可回滚）。
+/// 2. 计算合并明文（Union：`session_merge` 并集；New：incoming bytes）。
+/// 3. `atomic_write(orig/<rel>)`（全有或全无）。
+/// 4. `reingest_one_file`（原子替换 backing archive）。
+/// 5. `delete_permitted` 通过**才**删 underlay 条目；不过则中止该条目、underlay 保留、notes 记原因。
+///
+/// Identical 无需改 orig/backing，直接过 `delete_permitted`（ByteEqual）删 underlay。
+/// 其余计划（KeepSeparate/Passthrough/KeepBoth）本任务不落盘、underlay 保留，报告标 deferred。
+pub fn apply_entry(
+    paths: &Paths,
+    name: &str,
+    snap_entry: &EntrySnapshot,
+    plan: &EntryPlan,
+    mp: &Path,
+) -> io::Result<EntryReport> {
+    validate_name(name)?;
+    let rel = snap_entry.rel.clone();
+    let orig_file = paths.orig(name).join(&rel);
+    let mut notes: Vec<String> = Vec::new();
+
+    match plan {
+        EntryPlan::Union => {
+            stash_orig_preimage(paths, name, &rel, &mut notes)?;
+            let base_bytes = std::fs::read(&orig_file)?;
+            let base_str = String::from_utf8_lossy(&base_bytes);
+            let inc_str = String::from_utf8_lossy(&snap_entry.bytes);
+            let merged = session_merge(base_str.as_ref(), inc_str.as_ref());
+            let merged_bytes = lines_to_bytes(&merged.merged_lines);
+            atomic_write(&orig_file, &merged_bytes)?;
+            reingest_one_file(paths, name, &rel)?;
+            finish_delete(
+                snap_entry,
+                &orig_file,
+                SupersetMode::LinesSuperset,
+                mp,
+                "union",
+                notes,
+            )
+        }
+        EntryPlan::New => {
+            stash_orig_preimage(paths, name, &rel, &mut notes)?;
+            if let Some(parent) = orig_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            atomic_write(&orig_file, &snap_entry.bytes)?;
+            reingest_one_file(paths, name, &rel)?;
+            finish_delete(
+                snap_entry,
+                &orig_file,
+                SupersetMode::LinesSuperset,
+                mp,
+                "new",
+                notes,
+            )
+        }
+        EntryPlan::Identical => finish_delete(
+            snap_entry,
+            &orig_file,
+            SupersetMode::ByteEqual,
+            mp,
+            "identical",
+            notes,
+        ),
+        other => {
+            notes.push(format!(
+                "{other:?} 未在 Task 7 实现（KeepSeparate/Passthrough/KeepBoth），underlay 保留待 Task 8"
+            ));
+            Ok(EntryReport {
+                name: rel,
+                decision: format!("{other:?}"),
+                action: "deferred".into(),
+                notes,
+            })
+        }
+    }
+}
+
+/// 把当前 `orig/<rel>` 拷进 `reconcile_stash(name,ts)/orig/<rel>` 并 fsync（评审 I-3，改 orig 前留底）。
+/// orig 不存在（New 条目）→ 无前镜像可 stash，记 note 后返回。stash 路径记入 `notes`（回滚定位）。
+fn stash_orig_preimage(
+    paths: &Paths,
+    name: &str,
+    rel: &str,
+    notes: &mut Vec<String>,
+) -> io::Result<()> {
+    let orig_file = paths.orig(name).join(rel);
+    if !orig_file.exists() {
+        notes.push(format!("orig/{rel} 不存在，无前镜像可 stash（New 条目）"));
+        return Ok(());
+    }
+    let ts = now_unix_secs();
+    let stash_root = paths.reconcile_stash(name, &ts);
+    let dst = stash_root.join("orig").join(rel);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&orig_file, &dst)?;
+    fsync_path(&dst)?;
+    if let Some(parent) = dst.parent() {
+        fsync_dir_chain(parent, &stash_root)?;
+    }
+    notes.push(format!("stash-preimage={}", dst.display()));
+    Ok(())
+}
+
+/// 落盘尾闸：`delete_permitted` 通过才删 underlay 条目（唯一删除入口），否则保留并记原因。
+/// 删除后 fsync 父目录持久化 dirent。返回带 action 的 `EntryReport`。
+fn finish_delete(
+    snap_entry: &EntrySnapshot,
+    receiver: &Path,
+    mode: SupersetMode,
+    mp: &Path,
+    kind: &str,
+    mut notes: Vec<String>,
+) -> io::Result<EntryReport> {
+    let rel = snap_entry.rel.clone();
+    let action = if delete_permitted(receiver, snap_entry, mode, mp)? {
+        let live = mp.join(&rel);
+        match std::fs::remove_file(&live) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(parent) = live.parent() {
+            let _ = fsync_dir(parent);
+        }
+        format!("{kind}-applied+underlay-removed")
+    } else {
+        notes.push(
+            "delete_permitted 未通过（接收方非超集 或 live underlay 自快照已变）：underlay 保留"
+                .into(),
+        );
+        format!("{kind}-applied+underlay-kept")
+    };
+    Ok(EntryReport {
+        name: rel,
+        decision: kind.into(),
+        action,
+        notes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,5 +1021,260 @@ mod tests {
         let paths = paths_in(tmp.path());
         let e = set_reconciling(&paths, "../escape", true).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    // ── 逐条目规划 + 落盘 ──────────────────────────────────────────────────
+
+    /// 把 `bytes` 写成 `mp/rel` 的 live underlay 文件，并按其真实 metadata 造快照条目。
+    fn snap_entry_of(mp: &Path, rel: &str, bytes: &[u8]) -> EntrySnapshot {
+        let live = mp.join(rel);
+        if let Some(p) = live.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&live, bytes).unwrap();
+        let md = std::fs::metadata(&live).unwrap();
+        EntrySnapshot {
+            rel: rel.to_string(),
+            bytes: bytes.to_vec(),
+            mtime: md.modified().unwrap(),
+            size: md.len(),
+            ino: md.ino(),
+        }
+    }
+
+    /// 建 orig/<rel>（含父目录）写入 base 内容。
+    fn write_orig(paths: &Paths, name: &str, rel: &str, content: &[u8]) -> PathBuf {
+        let f = paths.orig(name).join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, content).unwrap();
+        f
+    }
+
+    const BASE_LOG: &str = concat!(
+        "{\"type\":\"assistant\",\"uuid\":\"u1\",\"timestamp\":\"2026-06-27T12:00:00.000Z\"}\n",
+        "{\"type\":\"ai-title\",\"aiTitle\":\"old\"}\n"
+    );
+    const INCOMING_LOG: &str = concat!(
+        "{\"type\":\"ai-title\",\"aiTitle\":\"new\"}\n",
+        "{\"type\":\"mode\",\"mode\":\"normal\"}\n"
+    );
+
+    #[test]
+    fn apply_union_log_only_merges_orig_reingests_and_removes_underlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "s.jsonl";
+        let orig_file = write_orig(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let snap_e = snap_entry_of(&mp, rel, INCOMING_LOG.as_bytes());
+        let snap = UnderlaySnapshot {
+            ts: "0".into(),
+            entries: vec![snap_e],
+        };
+
+        // incoming 只有日志记录（无 uuid）→ LogOnly → Union。
+        let plans = plan_entries(&paths, "demo", &snap).unwrap();
+        assert_eq!(plans[0].1, EntryPlan::Union);
+
+        let report = apply_entry(&paths, "demo", &snap.entries[0], &EntryPlan::Union, &mp).unwrap();
+
+        // orig 现含合并结果：base(u1/old) 全留 + incoming(new/mode) 并入。
+        let merged = std::fs::read_to_string(&orig_file).unwrap();
+        for needle in ["u1", "old", "new", "\"mode\""] {
+            assert!(
+                merged.contains(needle),
+                "orig 合并结果应含 {needle}：{merged}"
+            );
+        }
+        // underlay 条目已删（delete_permitted 通过）。
+        assert!(
+            !mp.join(rel).exists(),
+            "delete_permitted 通过 → underlay 应删"
+        );
+        // backing 该文件已原子重灌为合并结果（read-back 逐字节等于 orig）。
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        assert_eq!(read_archive(&backing_file), merged.as_bytes());
+        assert!(
+            report.action.contains("underlay-removed"),
+            "report.action={}",
+            report.action
+        );
+    }
+
+    #[test]
+    fn apply_union_stashes_orig_preimage_before_mutating_and_is_rollbackable() {
+        // 评审 I-3：改 orig 前 stash 里必须已有旧版，中途放弃可从 stash 回滚 orig。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "s.jsonl";
+        let orig_file = write_orig(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let snap_e = snap_entry_of(&mp, rel, INCOMING_LOG.as_bytes());
+
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Union, &mp).unwrap();
+
+        // orig 已被合并改写（≠ base）。
+        assert_ne!(std::fs::read(&orig_file).unwrap(), BASE_LOG.as_bytes());
+        // stash 前镜像 = 改 orig 前的 base，可回滚。
+        let stashed = report
+            .notes
+            .iter()
+            .find_map(|n| n.strip_prefix("stash-preimage="))
+            .expect("应记录 stash-preimage 路径");
+        let stashed = PathBuf::from(stashed);
+        assert!(stashed.exists(), "stash 前镜像文件应存在");
+        assert_eq!(
+            std::fs::read(&stashed).unwrap(),
+            BASE_LOG.as_bytes(),
+            "stash 应是改 orig 前的镜像"
+        );
+        // 从 stash 回滚 orig → 复原 base。
+        std::fs::copy(&stashed, &orig_file).unwrap();
+        assert_eq!(std::fs::read_to_string(&orig_file).unwrap(), BASE_LOG);
+    }
+
+    #[test]
+    fn apply_union_keeps_underlay_when_live_changed_after_snapshot() {
+        // 评审 C-a：接收方即便超集，若 live underlay 自快照后被追加 → delete_permitted 不过、underlay 保留。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "s.jsonl";
+        write_orig(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let snap_e = snap_entry_of(&mp, rel, INCOMING_LOG.as_bytes());
+
+        // 快照后 Claude 追加 live → size/mtime 变 → live_entry_unchanged 为假。
+        let live = mp.join(rel);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .unwrap();
+        f.write_all(b"{\"type\":\"extra\"}\n").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::Union, &mp).unwrap();
+        assert!(
+            mp.join(rel).exists(),
+            "live 已变 → underlay 必须保留（防丢尾）"
+        );
+        assert!(
+            report.action.contains("underlay-kept"),
+            "report.action={}",
+            report.action
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("delete_permitted 未通过")),
+            "notes 应记未通过原因：{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn apply_new_entry_writes_orig_backing_and_removes_underlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "fresh.jsonl";
+        let incoming = b"{\"type\":\"summary\",\"summary\":\"s\"}\n";
+        let snap_e = snap_entry_of(&mp, rel, incoming);
+        let snap = UnderlaySnapshot {
+            ts: "0".into(),
+            entries: vec![snap_e],
+        };
+
+        // orig 无此条目 → New。
+        let plans = plan_entries(&paths, "demo", &snap).unwrap();
+        assert_eq!(plans[0].1, EntryPlan::New);
+
+        let report = apply_entry(&paths, "demo", &snap.entries[0], &EntryPlan::New, &mp).unwrap();
+
+        let orig_file = paths.orig("demo").join(rel);
+        assert_eq!(std::fs::read(&orig_file).unwrap(), incoming);
+        assert!(!mp.join(rel).exists(), "New 落盘后 underlay 应删");
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        assert_eq!(read_archive(&backing_file), incoming);
+        assert!(report.action.contains("underlay-removed"));
+    }
+
+    #[test]
+    fn apply_identical_removes_underlay_without_touching_orig_or_backing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "same.jsonl";
+        let content = b"{\"type\":\"x\",\"uuid\":\"z\"}\n";
+        let orig_file = write_orig(&paths, "demo", rel, content);
+        // 预灌 backing（Identical 前提：incoming 已在 backing）。
+        reingest_one_file(&paths, "demo", rel).unwrap();
+        let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
+        let backing_before = read_archive(&backing_file);
+
+        let snap_e = snap_entry_of(&mp, rel, content);
+        let snap = UnderlaySnapshot {
+            ts: "0".into(),
+            entries: vec![snap_e],
+        };
+        let plans = plan_entries(&paths, "demo", &snap).unwrap();
+        assert_eq!(plans[0].1, EntryPlan::Identical);
+
+        let report =
+            apply_entry(&paths, "demo", &snap.entries[0], &EntryPlan::Identical, &mp).unwrap();
+        assert!(!mp.join(rel).exists(), "Identical 应直接删 underlay");
+        // orig / backing 均未改。
+        assert_eq!(std::fs::read(&orig_file).unwrap(), content);
+        assert_eq!(read_archive(&backing_file), backing_before);
+        assert!(report.action.contains("underlay-removed"));
+    }
+
+    #[test]
+    fn plan_entries_downgrades_oversize_to_keep_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        // 超限条目：bytes 留空（快照未整体读入），size 记超限值。
+        let snap = UnderlaySnapshot {
+            ts: "0".into(),
+            entries: vec![EntrySnapshot {
+                rel: "huge.jsonl".into(),
+                bytes: Vec::new(),
+                mtime: SystemTime::UNIX_EPOCH,
+                size: MAX_MERGE_FILE_BYTES + 1,
+                ino: 1,
+            }],
+        };
+        let plans = plan_entries(&paths, "demo", &snap).unwrap();
+        assert_eq!(plans[0].1, EntryPlan::KeepBoth, "超限应降级 KeepBoth");
+    }
+
+    #[test]
+    fn apply_deferred_plans_keep_underlay() {
+        // KeepSeparate/Passthrough/KeepBoth 本任务不落盘：underlay 保留、报告标 deferred。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let rel = "keep.jsonl";
+        let snap_e = snap_entry_of(&mp, rel, b"{\"a\":1}\n");
+        let report = apply_entry(&paths, "demo", &snap_e, &EntryPlan::KeepSeparate, &mp).unwrap();
+        assert_eq!(report.action, "deferred");
+        assert!(mp.join(rel).exists(), "deferred 计划不得删 underlay");
     }
 }
