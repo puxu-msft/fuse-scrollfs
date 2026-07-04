@@ -441,7 +441,11 @@ pub struct ReconcileReport {
 
 /// 逐条目规划（**从快照读 incoming**，非 live underlay，评审 I-7；base 取 orig；**不动盘**）。
 ///
-/// 对每个快照条目：base = `orig/<rel>`（存在则读，不存在 = New），incoming = 快照 `bytes`。
+/// **优先路由**（先于 size-cap/base 分类，与 `apply_entry` 同序，令 dry-run 报告如实反映 apply）：
+/// - `is_subagents_entry` → `Union`（子会话强制无损并集，apply 绕过 advisor 隔离）。
+/// - `is_passthrough_entry`（backing 顶层段是外链 symlink）→ `Passthrough`（写 canonical target，绝不落 orig）。
+///
+/// 否则对每个快照条目：base = `orig/<rel>`（存在则读，不存在 = New），incoming = 快照 `bytes`。
 /// 超 `MAX_MERGE_FILE_BYTES`（快照未整体读入、`bytes` 为空）→ 降级 `KeepBoth`；否则：
 /// orig 缺 → `New`；base 逐字节 == incoming → `Identical`；`.jsonl` → `session_merge` + `recommend`
 /// 按 advisor 动作映射 EntryPlan；非 jsonl 且不同 → 保守 `KeepSeparate`（不做行合并，留 Task 8）。
@@ -454,6 +458,16 @@ pub fn plan_entries(
     let orig_root = paths.orig(name);
     let mut out = Vec::with_capacity(snap.entries.len());
     for e in &snap.entries {
+        // 优先路由（与 apply_entry 同序）：subagents/透传绕过 plan 的 size-cap/base 分类，否则报告
+        // 会显示 New/KeepSeparate 而 apply 实际走并集/透传（写 canonical target，绝不落 orig）。
+        if is_subagents_entry(&e.rel) {
+            out.push((e.rel.clone(), EntryPlan::Union, subagents_rec()));
+            continue;
+        }
+        if is_passthrough_entry(paths, name, &e.rel) {
+            out.push((e.rel.clone(), EntryPlan::Passthrough, passthrough_rec()));
+            continue;
+        }
         if e.size > MAX_MERGE_FILE_BYTES {
             out.push((e.rel.clone(), EntryPlan::KeepBoth, oversize_rec()));
             continue;
@@ -497,6 +511,25 @@ fn oversize_rec() -> Recommendation {
         rationale: format!(
             "超单文件合并上限 {MAX_MERGE_FILE_BYTES}B，降级 KeepBoth 保两份（不有损合并）"
         ),
+    }
+}
+
+fn subagents_rec() -> Recommendation {
+    Recommendation {
+        action: Action::UnionIntoBase,
+        confidence: Confidence::High,
+        rationale:
+            "subagents 子会话无损并集（apply 时并入 orig 对应路径 + reingest，绝不按 mtime 取舍）"
+                .into(),
+    }
+}
+
+fn passthrough_rec() -> Recommendation {
+    Recommendation {
+        action: Action::PassthroughRestore,
+        confidence: Confidence::Medium,
+        rationale: "memory 外链透传恢复：新文件复制进 canonical 目标、冲突改名保两份，绝不落 orig"
+            .into(),
     }
 }
 
@@ -1015,7 +1048,7 @@ pub fn apply_entry(
     }
 
     // 优先路由：memory 透传。backing 顶层段是 symlink → 该条目属外链 memory 的物化回落写。
-    // （plan_entries 目前不产 Passthrough；据 backing symlink 判定，兼容显式 Passthrough plan。）
+    // （plan_entries 现也产 Passthrough plan；据 backing symlink 判定，两条路由等价、互为兜底。）
     if matches!(plan, EntryPlan::Passthrough) || is_passthrough_entry(paths, name, &rel) {
         if let Some((top, target)) = passthrough_top_symlink(paths, name, &rel)? {
             let underlay_dir = mp.join(&top);
@@ -2262,6 +2295,95 @@ mod tests {
         };
         let plans = plan_entries(&paths, "demo", &snap).unwrap();
         assert_eq!(plans[0].1, EntryPlan::KeepBoth, "超限应降级 KeepBoth");
+    }
+
+    #[test]
+    fn plan_entries_routes_subagents_to_union_matching_apply() {
+        // 报告准确性：subagents 条目即便 orig 无对应文件（朴素分类会判 New），plan_entries 必须
+        // 与 apply_entry 同序优先路由到 Union（无损并集），否则 dry-run 报告与实际 apply 不符。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let rel = "sess-uuid/subagents/agent.jsonl";
+        let body = b"{\"type\":\"assistant\",\"uuid\":\"sa1\",\"parentUuid\":null}\n";
+        let snap_e = snap_entry_of(&mp, rel, body);
+        let snap = UnderlaySnapshot {
+            ts: "0".into(),
+            entries: vec![snap_e],
+        };
+
+        let plans = plan_entries(&paths, "demo", &snap).unwrap();
+        assert_eq!(
+            plans[0].1,
+            EntryPlan::Union,
+            "subagents 应判 Union 而非 New"
+        );
+        assert!(
+            plans[0].2.rationale.contains("subagents"),
+            "rationale 应说明 subagents 并集：{}",
+            plans[0].2.rationale
+        );
+
+        // plan↔apply 一致性：apply_entry 对同条目实际路由到 subagents 并集。
+        let report = apply_entry(&paths, "demo", &snap.entries[0], &plans[0].1, &mp, "0").unwrap();
+        assert!(
+            report.decision.contains("subagents"),
+            "apply 实际应走 subagents，plan 须匹配：{}",
+            report.decision
+        );
+    }
+
+    #[test]
+    fn plan_entries_routes_memory_passthrough_matching_apply() {
+        // 报告准确性：backing/memory 是外链 symlink 时，memory/* 条目必须判 Passthrough 而非
+        // New/KeepSeparate——apply_entry 会走透传恢复（写 canonical target，绝不落 orig）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        // backing/memory = 指向树外 target 的 symlink（apply 期照 Claude 外链重建）。
+        let target = tmp.path().join("external-memory");
+        std::fs::create_dir_all(&target).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+        std::os::unix::fs::symlink(&target, backing.join("memory")).unwrap();
+
+        // 非 jsonl memory 文件：朴素分类（orig 无）会判 New。
+        let rel = "memory/foo.md";
+        let snap_e = snap_entry_of(&mp, rel, b"body\n");
+        let snap = UnderlaySnapshot {
+            ts: "0".into(),
+            entries: vec![snap_e],
+        };
+
+        let plans = plan_entries(&paths, "demo", &snap).unwrap();
+        assert_eq!(
+            plans[0].1,
+            EntryPlan::Passthrough,
+            "memory 外链条目应判 Passthrough 而非 New/KeepSeparate"
+        );
+        assert!(
+            matches!(plans[0].2.action, Action::PassthroughRestore),
+            "透传建议 action 应为 PassthroughRestore：{:?}",
+            plans[0].2.action
+        );
+        assert!(
+            plans[0].2.rationale.contains("透传") || plans[0].2.rationale.contains("memory"),
+            "rationale 应说明 memory 透传：{}",
+            plans[0].2.rationale
+        );
+
+        // plan↔apply 一致性：apply_entry 对同条目实际路由到透传恢复。
+        let report = apply_entry(&paths, "demo", &snap.entries[0], &plans[0].1, &mp, "0").unwrap();
+        assert_eq!(
+            report.decision, "passthrough",
+            "apply 实际应走透传，plan 须匹配"
+        );
     }
 
     #[test]
