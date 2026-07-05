@@ -35,10 +35,13 @@ pub fn classify_record(line: &str) -> (RawRecord, RecordKind) {
     match serde_json::from_str::<serde_json::Value>(line) {
         Ok(v) => {
             let kind = match record_uuid(&v) {
-                Some(u) => RecordKind::Transcript {
+                // 评审 R-I1：仅**非空字符串** uuid 才算 transcript 键。空串 `"uuid":""`（或缺失/
+                // 非字符串）降级 NoUuid 走整行去重——否则所有空串 uuid 共键 `""`、by_uuid 只留
+                // 最长者、其余 distinct 记录静默丢。
+                Some(u) if !u.is_empty() => RecordKind::Transcript {
                     uuid: u.to_string(),
                 },
-                None => RecordKind::NoUuid,
+                _ => RecordKind::NoUuid,
             };
             (
                 RawRecord {

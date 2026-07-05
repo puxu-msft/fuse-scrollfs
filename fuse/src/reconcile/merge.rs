@@ -219,6 +219,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_string_uuid_records_are_not_folded() {
+        // 评审 R-I1：`"uuid":""`（空串）曾被当 Transcript 键 `""`，所有空串 uuid 记录共键、
+        // 只留最长者，其余 distinct 静默丢。空串/非字符串 uuid 应降级 NoUuid（整行去重全保）。
+        let base = format!(
+            "{}\n{}\n",
+            r#"{"type":"x","uuid":"","a":"AAAA"}"#, // 空串 uuid，distinct 内容
+            r#"{"type":"x","uuid":"","a":"BBBBBBBB"}"#
+        );
+        let incoming = String::new();
+        let r = session_merge(&base, &incoming);
+        assert!(
+            r.merged_lines.iter().any(|l| l.contains("AAAA")),
+            "较短的空 uuid 记录必须保留（不折叠）"
+        );
+        assert!(
+            r.merged_lines.iter().any(|l| l.contains("BBBBBBBB")),
+            "较长的空 uuid 记录也保留"
+        );
+    }
+
+    #[test]
     fn log_only_keeps_base_transcript_and_unions_logs() {
         // 373e2835 类：base 有正文，incoming 只有日志记录 → 正文全留 + 日志并入。
         let base = format!(
