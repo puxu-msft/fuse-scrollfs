@@ -80,6 +80,17 @@ pub fn check_preconditions(
 
     let mp = paths.mountpoint(name);
     if !underlay_has_fallthrough(&mp)? {
+        // 评审 W1：underlay 空但 `.reconciling` marker 在 → 上次 reconcile 的收尾（清标记那步）
+        // 被崩溃打断（underlay 已抽干、manifest 未落）。orig/backing 此刻已是权威提交态，清陈旧
+        // marker 收敛即可——否则 marker 永久滞留，`bail_if_reconciling` 把 remount/compact/seal/
+        // 自启全拦死，项目 wedge，只能人工 rm。这也是「重跑 reconcile 自恢复」承诺的兑现点。
+        if paths.reconciling_marker(name).exists() {
+            set_reconciling(paths, name, false)?;
+            return Err(io::Error::other(format!(
+                "{} underlay 已空但残留 reconciling 标记（上次收尾被中断）→ 已清标记收敛，项目恢复可维护；无需 reconcile",
+                mp.display()
+            )));
+        }
         return Err(io::Error::other(format!(
             "{} 挂载点 underlay 无回落写（fall-through 为空），无需 reconcile",
             mp.display()
@@ -2551,6 +2562,26 @@ mod tests {
         set_reconciling(&paths, "demo", false).unwrap();
         assert!(!marker.exists(), "off 应删标记");
         set_reconciling(&paths, "demo", false).unwrap();
+    }
+
+    #[test]
+    fn check_preconditions_clears_stale_marker_when_underlay_empty() {
+        // 评审 W1：underlay 空 + 残留 reconciling marker（上次收尾被崩溃打断）→ check_preconditions
+        // 必须清陈旧 marker 收敛（解 wedge），而非拒绝后留 marker 卡死。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap(); // 空挂载点（underlay 无 fall-through）
+        set_reconciling(&paths, "demo", true).unwrap();
+        assert!(paths.reconciling_marker("demo").exists());
+
+        let res = check_preconditions(&paths, "demo", Backend::Shadow, false);
+        assert!(res.is_err(), "underlay 空 → 无需 reconcile（返回 Err）");
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "陈旧 marker 必须被清（解 wedge），否则 bail_if_reconciling 永久拦死维护"
+        );
     }
 
     #[test]
