@@ -34,6 +34,13 @@ path = "src/bin/append-bench.rs"
 name = "ratio-bench"
 path = "src/bin/ratio-bench.rs"
 
+# LDM 压缩比补测（M2）：对真实语料逐块 compress_with_params，只切换 enable_ldm 一个变量，量
+# 「>8MiB 封存块开 LDM 相比不开，比值提升多少」。区别于 ratio-bench（走 live 路径，不含 LDM），
+# 本 bin 直接测 codec 的 LDM 分支，作为「是否调大默认 DEFAULT_SEAL_CHUNK」的决策依据。
+[[bin]]
+name = "ldm-ratio"
+path = "src/bin/ldm-ratio.rs"
+
 # 会话发现读 micro-bench（docs/02 §6.1，head 缓存门控）：量「open 解析 + 块 0 解压」vs
 # 「open 解析 + 独立 head 流解压」的发现读成本差，零格式改动。决定是否值得落 archive v2。
 [[bin]]

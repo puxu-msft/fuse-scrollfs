@@ -72,6 +72,24 @@ impl CompressParams {
             window_log: window_log_for(chunk_size),
         }
     }
+
+    /// 测量友好构造器：显式指定 `enable_ldm`，`window_log` 恒取覆盖 `chunk_size` 的值（已 clamp ≤27）。
+    ///
+    /// 与 [`sealed`](Self::sealed) 的差别：`sealed` 对 ≤8MiB 块**自动关** LDM（退回 plain），而
+    /// `sized` **不做 8MiB 阈值判断**，忠实按传入的 `enable_ldm` 开/关。这让基准能在**同一 chunk、同一
+    /// 方法**下只切换 LDM 一个变量做对照（含 ≤8MiB 档，此时 LDM 窗口=默认窗口，收益预期近 no-op）。
+    /// 非基准场景请用 [`plain`](Self::plain) / [`sealed`](Self::sealed)，勿用本构造器。
+    pub fn sized(level: i32, chunk_size: u32, enable_ldm: bool) -> Self {
+        Self {
+            level,
+            enable_ldm,
+            window_log: if enable_ldm {
+                window_log_for(chunk_size)
+            } else {
+                0
+            },
+        }
+    }
 }
 
 /// 取覆盖 `chunk_size` 的最小 windowLog（`ceil(log2(chunk_size))`），**硬 clamp 到
