@@ -71,7 +71,7 @@ pub fn seal_shadow_tree(backing: &Path, seal_chunk: u32, level: i32) -> io::Resu
             format!("封存 backing 不是目录：{}", backing.display()),
         ));
     }
-    let _lock = crate::store::lock::acquire_backing(backing)?; // 评审 A3：与活守护互斥（见 compact）
+    let _lock = crate::store::lock::acquire_backing_retry(backing)?; // 评审 A3：与活守护互斥（见 compact）
     let mut stats = SealStats::default();
     seal_dir(backing, seal_chunk, level, &mut stats)?;
     Ok(stats)

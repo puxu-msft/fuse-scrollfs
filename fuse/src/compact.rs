@@ -41,7 +41,7 @@ pub fn compact_shadow_tree(backing: &Path, level: i32) -> io::Result<CompactStat
     }
     // 评审 A3：取 backing 排他锁，与活守护（ShadowStore::open）互斥。否则离线 compact 的
     // temp+rename 会整文件覆盖守护正在写的版本（Bug A 同构损坏）。WouldBlock = 守护仍在。
-    let _lock = crate::store::lock::acquire_backing(backing)?;
+    let _lock = crate::store::lock::acquire_backing_retry(backing)?;
     let mut stats = CompactStats::default();
     compact_dir(backing, level, &mut stats)?;
     Ok(stats)

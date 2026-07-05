@@ -19,7 +19,7 @@ use crate::enable::model::{validate_name, ApplyOptions, Backend, Paths};
 use crate::reconcile::advisor::{recommend, Action, Confidence, Recommendation};
 use crate::reconcile::guard::{is_harmless, underlay_has_fallthrough};
 use crate::reconcile::merge::session_merge;
-use crate::store::lock::acquire_exclusive;
+use crate::store::lock::acquire_exclusive_retry;
 
 /// 单文件合并读入上限（spec §5.1）。超限条目不整体读进内存，降级 KeepBoth（Task 7 消费）。
 pub const MAX_MERGE_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -101,7 +101,7 @@ pub fn check_preconditions(
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let lock = acquire_exclusive(&lock_path)?;
+    let lock = acquire_exclusive_retry(&lock_path)?;
     let snapshot = snapshot_underlay(&mp, &paths.reconcile_stash(name, &ts), ts)?;
 
     Ok(Preconditions {
@@ -1837,7 +1837,7 @@ pub fn reconcile_undo(paths: &Paths, name: &str) -> io::Result<UndoReport> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _lock = acquire_exclusive(&lock_path)?;
+    let _lock = acquire_exclusive_retry(&lock_path)?;
 
     // 前置门禁 3：选目标代次 = 全体 ts 最大的一代（§10.2/评审 I2）。
     let Some(ts) = latest_generation(paths, name)? else {
