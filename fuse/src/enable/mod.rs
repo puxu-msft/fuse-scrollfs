@@ -646,14 +646,18 @@ pub fn guard_underlay_or_exit(paths: &Paths, name: &str) -> std::io::Result<()> 
 
 /// underlay 守卫判定逻辑（纯一点，便于单测）：`name` 为 unescape 后的原始项目名。
 ///
-/// underlay 含停用期 fall-through 回落写（`underlay_has_fallthrough`）时落 NEEDS-RECONCILE sentinel
-/// 并打明确 stderr，返回 `NeedsReconcile`（调用方以码 75 退出，阻止自动挂载）。underlay 空时顺带
-/// 自愈清除可能残留的 sentinel（上次非空、经人工 reconcile 清空后自愈），返回 `Pass`。真正的读目录
-/// IO 错误（非 NotFound）向上传播（exit 1，仍可 Restart，区别于稳定的「需人工」态）。
+/// 阻止自启挂载的两种情形（评审 C-plan1）：(a) underlay 含停用期 fall-through 回落写
+/// （`underlay_has_fallthrough`，稳定态、需人工 reconcile）；(b) `reconciling` marker 在 = reconcile/undo
+/// 半改写窗口（undo「先改 backing、后还原 underlay」时 underlay 可能已空，仅此 marker 挡得住半改写
+/// backing 被自启挂上）。任一命中即落 NEEDS-RECONCILE sentinel、打明确 stderr，返回 `NeedsReconcile`
+/// （调用方以码 75 退出，`ExecCondition` skip / `RestartPreventExitStatus` 拦 Restart，防 crash-loop）。
+/// 两者都清时顺带自愈清除可能残留的 sentinel，返回 `Pass`。真正的读目录 IO 错误（非 NotFound）向上
+/// 传播（exit 1，仍可 Restart，区别于稳定的「需人工」态）。
 pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome> {
     let mp = paths.mountpoint(name);
-    if !crate::reconcile::guard::underlay_has_fallthrough(&mp)? {
-        // 放行前自愈：underlay 已空则清除可能残留的 sentinel（best-effort，缺失/失败不影响放行）。
+    let reconciling = paths.reconciling_marker(name).exists();
+    if !reconciling && !crate::reconcile::guard::underlay_has_fallthrough(&mp)? {
+        // 放行前自愈：underlay 空且非 reconcile 中，则清除可能残留的 sentinel（best-effort）。
         let sentinel = paths.needs_reconcile_sentinel(name);
         if let Err(e) = std::fs::remove_file(&sentinel) {
             if e.kind() != std::io::ErrorKind::NotFound {
@@ -665,7 +669,7 @@ pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome
         }
         return Ok(GuardOutcome::Pass);
     }
-    // 非空 → 落 sentinel（best-effort：即便写失败也 fail-closed 返回 NeedsReconcile，务必阻止挂载）。
+    // 阻止 → 落 sentinel（best-effort：即便写失败也 fail-closed 返回 NeedsReconcile，务必阻止挂载）。
     let sentinel = paths.needs_reconcile_sentinel(name);
     if let Err(e) = write_needs_reconcile_sentinel(&sentinel, name) {
         eprintln!(
@@ -673,10 +677,17 @@ pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome
             sentinel.display()
         );
     }
-    eprintln!(
-        "[zipfs] {name}: 挂载点 underlay 含停用期回落写，已阻止自动挂载（避免静默盖住）。\
-         需人工 `zipfs enable reconcile {name}` 重合并后方可自动挂载。"
-    );
+    if reconciling {
+        eprintln!(
+            "[zipfs] {name}: 正在 reconcile/undo（半改写窗口），已阻止自动挂载（防挂到半改写 backing）。\
+             待其完成后重试。"
+        );
+    } else {
+        eprintln!(
+            "[zipfs] {name}: 挂载点 underlay 含停用期回落写，已阻止自动挂载（避免静默盖住）。\
+             需人工 `zipfs enable reconcile {name}` 重合并后方可自动挂载。"
+        );
+    }
     Ok(GuardOutcome::NeedsReconcile)
 }
 
@@ -831,5 +842,21 @@ mod tests {
         std::fs::write(mp.join(".fuse_hidden0001"), b"").unwrap();
         assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
         assert!(!paths.needs_reconcile_sentinel("demo").exists());
+    }
+
+    #[test]
+    fn guard_check_blocks_while_reconciling_even_if_underlay_empty() {
+        // C-plan1：空 underlay 但 reconcile/undo 进行中（marker 在）→ NeedsReconcile。undo「先改
+        // backing、后还原 underlay」的顺序会把后端半改写暴露在「underlay 已空」窗口，自启此刻不可挂。
+        let (_tmp, paths) = temp_paths();
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        std::fs::write(paths.reconciling_marker("demo"), b"").unwrap();
+        assert_eq!(
+            underlay_guard(&paths, "demo").unwrap(),
+            GuardOutcome::NeedsReconcile
+        );
+        // marker 清 + underlay 空 → 放行。
+        std::fs::remove_file(paths.reconciling_marker("demo")).unwrap();
+        assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
     }
 }

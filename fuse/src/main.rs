@@ -255,6 +255,21 @@ fn home_or_err() -> std::io::Result<PathBuf> {
 fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
     let name = zipfs::enable::systemd::systemd_unescape(&args.name);
+    zipfs::enable::model::validate_name(&name).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
+        )
+    })?;
+    // 评审 C1 + Task 12 + C-plan1：systemd 开机自启（`ExecStart=zipfs mount-managed --name %i`）由 systemd
+    // 直接拉起本进程，**不经** `SystemdMounter::spawn`，故守卫必须在此真正挂载前兜底。underlay 含非白名单
+    // fall-through **或** reconcile/undo 半改写窗口（`reconciling` marker 在，undo 尤甚：先改 backing、后还原
+    // underlay，underlay 空也不可挂）→ 落 NEEDS-RECONCILE sentinel + 明确 stderr + 以独特码 75 退出
+    // （**不返回 Err/exit 1**）。这是主进程路径，单元 `RestartPreventExitStatus=75` 对主进程有效 → 拦住
+    // Restart 不 crash-loop；同时覆盖 `ExecCondition` guard-check 通过后到此处之间又生阻断态的 TOCTOU 窗口。
+    // **置于 resolve_managed_spec 之前**：marker/underlay 阻断态优先以 exit 75 短路，避免 resolve 的兜底
+    // marker 检查（返回普通 Err → exit 1）抢先触发 Restart（C-plan1：退出码语义须同 §5.4）。
+    zipfs::enable::guard_underlay_or_exit(&paths, &name)?;
     // 评审 H1：unescape 有损（裸 `-`→`/`），非法 %i 会被扭曲。出错时附原始实例名便于反查。
     let spec = zipfs::enable::systemd::resolve_managed_spec(&paths, &name).map_err(|e| {
         std::io::Error::new(
@@ -266,13 +281,6 @@ fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
         "systemd 托管挂载：name={name} backing={}",
         spec.backing.display()
     );
-    // 评审 C1 + Task 12：systemd 开机自启（`ExecStart=zipfs mount-managed --name %i`）由 systemd 直接
-    // 拉起本进程，**不经** `SystemdMounter::spawn`，故守卫必须在此真正挂载前兜底，否则自启路径会静默
-    // 盖住停用期回落写（主威胁面）。underlay 含非白名单 fall-through → 落 NEEDS-RECONCILE sentinel +
-    // 明确 stderr + 以独特码 75 退出（**不返回 Err/exit 1**）。这是主进程路径，单元 `RestartPreventExitStatus=75`
-    // 对主进程有效 → 拦住 Restart 不 crash-loop；同时覆盖 `ExecCondition` guard-check 通过后到此处之间
-    // underlay 又生回落写的 TOCTOU 窗口（guard-check 是 ExecCondition，防不到该窗口）。
-    zipfs::enable::guard_underlay_or_exit(&paths, &name)?;
     run_mount(mount_args_from_spec(&spec))
 }
 
