@@ -144,15 +144,15 @@ memory 本应是**单份透传软链**：ingest 在 backing 按软链重建、sh
 
 ### 10.1 依赖：per-generation manifest（记**逆转类**，非展示串）
 
-undo 要按各条目当初的处置分别逆转，故 `reconcile` 落盘时须在该代次 stash 里持久化 **manifest**：`reconcile_stash(name,ts)/manifest`，记录 `ts` 与每条目 `rel → 逆转类`。**逆转类不是展示用的 action 字符串，而是"undo 该怎么反做"的精确分类**（评审 C3：`reconcile_subagents_dir` 对 new 与 merge 都报同一 `subagents-union`，展示串抹平了 new-vs-merge，会致孤儿残留）——由 `apply_entry` 在处置时**据实际是否落了 orig 前镜像**判定：
+undo 要按各条目当初的处置分别逆转，故 `reconcile` 落盘时须在该代次 stash 里持久化 **manifest**：`reconcile_stash(name,ts)/manifest`，记录 `ts` 与每条目 `rel → 逆转类`。**逆转类不是展示用的 action 字符串，而是"undo 该怎么反做"的精确分类**（评审 C3：`reconcile_subagents_dir` 对 new 与 merge 都报同一 `subagents-union`，展示串抹平了 new-vs-merge，会致孤儿残留）——由 `apply_entry` 在处置时按其**实际走的分支**判定，`restore-orig` vs `remove-orig` 的判别子是**是否落了 orig 前镜像**（union/subagents 伞下也据此精确区分 merge 与 new），其余三类由分支上下文直接确定：
 
 | 逆转类 | 何时记 | undo 逆转动作 |
 |---|---|---|
 | `restore-orig` | union / subagents-merge：orig 预先存在、落了前镜像 | 从 `stash/<ts>/orig/<rel>` 原子还原 `orig/<rel>` → `reingest_one_file(rel)` 重建 `backing/<rel>` |
 | `remove-orig` | new / subagents-new：orig 原不存在、新增 | 删 `orig/<rel>` + 删 `backing/<rel>`（NotFound 容忍）→ prune 空父目录 |
 | `remove-quarantine` | keep-separate | orig/backing **不碰**；删本代次 `quarantine/<ts>/<rel>`（删前逐字节校验其内容 == `stash/<ts>/underlay/<rel>` 快照，非 live） |
-| `report-memory` | passthrough（真实目录 relocate） | orig/backing 不碰；**不触碰外部 memory 目标**，仅报告本代次往目标写过的文件（新文件 + `.underlay-<crc>` 变体）供用户 git 回退 |
-| `noop` | identical / skipped / keep-both / memory-symlink 短路（§6） | orig/backing 不碰 |
+| `report-memory` | passthrough**且实际 relocate 了**（真实目录、路径安全闸通过、往外部目标写过文件） | orig/backing 不碰；**不触碰外部 memory 目标**，仅报告本代次往目标写过的文件（新文件 + `.underlay-<crc>` 变体）供用户 git 回退 |
+| `noop` | identical / skipped / keep-both / memory-symlink 短路（§6）/ **memory-deferred（路径安全闸拦截、外部未写、underlay 未 relocate）** | orig/backing 不碰；无外部写可报 |
 
 manifest 随 run 结束写入（best-effort：写失败仅告警，但该 run **不可 undo**，需手动从 stash 恢复）。
 
