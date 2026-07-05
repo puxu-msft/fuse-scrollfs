@@ -1,6 +1,7 @@
-# reconcile 子系统专项审查 / Code Review — 2026-07-06 (No.1)
+# reconcile 子系统专项审查 / Code Review — 2026-07-06 (No.1)（已归档 / ARCHIVED）
 
-> 对象：session-reconcile 子系统（`fuse/src/reconcile/*` + `enable/{autostart,hang_free,force_umount,guard}.rs` 相关接线，~6400 行）。设计见 [09-session-reconcile.md](../09-session-reconcile.md) + 计划 [session-reconcile.md](./session-reconcile.md) / [reconcile-undo.md](./reconcile-undo.md)。
+> 状态：**已核验闭环、归档**。CRITICAL + HIGH + 2 Important + 1 wedge 已同会话 TDD 修复（见文末「修复状态」，370 lib 测试绿）；余 W2（需可信重挂路径）+ W3/W4（Low）为已记录的后续项，本报告作历史闭环记录归档。
+> 对象：session-reconcile 子系统（`fuse/src/reconcile/*` + `enable/{autostart,hang_free,force_umount,guard}.rs` 相关接线，~6400 行）。设计见 [09-session-reconcile.md](../09-session-reconcile.md) + 计划 [session-reconcile.md](../plans/session-reconcile.md) / [reconcile-undo.md](../plans/reconcile-undo.md)。
 > 方法：4 路并行 subagent（删除门 / 合并核 / 崩溃安全 / 路径并发），判据轴统一为**零数据丢失铁律 + 绝不 wedge**（非 ROI）；主代理对每条结论**独立核对当前源码**（标注"已核实"）。
 > 总评：**零数据丢失基本成立**（删除门对 incoming 侧强壮、路径/symlink 全 fail-closed、undo 双保险陈旧门），但有 **1 CRITICAL + 1 HIGH + 2 Important + 2 Medium(wedge)** 需收口。
 
