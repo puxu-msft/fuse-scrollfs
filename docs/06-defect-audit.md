@@ -1,7 +1,8 @@
-# 06 · 缺陷审查台账 / Defect Audit — 单一信息源
+# 06 · 缺陷审查台账 / Defect Audit — 单一信息源（已归档 / ARCHIVED）
 
-> 状态：第二轮全面审查完成并修复（23 提交，188 lib + 31 集成测试全绿，fmt/clippy 干净）。日期：2026-06-30。
-> 上游：第一轮数据损坏事故（Bug A/B/C/D）见计划 `~/.claude/plans/cheeky-hatching-clock.md` 与提交 `95775d3..e70bed9`。本文收敛**第二轮**（数据安全四梯队 + enable 编排竞态）的全部发现、修复、未做项与判断依据，作为后续路线图的缺陷侧单一信息源。
+> 状态：**已核验闭环、归档**。第二轮全面审查完成并修复；2026-07-06 在 +98 提交 / +11k 行（session reconcile 子系统等）之后**重新核验全部修复仍完好**（见 §7），本台账作为历史闭环记录归档。
+> 上游：第一轮数据损坏事故（Bug A/B/C/D）见计划 `~/.claude/plans/cheeky-hatching-clock.md` 与提交 `95775d3..e70bed9`。本文收敛**第二轮**（数据安全四梯队 + enable 编排竞态）的全部发现、修复、未做项与判断依据。
+> 后续新表面（reconcile/hang_free/force_umount/blockcache）的审查另立文档，不在本台账范围。
 
 ## §0 背景 / Background
 
@@ -92,7 +93,24 @@ cargo clippy --release --all-targets --features fault-injection   # 0 warning
 cargo fmt --check               # clean
 ```
 
-## §6 相关 / See Also
+## §7 归档核验 / Closure Re-verification (2026-07-06)
+
+台账落成后，主线又并入 **98 提交 / +11k 行**（session reconcile 子系统 4731 行 orchestrator + hang_free / force_umount / blockcache / metrics）。归档前对全部 23 项修复**逐一重新核验仍完好**（真值取自当前代码，非旧台账）：
+
+| 核验维度 | 结果 |
+|---|---|
+| 21 个"评审 XX"注释锚点 | 全部在位 |
+| 关键函数（`forget_inode_flush`/`validate_name`/`fsync_dir_of`/`acquire_backing`/`decode_capped`/`index_dirty`/`canonicalized_target`/`sidecar_value`） | 全部在位 |
+| 13 个专项回归测试 | 全部存在且通过 |
+| 全量测试 | **366 lib + 集成全绿 / 0 失败**（原 188→366） |
+| 无独立测试的 A2（create fsync 父目录） | `shadow.rs` 真代码仍在 |
+| D2（删块溢出） | `container.rs` 无 `+1,0)` 溢出模式、5 处 `..=(x,u64::MAX)` |
+
+**A3 未被后续锁改动削弱**：提交 `02393dc` 给维护/reconcile 路径加 `acquire_backing_retry`（25×20ms 有界重试）仅 riding out 同会话"释放→重取"的假 WouldBlock；被另一活操作真持有时锁贯穿整个多秒操作仍 WouldBlock，守护 open 路径仍用不重试的 `acquire_exclusive`。`compact_shadow_tree_blocked_while_backing_locked` 仍绿。
+
+**新表面未纳入本台账**：reconcile 子系统抽查复用了安全 chokepoint（`fsync_dir_of` ×55 / `acquire_backing` 锁 / `ByteEqual` readback 删除门 / Store 层 name 校验自动覆盖新调用方），未明显重蹈旧覆辙，但**未经同深度审计**——另立专项。
+
+## §8 相关 / See Also
 
 - [04-crash-safe-commit.md](./04-crash-safe-commit.md) — 双 superblock + 尾日志（A3/B3 的格式基础）
 - [05-fault-injection-testing.md](./05-fault-injection-testing.md) — 故障注入两层架构
