@@ -4042,4 +4042,458 @@ mod tests {
             "dry_run 不应写 manifest"
         );
     }
+
+    // ── reconcile-undo（回退最近一次重合并，§10） ─────────────────────────────
+
+    /// 把文件 mtime/atime 回拨 `secs_ago` 秒（测试用，绕过 5min 活跃门以单独验证陈旧 byte 门）。
+    fn backdate_mtime(path: &Path, secs_ago: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let t = SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+        let d = t.duration_since(UNIX_EPOCH).unwrap();
+        let tv = libc::timeval {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::utimes(cpath.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes 回拨 mtime 失败");
+    }
+
+    const KEEP_BASE: &str = concat!(
+        "{\"type\":\"assistant\",\"uuid\":\"a1\",\"parentUuid\":null,",
+        "\"timestamp\":\"2026-06-24T00:00:00.000Z\"}\n"
+    );
+    const KEEP_INCOMING: &str = concat!(
+        "{\"type\":\"assistant\",\"uuid\":\"b1\",\"parentUuid\":null,",
+        "\"timestamp\":\"2026-06-30T00:00:00.000Z\"}\n"
+    );
+
+    fn accept_opts() -> ReconcileOptions {
+        ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        }
+    }
+
+    /// 跑一次 union（orig 预存）+ new（orig 缺）+ keep-separate（疑 reuse）的 reconcile，返回 run ts。
+    fn reconcile_three_kinds(paths: &Paths, mp: &Path) -> String {
+        write_orig(paths, "demo", "s.jsonl", BASE_LOG.as_bytes());
+        reingest_one_file(paths, "demo", "s.jsonl").unwrap();
+        write_underlay(mp, "s.jsonl", INCOMING_LOG.as_bytes());
+
+        write_underlay(mp, "new.jsonl", INCOMING_LOG.as_bytes());
+
+        write_orig(paths, "demo", "3f2a-b1c2-uuid.jsonl", KEEP_BASE.as_bytes());
+        reingest_one_file(paths, "demo", "3f2a-b1c2-uuid.jsonl").unwrap();
+        write_underlay(mp, "3f2a-b1c2-uuid.jsonl", KEEP_INCOMING.as_bytes());
+
+        let m = FakeMounter::default();
+        let rec = reconcile(paths, "demo", accept_opts(), &m).unwrap();
+        rec.stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn reconcile_undo_full_flow_restores_orig_removes_new_and_quarantine() {
+        // union+new+keep-separate reconcile 后 undo：RestoreOrig 还原前镜像、RemoveOrig 删新增、
+        // RemoveQuarantine 删隔离副本、underlay 从快照还原、结束态可再 reconcile。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        let ts = reconcile_three_kinds(&paths, &mp);
+        let orig_union = paths.orig("demo").join("s.jsonl");
+        let orig_new = paths.orig("demo").join("new.jsonl");
+        let orig_keep = paths.orig("demo").join("3f2a-b1c2-uuid.jsonl");
+        let quarantine_keep = paths.quarantine("demo", &ts).join("3f2a-b1c2-uuid.jsonl");
+
+        // reconcile 后态：underlay 清空、union orig 已合并、new orig 已建、keep 已隔离。
+        assert!(!mp.join("s.jsonl").exists());
+        assert!(orig_new.exists(), "new 应落 orig");
+        assert!(quarantine_keep.exists(), "keep 应隔离");
+        assert_ne!(
+            std::fs::read(&orig_union).unwrap(),
+            BASE_LOG.as_bytes(),
+            "union orig 已合并（≠ base）"
+        );
+
+        // ── undo ──
+        let report = reconcile_undo(&paths, "demo").unwrap();
+        assert_eq!(report.ts, ts, "选中最近一代");
+
+        // RestoreOrig：union orig 还原前镜像（== base）；backing 重建为 base。
+        assert_eq!(
+            std::fs::read(&orig_union).unwrap(),
+            BASE_LOG.as_bytes(),
+            "union orig 还原前镜像"
+        );
+        assert_eq!(
+            read_archive(&paths.backing("demo", Backend::Shadow).join("s.jsonl")),
+            BASE_LOG.as_bytes(),
+            "union backing 重建为 base"
+        );
+        // RemoveOrig：new orig + backing 删除。
+        assert!(!orig_new.exists(), "new orig 应删");
+        assert!(
+            !paths
+                .backing("demo", Backend::Shadow)
+                .join("new.jsonl")
+                .exists(),
+            "new backing 应删"
+        );
+        // RemoveQuarantine：隔离副本删除；keep orig base 不动。
+        assert!(!quarantine_keep.exists(), "keep 隔离副本应删");
+        assert_eq!(
+            std::fs::read(&orig_keep).unwrap(),
+            KEEP_BASE.as_bytes(),
+            "keep orig base 绝不触碰"
+        );
+
+        // underlay 从快照还原：三条都回 mp。
+        assert_eq!(
+            std::fs::read(mp.join("s.jsonl")).unwrap(),
+            INCOMING_LOG.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(mp.join("new.jsonl")).unwrap(),
+            INCOMING_LOG.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(mp.join("3f2a-b1c2-uuid.jsonl")).unwrap(),
+            KEEP_INCOMING.as_bytes()
+        );
+
+        // reversed 记三条逆转类。
+        let rev: std::collections::HashMap<String, String> = report.reversed.into_iter().collect();
+        assert_eq!(rev.get("s.jsonl").map(String::as_str), Some("RestoreOrig"));
+        assert_eq!(rev.get("new.jsonl").map(String::as_str), Some("RemoveOrig"));
+        assert_eq!(
+            rev.get("3f2a-b1c2-uuid.jsonl").map(String::as_str),
+            Some("RemoveQuarantine")
+        );
+
+        // .undone 落 + reconciling 清 + 结束态可再 reconcile（underlay 又有 fall-through）。
+        assert!(
+            paths.reconcile_stash("demo", &ts).join(".undone").exists(),
+            "落 .undone 标记"
+        );
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "收尾清 reconciling 标记"
+        );
+        assert!(
+            underlay_has_fallthrough(&mp).unwrap(),
+            "还原后 underlay 又有 fall-through → 可再 reconcile"
+        );
+    }
+
+    #[test]
+    fn reconcile_undo_stale_gate_rejects_and_zero_change() {
+        // 陈旧门：undo 前对某快照条目在 mp 写不同内容 → 拒绝整个 undo、零改动、报告该 rel。
+        // 回拨 mtime 绕过 5min 活跃门，单独验证 byte 门（活跃门另有覆盖）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        let orig_file = setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+        let rec = reconcile(&paths, "demo", accept_opts(), &m).unwrap();
+        let ts = rec
+            .stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let orig_merged = std::fs::read(&orig_file).unwrap();
+
+        // reconcile 后 Claude 又写不同内容（回拨 mtime → 非活跃，但与快照字节不同）。
+        write_underlay(&mp, rel, b"{\"type\":\"NEW-AFTER-RECONCILE\"}\n");
+        backdate_mtime(&mp.join(rel), 600);
+
+        let e = reconcile_undo(&paths, "demo").unwrap_err();
+        assert!(
+            e.to_string().contains("已有新写") && e.to_string().contains(rel),
+            "陈旧门应拒绝并报告 rel：{e}"
+        );
+        // 零改动：orig 未还原、live 未动、marker 未落、.undone 未落。
+        assert_eq!(
+            std::fs::read(&orig_file).unwrap(),
+            orig_merged,
+            "拒绝→orig 未动"
+        );
+        assert_eq!(
+            std::fs::read(mp.join(rel)).unwrap(),
+            b"{\"type\":\"NEW-AFTER-RECONCILE\"}\n",
+            "拒绝→live 未动"
+        );
+        assert!(
+            !paths.reconcile_stash("demo", &ts).join(".undone").exists(),
+            "拒绝→不落 .undone"
+        );
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "拒绝前从未置 reconciling 标记"
+        );
+    }
+
+    #[test]
+    fn stale_gate_helper_reports_only_changed_rels() {
+        // 陈旧门核心比对：live 与快照逐字节不同 → 报告该 rel；相等或 live 缺失 → 不报。
+        let tmp = tempfile::tempdir().unwrap();
+        let stash_underlay = tmp.path().join("stash").join("underlay");
+        std::fs::create_dir_all(&stash_underlay).unwrap();
+        std::fs::write(stash_underlay.join("same.jsonl"), b"SNAP\n").unwrap();
+        std::fs::write(stash_underlay.join("diff.jsonl"), b"SNAP\n").unwrap();
+        std::fs::write(stash_underlay.join("gone.jsonl"), b"SNAP\n").unwrap();
+        let mp = tmp.path().join("mp");
+        std::fs::create_dir_all(&mp).unwrap();
+        std::fs::write(mp.join("same.jsonl"), b"SNAP\n").unwrap(); // 相等
+        std::fs::write(mp.join("diff.jsonl"), b"CHANGED\n").unwrap(); // 不同
+                                                                      // gone.jsonl live 缺失
+
+        let changed = live_underlay_changed_since_snapshot(&stash_underlay, &mp).unwrap();
+        assert_eq!(changed, vec!["diff.jsonl".to_string()], "仅报字节不同者");
+    }
+
+    #[test]
+    fn restore_underlay_guard_keeps_changed_live() {
+        // 逐条守卫：还原步遇 live 缺失 → 还原快照；live 与快照不同 → 不覆盖、保留 live、记 skipped。
+        let tmp = tempfile::tempdir().unwrap();
+        let stash_underlay = tmp.path().join("stash").join("underlay");
+        std::fs::create_dir_all(&stash_underlay).unwrap();
+        std::fs::write(stash_underlay.join("a.jsonl"), b"SNAP-A\n").unwrap();
+        std::fs::write(stash_underlay.join("b.jsonl"), b"SNAP-B\n").unwrap();
+        let mp = tmp.path().join("mp");
+        std::fs::create_dir_all(&mp).unwrap();
+        // a 缺失 → 还原；b 已存在且不同 → 保留 live。
+        std::fs::write(mp.join("b.jsonl"), b"LIVE-B-CHANGED\n").unwrap();
+
+        let mut skipped = Vec::new();
+        restore_underlay_from_snapshot(&stash_underlay, &mp, &mut skipped).unwrap();
+
+        assert_eq!(
+            std::fs::read(mp.join("a.jsonl")).unwrap(),
+            b"SNAP-A\n",
+            "缺失 → 还原快照"
+        );
+        assert_eq!(
+            std::fs::read(mp.join("b.jsonl")).unwrap(),
+            b"LIVE-B-CHANGED\n",
+            "不同 → 保留 live、绝不覆盖"
+        );
+        assert_eq!(
+            skipped,
+            vec!["b.jsonl".to_string()],
+            "记 skipped_live_changed"
+        );
+    }
+
+    #[test]
+    fn reconcile_undo_marker_stays_on_restore_orig_preimage_missing() {
+        // marker 对称：中途注入失败（RestoreOrig 前镜像缺失）→ reconciling 标记仍在、无 .undone、可重跑。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        let orig_file = setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+        let rec = reconcile(&paths, "demo", accept_opts(), &m).unwrap();
+        let ts = rec
+            .stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let preimage = paths.reconcile_stash("demo", &ts).join("orig").join(rel);
+        assert!(preimage.exists(), "reconcile 应留 union 前镜像");
+        let preimage_bytes = std::fs::read(&preimage).unwrap();
+
+        // 注入失败：删前镜像 → RestoreOrig fail-closed 中止。
+        std::fs::remove_file(&preimage).unwrap();
+        let e = reconcile_undo(&paths, "demo").unwrap_err();
+        assert!(
+            e.to_string().contains("前镜像") && e.to_string().contains("缺失"),
+            "应因前镜像缺失 fail-closed 中止：{e}"
+        );
+        // marker 仍在（半改写窗口未收尾），无 .undone。
+        assert!(
+            paths.reconciling_marker("demo").exists(),
+            "中途失败 → reconciling 标记保留，让维护让路"
+        );
+        assert!(
+            !paths.reconcile_stash("demo", &ts).join(".undone").exists(),
+            "失败 → 不落 .undone"
+        );
+
+        // 修复（复原前镜像）后重跑 → 幂等成功收尾。
+        std::fs::write(&preimage, &preimage_bytes).unwrap();
+        let report = reconcile_undo(&paths, "demo").unwrap();
+        assert_eq!(report.ts, ts);
+        assert_eq!(
+            std::fs::read(&orig_file).unwrap(),
+            BASE_LOG.as_bytes(),
+            "重跑后 orig 还原前镜像"
+        );
+        assert!(
+            paths.reconcile_stash("demo", &ts).join(".undone").exists(),
+            "重跑成功落 .undone"
+        );
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "重跑成功清 reconciling 标记"
+        );
+    }
+
+    #[test]
+    fn reconcile_undo_rejects_crashed_run_without_manifest_and_keeps_marker() {
+        // 最新代次无 manifest（崩溃未完成的 run）→ 拒绝，且绝不清崩溃 run 的 reconciling marker。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+
+        // 崩溃代次：有 underlay 快照但无 manifest。
+        let ts = "1000";
+        let stash_underlay = paths.reconcile_stash("demo", ts).join("underlay");
+        std::fs::create_dir_all(&stash_underlay).unwrap();
+        std::fs::write(stash_underlay.join("s.jsonl"), b"{}\n").unwrap();
+        // 崩溃 run 遗留的 reconciling 标记。
+        set_reconciling(&paths, "demo", true).unwrap();
+
+        let e = reconcile_undo(&paths, "demo").unwrap_err();
+        assert!(
+            e.to_string().contains("manifest") && e.to_string().contains("未完成"),
+            "无 manifest 的崩溃 run 应拒绝：{e}"
+        );
+        assert!(
+            paths.reconciling_marker("demo").exists(),
+            "绝不清除属于崩溃 run 的 reconciling 标记"
+        );
+    }
+
+    #[test]
+    fn reconcile_undo_rejects_when_no_generation() {
+        // 无任何 reconcile 代次 → Err「无可回退」。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        let e = reconcile_undo(&paths, "demo").unwrap_err();
+        assert!(
+            e.to_string().contains("无可回退") || e.to_string().contains("无任何代次"),
+            "无代次应拒绝：{e}"
+        );
+    }
+
+    #[test]
+    fn reconcile_undo_second_time_is_noop() {
+        // .undone 二次 undo → no-op（返回回填 ts 的空报告，零改动）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+        let rec = reconcile(&paths, "demo", accept_opts(), &m).unwrap();
+        let ts = rec
+            .stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let r1 = reconcile_undo(&paths, "demo").unwrap();
+        assert_eq!(r1.ts, ts);
+        assert!(!r1.reversed.is_empty(), "首次 undo 有实际逆转");
+
+        // 二次 undo：.undone 已在 → no-op（在活跃/陈旧门之前短路，即便 underlay 已还原）。
+        let r2 = reconcile_undo(&paths, "demo").unwrap();
+        assert_eq!(r2.ts, ts, "no-op 仍回填 ts");
+        assert!(
+            r2.reversed.is_empty(),
+            ".undone 二次 undo → 空 reversed（no-op）"
+        );
+    }
+
+    #[test]
+    fn reconcile_undo_reports_memory_manual_without_touching_target() {
+        // ReportMemory：memory 条目进 memory_manual、外部目标未被 undo 触碰、underlay 从快照还原。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        // backing/memory = 指向树外 target 的 symlink；underlay memory 被物化含文件。
+        let target = tmp.path().join("external-memory");
+        std::fs::create_dir_all(&target).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+        std::os::unix::fs::symlink(&target, backing.join("memory")).unwrap();
+        let mem_body = b"# NOTES\nrelocated\n";
+        write_underlay(&mp, "memory/NOTE.md", mem_body);
+
+        let m = FakeMounter::default();
+        let rec = reconcile(&paths, "demo", accept_opts(), &m).unwrap();
+        let ts = rec
+            .stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        // reconcile 后：memory 文件安置进 target。
+        assert_eq!(std::fs::read(target.join("NOTE.md")).unwrap(), mem_body);
+
+        let report = reconcile_undo(&paths, "demo").unwrap();
+        assert_eq!(report.ts, ts);
+        // memory 条目进 memory_manual（供用户 git 回退）。
+        assert!(
+            report.memory_manual.iter().any(|m| m == "memory/NOTE.md"),
+            "memory 条目应进 memory_manual：{:?}",
+            report.memory_manual
+        );
+        // undo 绝不触碰外部 memory 目标（target 仍有 reconcile 写入的文件）。
+        assert_eq!(
+            std::fs::read(target.join("NOTE.md")).unwrap(),
+            mem_body,
+            "undo 绝不触碰外部 memory 目标"
+        );
+        // underlay memory 从快照还原。
+        assert_eq!(
+            std::fs::read(mp.join("memory/NOTE.md")).unwrap(),
+            mem_body,
+            "underlay memory 从快照还原"
+        );
+    }
+
+    #[test]
+    fn latest_generation_picks_numeric_max_not_lexical() {
+        // ts 按数值比较（"9" < "100"），非字典序。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        for ts in ["9", "100", "20"] {
+            std::fs::create_dir_all(paths.reconcile_stash("demo", ts)).unwrap();
+        }
+        assert_eq!(
+            latest_generation(&paths, "demo").unwrap().as_deref(),
+            Some("100"),
+            "数值最大而非字典序最大"
+        );
+    }
 }
