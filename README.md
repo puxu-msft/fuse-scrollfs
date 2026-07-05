@@ -79,7 +79,7 @@ zipfs enable apply <name> --backend shadow|container \
 
 - **两种后端可选**：`shadow`（默认；真实目录树，支持 symlink，append 友好）/ `container`（redb 单文件，便于搬运；不支持 symlink）。
 - **持久化默认**：`zipfs enable config set level 19` / `config show` —— 免去每次重复敲选项。
-- **维护**：`zipfs enable compact <name>`（回收空间，两后端）、`zipfs enable seal <name>`（仅 shadow，冷文件大块重压）—— 自动卸载→操作→重挂。
+- **维护**：`zipfs enable compact <name>`（回收空间，两后端）、`zipfs enable seal <name>`（仅 shadow，冷文件大块重压）—— 自动卸载→操作→重挂。大文件（会话 jsonl）为主的库可加 `--seal-chunk` 提块到 >8MiB（如 `67108864`=64MiB），自动启用 zstd 长程匹配（LDM）逼近整流上界（实测大 transcript +8~16%，见 [bench/results/ldm-ratio/REPORT.md](bench/results/ldm-ratio/REPORT.md)）；默认 8MiB 不开 LDM，代价是冷读单块解压内存随块增大。
 - 透明支持 Claude 的 `memory` 外部软链（shadow：ingest 照原样重建、运行时经 readlink 服务）；真正特殊文件（FIFO/socket/设备）会被拒绝并回滚，避免静默丢失。
 
 > 路径可经 env `CLAUDE_PROJECTS` / `ZIPFS_HOME` 覆盖（默认 `~/.claude/projects`、`~/.claude-zip`）。
