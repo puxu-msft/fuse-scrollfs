@@ -159,11 +159,13 @@ pub fn session_merge(base: &str, incoming: &str) -> MergeResult {
                 RecordKind::Transcript { uuid } => match by_uuid.get(uuid) {
                     Some(prev) if prev.line.len() >= r.line.len() => {
                         if prev.line != r.line {
-                            conflicts.push(uuid.clone());
+                            // 评审 R-I2：同 uuid 内容分叉，保留更长者（§4.1，短者疑崩溃截断）。
+                            // conflicts 携**被丢的落败整行**（非仅 uuid），使其可从报告复原（零丢失）。
+                            conflicts.push(format!("uuid={uuid} dropped={}", r.line));
                         }
                     }
-                    Some(_) => {
-                        conflicts.push(uuid.clone());
+                    Some(prev) => {
+                        conflicts.push(format!("uuid={uuid} dropped={}", prev.line));
                         by_uuid.insert(
                             uuid.clone(),
                             Item {
@@ -476,5 +478,13 @@ mod tests {
             1
         );
         assert!(!r.conflicts.is_empty(), "同 uuid 冲突记入报告");
+        // 评审 R-I2：conflicts 须携被丢的落败整行，使其可从报告复原（零丢失）。
+        assert!(
+            r.conflicts
+                .iter()
+                .any(|c| c.contains("dropped=") && c.contains("u1")),
+            "冲突报告应含被丢落败行内容：{:?}",
+            r.conflicts
+        );
     }
 }
