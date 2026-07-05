@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn read_range_head_缓存命中_逐字节正确() {
+    fn read_range_head_cache_hit_byte_for_byte_correct() {
         let (fs, data, ino) = fs_with_head_cache();
         // 区间完全落在 head 缓存前缀（< 64KiB）→ 走快路径，免整块解压。
         let got = fs.read_range(ino, 100, 4000).unwrap();
@@ -1045,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn read_range_越缓存前缀_回退逐块仍正确() {
+    fn read_range_beyond_cached_prefix_falls_back_per_block_still_correct() {
         let (fs, data, ino) = fs_with_head_cache();
         // 跨越 head 缓存末端（HEAD_CACHE_BYTES 附近）→ 回退逐块路径，仍逐字节正确。
         let off = HEAD_CACHE_BYTES - 50;
@@ -1197,7 +1197,7 @@ mod tests {
     /// 锁真正包住 `InodeState`：多线程对同 ino 反复 write，期间穿插 forget（丢弃尾块 + evict 锁项），
     /// 全程串行化于该 inode 写锁 → 无数据竞争 panic；末轮全静默后 forget 应把该 ino 从 DashMap 移除。
     #[test]
-    fn 并发_write_与_forget_同_ino_无_panic_且_evict_后表不含该_ino() {
+    fn concurrent_write_and_forget_same_ino_no_panic_and_evicted_ino_absent_after() {
         use std::sync::atomic::{AtomicBool, Ordering as AOrd};
         use std::thread;
 
@@ -1510,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn 块缓存_同内部块多次小读只取块一次() {
+    fn block_cache_multiple_small_reads_same_interior_block_fetch_once() {
         let cs = 4096u32;
         // 4 满块 + 100B 尾块 → tail_idx=4，块 0..3 为可缓存内部块。
         let (fs, store, data, ino) = fs_counting(cs, 4 * cs as usize + 100, 1 << 20);
@@ -1534,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn 块缓存_尾块不缓存_每次读都取块() {
+    fn block_cache_tail_block_not_cached_fetch_every_read() {
         let cs = 4096u32;
         let nbytes = 4 * cs as usize + 100; // tail_idx=4，尾块部分 100B。
         let (fs, store, data, ino) = fs_counting(cs, nbytes, 1 << 20);
@@ -1556,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn 块缓存_写内部块后失效_读到新字节非缓存旧值() {
+    fn block_cache_invalidated_after_write_interior_block_reads_new_bytes_not_stale() {
         let cs = 4096u32;
         let (fs, store, _data, ino) = fs_counting(cs, 4 * cs as usize + 100, 1 << 20);
         let b1 = cs as u64;
@@ -1575,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn 块缓存_命中未命中计数进指标() {
+    fn block_cache_hit_miss_counts_recorded_in_metrics() {
         let cs = 4096u32;
         // 4 满块 + 100B 尾块 → tail_idx=4，块 0..3 为可缓存内部块。
         let (fs, _store, _data, ino) = fs_counting(cs, 4 * cs as usize + 100, 1 << 20);

@@ -307,7 +307,7 @@ mod tests {
     // ----- FaultIo 页缓存崩溃模型（docs/05 §4 / 任务 2.1）-----
 
     #[test]
-    fn faultio_未sync的写_crash不含_sync后含() {
+    fn faultio_unsynced_write_absent_after_crash_present_after_sync() {
         let io = FaultIo::from_bytes(vec![0u8; 8]);
         BlockIo::write_at(&io, 0, b"AB").unwrap();
         // 未 sync：最悲观镜像（mask=0，不应用任何 dirty）不含该写。
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn faultio_乱序子集_能产出含a不含b() {
+    fn faultio_reordered_subset_can_yield_a_without_b() {
         // 钉死模型未退化成「全丢 dirty」：两条未 sync 的写 A(off0)、B(off4)，crash 能产出含 A 不含 B
         // （评审 CRITICAL ②：否则 2.5 的乱序剪枝可能悄悄废掉整条链）。
         let io = FaultIo::from_bytes(vec![0u8; 8]);

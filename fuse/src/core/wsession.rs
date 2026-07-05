@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn 大量小_append_后整文件正确_且重压次数远少于行数() {
+    fn many_small_appends_whole_file_correct_and_recompress_count_far_fewer_than_lines() {
         // 64 字节块，逐行 append 4 字节 × 100 行 = 6400 字节 = 100 块。
         let store = MemStore::new(64);
         let ino = store.new_file();
@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn fsync_后尾块已封且可经_store_读出() {
+    fn tail_block_sealed_after_fsync_and_readable_via_store() {
         let store = MemStore::new(16);
         let ino = store.new_file();
         let mut sess = Session::new(true);
@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn read_while_appending_读到缓冲尾块而非旧封块() {
+    fn read_while_appending_reads_buffered_tail_block_not_old_sealed_block() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let mut sess = Session::new(true);
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn append_与随机写混合_保持正确() {
+    fn mixed_append_and_random_write_stays_correct() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let mut sess = Session::new(true);
@@ -668,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn 越_eof_空洞写仍正确() {
+    fn hole_write_beyond_eof_still_correct() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let mut sess = Session::new(true);
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_后再_append_正确() {
+    fn append_after_truncate_correct() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let mut sess = Session::new(true);
@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn 关闭优化时退化为旧路径_仍正确() {
+    fn degrades_to_old_path_when_optimization_off_still_correct() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let mut sess = Session::new(false);
@@ -712,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn 注入共享_metrics_后封块计数进该注册表() {
+    fn injected_shared_metrics_seal_count_goes_to_registry() {
         // 注入前端共享的 Metrics 后，seal 落 Store 应同时进该注册表的 seals counter，
         // 且 seal_count() 委托它读回同一值（API 语义不变、又进 .prom）。
         let store = MemStore::new(8);
@@ -737,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn forget_丢弃尾块不封块() {
+    fn forget_discards_tail_block_without_sealing() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         let mut sess = Session::new(true);

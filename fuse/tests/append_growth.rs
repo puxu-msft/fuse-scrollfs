@@ -50,7 +50,7 @@ fn incompressible(len: usize, seed: u64) -> Vec<u8> {
 }
 
 #[test]
-fn shadow_append_只增量增长不重写全文() {
+fn shadow_append_grows_append_only_no_full_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), CHUNK_SIZE).unwrap();
     let ino = store.create(ROOT_INO, "big.dat", new_attr()).unwrap();
@@ -81,7 +81,7 @@ fn shadow_append_只增量增长不重写全文() {
 }
 
 #[test]
-fn container_append_只增量增长() {
+fn container_append_grows_append_only() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.redb");
     let store = ContainerStore::open_with_chunk_size(&path, CHUNK_SIZE).unwrap();
@@ -108,7 +108,7 @@ fn container_append_只增量增长() {
 /// redb 写批处理正确性：一次会话内多块 put 合并一事务（fsync 才落盘），
 /// fsync 前后读一致（read-through 挂起），fsync 后重开容器仍可读。
 #[test]
-fn container_批量事务_读写后重开一致() {
+fn container_batch_transaction_consistent_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.redb");
     let payload = incompressible(10 * 1024, 7);

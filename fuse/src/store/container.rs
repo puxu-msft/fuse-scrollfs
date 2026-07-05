@@ -1009,7 +1009,7 @@ mod tests {
 
     /// compact 后数据仍可读，且物理文件不大于 compact 前（通常显著收缩）。
     #[test]
-    fn compact_后数据可读且体积不增() {
+    fn data_readable_and_size_not_grown_after_compact() {
         let cs = 4096u32;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.redb");
@@ -1072,7 +1072,7 @@ mod tests {
 
     /// 空/新建容器 compact 不报错（幂等边界）。
     #[test]
-    fn compact_新建容器不报错() {
+    fn compact_creates_new_container_without_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.redb");
         {

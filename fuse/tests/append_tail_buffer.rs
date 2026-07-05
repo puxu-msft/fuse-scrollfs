@@ -89,7 +89,7 @@ fn run_append_workload(
 }
 
 #[test]
-fn shadow_append_重压次数远少于行数_且内容正确() {
+fn shadow_append_recompress_count_far_fewer_than_lines_and_content_correct() {
     let dir = tempfile::tempdir().unwrap();
     let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), CHUNK_SIZE).unwrap();
     let ino = store.create(ROOT_INO, "t.jsonl", new_attr()).unwrap();
@@ -112,7 +112,7 @@ fn shadow_append_重压次数远少于行数_且内容正确() {
 }
 
 #[test]
-fn container_append_重压次数远少于行数_且内容正确() {
+fn container_append_recompress_count_far_fewer_than_lines_and_content_correct() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.redb");
     let store = ContainerStore::open_with_chunk_size(&path, CHUNK_SIZE).unwrap();
@@ -137,7 +137,7 @@ fn container_append_重压次数远少于行数_且内容正确() {
 }
 
 #[test]
-fn 关闭尾块缓冲_每次_append_直接落_store_仍正确() {
+fn tail_buffer_off_each_append_goes_straight_to_store_still_correct() {
     // --no-tail-buffer 对照：enabled=false，每次 append 直接走旧 rmw（落 Store），无封块计数。
     let dir = tempfile::tempdir().unwrap();
     let store = ShadowStore::open_with_chunk_size(dir.path().to_path_buf(), CHUNK_SIZE).unwrap();
@@ -166,7 +166,7 @@ fn 关闭尾块缓冲_每次_append_直接落_store_仍正确() {
 ///
 /// 读路径与 rwfs::read_range 一致：持写锁 → geometry → 逐块（尾块走缓冲，其余走 Store 解压）。
 #[test]
-fn 并发_读与_seal_无_torn_read() {
+fn concurrent_read_and_seal_no_torn_read() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -278,7 +278,7 @@ fn shadow_append_run(
 }
 
 #[test]
-fn shadow_频繁_fsync_块数一致_append_only() {
+fn shadow_frequent_fsync_block_count_consistent_append_only() {
     // §8.4 in-archive 尾日志：fsync 只追加未封尾块原始增量，不再每次重压尾块。故频繁/稀疏 fsync
     // 块数一致（只取决于逻辑量），且**物理体积接近**——写放大根治（§8.3 曾因 append-only 暂放宽，
     // journal 让它重新成立）。
@@ -299,7 +299,7 @@ fn shadow_频繁_fsync_块数一致_append_only() {
 }
 
 #[test]
-fn shadow_remount_journal_重建尾块逐字节一致() {
+fn shadow_remount_journal_rebuilds_tail_block_byte_for_byte_consistent() {
     // remount 安全网：多次 fsync 但不封块（行远小于块），尾块全在 journal。卸载（drop store）→
     // 重开 → 经 get_block 重放 journal 重建未封尾块，整文件逐字节与期望一致（§8.4 (2)：只做写放大
     // 不做重建会丢已 fsync 数据）。
@@ -343,7 +343,7 @@ fn shadow_remount_journal_重建尾块逐字节一致() {
 }
 
 #[test]
-fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
+fn shadow_content_durable_after_frequent_fsync_and_continued_write_byte_for_byte_consistent() {
     // durability + 续写正确性：频繁 fsync → 中途重开 store 读回（验证已 fsync 数据落盘）→
     // 继续 append → 读回整文件逐字节与期望一致（验证「fsync 后续写同一逻辑尾块」无错位）。
     use zipfs::archive::ArchiveReader;
@@ -427,7 +427,7 @@ fn shadow_频繁_fsync_后内容_durable_且续写逐字节一致() {
 /// 大文件边界（评审测试盲区）：>1MiB 默认块、多块、跨块 append、>5MB 体量。
 /// 现有测试最大仅 ~200KiB，从不跨越 1MiB 默认块多次——本测试补该回归。
 #[test]
-fn 大文件_多块_跨块append_逐字节正确() {
+fn large_file_multi_block_cross_block_append_byte_for_byte_correct() {
     use zipfs::core::rmw;
     let cs = 1024 * 1024u32; // 1MiB 默认块
     let dir = tempfile::tempdir().unwrap();

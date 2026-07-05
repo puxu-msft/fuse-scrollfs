@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn 封存后内容_round_trip_一致_且更小() {
+    fn content_round_trip_consistent_and_smaller_after_seal() {
         let dir = tempfile::tempdir().unwrap();
         let small_chunk = 64 * 1024;
         let content = redundant_content(50_000); // 约数 MB，多个 64KiB 块
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn 已是大块的文件被跳过_幂等() {
+    fn already_large_block_file_skipped_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let backing = dir.path().join("backing");
         std::fs::create_dir(&backing).unwrap();
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn 非archive文件被安全跳过() {
+    fn non_archive_file_safely_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let backing = dir.path().join("backing");
         std::fs::create_dir(&backing).unwrap();
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn 封存大块_ldm_自动开_round_trip_一致() {
+    fn seal_large_block_ldm_auto_on_round_trip_consistent() {
         // 封存到 16MiB 单块（>8MiB → seal 自动开 LDM）。整文件 ~18MiB 含 >8MiB 距离的 4MiB 自重复。
         // 红线：经完整 seal 管线（temp+fsync+rename）写出的 LDM 大块，读路径必须逐字节 round-trip。
         let dir = tempfile::tempdir().unwrap();

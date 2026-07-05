@@ -872,13 +872,13 @@ mod tests {
     }
 
     #[test]
-    fn inode_map_根为_1_路径为空() {
+    fn inode_map_root_is_1_path_empty() {
         let m = InodeMap::new();
         assert_eq!(m.path_of(ROOT_INO), Some(PathBuf::new()));
     }
 
     #[test]
-    fn intern_同路径复用_ino() {
+    fn intern_same_path_reuses_ino() {
         let mut m = InodeMap::new();
         let a = m.intern(PathBuf::from("a/b.txt"));
         let b = m.intern(PathBuf::from("a/b.txt"));
@@ -889,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_path_保持_ino_稳定() {
+    fn rename_path_keeps_ino_stable() {
         let mut m = InodeMap::new();
         let a = m.intern(PathBuf::from("old.txt"));
         m.rename_path(Path::new("old.txt"), Path::new("new.txt"));
@@ -970,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_缓存_写后读经提交可见且命中缓存() {
+    fn reader_cache_write_then_read_visible_after_commit_and_cache_hit() {
         let cs = 8u32;
         let (store, _d, ino) = store_with_file(cs);
 
@@ -994,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_缓存_提交后失效_不读陈旧数据() {
+    fn reader_cache_invalidated_after_commit_no_stale_read() {
         let cs = 8u32;
         let (store, _d, ino) = store_with_file(cs);
 
@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_缓存_release_释放() {
+    fn reader_cache_release_frees() {
         let cs = 8u32;
         let (store, _d, ino) = store_with_file(cs);
         store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_缓存_未提交脏块_read_through_不污染缓存() {
+    fn reader_cache_uncommitted_dirty_block_read_through_does_not_pollute_cache() {
         let cs = 8u32;
         let (store, _d, ino) = store_with_file(cs);
         // 先提交块0，建立缓存。
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_缓存_rename_覆盖目标_失效旧缓存() {
+    fn reader_cache_rename_overwrite_target_invalidates_old_cache() {
         let cs = 8u32;
         let (store, _d, _ino) = store_with_file(cs);
         // 建第二个文件 dst.bin，写入并提交后读一次（填充其缓存）。
@@ -1117,7 +1117,7 @@ mod tests {
     // ----- 故障注入：commit_session 的 up.sync() 失败后 reader 缓存仍失效（docs/05 §4 / 任务 2.6）-----
 
     #[test]
-    fn commit_session_sync失败_仍失效reader缓存_不读陈旧() {
+    fn commit_session_sync_failure_still_invalidates_reader_cache_no_stale() {
         // 历史 reuse-tail-slot durability 洞高发区：commit_session 把 invalidate_reader 放在
         // up.sync() **之前**，故即便 sync 失败提前返回，缓存也已失效。三层中只有 FaultIo 能在
         // 进程内令 up.sync() 返 EIO（docs/05 §8）。
@@ -1166,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn head_cache_块0封为正文块时建_读快路径解压等于前缀() {
+    fn head_cache_built_when_block0_sealed_as_body_fast_path_decompress_equals_prefix() {
         // 块大小 128KiB（> HEAD_CACHE_BYTES 64KiB）。写 200KiB（2 块）：块0 满封为不可变正文块
         // （new_size 200K > 块0 128K）→ Core 建 head 缓存。fsync 落盘后 read_head_cache 命中。
         let cs = 128 * 1024u32;
@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn head_cache_单块小文件不建() {
+    fn head_cache_not_built_for_single_block_small_file() {
         // 写 100KiB（< 128KiB 块，单块、块0 即末块）→ 不建缓存（无放大、块0 仍可变）。
         let cs = 128 * 1024u32;
         let (store, _d, ino) = store_with_file(cs);
@@ -1209,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn head_cache_请求越出覆盖前缀返回_none() {
+    fn head_cache_request_beyond_covered_prefix_returns_none() {
         let cs = 128 * 1024u32;
         let (store, _d, ino) = store_with_file(cs);
         let data = patterned(200 * 1024);
@@ -1226,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn head_cache_脏会话期间回退逐块() {
+    fn head_cache_falls_back_per_block_during_dirty_session() {
         // 块0 封块建缓存 + fsync。再开新写会话（脏块）→ read_head_cache 回退 None（脏块0 可能
         // 与盘上缓存不一致），保证读快路径不读陈旧前缀。fsync 后恢复命中。
         let cs = 128 * 1024u32;
@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn head_cache_跨_append_提交保留() {
+    fn head_cache_preserved_across_append_commit() {
         // 块0 封块建缓存后，继续 append 增长（不动块0）。多次 fsync 后 head 缓存仍在且内容不变
         // ——验证 ArchiveUpdater 跨提交从 footer 载入并重写既有缓存。
         let cs = 128 * 1024u32;
@@ -1369,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn 并发同名_create_只一个文件_不互相截断() {
+    fn concurrent_same_name_create_only_one_file_no_mutual_truncation() {
         // 缺陷：create 无 O_EXCL（底层 File::create = O_TRUNC），两个并发同名 create
         // 双成功且第二个截断第一个。加 O_EXCL 后：底层只一个文件被建出，恰一个 create 成功，
         // 其余得 AlreadyExists；且 by_ino/by_path 双向一致。
@@ -1405,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn 并发_create_与_unlink_同名_inode表无悬挂() {
+    fn concurrent_create_and_unlink_same_name_no_dangling_inode_table() {
         // 缺陷：unlink 的「查 ino → remove_file → 清 sessions/readers/inodes」跨多次独立加锁、
         // syscall 夹在中间，与并发 create 交错会留孤儿映射 / 双向失配。ns 锁覆盖整段后表恒自洽。
         let iters = 60usize;
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn 并发_rename_覆盖_inode表无悬挂_无孤儿会话() {
+    fn concurrent_rename_overwrite_no_dangling_inode_table_no_orphan_session() {
         // 缺陷：rename 的 overwritten_ino 快照在 fs::rename 之前、与并发 create 交错可能漏失效，
         // 且清 victim 三表与 rename_path 跨多次加锁非原子。ns 锁内一气呵成后表自洽、无孤儿会话。
         let iters = 50usize;

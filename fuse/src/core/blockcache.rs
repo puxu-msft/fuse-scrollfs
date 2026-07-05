@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn 命中返回同字节_未命中_none() {
+    fn hit_returns_same_bytes_miss_none() {
         let c = cache_uncapped(1 << 20);
         assert!(c.get(1, 0).is_none(), "空缓存未命中");
         let b = blk(7, 100);
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn 字节预算_lru_逐出最旧() {
+    fn byte_budget_lru_evicts_oldest() {
         // cap 容 2 块（每块 100B），插第 3 块应逐出最久未用。
         let c = cache_uncapped(250);
         c.insert(1, 0, blk(0, 100));
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_只清该ino_回收字节_他ino保留() {
+    fn invalidate_only_clears_that_ino_reclaims_bytes_other_ino_kept() {
         let c = cache_uncapped(1 << 20);
         c.insert(1, 0, blk(0, 100));
         c.insert(1, 1, blk(1, 100));
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn by_ino_索引随逐出与失效保持一致_不泄漏() {
+    fn by_ino_index_stays_consistent_across_eviction_and_invalidation_no_leak() {
         // 索引项数应随 map 收敛：逐出、替换、失效后 by_ino 不残留空 ino。
         let c = cache_uncapped(250); // 容 2 块。
         c.insert(7, 0, blk(0, 100));
@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn 同键重复insert_记账不漂移_无悬空seq() {
+    fn duplicate_insert_same_key_accounting_no_drift_no_dangling_seq() {
         // 评审 MEDIUM-1：同键 insert 两次（并发双读各 miss 各 insert 的串行等价），
         // cur_bytes 不得双计，order 不得残留悬空 seq。
         let c = cache_uncapped(1 << 20);
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn cap0_全no_op() {
+    fn cap0_all_no_op() {
         let c =
             BlockCache::with_probe_and_interval(0, Box::new(FakeMem::new(None)), Duration::ZERO);
         assert!(!c.enabled());
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn 单块超eff_cap_不缓存_且清旧值() {
+    fn single_block_over_eff_cap_not_cached_and_clears_old_value() {
         let c = cache_uncapped(150);
         c.insert(1, 0, blk(0, 100)); // 占 100。
         c.insert(1, 0, blk(0, 200)); // 200 > eff_cap=150 → 不缓存，且须清掉旧的 100B 值。
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn 压力低_eff_cap缩到0_不缓存() {
+    fn low_pressure_eff_cap_shrinks_to_0_not_cached() {
         // available == RESERVE → budget = (RESERVE + 0 - RESERVE)/2 = 0 → eff_cap 0。
         let fake = FakeMem::new(Some(RESERVE_BYTES));
         let c = BlockCache::with_probe_and_interval(1 << 30, Box::new(fake), Duration::ZERO);
@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn 压力高_用configured_cap() {
+    fn high_pressure_uses_configured_cap() {
         // available 远超 RESERVE → budget 远超 cap → 取 min = configured_cap。
         let fake = FakeMem::new(Some(RESERVE_BYTES + 100 * (1 << 30)));
         let cap = 64 * 1024;
@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn 探测按间隔节流() {
+    fn probe_throttled_by_interval() {
         // 默认 1s 间隔：两次快速 insert 只探测一次（首次 last_probe=None 必探，第二次在窗口内跳过）。
         let fake = FakeMem::new(Some(RESERVE_BYTES + 100 * (1 << 30)));
         let c = BlockCache::with_probe_and_interval(
@@ -471,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn 压力缩cap后逐出已缓存_含cur_bytes加回() {
+    fn pressure_shrinks_cap_evicts_cached_including_cur_bytes_added_back() {
         // interval=0 每次重探测：先充裕填 2 块，再把 available 降到只够 ~1 块，下次 insert 逐出。
         let fake = FakeMem::new(Some(RESERVE_BYTES + 100 * (1 << 30)));
         let c =

@@ -28,14 +28,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 单块内的小区间映射到同一块() {
+    fn small_range_within_one_block_maps_to_same_block() {
         // chunk=64KiB，区间完全落在块 0 内。
         assert_eq!(block_range(0, 100, 65536), (0, 0));
         assert_eq!(block_range(100, 200, 65536), (0, 0));
     }
 
     #[test]
-    fn 跨块区间覆盖正确的块范围() {
+    fn cross_block_range_covers_correct_block_span() {
         // 从块 0 末尾跨到块 1。
         assert_eq!(block_range(65500, 100, 65536), (0, 1));
         // 恰好对齐到块 2 的起点，长度 1 字节。
@@ -43,12 +43,12 @@ mod tests {
     }
 
     #[test]
-    fn 零长度区间退化为所在块() {
+    fn zero_length_range_degenerates_to_containing_block() {
         assert_eq!(block_range(70000, 0, 65536), (1, 1));
     }
 
     #[test]
-    fn 块内偏移取模正确() {
+    fn intra_block_offset_modulo_correct() {
         assert_eq!(offset_in_block(65536, 65536), 0);
         assert_eq!(offset_in_block(65600, 65536), 64);
     }

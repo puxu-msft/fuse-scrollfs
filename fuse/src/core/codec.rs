@@ -326,7 +326,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 解压炸弹_超上限块被拒() {
+    fn decompression_bomb_oversize_block_rejected() {
         // 评审 H2：构造一个解压后远超 MAX_DECOMPRESSED_BLOCK 的合法 zstd 帧（全零高压缩比），
         // decompress_block 必须返回 InvalidData 而非 OOM。诚实块（≤ chunk_size）不受影响。
         let huge = vec![0u8; MAX_DECOMPRESSED_BLOCK + 1024];
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn zstd_压缩可压缩数据_round_trip() {
+    fn zstd_compresses_compressible_data_round_trip() {
         // 高度可压缩：重复字节。
         let raw = vec![b'a'; 64 * 1024];
         let (stored, verbatim) = compress(&raw, Algo::Zstd, 3).unwrap();
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn 不可压缩数据触发_verbatim_flag() {
+    fn incompressible_data_triggers_verbatim_flag() {
         // 伪随机不可压缩数据（线性同余，确定性，避免依赖 rand）。
         let mut raw = Vec::with_capacity(4096);
         let mut x: u32 = 0x1234_5678;
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn algo_none_总是_verbatim() {
+    fn algo_none_always_verbatim() {
         let raw = vec![b'x'; 1000];
         let (stored, verbatim) = compress(&raw, Algo::None, 0).unwrap();
         assert!(verbatim);
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn 空块_round_trip() {
+    fn empty_block_round_trip() {
         let (stored, verbatim) = compress(&[], Algo::Zstd, 3).unwrap();
         assert!(verbatim);
         assert!(stored.is_empty());
@@ -391,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn 不可压缩阈值_整数边界() {
+    fn incompressible_threshold_integer_boundary() {
         // clen == raw*0.95 正好触发（>=）。
         assert!(is_incompressible(100, 95));
         // clen 略低于阈值则不触发。
@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn lz4_返回_unsupported() {
+    fn lz4_returns_unsupported() {
         let err = compress(b"hello", Algo::Lz4, 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn 字典_round_trip_一致() {
+    fn dictionary_round_trip_consistent() {
         let samples = boilerplate_samples(64);
         let dict_bytes = train_dict(&samples, 16 * 1024).unwrap();
         let dict = SharedDict::new(dict_bytes, 3).expect("非空字典");
@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn 字典对高冗余小块比无字典更省() {
+    fn dictionary_saves_more_than_no_dict_on_high_redundancy_small_block() {
         // boilerplate 占主体的小块：字典把 boilerplate 当「永久窗口」，应显著优于无字典独立压缩。
         let samples = boilerplate_samples(64);
         let dict_bytes = train_dict(&samples, 16 * 1024).unwrap();
@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn 空字典返回_none() {
+    fn empty_dictionary_returns_none() {
         assert!(SharedDict::new(Vec::new(), 3).is_none(), "空字典不应构造");
     }
 
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn ldm_对超窗口长程重复显著更省() {
+    fn ldm_saves_significantly_on_beyond_window_long_range_repeats() {
         // RED→GREEN：>8MiB 距离的自重复，开 LDM 应显著小于不开 LDM。
         let raw = long_range_dup_sample();
         let chunk = raw.len() as u32;
@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn ldm_大块_round_trip_逐字节一致() {
+    fn ldm_large_block_round_trip_byte_for_byte_consistent() {
         // 正确性红线：LDM + 大 windowLog 压缩的块必须能被 decompress_block 逐字节解回。
         let raw = long_range_dup_sample();
         let chunk = raw.len() as u32;
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn windowlog_硬clamp_不超27() {
+    fn windowlog_hard_clamp_not_exceeding_27() {
         // 即便块大小 > 128MiB（windowLog 28+），编码 windowLog 必须 clamp 到 ≤27（=解码上限），
         // 否则封存后帧窗口超解码器 window_log_max → 解不出 = 损坏。
         // 直接验证：用一个 >128MiB 声明的 chunk_size 构造 params，对一个可解的小样本压缩→解压成功。
@@ -536,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn ldm_与字典互斥_显式拒绝() {
+    fn ldm_mutually_exclusive_with_dictionary_explicitly_rejected() {
         // 安全：LDM 与共享字典路径互斥（seal 不用字典，热路径不用 LDM），同传必须显式拒绝而非静默走错。
         let samples = boilerplate_samples(16);
         let dict = SharedDict::new(train_dict(&samples, 8 * 1024).unwrap(), 3).unwrap();
@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn 字典帧_无字典解压_必须报错而非静默脏数据() {
+    fn dict_frame_decompress_without_dict_must_error_not_silent_garbage() {
         // 安全属性：用字典压的块，解压若忘了传字典，zstd 帧带 dictID 找不到字典 → 必须 Err，
         // 绝不静默返回脏数据（错误显式处理）。反向（无字典帧 + 带字典解压）zstd 会正常解出原文，
         // 字典未被引用，是安全的，不在此断言。

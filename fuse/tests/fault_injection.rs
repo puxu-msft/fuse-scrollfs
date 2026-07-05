@@ -92,22 +92,22 @@ fn read_block0(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn eio_index_write_失败回落上一版() {
+fn eio_index_write_failure_falls_back_to_previous_version() {
     run_eio_point(Inject::IndexWrite);
 }
 
 #[test]
-fn eio_barrier1_sync_失败回落上一版() {
+fn eio_barrier1_sync_failure_falls_back_to_previous_version() {
     run_eio_point(Inject::Barrier1Sync);
 }
 
 #[test]
-fn eio_sb_槽写_失败回落上一版() {
+fn eio_sb_slot_write_failure_falls_back_to_previous_version() {
     run_eio_point(Inject::SbWrite);
 }
 
 #[test]
-fn eio_barrier2_sync_失败回落上一版() {
+fn eio_barrier2_sync_failure_falls_back_to_previous_version() {
     run_eio_point(Inject::Barrier2Sync);
 }
 
@@ -124,7 +124,7 @@ fn base_archive_n(n: usize) -> Vec<u8> {
 }
 
 #[test]
-fn torn_index_写_512对齐_失败回落或报损不静默错读() {
+fn torn_index_write_512_aligned_failure_falls_back_or_reports_corruption_no_silent_misread() {
     // 25 块 → index = 600B（> 512B 扇区）。撕裂 index 写（只落前 512B），其余 commit 步骤正常。
     // 崩溃后：新 SB（seq2）指向的 index 区被截断（尾部未达盘）→ append-only 下 index 尾部越界，reader
     // 经 bounds 拒该槽（index_crc 为更内层兜底）→ 回落上一已提交版 v1（或 fail-closed 报损），**绝不**
@@ -184,7 +184,7 @@ fn active_seq_of(bytes: &[u8]) -> u64 {
 }
 
 #[test]
-fn 穷举崩溃点_durability_与_fail_closed_带外oracle() {
+fn exhaustive_crash_points_durability_and_fail_closed_out_of_band_oracle() {
     // 固定工作负载：0 块 archive 起，逐行 append_journal + commit_journal（各 fsync），仿 crash-test.sh。
     let io = FaultIo::from_bytes(empty_archive());
     let mut up = ArchiveUpdater::from_io(io.clone()).unwrap();
@@ -240,7 +240,7 @@ fn 穷举崩溃点_durability_与_fail_closed_带外oracle() {
 // 断言任一子集 reader 读出 ∈ {历史版本} 或 fail-closed，**绝不**让 SB 先于其依赖数据生效。
 
 #[test]
-fn 脏页乱序子集_x_barrier软化_双barrier真有序() {
+fn dirty_page_reordered_subset_x_barrier_softened_double_barrier_truly_ordered() {
     let io = FaultIo::from_bytes(base_archive());
     let mut up = ArchiveUpdater::from_io(io.clone()).unwrap();
 
@@ -321,7 +321,7 @@ fn active_slot_offset(bytes: &[u8]) -> usize {
 }
 
 #[test]
-fn 提交写非活跃槽_损坏活跃槽回落上一已提交版_非更早版() {
+fn commit_writes_inactive_slot_corrupt_active_slot_falls_back_to_last_committed_not_earlier() {
     // 双 superblock 存在的根本理由：commit 把新版本写**非活跃槽**，旧槽完好直到 barrier 2 原子翻转。
     // 连提交 v1、v2（均成功），再损坏活跃（seq2=v2）槽的 seq 字节 → reader 必经 sb_crc 拒该槽并回落
     // **上一已提交版 v1**（在另一槽保命），绝非更早的 base。

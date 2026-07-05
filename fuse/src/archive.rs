@@ -1104,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn superblock_round_trip_无head缓存() {
+    fn superblock_round_trip_no_head_cache() {
         let sb = sample_sb(42, None);
         let bytes = serialize_superblock(&sb);
         assert_eq!(bytes.len(), SB_LEN as usize);
@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn superblock_round_trip_带head缓存() {
+    fn superblock_round_trip_with_head_cache() {
         let hc = HeadCache {
             offset: 500,
             clen: 20,
@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn superblock_crc_检出任意单字节翻转() {
+    fn superblock_crc_detects_any_single_byte_flip() {
         let sb = sample_sb(1, None);
         let good = serialize_superblock(&sb);
         // 翻转字段区/填充区任一字节，crc 都应检出（除 sb_crc 自身的边角，逐个验证字段+填充区）。
@@ -1149,20 +1149,20 @@ mod tests {
     }
 
     #[test]
-    fn superblock_坏magic_返回none() {
+    fn superblock_bad_magic_returns_none() {
         let mut bytes = serialize_superblock(&sample_sb(1, None));
         bytes[0] ^= 0xFF; // 破坏 magic
         assert_eq!(parse_superblock(&bytes), None);
     }
 
     #[test]
-    fn superblock_短buffer_返回none() {
+    fn superblock_short_buffer_returns_none() {
         assert_eq!(parse_superblock(&[0u8; 10]), None);
         assert_eq!(parse_superblock(&[]), None);
     }
 
     #[test]
-    fn pick_active_取seq最大者_与顺序无关() {
+    fn pick_active_picks_max_seq_regardless_of_order() {
         let a = sample_sb(5, None);
         let b = sample_sb(3, None);
         assert_eq!(pick_active(Some(a), Some(b)).unwrap().seq, 5);
@@ -1170,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_active_一槽损坏取另一槽_皆坏取none() {
+    fn pick_active_one_slot_corrupt_picks_other_both_corrupt_none() {
         let a = sample_sb(9, None);
         assert_eq!(pick_active(Some(a), None), Some(a));
         assert_eq!(pick_active(None, Some(a)), Some(a));
@@ -1178,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_active_seq相等取a_确定性() {
+    fn pick_active_equal_seq_picks_a_deterministic() {
         // seq 相等（正常不应发生）：tie-break 取 A，确定性。用不同 chunk_count 区分。
         let mut a = sample_sb(5, None);
         a.chunk_count = 1;
@@ -1194,7 +1194,7 @@ mod tests {
     // ---- 尾日志记录编解码 + 重放（docs/04 §8.2，TDD）----
 
     #[test]
-    fn journal_单条_round_trip() {
+    fn journal_single_record_round_trip() {
         let raw = b"hello world payload";
         let rec = serialize_journal_record(raw);
         assert_eq!(rec.len(), JOURNAL_REC_HEADER_LEN + raw.len());
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_多条拼接_顺序还原() {
+    fn journal_multi_record_concat_order_preserved() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&serialize_journal_record(b"line1\n"));
         buf.extend_from_slice(&serialize_journal_record(b"line2\n"));
@@ -1211,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_空区_空记录() {
+    fn journal_empty_region_empty_records() {
         assert_eq!(replay_journal(&[]), Vec::<u8>::new());
         // 空 payload 记录：合法，贡献 0 字节。
         let rec = serialize_journal_record(b"");
@@ -1220,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_半截头_返回上一完整前缀() {
+    fn journal_truncated_header_returns_previous_complete_prefix() {
         let mut buf = serialize_journal_record(b"complete");
         // 追加一段不足 8 字节的半截头（崩溃于写记录头中途）。
         buf.extend_from_slice(&[0u8; 5]);
@@ -1228,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_半截payload_返回上一完整前缀() {
+    fn journal_truncated_payload_returns_previous_complete_prefix() {
         let mut buf = serialize_journal_record(b"first");
         // 第二条：头声明 100 字节但只写 3 字节 payload（半截写）。
         buf.extend_from_slice(&100u32.to_le_bytes());
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_payload_损坏_crc检出即停() {
+    fn journal_payload_corrupt_crc_detected_stops() {
         let mut buf = serialize_journal_record(b"good");
         buf.extend_from_slice(&serialize_journal_record(b"willcorrupt"));
         // 翻转第二条 payload 的一个字节（在 buf 末尾区）。
@@ -1256,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_rec_len_巨值_不越界不panic() {
+    fn journal_rec_len_huge_value_no_oob_no_panic() {
         // rec_len = u32::MAX，bounds 校验应直接停，不 panic / 不分配。
         let mut buf = Vec::new();
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
@@ -1284,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_reader_round_trip_单块() {
+    fn writer_reader_round_trip_single_block() {
         let bytes = build_archive(64, &[(b"compressed-block-0".to_vec(), false, 50)]);
         let r = reader_from_bytes(&bytes);
         assert_eq!(r.chunk_count(), 1);
@@ -1296,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn 多块_offset_与_clen_正确() {
+    fn multi_block_offset_and_clen_correct() {
         let b0 = vec![1u8; 10];
         let b1 = vec![2u8; 25];
         let b2 = vec![3u8; 7];
@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn 越界块返回_none() {
+    fn out_of_bounds_block_returns_none() {
         let bytes = build_archive(64, &[(b"x".to_vec(), false, 1)]);
         let r = reader_from_bytes(&bytes);
         assert!(r.read_block(1).unwrap().is_none());
@@ -1331,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn 零块_archive_合法() {
+    fn zero_block_archive_valid() {
         let bytes = build_archive(64, &[]);
         let r = reader_from_bytes(&bytes);
         assert_eq!(r.chunk_count(), 0);
@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn 坏_magic_被拒() {
+    fn bad_magic_rejected() {
         let mut bytes = build_archive(64, &[(b"y".to_vec(), false, 1)]);
         bytes[0] = b'X'; // 破坏 magic
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1377,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn 索引_crc_损坏被检出() {
+    fn index_crc_corruption_detected() {
         let bytes = build_archive(64, &[(b"abc".to_vec(), false, 3)]);
         // 破坏 index 区某字节 → 两槽 index_crc 均不符 → 级联校验失败 → open 报损坏。
         let mut corrupted = bytes.clone();
@@ -1403,13 +1403,13 @@ mod tests {
     }
 
     #[test]
-    fn crc32_已知向量() {
+    fn crc32_known_vectors() {
         // "123456789" 的 IEEE CRC32 标准向量 = 0xCBF43926。
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
-    fn 块字节静默翻转_被_per_block_crc_检出() {
+    fn block_silent_byte_flip_detected_by_per_block_crc() {
         // index_crc/越界都自洽，仅某块数据字节翻转 → read_block 应 fail-closed（per-block CRC，T1）。
         let bytes = build_archive(64, &[(b"compressed-block-0".to_vec(), false, 50)]);
         let r = reader_from_bytes(&bytes);
@@ -1426,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn 越界的_clen_在_open_期被拒() {
+    fn out_of_bounds_clen_rejected_during_open() {
         // 构造一个「两槽 index_crc 自洽、但索引项 clen 越界」的 archive：
         // open 阶段 bounds 校验应拒绝（防 read_block 据不可信 clen 无界分配）。
         let bytes = build_archive(64, &[(b"abc".to_vec(), false, 3)]);
@@ -1476,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_append_尾块不重写前部数据() {
+    fn updater_append_tail_block_does_not_rewrite_prior_data() {
         let (_d, path) = build_archive_file(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);
         let len_before = std::fs::metadata(&path).unwrap().len();
         let block0_before = read_all_raw(&path)[0].0.clone();
@@ -1497,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_rmw_中间块追加新版本_旧块成空洞() {
+    fn updater_rmw_interior_block_appends_new_version_old_block_becomes_hole() {
         let (_d, path) = build_archive_file(
             8,
             &[
@@ -1521,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_truncate_丢弃尾块() {
+    fn updater_truncate_discards_tail_block() {
         let (_d, path) = build_archive_file(
             8,
             &[
@@ -1540,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_提交后_crc_仍自洽可重开() {
+    fn updater_after_commit_crc_stays_consistent_reopenable() {
         let (_d, path) = build_archive_file(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);
         let mut up = ArchiveUpdater::open(&path).unwrap();
         up.set_block(1, b"BBBB", false, 12).unwrap();
@@ -1556,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_未提交即崩溃_恢复上一致版本() {
+    fn updater_crash_before_commit_recovers_last_consistent_version() {
         // append-only + 双 SB（崩溃安全根治）：set_block 把新块 append 到 EOF，但**未 commit**
         // （无 SB 更新）即崩溃。旧设计这里 fail-closed-不可恢复；新设计 open 取活跃 SB（仍 seq0、
         // 指向旧 index）→ **恢复上一致版本**，未提交的尾部追加被忽略。这正是根治：丢未提交写，
@@ -1573,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_活跃sb损坏_回落另一槽恢复() {
+    fn updater_active_sb_corrupt_falls_back_to_other_slot_recovers() {
         // 双 superblock 的核心保证（构造性崩溃测试，docs/04 §8.5）：commit 写非活跃槽（seq+1）。
         // 若该 SB 写半截/损坏（崩溃窗口），open 回落另一槽（上一 seq）→ 恢复上一致版本，绝不丢
         // 已提交数据。这取代了旧 reuse-tail-slot 的「fail-closed 不可恢复」边界。
@@ -1613,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_反复重写尾块跨提交_读回正确() {
+    fn updater_repeated_tail_rewrite_across_commits_readback_correct() {
         // append-only + 双 SB：每次提交把渐增尾块 append 到 EOF（旧版本成空洞，压实回收）。
         // 文件单调增长（与旧 reuse 的「紧凑」不同——空洞由压实而非在线覆盖回收）；本测验证的是
         // **跨提交每次都读回正确且 durable**（崩溃安全的正确性，不再断言文件不增长）。
@@ -1638,7 +1638,7 @@ mod tests {
     // ----- head 缓存（发现读快路径，docs/02）-----
 
     #[test]
-    fn head_cache_无时_reader_返回_none() {
+    fn head_cache_absent_reader_returns_none() {
         // 不设 head 缓存 → footer 字段全 0 → read_head_cache None、rawlen 0。
         let bytes = build_archive(64, &[(b"blk0".to_vec(), false, 4)]);
         let r = reader_from_bytes(&bytes);
@@ -1666,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn head_cache_verbatim_flag_保真() {
+    fn head_cache_verbatim_flag_preserved() {
         let cursor = Cursor::new(Vec::new());
         let mut w = ArchiveWriter::new(cursor, 64).unwrap();
         w.append_block(b"x", false, 1).unwrap();
@@ -1678,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn head_cache_越界_优雅回退_none() {
+    fn head_cache_out_of_bounds_graceful_fallback_none() {
         // head 缓存是可丢弃派生数据（docs/04 §11 M2）：superblock 里 head_cache_offset 越界
         // → open **成功**，read_head_cache 返回 None（优雅回退逐块），**绝不** fail-closed 整文件。
         let cursor = Cursor::new(Vec::new());
@@ -1702,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_保留_head_cache_跨提交_append() {
+    fn updater_preserves_head_cache_across_commits_append() {
         // build 一个带 head 缓存的 archive，open updater append 一块（不动 head 缓存），
         // commit 后 head 缓存仍在（rawlen + 字节保真）—— 验证 updater 跨提交重写元数据尾区时
         // 从 footer 载入并重新落盘 head 缓存。
@@ -1730,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_truncate_丢弃越界_head_cache() {
+    fn updater_truncate_discards_out_of_bounds_head_cache() {
         // 评审 B1：head 缓存覆盖块 0 前缀 rawlen 字节。若 truncate 使文件短于 rawlen，
         // 旧码不动 head_cache → commit 原样重写陈旧缓存 → 发现读返回已被截掉的旧前缀。
         // 截断到短于 rawlen 后，缓存必须失效（rawlen 归 0）。
@@ -1760,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_set_head_cache_后提交可读回() {
+    fn updater_set_head_cache_after_commit_readback() {
         // 无 head 缓存的 archive，open updater 设 head 缓存并 commit → reader 读回。
         let (_d, path) = build_archive_file(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);
         let mut up = ArchiveUpdater::open(&path).unwrap();
@@ -1775,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_含head_cache_未提交即崩溃_恢复上一致版本() {
+    fn updater_with_head_cache_crash_before_commit_recovers_last_consistent_version() {
         // 崩溃安全（M2 变体）：set_head_cache + set_block 后不 commit（drop），模拟「写了新尾区但
         // SB 未落盘即崩溃」。新设计 open 取活跃 SB（仍 seq0）→ 恢复上一致版本（1 块，无 head 缓存），
         // 未提交的 head 缓存 + 尾块追加被忽略。不报损坏、不丢已提交数据。
@@ -1798,7 +1798,7 @@ mod tests {
     // ----- 尾日志接线（docs/04 §8.4，TDD）-----
 
     #[test]
-    fn journal_append_commit_重开_重放尾块() {
+    fn journal_append_commit_reopen_replay_tail_block() {
         // 0 块 archive（空文件）。逐次 append_journal（原始增量）+ commit_journal（不动 index）→
         // 重开 read_tail 应重放出全部原始字节。模拟 fsync 路径：不压缩、只追加 delta。
         let dir = tempfile::tempdir().unwrap();
@@ -1824,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_未提交即崩溃_丢未提交delta_保住已提交() {
+    fn journal_crash_before_commit_drop_uncommitted_delta_keep_committed() {
         // append_journal 两条都 commit_journal（durable），第三条 append 后不 commit（drop=崩溃）。
         // 重开应只见前两条（已提交），第三条未提交被忽略——崩溃安全的尾日志。
         let dir = tempfile::tempdir().unwrap();
@@ -1851,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_封块后重置_尾块迁入压缩块() {
+    fn journal_reset_after_sealing_tail_migrated_into_compressed_block() {
         // 攒了尾日志后「封块」：set_block 写压缩块（这里 verbatim 模拟）+ reset_journal + commit。
         // 重开：read_tail 应为 None（journal 已重置），内容改由块 0 承载。
         let dir = tempfile::tempdir().unwrap();
@@ -1878,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_越界_load_active拒绝该槽() {
+    fn journal_out_of_bounds_load_active_rejects_slot() {
         // SB 的 tail_journal 区越界 → 该槽不可用（级联校验拒绝）。两槽都坏则报损坏。
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.archive");
@@ -1968,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn updater_spy_io_字节镜像与_file_路径逐字节等价() {
+    fn updater_spy_io_byte_mirror_equals_file_path_byte_for_byte() {
         // 基线档 1 块；两条路径从同一初始字节出发跑同一工作负载（两次 set_block + commit），
         // 比对最终盘面逐字节相等——证 in-memory 基底与真实 File 字节级保真。
         let base = build_archive(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);

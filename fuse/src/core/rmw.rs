@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn 顺序写单块_round_trip() {
+    fn sequential_write_single_block_round_trip() {
         let store = MemStore::new(16);
         let ino = store.new_file();
         write_at(&store, ino, 0, b"hello", &params()).unwrap();
@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn append_延伸跨块() {
+    fn append_extends_across_blocks() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         write_at(&store, ino, 0, b"abcdefgh", &params()).unwrap(); // 块0满
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn 中间块_rmw_保留两侧字节() {
+    fn middle_block_rmw_keeps_both_sides() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         write_at(&store, ino, 0, b"AAAAAAAABBBBBBBB", &params()).unwrap();
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn 越_eof_写产生空洞零填充() {
+    fn write_beyond_eof_creates_hole_zero_fill() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         write_at(&store, ino, 0, b"ab", &params()).unwrap();
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_缩小到块中间() {
+    fn truncate_shrink_to_mid_block() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         write_at(&store, ino, 0, b"0123456789ABCDEF", &params()).unwrap(); // 16 字节 / 2 块
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_扩展产生空洞() {
+    fn truncate_extend_creates_hole() {
         let store = MemStore::new(8);
         let ino = store.new_file();
         write_at(&store, ino, 0, b"abc", &params()).unwrap();
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn 整块覆盖跳过读仍正确() {
+    fn full_block_overwrite_skips_read_still_correct() {
         let store = MemStore::new(4);
         let ino = store.new_file();
         write_at(&store, ino, 0, b"WXYZ", &params()).unwrap();
@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn 稀疏空洞过大被拒() {
+    fn oversized_sparse_hole_rejected() {
         let store = MemStore::new(64);
         let ino = store.new_file();
         // 在远超上限的 offset 写，应拒绝（防写放大 / OOM），而非物化海量零块。
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn 写偏移溢出被拒() {
+    fn write_offset_overflow_rejected() {
         let store = MemStore::new(64);
         let ino = store.new_file();
         let err = write_at(&store, ino, u64::MAX, b"xx", &params()).unwrap_err();

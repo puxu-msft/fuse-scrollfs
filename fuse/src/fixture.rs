@@ -96,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn 单文件分块_round_trip_跨多块() {
+    fn single_file_chunked_round_trip_across_multiple_blocks() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("f.archive");
         // 用小 chunk 制造多块：250 字节 / chunk 64 → 4 块（末块 58）。
@@ -109,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn 空文件写成零块合法_archive() {
+    fn empty_file_written_as_zero_block_valid_archive() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("empty.archive");
         write_archive_from_bytes(&dst, &[], 64, Algo::Zstd, 3).unwrap();
@@ -120,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tree_递归镜像目录() {
+    fn build_tree_recursively_mirrors_directory() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("a.txt"), b"hello").unwrap();

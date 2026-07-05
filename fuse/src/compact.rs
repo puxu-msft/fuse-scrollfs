@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn 压实回收频繁fsync空洞_内容一致() {
+    fn compaction_reclaims_frequent_fsync_holes_content_consistent() {
         let dir = tempfile::tempdir().unwrap();
         // backing 用 tempdir 内子目录，令 `.zipfs.lock` 落 tempdir 内（唯一+随清理），
         // 避免 backing=tempdir 时 lock 落共享 temp 根被并发测试碰撞（测试隔离缺陷）。

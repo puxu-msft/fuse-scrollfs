@@ -866,14 +866,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 根_inode_预置为_1_且路径为空() {
+    fn root_inode_preset_to_1_and_path_empty() {
         let t = InodeTable::new();
         assert_eq!(t.path_of(ROOT_INO), Some(PathBuf::new()));
         assert_eq!(t.len(), 1);
     }
 
     #[test]
-    fn lookup_为子项分配单调递增的_ino() {
+    fn assigns_monotonically_increasing_ino_to_children() {
         let mut t = InodeTable::new();
         let a = t.lookup_or_insert(ROOT_INO, OsStr::new("a.txt")).unwrap();
         let b = t.lookup_or_insert(ROOT_INO, OsStr::new("b.txt")).unwrap();
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn 同一路径多次_lookup_复用_ino_并累加计数() {
+    fn repeated_lookup_same_path_reuses_ino_and_accumulates_refcount() {
         let mut t = InodeTable::new();
         let first = t.lookup_or_insert(ROOT_INO, OsStr::new("x")).unwrap();
         let second = t.lookup_or_insert(ROOT_INO, OsStr::new("x")).unwrap();
@@ -892,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn forget_归零后从表中移除根除外() {
+    fn forget_to_zero_removes_from_table_except_root() {
         let mut t = InodeTable::new();
         let ino = t.lookup_or_insert(ROOT_INO, OsStr::new("y")).unwrap();
         // 计数为 1，forget(1) 应移除
@@ -904,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn forget_部分计数不移除() {
+    fn forget_partial_refcount_keeps_entry() {
         let mut t = InodeTable::new();
         let ino = t.lookup_or_insert(ROOT_INO, OsStr::new("z")).unwrap();
         t.lookup_or_insert(ROOT_INO, OsStr::new("z")).unwrap(); // 计数=2
@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn 嵌套路径正确拼接() {
+    fn nested_path_joined_correctly() {
         let mut t = InodeTable::new();
         let dir = t.lookup_or_insert(ROOT_INO, OsStr::new("sub")).unwrap();
         let file = t.lookup_or_insert(dir, OsStr::new("inner.txt")).unwrap();
@@ -921,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_path_更新映射() {
+    fn rename_path_updates_mapping() {
         let mut t = InodeTable::new();
         let ino = t.lookup_or_insert(ROOT_INO, OsStr::new("old")).unwrap();
         t.rename_path(&PathBuf::from("old"), &PathBuf::from("new"));
@@ -929,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_推导_filetype() {
+    fn mode_derives_filetype() {
         assert_eq!(
             mode_to_filetype(libc::S_IFREG | 0o644),
             FileType::RegularFile

@@ -402,7 +402,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ingest_流式_round_trip_verify() {
+    fn ingest_streaming_round_trip_verify() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         let big: Vec<u8> = (0..300_000).map(|i| b"jsonl line \n"[i % 12]).collect();
