@@ -5,7 +5,52 @@ use crate::reconcile::record::{
     classify_record, is_compact_summary, record_parent_uuid, record_timestamp, RawRecord,
     RecordKind,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
+/// **base 侧超集铁律门（评审 R-C1，§5.3 步4 的 base 半边）**：`merged` 是否覆盖 `base` 的全部内容。
+///
+/// 覆盖判据**按记录语义而非裸行**（关键）：
+/// - base 的每个 **transcript uuid** 必 ∈ merged 的 uuid 集（uuid 级）——同 uuid「取更长者」是
+///   §4.1 许可的无损收敛（短者为崩溃截断），uuid 仍在即视为覆盖，故裸行比对会**误判**过严。
+/// - base 的每条 **no-uuid 行 / 坏行**必 ∈ merged 的 no-uuid 行集（行级去重语义）。
+///
+/// 返回 false = merged 丢了 base 的某记录（疑合并核缺陷）。删除门只证 incoming ⊆ merged，
+/// 本函数补 base ⊆ merged，二者合起来才是设计要求的**双向超集**——不过则调用方中止、不覆盖 orig。
+pub fn base_covered_by_merged(base: &str, merged: &str) -> bool {
+    let mut merged_uuids: HashSet<String> = HashSet::new();
+    let mut merged_lines: HashSet<&str> = HashSet::new();
+    for line in merged.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match classify_record(line).1 {
+            RecordKind::Transcript { uuid } => {
+                merged_uuids.insert(uuid);
+            }
+            _ => {
+                merged_lines.insert(line);
+            }
+        }
+    }
+    for line in base.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match classify_record(line).1 {
+            RecordKind::Transcript { uuid } => {
+                if !merged_uuids.contains(&uuid) {
+                    return false;
+                }
+            }
+            _ => {
+                if !merged_lines.contains(line) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -216,6 +261,34 @@ mod tests {
 
     fn ts(u: &str, t: &str) -> String {
         format!(r#"{{"type":"assistant","uuid":"{u}","parentUuid":null,"timestamp":"{t}"}}"#)
+    }
+
+    #[test]
+    fn base_covered_gate_uuid_aware() {
+        // 评审 R-C1：base 覆盖门按记录语义（uuid 级 + no-uuid 行级）。
+        // 1) base uuid 丢失 → false。
+        let base = format!("{}\n", ts("u1", "2026-06-27T00:00:00.000Z"));
+        let merged_missing = format!("{}\n", ts("u2", "2026-06-27T00:00:00.000Z"));
+        assert!(
+            !base_covered_by_merged(&base, &merged_missing),
+            "base 的 uuid u1 不在 merged → 未覆盖"
+        );
+        // 2) base no-uuid 行丢失 → false。
+        let base_log = "{\"type\":\"ai-title\",\"aiTitle\":\"X\"}\n";
+        assert!(
+            !base_covered_by_merged(base_log, ""),
+            "base 日志行不在 merged → 未覆盖"
+        );
+        // 3) 同 uuid「取更长者」不应误判过严：base 短变体、merged 保 uuid 的长变体 → 覆盖成立。
+        let base_short = "{\"uuid\":\"u1\",\"x\":\"AA\"}\n";
+        let merged_long = "{\"uuid\":\"u1\",\"x\":\"BBBBBB\"}\n";
+        assert!(
+            base_covered_by_merged(base_short, merged_long),
+            "同 uuid 取更长者是 §4.1 许可收敛，uuid 仍在即视为覆盖（不得误判过严）"
+        );
+        // 4) 正常超集 → 覆盖。
+        let m = format!("{}\n{}\n", ts("u1", "t"), base_log.trim());
+        assert!(base_covered_by_merged(&base, &m) && base_covered_by_merged(base_log, &m));
     }
 
     #[test]

@@ -738,7 +738,24 @@ pub fn reconcile_subagents_dir(
         let base_str = String::from_utf8_lossy(&base_bytes);
         let inc_str = String::from_utf8_lossy(&snap_entry.bytes);
         let merged = session_merge(base_str.as_ref(), inc_str.as_ref());
-        lines_to_bytes(&merged.merged_lines)
+        let merged_bytes = lines_to_bytes(&merged.merged_lines);
+        // 评审 R-C1：base 侧超集铁律（同 apply_entry Union）。不覆盖则中止、保两份。
+        if !crate::reconcile::merge::base_covered_by_merged(
+            &base_str,
+            &String::from_utf8_lossy(&merged_bytes),
+        ) {
+            notes.push(
+                "subagents 合并未覆盖 base 全部记录（疑合并核缺陷）→ 中止：不改 orig、不删 underlay".into(),
+            );
+            return Ok(EntryReport {
+                name: rel,
+                decision: "subagents".into(),
+                action: "aborted-base-not-covered".into(),
+                notes,
+                reversal: ReversalClass::Noop,
+            });
+        }
+        merged_bytes
     } else {
         snap_entry.bytes.clone()
     };
@@ -1136,12 +1153,30 @@ pub fn apply_entry(
 
     match plan {
         EntryPlan::Union => {
-            let has_preimage = stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
             let base_bytes = std::fs::read(&orig_file)?;
             let base_str = String::from_utf8_lossy(&base_bytes);
             let inc_str = String::from_utf8_lossy(&snap_entry.bytes);
             let merged = session_merge(base_str.as_ref(), inc_str.as_ref());
             let merged_bytes = lines_to_bytes(&merged.merged_lines);
+            // 评审 R-C1（双向超集铁律 base 半边）：incoming ⊆ merged 由 finish_delete 删除门把关；
+            // base ⊆ merged 在此 fail-fast 校验——merged 若丢了 base 任一记录（疑合并核缺陷），
+            // **绝不覆盖金源 orig、绝不删 underlay**，保两份待人工，杜绝静默失真。
+            if !crate::reconcile::merge::base_covered_by_merged(
+                &base_str,
+                &String::from_utf8_lossy(&merged_bytes),
+            ) {
+                notes.push(
+                    "合并结果未覆盖 base 全部记录（疑合并核缺陷）→ 中止：不改 orig、不删 underlay，保两份".into(),
+                );
+                return Ok(EntryReport {
+                    name: rel,
+                    decision: "union".into(),
+                    action: "aborted-base-not-covered".into(),
+                    notes,
+                    reversal: ReversalClass::Noop,
+                });
+            }
+            let has_preimage = stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
             atomic_write(&orig_file, &merged_bytes)?;
             reingest_one_file(paths, name, &rel)?;
             finish_delete(
