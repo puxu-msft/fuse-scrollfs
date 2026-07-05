@@ -48,6 +48,7 @@
 **Interfaces:**
 - 在 `resolve_managed_spec` 建 spec 挂载**前**（或 `SystemdMounter::spawn`/`run_mount_managed` 挂载前的单点），加 `reconciling_marker(name).exists()` 检查 → 存在即 Err（"<name> 正在 reconcile/undo，拒绝自动挂载"）+ 落 NEEDS-RECONCILE sentinel（复用 Task12 sentinel 机制），使自启 fail-closed 且不 crash-loop（ExecCondition/退出码语义同 §5.4）。
 - 复用 `crate::enable::discovery`/`Paths::reconciling_marker` 与 guard 现有下沉点，避免漂移。
+- **两个 chokepoint（评审 Minor）**：`ensure_underlay_empty` 有两处调用——`systemd.rs:139`（`resolve_managed_spec`，**开机自启无人值守路径 = 真洞**，本 Task 必加 marker 检查）与 `daemon.rs:75`（`SystemdMounter::spawn`，`systemctl start` 编排路径，已由上游 `bail_if_reconciling` + reconcile 锁串行化 fence）。**求稳起见两点都加 marker 检查**（marker 路径由 name 派生、两处均有 spec/name 上下文），并注明 spawn 路径本已被上游 bail 覆盖。
 
 - [ ] **Step 1: 写失败测试** —— 置 `reconciling` marker 后，`resolve_managed_spec`（或其挂载前置）对该项目返回 Err/拒挂；marker 清后放行。若纯逻辑难测，抽 `fn managed_mount_blocked(paths,name)->bool` 单测（marker 存在 || underlay 非空）。
 - [ ] **Step 2: 确认失败。**
