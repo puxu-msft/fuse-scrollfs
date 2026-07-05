@@ -25,7 +25,7 @@ use clap::Subcommand;
 use crate::enable::systemd::select_mounter;
 use crate::reconcile::advisor::Recommendation;
 use crate::reconcile::orchestrator::{
-    reconcile, Confirm, ConfirmFn, ReconcileOptions, ReconcileReport,
+    reconcile, reconcile_undo, Confirm, ConfirmFn, ReconcileOptions, ReconcileReport, UndoReport,
 };
 pub use model::{ApplyOptions, Backend, Paths, ProjectStatus};
 
@@ -127,6 +127,10 @@ pub enum EnableAction {
         #[arg(long, default_value_t = false)]
         rebuild: bool,
     },
+    /// 回退**最近一次** reconcile（仅 shadow）：把项目还原到该 run **之前**的状态（underlay + orig +
+    /// backing），供换选项重选、重跑 `reconcile`。**须先卸载**（同 reconcile：挂载态读挂载点是 FUSE 视图
+    /// 而非 underlay，会误判）。**不触碰外部 memory 目标**——那些文件仅在报告中列出，待你手动 git 回退。
+    ReconcileUndo { name: String },
     /// 查看 / 设置持久化默认选项（ZIPFS_HOME/config，apply 起点）。
     Config {
         #[command(subcommand)]
@@ -187,6 +191,7 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
         | EnableAction::Compact { name }
         | EnableAction::Reingest { name, .. }
         | EnableAction::Reconcile { name, .. }
+        | EnableAction::ReconcileUndo { name }
         | EnableAction::Seal { name, .. },
     ) = &action
     {
@@ -247,6 +252,7 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
             force,
             rebuild,
         }) => cmd_reconcile(&paths, &name, dry_run, force, rebuild),
+        Some(EnableAction::ReconcileUndo { name }) => cmd_reconcile_undo(&paths, &name),
         Some(EnableAction::Seal {
             name,
             seal_chunk,
@@ -508,6 +514,53 @@ fn reconcile_not_mounted_guard(mounted: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `reconcile-undo <name>`：回退最近一次 reconcile（§10.5，仅 shadow）。
+///
+/// 前置：**项目必须未挂载**（复用 [`reconcile_not_mounted_guard`]，同 `reconcile` 的理由）。其余门禁
+/// （shadow-only / 陈旧门 / 锁 / 代次选择）都在引擎 [`reconcile_undo`] 内，拒绝时错误信息透传。
+/// undo **不重挂**（无 mounter 参），**绝不触碰外部 memory 目标**——那些文件仅列入报告待人工 git 回退。
+fn cmd_reconcile_undo(paths: &Paths, name: &str) -> std::io::Result<()> {
+    reconcile_not_mounted_guard(discovery::is_mounted(&paths.mountpoint(name)))?;
+    let report = reconcile_undo(paths, name)?;
+    print!("{}", format_undo_report(&report));
+    Ok(())
+}
+
+/// 渲染 [`UndoReport`] 为人读文本：选中代次 `ts` + 三段清单（reversed / skipped / memory）。抽成纯函数
+/// 便于单测（CLI 打印靠手验）。no-op（三段全空）也回显选中 ts + 「无实际改动」措辞。
+fn format_undo_report(report: &UndoReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "reconcile-undo 报告（回退代次 {}）：", report.ts);
+    if report.reversed.is_empty() {
+        let _ = writeln!(out, "  无实际改动（该代次已回退过或无逆转类条目）。");
+    } else {
+        let _ = writeln!(out, "  已反做条目：");
+        for (rel, class) in &report.reversed {
+            let _ = writeln!(out, "    {rel} — {class}");
+        }
+    }
+    if !report.skipped_live_changed.is_empty() {
+        let _ = writeln!(
+            out,
+            "  保留未覆盖（reconcile 后有新写、live 已变，绝不用旧快照盖新数据）："
+        );
+        for rel in &report.skipped_live_changed {
+            let _ = writeln!(out, "    {rel}");
+        }
+    }
+    if !report.memory_manual.is_empty() {
+        let _ = writeln!(
+            out,
+            "  外部 memory 目标（undo 不触碰，需你手动 git 回退）："
+        );
+        for rel in &report.memory_manual {
+            let _ = writeln!(out, "    {rel}");
+        }
+    }
+    out
+}
+
 /// 据 `dry_run`/`is_tty` 构造逐条目裁决回调（策略 B）：
 /// - `dry_run` → 占位回调（恒 `Skip`，引擎 dry 分支实际不调用它）。
 /// - 实跑 + tty → 交互回调（逐条读 stdin）。
@@ -646,14 +699,18 @@ pub fn guard_underlay_or_exit(paths: &Paths, name: &str) -> std::io::Result<()> 
 
 /// underlay 守卫判定逻辑（纯一点，便于单测）：`name` 为 unescape 后的原始项目名。
 ///
-/// underlay 含停用期 fall-through 回落写（`underlay_has_fallthrough`）时落 NEEDS-RECONCILE sentinel
-/// 并打明确 stderr，返回 `NeedsReconcile`（调用方以码 75 退出，阻止自动挂载）。underlay 空时顺带
-/// 自愈清除可能残留的 sentinel（上次非空、经人工 reconcile 清空后自愈），返回 `Pass`。真正的读目录
-/// IO 错误（非 NotFound）向上传播（exit 1，仍可 Restart，区别于稳定的「需人工」态）。
+/// 阻止自启挂载的两种情形（评审 C-plan1）：(a) underlay 含停用期 fall-through 回落写
+/// （`underlay_has_fallthrough`，稳定态、需人工 reconcile）；(b) `reconciling` marker 在 = reconcile/undo
+/// 半改写窗口（undo「先改 backing、后还原 underlay」时 underlay 可能已空，仅此 marker 挡得住半改写
+/// backing 被自启挂上）。任一命中即落 NEEDS-RECONCILE sentinel、打明确 stderr，返回 `NeedsReconcile`
+/// （调用方以码 75 退出，`ExecCondition` skip / `RestartPreventExitStatus` 拦 Restart，防 crash-loop）。
+/// 两者都清时顺带自愈清除可能残留的 sentinel，返回 `Pass`。真正的读目录 IO 错误（非 NotFound）向上
+/// 传播（exit 1，仍可 Restart，区别于稳定的「需人工」态）。
 pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome> {
     let mp = paths.mountpoint(name);
-    if !crate::reconcile::guard::underlay_has_fallthrough(&mp)? {
-        // 放行前自愈：underlay 已空则清除可能残留的 sentinel（best-effort，缺失/失败不影响放行）。
+    let reconciling = paths.reconciling_marker(name).exists();
+    if !reconciling && !crate::reconcile::guard::underlay_has_fallthrough(&mp)? {
+        // 放行前自愈：underlay 空且非 reconcile 中，则清除可能残留的 sentinel（best-effort）。
         let sentinel = paths.needs_reconcile_sentinel(name);
         if let Err(e) = std::fs::remove_file(&sentinel) {
             if e.kind() != std::io::ErrorKind::NotFound {
@@ -665,7 +722,7 @@ pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome
         }
         return Ok(GuardOutcome::Pass);
     }
-    // 非空 → 落 sentinel（best-effort：即便写失败也 fail-closed 返回 NeedsReconcile，务必阻止挂载）。
+    // 阻止 → 落 sentinel（best-effort：即便写失败也 fail-closed 返回 NeedsReconcile，务必阻止挂载）。
     let sentinel = paths.needs_reconcile_sentinel(name);
     if let Err(e) = write_needs_reconcile_sentinel(&sentinel, name) {
         eprintln!(
@@ -673,10 +730,17 @@ pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome
             sentinel.display()
         );
     }
-    eprintln!(
-        "[zipfs] {name}: 挂载点 underlay 含停用期回落写，已阻止自动挂载（避免静默盖住）。\
-         需人工 `zipfs enable reconcile {name}` 重合并后方可自动挂载。"
-    );
+    if reconciling {
+        eprintln!(
+            "[zipfs] {name}: 正在 reconcile/undo（半改写窗口），已阻止自动挂载（防挂到半改写 backing）。\
+             待其完成后重试。"
+        );
+    } else {
+        eprintln!(
+            "[zipfs] {name}: 挂载点 underlay 含停用期回落写，已阻止自动挂载（避免静默盖住）。\
+             需人工 `zipfs enable reconcile {name}` 重合并后方可自动挂载。"
+        );
+    }
     Ok(GuardOutcome::NeedsReconcile)
 }
 
@@ -831,5 +895,68 @@ mod tests {
         std::fs::write(mp.join(".fuse_hidden0001"), b"").unwrap();
         assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
         assert!(!paths.needs_reconcile_sentinel("demo").exists());
+    }
+
+    #[test]
+    fn run_reconcile_undo_rejects_invalid_name() {
+        // run() 顶部 validate_name 的 name-提取 match 须覆盖 ReconcileUndo：非法名（含 /）在触碰
+        // 文件系统前即被拒（fail-closed，杜绝 join 穿越）。
+        let err = run(
+            Some(EnableAction::ReconcileUndo { name: "a/b".into() }),
+            std::path::PathBuf::from("/nonexistent-home"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn format_undo_report_renders_ts_and_three_sections() {
+        use crate::reconcile::orchestrator::UndoReport;
+        let report = UndoReport {
+            ts: "20260704T120000Z".into(),
+            reversed: vec![
+                ("a.jsonl".into(), "RestoreOrig".into()),
+                ("b.txt".into(), "RemoveOrig".into()),
+            ],
+            skipped_live_changed: vec!["c.jsonl".into()],
+            memory_manual: vec!["mem/d.md".into()],
+        };
+        let out = format_undo_report(&report);
+        assert!(out.contains("20260704T120000Z"), "含选中代次 ts");
+        assert!(
+            out.contains("a.jsonl") && out.contains("RestoreOrig"),
+            "含逆转条目"
+        );
+        assert!(out.contains("b.txt") && out.contains("RemoveOrig"));
+        assert!(out.contains("c.jsonl"), "含保留未覆盖（live 已变）条目");
+        assert!(out.contains("mem/d.md"), "含待手动 git 回退的 memory 目标");
+    }
+
+    #[test]
+    fn format_undo_report_noop_generation_reads_clearly() {
+        use crate::reconcile::orchestrator::UndoReport;
+        // 二次 undo 的 no-op：reversed/skipped/memory 均空，仍回显选中 ts + 无改动措辞。
+        let report = UndoReport {
+            ts: "20260704T120000Z".into(),
+            ..Default::default()
+        };
+        let out = format_undo_report(&report);
+        assert!(out.contains("20260704T120000Z"));
+    }
+
+    #[test]
+    fn guard_check_blocks_while_reconciling_even_if_underlay_empty() {
+        // C-plan1：空 underlay 但 reconcile/undo 进行中（marker 在）→ NeedsReconcile。undo「先改
+        // backing、后还原 underlay」的顺序会把后端半改写暴露在「underlay 已空」窗口，自启此刻不可挂。
+        let (_tmp, paths) = temp_paths();
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        std::fs::write(paths.reconciling_marker("demo"), b"").unwrap();
+        assert_eq!(
+            underlay_guard(&paths, "demo").unwrap(),
+            GuardOutcome::NeedsReconcile
+        );
+        // marker 清 + underlay 空 → 放行。
+        std::fs::remove_file(paths.reconciling_marker("demo")).unwrap();
+        assert_eq!(underlay_guard(&paths, "demo").unwrap(), GuardOutcome::Pass);
     }
 }

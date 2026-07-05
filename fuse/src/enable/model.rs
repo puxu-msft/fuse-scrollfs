@@ -101,6 +101,12 @@ impl Paths {
         self.zipfs_home.join("reconcile-stash").join(name).join(ts)
     }
 
+    /// per-generation reconcile manifest = `reconcile_stash(name,ts)/manifest`（undo 依赖，§10.1）。
+    /// 首行 `ts`，其后每行真实 `rel\tclass`（逆转类），供 `reconcile_undo` 逐条目反向还原。
+    pub fn reconcile_manifest(&self, name: &str, ts: &str) -> PathBuf {
+        self.reconcile_stash(name, ts).join("manifest")
+    }
+
     /// reconcile 隔离区 = `zipfs_home/reconcile-quarantine/<name>/<ts>`。
     /// 合并冲突/超限降级为 KeepBoth 的条目搬此处保全（绝不静默丢弃），供人工核查。
     pub fn quarantine(&self, name: &str, ts: &str) -> PathBuf {

@@ -23,6 +23,9 @@ pub struct MountSpec {
     pub chunk_size: u32,
     pub level: i32,
     pub pid_file: PathBuf,
+    /// `reconciling` marker 路径（`back_root/<name>.reconciling`，源自 `Paths::reconciling_marker`）。
+    /// spawn 前查它挡住 reconcile/undo 半改写窗口（评审 C-plan1）；随 spec 携带以免各挂载器再拼路径。
+    pub reconciling_marker: PathBuf,
     pub dict: Option<PathBuf>,
     pub threads: usize,
     pub writeback: bool,
@@ -71,8 +74,9 @@ pub struct RealMounter;
 
 impl Mounter for RealMounter {
     fn spawn(&self, spec: &MountSpec) -> std::io::Result<()> {
-        // 挂载前最后一道守卫：underlay 含停用期 fall-through 回落写即拒（评审 C1/I-6，单点下沉）。
-        crate::reconcile::guard::ensure_underlay_empty(&spec.mountpoint)?;
+        // 挂载前最后一道守卫：reconcile/undo 半改写窗口（marker 在）或 underlay 含停用期 fall-through
+        // 回落写即拒（评审 C1/C-plan1/I-6，单点下沉）。
+        crate::reconcile::guard::ensure_mountable(&spec.reconciling_marker, &spec.mountpoint)?;
 
         // 删除任何 stale pid 文件，避免读到陈旧 pid（评审 H3）。
         let _ = std::fs::remove_file(&spec.pid_file);
@@ -264,6 +268,7 @@ mod tests {
             chunk_size: 1048576,
             level: 3,
             pid_file: PathBuf::from("/m.pid"),
+            reconciling_marker: PathBuf::from("/b.reconciling"),
             dict: None,
             threads: 0,
             writeback: false,
@@ -307,6 +312,7 @@ mod tests {
             chunk_size: 65536,
             level: 19,
             pid_file: PathBuf::from("/m.pid"),
+            reconciling_marker: PathBuf::from("/b.redb.reconciling"),
             dict: Some(PathBuf::from("/d.dict")),
             threads: 8,
             writeback: true,

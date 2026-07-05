@@ -41,6 +41,20 @@ pub fn ensure_underlay_empty(mp: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 挂载前双守卫（评审 C-plan1）：`reconciling` marker 在 = 项目正被 reconcile/undo 半改写 backing，
+/// 拒绝挂载；否则再走 `ensure_underlay_empty`。fail-closed 单点，供编排挂载路径（`*Mounter::spawn`）
+/// 复用。marker 优先：undo「先改 backing、后还原 underlay」时 underlay 可能已空，仅 marker 挡得住。
+pub fn ensure_mountable(reconciling_marker: &Path, mp: &Path) -> io::Result<()> {
+    if reconciling_marker.exists() {
+        return Err(io::Error::other(format!(
+            "{} 正在 reconcile/undo（{} 在），拒绝挂载（防挂到半改写 backing）",
+            mp.display(),
+            reconciling_marker.display()
+        )));
+    }
+    ensure_underlay_empty(mp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +76,28 @@ mod tests {
         std::fs::write(d.path().join("s.jsonl"), b"{}").unwrap();
         let e = ensure_underlay_empty(d.path()).unwrap_err();
         assert!(e.to_string().contains("reconcile"), "错误应指向 reconcile");
+    }
+
+    #[test]
+    fn ensure_mountable_blocks_on_reconciling_marker() {
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("demo.reconciling");
+        let mp = d.path().join("mp");
+        std::fs::create_dir_all(&mp).unwrap();
+        // marker 在 = reconcile/undo 半改写窗口 → 拒（即便 underlay 空）。
+        std::fs::write(&marker, b"").unwrap();
+        assert!(
+            ensure_mountable(&marker, &mp).is_err(),
+            "reconciling marker 在应拒挂载"
+        );
+        // marker 清 + underlay 空 → 放行。
+        std::fs::remove_file(&marker).unwrap();
+        assert!(ensure_mountable(&marker, &mp).is_ok());
+        // marker 清但 underlay 非空 → 仍拒（复用 ensure_underlay_empty）。
+        std::fs::write(mp.join("s.jsonl"), b"{}").unwrap();
+        assert!(
+            ensure_mountable(&marker, &mp).is_err(),
+            "underlay 非空仍应拒挂载"
+        );
     }
 }

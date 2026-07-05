@@ -83,6 +83,16 @@ pub fn resolve_managed_spec(
     name: &str,
 ) -> std::io::Result<crate::enable::daemon::MountSpec> {
     crate::enable::model::validate_name(name)?;
+    // 评审 C-plan1：reconcile/undo 半改写窗口（`reconciling` marker 在）拒绝自启挂载——防挂到半改写
+    // backing（undo 先改 backing、后还原 underlay，underlay 空时也不可挂）。**只查 marker、不并 underlay
+    // 检查**：underlay 守卫在 `run_mount_managed` 走 exit-75 guard（防 crash-loop），此处并 underlay 会把
+    // 稳定态误降为 exit 1。此 marker 检查是「唯一挂载入口」的兜底 + 单测点，主自启路径由 run_mount_managed
+    // 的 guard 先行拦截（同样认 marker，见 mod.rs underlay_guard）。
+    if paths.reconciling_marker(name).exists() {
+        return Err(std::io::Error::other(format!(
+            "{name} 正在 reconcile/undo，拒绝自动挂载（防挂到半改写 backing）；待其完成后重试"
+        )));
+    }
     let meta = crate::enable::discovery::read_meta(&paths.meta_path(name))?
         .filter(|m| m.committed)
         .ok_or_else(|| {
@@ -133,10 +143,11 @@ pub struct SystemdMounter;
 
 impl crate::enable::daemon::Mounter for SystemdMounter {
     fn spawn(&self, spec: &crate::enable::daemon::MountSpec) -> std::io::Result<()> {
-        // 挂载前最后一道守卫：underlay 含停用期 fall-through 回落写即拒（评审 C1/I-6）。
-        // 覆盖经 orchestrator 主动 `systemctl start` 的编排路径；systemd 开机自启路径另在
+        // 挂载前最后一道守卫：reconcile/undo 半改写窗口（marker 在）或 underlay 含停用期 fall-through
+        // 回落写即拒（评审 C1/C-plan1/I-6）。覆盖经 orchestrator 主动 `systemctl start` 的编排路径
+        // （已由上游 `bail_if_reconciling` 覆盖，此处求稳并列）；systemd 开机自启路径另在
         // `run_mount_managed` 兜底（该路径不经本函数，见 main.rs 注释）。
-        crate::reconcile::guard::ensure_underlay_empty(&spec.mountpoint)?;
+        crate::reconcile::guard::ensure_mountable(&spec.reconciling_marker, &spec.mountpoint)?;
         // 先 reset-failed 清掉上次失败计数，否则触发 start-limit 时 start 直接被拒（评审建议）。
         let _ = run_systemctl(&systemctl_args("reset-failed", &spec.name));
         // Type=notify：start 阻塞到 main.rs sd_notify READY，比轮询更可靠。
@@ -369,5 +380,37 @@ mod tests {
         );
         // 完全无 meta → 也 Err。
         assert!(resolve_managed_spec(&paths, "nope").is_err());
+    }
+
+    #[test]
+    fn resolve_managed_spec_rejects_while_reconciling() {
+        use crate::enable::discovery::{write_meta, Meta};
+        use crate::enable::model::{ApplyOptions, Backend, Paths};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            zipfs_home: tmp.path().join("zip"),
+        };
+        std::fs::create_dir_all(paths.back_root()).unwrap();
+        let opts = ApplyOptions {
+            backend: Backend::Shadow,
+            chunk_size: 65536,
+            level: 7,
+            ..ApplyOptions::default()
+        };
+        // meta 已提交，仅 reconciling marker 在 → 仍拒（C-plan1：堵 reconcile/undo 半改写窗口）。
+        let meta = Meta::from_apply(&opts, 100, 50, 0);
+        write_meta(&paths.meta_path("demo"), &meta).unwrap();
+        std::fs::write(paths.reconciling_marker("demo"), b"").unwrap();
+        assert!(
+            resolve_managed_spec(&paths, "demo").is_err(),
+            "reconciling marker 在应拒绝自启挂载（即便 meta 已提交）"
+        );
+        // marker 清后放行。
+        std::fs::remove_file(paths.reconciling_marker("demo")).unwrap();
+        assert!(
+            resolve_managed_spec(&paths, "demo").is_ok(),
+            "marker 清后应放行"
+        );
     }
 }

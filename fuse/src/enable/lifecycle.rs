@@ -628,6 +628,7 @@ pub(crate) fn mount_spec(paths: &Paths, name: &str, opts: &ApplyOptions) -> Moun
         chunk_size: opts.chunk_size,
         level: opts.level,
         pid_file: paths.pid_file(name),
+        reconciling_marker: paths.reconciling_marker(name),
         dict: opts.dict.clone(),
         threads: opts.threads,
         writeback: opts.writeback,
