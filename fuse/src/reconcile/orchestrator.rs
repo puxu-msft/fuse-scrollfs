@@ -1327,6 +1327,25 @@ fn write_manifest(paths: &Paths, name: &str, ts: &str, entries: &[EntryReport]) 
 /// 读回 `reconcile_manifest(name,ts)`：manifest 不存在 → `Ok(None)`（该代次无 undo 依据）；存在则解析
 /// 首行 `ts` 之后的每行 `rel\tclass` 为 `(rel, ReversalClass)`。空行跳过；无法解析的行（缺 tab / 未知
 /// class）→ `Err`（fail-closed：宁可拒绝 undo 也不静默漏条）。`reconcile_undo` 消费。
+/// 校验 manifest 读回的相对路径 `rel`（Task2 Minor，纵深防御）：`rel` 是**多段相对路径**（如
+/// `<uuid>/subagents/x.jsonl`），须每个组件均为 `Normal`——即非 `..`、非绝对根、非 `.`、非空。rel 实源自
+/// 真实目录 walk（无 `..`）、stash 本地同信任域，风险低，但反做入口直接 `orig/backing/mp.join(rel)`，故作
+/// 纵深防御拒绝穿越/绝对/空。命中（返回 `false`）由 `read_manifest` 跳过该条 + 记 warn，不中止整个 undo。
+fn is_safe_rel(rel: &str) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    let mut saw_normal = false;
+    for comp in Path::new(rel).components() {
+        match comp {
+            std::path::Component::Normal(_) => saw_normal = true,
+            // RootDir（绝对）/ ParentDir（..）/ CurDir（.）/ Prefix 均拒。
+            _ => return false,
+        }
+    }
+    saw_normal
+}
+
 fn read_manifest(
     paths: &Paths,
     name: &str,
@@ -1357,6 +1376,13 @@ fn read_manifest(
                 format!("manifest 未知逆转类：{class:?}"),
             )
         })?;
+        // Task2 Minor：纵深防御——拒绝含 `..`/绝对/空组件的 rel（跳过该条 + warn，不中止整个 undo）。
+        if !is_safe_rel(rel) {
+            log::warn!(
+                "{name} 代次 {ts} manifest rel {rel:?} 含非法组件（穿越/绝对/空），跳过该条 undo"
+            );
+            continue;
+        }
         out.push((rel.to_owned(), reversal));
     }
     Ok(Some(out))
@@ -1768,6 +1794,20 @@ pub struct UndoReport {
 /// → 统一还原 underlay（逐条守卫）→ `set_reconciling(false)` **先于** 落 `.undone`（闭合崩溃 wedge 窗口，
 /// Task4 Important）→ 剪空目录。逆转/还原任一步
 /// 出错即传播 `Err` 而**不清 marker**（marker 留存 → 生命周期维护让路、可修复后重跑，重跑幂等）。
+/// 置 marker 后复检挂载态、命中即清 marker 并中止的可测小函数（Task1 Important）。抽出以便单测——真实
+/// 挂载态复检（`discovery::is_mounted` 读 `/proc/self/mountinfo`）在集成环境验证。`mounted` 为真表示复检
+/// 发现项目已在 undo 准备期间被挂载：先 `set_reconciling(false)` 清 marker（此刻尚未任何改写、清 marker
+/// 安全），再返回 `Err` 中止（绝不留滞留 marker）；为假则放行（`Ok`）。
+fn abort_if_mounted_clearing_marker(paths: &Paths, name: &str, mounted: bool) -> io::Result<()> {
+    if mounted {
+        set_reconciling(paths, name, false)?;
+        return Err(io::Error::other(format!(
+            "{name} 在 undo 准备期间被挂载，已中止；请卸载后重试"
+        )));
+    }
+    Ok(())
+}
+
 pub fn reconcile_undo(paths: &Paths, name: &str) -> io::Result<UndoReport> {
     validate_name(name)?;
 
@@ -1843,6 +1883,15 @@ pub fn reconcile_undo(paths: &Paths, name: &str) -> io::Result<UndoReport> {
 
     // ── 逆转（§10.3）：置 marker（半改写窗口）→ 逐条目反做 → 还原 underlay → .undone → 清 marker。
     set_reconciling(paths, name, true)?;
+
+    // Task1 Important：置 marker **后、任何改写前**复检挂载态，闭合「未挂载判定（门禁 1a）→ 置 marker」
+    // 间的自启挂载竞态窗口。此窗口内项目 = 未挂载 + underlay 已被上代 reconcile 抽干（空）+ marker 未置：
+    // reconcile 靠「underlay 非空」挡自启，但 undo 的 underlay 是空的、该保护失效，仅 marker 能挡——而 marker
+    // 到此刻才置。故此空档 systemd 自启（underlay 空 + 无 marker → 放行）可把项目挂上，undo 随后在活 FUSE
+    // 挂载之上改写 backing/写回 mp → 不一致却「成功」返回。加此复检后：任何挂载要么早于置 marker（被本复检
+    // 抓到）、要么晚于置 marker（被 marker 挡下自启入口）→ 窗口闭合。命中即先清 marker（此刻尚未改写、清
+    // marker 安全）再返回 Err（与既有崩溃窗口修复同精神：中止路径绝不留滞留 marker）。
+    abort_if_mounted_clearing_marker(paths, name, discovery::is_mounted(&mp))?;
 
     let mut report = UndoReport {
         ts: ts.clone(),
@@ -2466,6 +2515,84 @@ mod tests {
         let paths = paths_in(tmp.path());
         let e = set_reconciling(&paths, "../escape", true).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn abort_if_mounted_clears_marker_and_errs_when_mounted() {
+        // Task1 Important 复检路径：置 marker 后若复检发现已挂载 → 中止 + marker 已清（此刻尚未改写，
+        // 清 marker 安全）。真实挂载态复检（is_mounted 读 /proc/self/mountinfo）靠集成环境；此处直接
+        // 以 mounted=true 驱动抽出的可测函数。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        // 模拟逆转前刚置 marker 的状态。
+        set_reconciling(&paths, "demo", true).unwrap();
+        assert!(
+            paths.reconciling_marker("demo").exists(),
+            "前置：marker 已置"
+        );
+
+        let e = abort_if_mounted_clearing_marker(&paths, "demo", true).unwrap_err();
+        assert!(e.to_string().contains("被挂载"), "应报被挂载中止");
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "中止路径必须已清 marker，绝不留滞留 marker"
+        );
+    }
+
+    #[test]
+    fn abort_if_mounted_is_noop_when_not_mounted() {
+        // mounted=false → 放行（Ok），marker 原样保留供后续逆转使用。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        set_reconciling(&paths, "demo", true).unwrap();
+
+        abort_if_mounted_clearing_marker(&paths, "demo", false).unwrap();
+        assert!(
+            paths.reconciling_marker("demo").exists(),
+            "未挂载：marker 应原样保留"
+        );
+    }
+
+    #[test]
+    fn read_manifest_skips_traversal_and_absolute_rel() {
+        // Task2 Minor：manifest 含 `../evil` / 绝对 / 空 rel → 跳过该条（不 join 到树外），合法条保留。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let ts = "7";
+        let manifest = paths.reconcile_manifest("demo", ts);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        // 首行 ts 头，随后混入穿越/绝对/空 rel 与一条合法 rel。
+        std::fs::write(
+            &manifest,
+            "7\n\
+             ../evil.jsonl\tRestoreOrig\n\
+             /etc/passwd\tRemoveOrig\n\
+             a/../../b.jsonl\tRestoreOrig\n\
+             good/s.jsonl\tRemoveOrig\n",
+        )
+        .unwrap();
+
+        let out = read_manifest(&paths, "demo", ts).unwrap().unwrap();
+        // 仅合法条保留；三条非法 rel 全被跳过。
+        assert_eq!(
+            out,
+            vec![("good/s.jsonl".to_string(), ReversalClass::RemoveOrig)],
+            "穿越/绝对/含 .. 的 rel 必须被跳过，仅保留合法条"
+        );
+    }
+
+    #[test]
+    fn is_safe_rel_accepts_multi_segment_rejects_traversal() {
+        // 多段相对路径合法；`..`/绝对/`.`/空 均拒。
+        assert!(is_safe_rel("uuid/subagents/x.jsonl"));
+        assert!(is_safe_rel("s.jsonl"));
+        assert!(!is_safe_rel(""));
+        assert!(!is_safe_rel("../evil"));
+        assert!(!is_safe_rel("a/../b"));
+        assert!(!is_safe_rel("/etc/passwd"));
+        assert!(!is_safe_rel("."));
     }
 
     // ── 逐条目规划 + 落盘 ──────────────────────────────────────────────────
