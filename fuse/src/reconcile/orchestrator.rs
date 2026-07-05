@@ -1273,6 +1273,75 @@ fn prune_dir_bottom_up(dir: &Path) -> io::Result<bool> {
     Ok(!has_kept)
 }
 
+/// memory-symlink 短路：清除 `mp` 顶层「与 backing 同名同目标」的冗余 underlay 软链（§6）。
+///
+/// 背景：Claude 的 `memory` 常是指向 canonical 目标的 symlink。停用期软链仍在、写已透传到
+/// canonical → 无 split-brain、无内容要合并；但 `walk_snapshot` 跳过 symlink，该顶层软链既不
+/// 进快照被处理、又令 `underlay_has_fallthrough` 判非空 → 永久 wedge 重挂。此步遍历 `mp` 顶层：
+/// 某条目是 symlink 且 backing 同名条目也是 symlink 且二者 `read_link` 目标相等 → `remove_file`
+/// 删 underlay 那个（backing 有同款、挂载时透传服务）。目标不一致或 backing 无同名 symlink（异常）
+/// → **保留** + push 一条报告串，绝不误删。
+///
+/// **零丢失**：只删「与 backing 同名同目标的 symlink」；真实目录 `memory`（split-brain）不是
+/// symlink，天然不命中此步（`is_symlink` 为假即跳过），仍走 `passthrough_restore_memory`。返回
+/// 异常保留项的报告 Vec（并入 `ReconcileReport`）。
+fn prune_redundant_symlinks(paths: &Paths, name: &str, mp: &Path) -> io::Result<Vec<String>> {
+    let mut notes: Vec<String> = Vec::new();
+    let backing_root = paths.backing(name, Backend::Shadow);
+    let rd = match std::fs::read_dir(mp) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(notes),
+        Err(e) => return Err(e),
+    };
+    for dent in rd {
+        let dent = dent?;
+        if !dent.file_type()?.is_symlink() {
+            // 真实目录/文件（含 split-brain memory 目录）天然不命中——绝不误删。
+            continue;
+        }
+        let name_os = dent.file_name();
+        let under_link = dent.path();
+        let backing_link = backing_root.join(&name_os);
+        let top = name_os.to_string_lossy();
+
+        // backing 同名条目须也是 symlink，否则保留（异常：underlay 有软链 backing 无对应）。
+        let backing_is_symlink = match std::fs::symlink_metadata(&backing_link) {
+            Ok(m) => m.file_type().is_symlink(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        if !backing_is_symlink {
+            notes.push(format!(
+                "underlay 顶层 symlink {top} 在 backing 无同名 symlink → 保留、待人工"
+            ));
+            continue;
+        }
+
+        let under_target = std::fs::read_link(&under_link)?;
+        let backing_target = std::fs::read_link(&backing_link)?;
+        if under_target != backing_target {
+            notes.push(format!(
+                "underlay 顶层 symlink {top} 目标 {} 与 backing 同名目标 {} 不一致 → 保留、待人工",
+                under_target.display(),
+                backing_target.display()
+            ));
+            continue;
+        }
+
+        // 同名同目标：backing 有同款、挂载时透传服务，删 underlay 冗余软链。
+        match std::fs::remove_file(&under_link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(parent) = under_link.parent() {
+            // 持久化软链移除的 dirent（best-effort，与本文件其余落盘链一致）。
+            let _ = fsync_dir(parent);
+        }
+    }
+    Ok(notes)
+}
+
 /// 逐条目的人工确认决定（`ReconcileOptions::confirm` 回调返回）。策略 B：本 driver 只按此裁决，
 /// **不自动执行**——交互式提示留 CLI（Task 10），非交互驱动由调用方给恒定策略实现（如全 Accept）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1402,6 +1471,32 @@ pub fn reconcile(
                 "剪除空 underlay 子目录失败（仅影响重挂门禁，非数据安全）：{e}"
             )],
         });
+    }
+
+    // 并列清除与 backing 同名同目标的顶层冗余 underlay 软链（§6 memory-symlink 短路）：memory 软链
+    // 在、写已透传 canonical → walk_snapshot 跳过 symlink 不处理，却令 fall-through 永真拒挂。删这类
+    // 冗余软链（backing 有同款、挂载时透传）解锁重挂；目标不一致/异常项保留并报告，绝不误删。best-effort：
+    // 与空目录剪枝同为「失败仅记 warn、不 wedge」（非数据安全，软链无内容）。
+    match prune_redundant_symlinks(paths, name, &mp) {
+        Ok(sym_notes) if !sym_notes.is_empty() => {
+            entries.push(EntryReport {
+                name: format!("<prune-symlinks {name}>"),
+                decision: "prune-redundant-symlinks".into(),
+                action: "kept-anomaly".into(),
+                notes: sym_notes,
+            });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            entries.push(EntryReport {
+                name: format!("<prune-symlinks {name}>"),
+                decision: "prune-redundant-symlinks".into(),
+                action: "warn".into(),
+                notes: vec![format!(
+                    "清除冗余 underlay 软链失败（仅影响重挂门禁，非数据安全）：{e}"
+                )],
+            });
+        }
     }
 
     // 4. underlay 清空且非 rebuild → meta 字节数收尾（rebuild 由 reingest 自写 meta，不重复）。
@@ -3214,5 +3309,87 @@ mod tests {
             !paths.reconciling_marker("demo").exists(),
             "收尾应清 reconciling 标记"
         );
+    }
+
+    // ── memory-symlink 短路：清与 backing 同目标的冗余 underlay 软链（§6） ──────────
+
+    /// underlay 顶层 `memory` 软链与 backing 同名软链同目标 → 删 underlay 那个、
+    /// `underlay_has_fallthrough` 转假（不再 wedge 重挂），无异常报告。
+    #[test]
+    fn prune_redundant_symlink_removes_matching_underlay_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+
+        let target = tmp.path().join("canonical");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, mp.join("memory")).unwrap();
+        std::os::unix::fs::symlink(&target, backing.join("memory")).unwrap();
+
+        let notes = prune_redundant_symlinks(&paths, "demo", &mp).unwrap();
+        assert!(
+            notes.is_empty(),
+            "同目标冗余软链应静默删除、无异常报告：{notes:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(mp.join("memory")).is_err(),
+            "underlay memory 软链应被删除"
+        );
+        assert!(
+            !underlay_has_fallthrough(&mp).unwrap(),
+            "删除冗余软链后 underlay 不再判非空（不 wedge 重挂）"
+        );
+    }
+
+    /// underlay 与 backing 同名软链**目标不一致**（异常）→ underlay 软链保留 + 报告非空。
+    #[test]
+    fn prune_redundant_symlink_keeps_mismatched_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+
+        // read_link 不解析目标，target 无需真实存在。
+        std::os::unix::fs::symlink(tmp.path().join("a"), mp.join("memory")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("b"), backing.join("memory")).unwrap();
+
+        let notes = prune_redundant_symlinks(&paths, "demo", &mp).unwrap();
+        assert!(!notes.is_empty(), "目标不一致应保留并报告");
+        assert!(
+            std::fs::symlink_metadata(mp.join("memory"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "目标不一致的 underlay 软链绝不被误删"
+        );
+    }
+
+    /// 真实目录 `memory`（split-brain，非 symlink）天然不命中此步 → 绝不被误删。
+    #[test]
+    fn prune_redundant_symlink_ignores_real_dir_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+
+        // underlay memory 是真实目录（含文件）；backing memory 是软链。
+        let memdir = mp.join("memory");
+        std::fs::create_dir_all(&memdir).unwrap();
+        std::fs::write(memdir.join("f.md"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("canon"), backing.join("memory")).unwrap();
+
+        let notes = prune_redundant_symlinks(&paths, "demo", &mp).unwrap();
+        assert!(
+            memdir.join("f.md").exists(),
+            "真实目录 memory（split-brain）绝不被此步误删"
+        );
+        assert!(notes.is_empty(), "非 symlink 条目不产生报告：{notes:?}");
     }
 }
