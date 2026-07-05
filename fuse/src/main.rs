@@ -948,4 +948,26 @@ mod cli_tests {
             _ => panic!("应解析为 Enable 子命令"),
         }
     }
+
+    #[test]
+    fn parses_enable_reconcile_undo_subcommand() {
+        // §10.5：`enable reconcile-undo <name>` 回退最近一次 reconcile（无 flag，仅项目名）。
+        // 项目名以 `-` 开头（path-encoded），与 Reconcile 等兄弟同为 positional，故经 `--` 传入。
+        let cli = Cli::parse_from([
+            "zipfs",
+            "enable",
+            "reconcile-undo",
+            "--",
+            "-home-xp-src-foo",
+        ]);
+        match cli.command {
+            Some(Command::Enable(a)) => match a.action {
+                Some(zipfs::enable::EnableAction::ReconcileUndo { name }) => {
+                    assert_eq!(name, "-home-xp-src-foo");
+                }
+                _ => panic!("应解析为 EnableAction::ReconcileUndo"),
+            },
+            _ => panic!("应解析为 Enable 子命令"),
+        }
+    }
 }
