@@ -58,12 +58,16 @@ fuse/target/release/zipfs compact --backend container --backing <redb文件>
 
 ```bash
 fuse/target/release/zipfs enable                 # 交互式 TUI（列表/状态/切换/还原/重挂/选项/批量）
-fuse/target/release/zipfs enable list            # 状态总览（PLAIN/ZIPFS/STOPPED/BROKEN + 压缩比）
+fuse/target/release/zipfs enable list            # 状态总览（PLAIN/ZIPFS/STOPPED/BROKEN + NEEDS-RECONCILE + 压缩比）
 fuse/target/release/zipfs enable apply  <name>   # 切换（活跃会话默认拦截，需 --force）
 fuse/target/release/zipfs enable restore <name>  # 还原（backing 保留，可 `enable purge` 清理）
 fuse/target/release/zipfs enable remount --all   # 守护崩溃/重启后重挂所有 STOPPED
+fuse/target/release/zipfs enable reconcile      -- <name>   # 停用期回落写重合并（详见 docs/09；须先卸载；逐条确认，高置信回车即采纳）
+fuse/target/release/zipfs enable reconcile-undo -- <name>   # 回退最近一次 reconcile 供重选（docs/09 §10）
 fuse/target/release/zipfs enable autostart install   # systemd user 登录自挂载（WSL 用 `autostart print`）
 ```
+
+> 项目名前导 `-`（path-encoded）在子命令里须用 `--` 分隔，如 `enable reconcile -- -home-xp-src-foo`。停用期若 Claude 直接写进裸挂载点（回落写），`enable list` 标 `NEEDS-RECONCILE`、remount 被守卫拒；先 `enable reconcile` 无损并回 backing（详见 [docs/09-session-reconcile.md](docs/09-session-reconcile.md)）。
 
 apply 选项（全部持久化到 backing sidecar，remount 原样复用；TUI 内 `o` 调 backend/chunk/level/threads/writeback）：
 

@@ -96,14 +96,14 @@
 4. **删 underlay 条目前**（通用删除许可，覆盖**所有**接收方路径 —— merged / quarantine 隔离 / new / memory 目标）：校验**运行时超集不变量** —— 该 underlay 条目的接收方已 **durable（fsync + readback）** 且逐字节 **⊇ 或 ==** 该条目内容（merged：base transcript uuid 集 ⊆ merged、base 无uuid 行多重集 ⊆ merged、已接受 incoming 项 ⊆ merged；quarantine/new/memory：接收文件字节 == 源条目，含跨卷 copy 后的 readback）+ 复核 underlay 快照未变（mtime/size/inode）；任一不满足 → 中止、保两份、报告。
 5. 全部处置完、underlay 清空 → 更新 committed meta 字节数（呼应 `reingest` 自写 meta）→ 清陈旧 pid/lock。
 
-**reconciling 中间标记**：改 backing 期间置 `committed=0`（或落 `reconciling` sidecar），使中途崩溃被 `classify` 判为 **Broken/需人工**而非"可自动重挂"，杜绝半 reconcile 的 backing 被当权威挂出。完成才复位 `committed=1`。
+**reconciling 中间标记**（实现取此方案，非 committed=0）：改 orig/backing 期间落**独立 `reconciling` sidecar**（`back_root/<name>.reconciling`，`Paths::reconciling_marker`），`committed` **全程不变**（评审 I-4：复用 committed=0 会与 Broken/半灌语义冲突、且 `reingest` 要求 committed=1）。`probe` 检出标记 → 报 `Reconciling` 态；`lifecycle` 的 restore/remount/reingest/compact/seal 见标记即 `bail_if_reconciling` 让路；systemd 自启入口（`resolve_managed_spec`/`run_mount_managed`）亦认标记拒挂——半 reconcile 窗口内既不被维护也不被自启挂上。完成才清标记。
 
 **5.4 挂载前 underlay 守卫（失败即拒，单点复用）** —— 抽成 `ensure_underlay_empty(paths,name)`，下沉到**真正挂载前的最后一道**：`resolve_managed_spec` / `Mounter::spawn` 前置，被 `remount` / `mount-managed`(systemd 自启) / `apply` 重挂路径**全部**复用。underlay 非空即拒、指向 `enable reconcile`。
 - **systemd crash-loop 处理**：模板单元 `Restart=on-failure`+`WatchdogSec` 下，守卫直接非零退出会反复重启至 start-limit。改用 `ExecStartPre` 显式检查：非空 underlay → 落 `NEEDS-RECONCILE` sentinel + 明确日志 + 不进入重启循环（oneshot 失败或自我 `disable`），给可操作指引而非噪声。
 - 守卫谓词精确：忽略已知无害隐藏项白名单（`.fuse_hidden*`/`.DS_Store`/编辑器锁），只认 fall-through 语义条目，避免残渣永久阻塞挂载。
 - `apply` 的 mount 分支此刻 mp 定义上为空（rename 后 create_dir），**不纳入**守卫（避免误拒正常 apply）。
 
-**5.5 CLI / TUI** —— `zipfs enable reconcile <name> [--dry-run] [--force] [--rebuild]`（`--force` 越过活跃门禁由人确认；`--rebuild` = 全量重灌兜底，backing 可疑时用）。`enable list`：STOPPED 且 underlay 非空 → 标 `NEEDS-RECONCILE`；reconcile 进行中因 `committed=0` 会短暂显示 Broken —— 属正常（有 reconcile 锁保护、崩溃本就应判 Broken），list/TUI 对持锁项标注"reconciling"以免误判。TUI 同标记 + 逐条建议复核。
+**5.5 CLI / TUI** —— `zipfs enable reconcile <name> [--dry-run] [--force] [--rebuild]`（`--force` 越过活跃门禁由人确认；`--rebuild` = 全量重灌兜底，backing 可疑时用）；交互逐条 `[a]ccept/[k]eep-both/[s]kip`，**高置信度条目回车即 accept**（快速采纳证据确凿项）；非交互（stdin 非 tty）且非 dry-run → 拒绝（策略 B）。`enable reconcile-undo <name>` 回退最近一次 reconcile（§10）。`enable list`：STOPPED 且 underlay 非空 → 标 `NEEDS-RECONCILE`；reconcile/undo 进行中（`.reconciling` 标记在，`committed` 不变）→ 标 `RECONCILING`（优先于 NEEDS-RECONCILE）。列宽据数据动态对齐（长 path-encoded 名不撑破列）。项目名前导 `-`，CLI 须用 `--` 分隔（如 `enable reconcile -- -home-xp-src-foo`）。TUI 同标记 + 逐条建议复核。
 
 ## 6. memory 透传恢复（例外规则）
 
