@@ -451,9 +451,8 @@ impl ReversalClass {
         }
     }
 
-    /// 解析 manifest 标签（未知标签 → `None`，由调用方决定容错策略）。Task 4 `reconcile_undo` 经
+    /// 解析 manifest 标签（未知标签 → `None`，由调用方决定容错策略）。`reconcile_undo` 经
     /// `read_manifest` 消费。
-    #[allow(dead_code)] // 由 Task 4 undo 消费；本任务只落盘 manifest。
     fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "RestoreOrig" => ReversalClass::RestoreOrig,
@@ -1327,8 +1326,7 @@ fn write_manifest(paths: &Paths, name: &str, ts: &str, entries: &[EntryReport]) 
 
 /// 读回 `reconcile_manifest(name,ts)`：manifest 不存在 → `Ok(None)`（该代次无 undo 依据）；存在则解析
 /// 首行 `ts` 之后的每行 `rel\tclass` 为 `(rel, ReversalClass)`。空行跳过；无法解析的行（缺 tab / 未知
-/// class）→ `Err`（fail-closed：宁可拒绝 undo 也不静默漏条）。Task 4 `reconcile_undo` 消费。
-#[allow(dead_code)] // 由 Task 4 undo 消费；本任务只落盘 manifest。
+/// class）→ `Err`（fail-closed：宁可拒绝 undo 也不静默漏条）。`reconcile_undo` 消费。
 fn read_manifest(
     paths: &Paths,
     name: &str,
@@ -1732,6 +1730,385 @@ fn dir_file_bytes(dir: &Path) -> io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+// ── reconcile-undo（回退最近一次重合并，供重选，§10） ─────────────────────────
+
+/// 一次 `reconcile_undo` 的报告（§10.5 CLI 打印用）。
+///
+/// - `ts`：实际选中并回退的代次时间戳（`.undone` 二次 undo 的 no-op 也回填，`reversed` 为空）。
+/// - `reversed`：逐条目实际反做记录 `(rel, 逆转类标签)`（RestoreOrig / RemoveOrig / RemoveQuarantine）。
+/// - `skipped_live_changed`：还原 underlay 时因 live 已与快照不同而**保留 live、未覆盖**的条目
+///   （reconcile 后又有新写；陈旧门与此逐条守卫双保险，绝不用旧快照盖新数据）。
+/// - `memory_manual`：ReportMemory 条目（本代次往外部 memory 目标写过的文件），仅报告待用户 git 回退——
+///   undo **绝不触碰外部 memory 目标**（§10.4）。
+#[derive(Debug, Clone, Default)]
+pub struct UndoReport {
+    pub ts: String,
+    pub reversed: Vec<(String, String)>,
+    pub skipped_live_changed: Vec<String>,
+    pub memory_manual: Vec<String>,
+}
+
+/// 回退**最近一代** reconcile（§10）：把项目还原到该 run **之前**的状态（underlay + orig + backing），
+/// 随后可换选项重跑 `reconcile`。**无 mounter 参数**（评审 M4：undo 不重挂，未挂载判定走
+/// `discovery::is_mounted`）。全程与 reconcile 对称：reconcile 锁 + `reconciling` marker + 陈旧门 +
+/// 逐条守卫，满足零丢失铁律。
+///
+/// **前置门禁（缺一即拒，§10.2）：**
+/// 1. `validate_name`；项目**未挂载**（`is_mounted` 为真即拒）；**shadow** 后端（读 meta 判，非 shadow 拒）。
+/// 2. 取 **reconcile 锁**（`reconcile_lock`，持锁到结束，与 reconcile / 其他 undo 互斥）。
+/// 3. 选**目标代次 = 全体 ts 最大**的一代：无任何代次→Err；**最新代次无 manifest**（崩溃未完成的 run）
+///    →Err 且**绝不清 marker**（marker 归崩溃 run）。该代次已 `.undone`→no-op（幂等，返回空 reversed）。
+/// 4. **陈旧门（§10.2 C1）**：`detect_activity` 空闲否则拒；且对 `stash/<ts>/underlay/**` 每个快照文件，
+///    比对 live `mp/<rel>`：**live 缺失或与快照逐字节相等**才算未变（mtime/size/ino 未随进程存活，用
+///    byte-equal，比 mtime 更强）。任一 live 已变（存在且字节不同）→ **拒绝整个 undo**、报告该 rel、零改动。
+///
+/// **逆转（§10.3）：** `set_reconciling(true)`（半改写窗口保护）→ 逐条目按 manifest `ReversalClass` 反做
+/// → 统一还原 underlay（逐条守卫）→ 落 `.undone` → `set_reconciling(false)` → 剪空目录。逆转/还原任一步
+/// 出错即传播 `Err` 而**不清 marker**（marker 留存 → 生命周期维护让路、可修复后重跑，重跑幂等）。
+pub fn reconcile_undo(paths: &Paths, name: &str) -> io::Result<UndoReport> {
+    validate_name(name)?;
+
+    // 前置门禁 1a：项目必须未挂载（undo 半改写 orig/backing，不能作用在挂载态视图上）。
+    let mp = paths.mountpoint(name);
+    if discovery::is_mounted(&mp) {
+        return Err(io::Error::other(format!(
+            "{name} 已挂载，拒绝 reconcile-undo；请先卸载后重试"
+        )));
+    }
+
+    // 前置门禁 1b：shadow 后端（container 无 fall-through / per-file 语义，undo 不适用）。无 meta = 未 apply。
+    let meta = discovery::read_meta(&paths.meta_path(name))?.ok_or_else(|| {
+        io::Error::other(format!(
+            "{name} 无提交标记 meta，无法 reconcile-undo（未 apply？）"
+        ))
+    })?;
+    if meta.backend != Backend::Shadow {
+        return Err(io::Error::other(format!(
+            "reconcile-undo 仅支持 shadow 后端；{name:?} 为 {}，不适用",
+            meta.backend.flag()
+        )));
+    }
+
+    // 前置门禁 2：取 reconcile 锁（与 reconcile / 其他 undo 互斥），持锁到函数末。
+    let lock_path = paths.reconcile_lock(name);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = acquire_exclusive(&lock_path)?;
+
+    // 前置门禁 3：选目标代次 = 全体 ts 最大的一代（§10.2/评审 I2）。
+    let Some(ts) = latest_generation(paths, name)? else {
+        return Err(io::Error::other(format!(
+            "{name} 无可回退的 reconcile 记录（无任何代次）"
+        )));
+    };
+    let stash_root = paths.reconcile_stash(name, &ts);
+    // 最新代次无 manifest = 崩溃未完成的 run → 拒绝，**绝不清属于崩溃 run 的 marker**（此处也从未动 marker）。
+    let manifest = read_manifest(paths, name, &ts)?.ok_or_else(|| {
+        io::Error::other(format!(
+            "{name} 最新代次 {ts} 无 manifest（该 reconcile run 未完成、不可 undo）；请查 stash 手动恢复"
+        ))
+    })?;
+    // 幂等：该代次已 `.undone` → no-op（返回回填 ts 的空报告，防二次误触）。
+    let undone_marker = stash_root.join(".undone");
+    if undone_marker.exists() {
+        return Ok(UndoReport {
+            ts,
+            ..Default::default()
+        });
+    }
+
+    // 前置门禁 4：陈旧门（§10.2 C1）——detect_activity 空闲 + 每条快照 underlay 文件 live 缺失或逐字节相等。
+    if let Some(reason) = detect_activity(&mp).reason() {
+        return Err(io::Error::other(format!(
+            "{name} 挂载点疑似活跃（{reason}），拒绝 reconcile-undo；确认空闲后重试"
+        )));
+    }
+    let stash_underlay = stash_root.join("underlay");
+    let changed = live_underlay_changed_since_snapshot(&stash_underlay, &mp)?;
+    if !changed.is_empty() {
+        return Err(io::Error::other(format!(
+            "{name} reconcile 后 live underlay 已有新写，拒绝整个 undo（零改动）：{changed:?}；\
+             请先 `enable reconcile` 收编新写、或手动处理"
+        )));
+    }
+
+    // ── 逆转（§10.3）：置 marker（半改写窗口）→ 逐条目反做 → 还原 underlay → .undone → 清 marker。
+    set_reconciling(paths, name, true)?;
+
+    let mut report = UndoReport {
+        ts: ts.clone(),
+        ..Default::default()
+    };
+    for (rel, class) in &manifest {
+        match class {
+            ReversalClass::RestoreOrig => {
+                undo_restore_orig(paths, name, &stash_root, rel)?;
+                report.reversed.push((rel.clone(), "RestoreOrig".into()));
+            }
+            ReversalClass::RemoveOrig => {
+                undo_remove_orig(paths, name, rel)?;
+                report.reversed.push((rel.clone(), "RemoveOrig".into()));
+            }
+            ReversalClass::RemoveQuarantine => {
+                undo_remove_quarantine(paths, name, &ts, &stash_root, rel)?;
+                report
+                    .reversed
+                    .push((rel.clone(), "RemoveQuarantine".into()));
+            }
+            // ReportMemory：仅报告本代次往外部目标写过的文件，绝不触碰外部 memory 目标（§10.4）。
+            ReversalClass::ReportMemory => report.memory_manual.push(rel.clone()),
+            // manifest 已过滤 Noop（write_manifest），防御性忽略。
+            ReversalClass::Noop => {}
+        }
+    }
+
+    // 统一还原 underlay：stash/<ts>/underlay/** 逐文件拷回 mp/<rel>，逐条守卫记 skipped_live_changed。
+    restore_underlay_from_snapshot(&stash_underlay, &mp, &mut report.skipped_live_changed)?;
+
+    // 落 .undone 标记（防二次误触）→ 清 marker → 剪除还原可能留的空目录。
+    write_undone_marker(&undone_marker)?;
+    set_reconciling(paths, name, false)?;
+    prune_empty_underlay_dirs(&mp)?;
+
+    Ok(report)
+}
+
+/// 枚举 `reconcile_stash(name)` 下所有 `<ts>` 代次目录，返回**数值 ts 最大**者。无代次/目录不存在 → `None`。
+/// ts 是 unix 秒字符串，按 `u64` 解析比较（解析失败退化为字典序，容错）。
+fn latest_generation(paths: &Paths, name: &str) -> io::Result<Option<String>> {
+    // reconcile_stash(name, ts) 的父目录即 `<name>` 代次根，取一个占位 ts 后 parent。
+    let probe = paths.reconcile_stash(name, "0");
+    let Some(gen_root) = probe.parent() else {
+        return Ok(None);
+    };
+    let rd = match std::fs::read_dir(gen_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut best: Option<String> = None;
+    for dent in rd {
+        let dent = dent?;
+        if !dent.file_type()?.is_dir() {
+            continue;
+        }
+        let ts = dent.file_name().to_string_lossy().into_owned();
+        best = Some(match best {
+            Some(cur) if !ts_greater(&ts, &cur) => cur,
+            _ => ts,
+        });
+    }
+    Ok(best)
+}
+
+/// ts 数值比较（unix 秒），解析失败退化为字典序。返回 `a > b`。
+fn ts_greater(a: &str, b: &str) -> bool {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x > y,
+        _ => a > b,
+    }
+}
+
+/// 陈旧门比对（§10.2 C1）：遍历 `stash_underlay`（快照）下每个文件，与 `mp/<rel>` 逐字节比对。
+/// live **存在且内容不同** → 收进返回 Vec（reconcile 后有新写）；live 缺失或逐字节相等 → 视为未变。
+///
+/// 用 byte-equal（而非 mtime/size/ino）：快照落盘只存内容，身份三元组随进程退出已丢失，byte-equal
+/// 是可从磁盘复算的、比 mtime 更强的「未变」判据。
+fn live_underlay_changed_since_snapshot(
+    stash_underlay: &Path,
+    mp: &Path,
+) -> io::Result<Vec<String>> {
+    let mut changed = Vec::new();
+    walk_compare_snapshot(stash_underlay, stash_underlay, mp, &mut changed)?;
+    Ok(changed)
+}
+
+/// `live_underlay_changed_since_snapshot` 的递归实现。`root` 是快照 underlay 根（算 rel 用）。
+fn walk_compare_snapshot(
+    root: &Path,
+    dir: &Path,
+    mp: &Path,
+    changed: &mut Vec<String>,
+) -> io::Result<()> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for dent in rd {
+        let dent = dent?;
+        let path = dent.path();
+        let ft = dent.file_type()?;
+        if ft.is_dir() {
+            walk_compare_snapshot(root, &path, mp, changed)?;
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io::Error::other("stash underlay 条目逃出根"))?;
+        let live = mp.join(rel);
+        match std::fs::read(&live) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {} // live 缺失 → 未变
+            Err(e) => return Err(e),
+            Ok(live_bytes) => {
+                if live_bytes != std::fs::read(&path)? {
+                    changed.push(rel.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// RestoreOrig 反做：**先 fail-closed 校验** `stash/<ts>/orig/<rel>` 前镜像存在（缺→Err 中止，绝不
+/// 静默半还原，评审 I-plan2）→ 读前镜像 → `atomic_write(orig/<rel>)` 原子还原 → `reingest_one_file`
+/// 原子重建 `backing/<rel>`（与 reconcile 同原语）。
+fn undo_restore_orig(paths: &Paths, name: &str, stash_root: &Path, rel: &str) -> io::Result<()> {
+    let preimage = stash_root.join("orig").join(rel);
+    let bytes = match std::fs::read(&preimage) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::other(format!(
+                "RestoreOrig 反做中止：前镜像 {} 缺失（绝不静默半还原）；reconciling 标记保留，修复后可重跑",
+                preimage.display()
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let orig_file = paths.orig(name).join(rel);
+    if let Some(parent) = orig_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(&orig_file, &bytes)?;
+    reingest_one_file(paths, name, rel)
+}
+
+/// RemoveOrig 反做：删 `orig/<rel>` + `backing/<rel>`（NotFound 容忍，幂等重跑安全）。防 undo 后残留
+/// new 增出的孤儿。
+fn undo_remove_orig(paths: &Paths, name: &str, rel: &str) -> io::Result<()> {
+    remove_file_if_exists(&paths.orig(name).join(rel))?;
+    remove_file_if_exists(&paths.backing(name, Backend::Shadow).join(rel))
+}
+
+/// RemoveQuarantine 反做：`quarantine(name,ts)/<rel>` 副本先逐字节校验 == `stash/<ts>/underlay/<rel>`
+/// **快照**（校验基准是快照、非 live，评审 I1）后删除。quarantine 副本缺失 → 幂等跳过（已删）；校验
+/// 不符 → Err（绝不误删与快照不符的隔离副本，可能被人工改过）。orig/backing **绝不触碰**（keep-separate
+/// 当初就没改 base）。
+fn undo_remove_quarantine(
+    paths: &Paths,
+    name: &str,
+    ts: &str,
+    stash_root: &Path,
+    rel: &str,
+) -> io::Result<()> {
+    let quarantine_file = paths.quarantine(name, ts).join(rel);
+    let q_bytes = match std::fs::read(&quarantine_file) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()), // 已删，幂等
+        Err(e) => return Err(e),
+        Ok(b) => b,
+    };
+    let snapshot_file = stash_root.join("underlay").join(rel);
+    if q_bytes != std::fs::read(&snapshot_file)? {
+        return Err(io::Error::other(format!(
+            "RemoveQuarantine 反做中止：隔离副本 {} 与快照 {} 不符（绝不误删）",
+            quarantine_file.display(),
+            snapshot_file.display()
+        )));
+    }
+    remove_file_if_exists(&quarantine_file)
+}
+
+/// 删单文件（NotFound 容忍，幂等）并 best-effort fsync 父目录持久化 dirent。
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fsync_dir(parent);
+    }
+    Ok(())
+}
+
+/// 统一还原 underlay（§10.3 步3）：把 `stash_underlay`（快照）下每个文件拷回 `mp/<rel>`（重建目录结构）。
+///
+/// **逐条守卫（承 §10.2 C1）**：仅当 live **缺失**或与快照**逐字节一致**才覆盖还原；live 已存在且不同
+/// （reconcile 后新写）→ **保留 live、记入 `skipped`、绝不覆盖**（陈旧门 + 此守卫双保险，绝不用旧快照
+/// 盖新数据）。原子写还原（`atomic_write`）。
+fn restore_underlay_from_snapshot(
+    stash_underlay: &Path,
+    mp: &Path,
+    skipped: &mut Vec<String>,
+) -> io::Result<()> {
+    walk_restore_snapshot(stash_underlay, stash_underlay, mp, skipped)
+}
+
+/// `restore_underlay_from_snapshot` 的递归实现。`root` 是快照 underlay 根（算 rel 用）。
+fn walk_restore_snapshot(
+    root: &Path,
+    dir: &Path,
+    mp: &Path,
+    skipped: &mut Vec<String>,
+) -> io::Result<()> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for dent in rd {
+        let dent = dent?;
+        let path = dent.path();
+        let ft = dent.file_type()?;
+        if ft.is_dir() {
+            walk_restore_snapshot(root, &path, mp, skipped)?;
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io::Error::other("stash underlay 条目逃出根"))?;
+        let live = mp.join(rel);
+        let snap_bytes = std::fs::read(&path)?;
+        match std::fs::read(&live) {
+            // live 缺失 → 还原快照。
+            Err(e) if e.kind() == io::ErrorKind::NotFound => restore_one(&live, &snap_bytes)?,
+            Err(e) => return Err(e),
+            // 逐字节一致 → 已是快照内容，幂等 no-op（不重写）。
+            Ok(live_bytes) if live_bytes == snap_bytes => {}
+            // live 已存在且不同（reconcile 后新写）→ 保留 live、记 skipped、绝不覆盖。
+            Ok(_) => skipped.push(rel.to_string_lossy().into_owned()),
+        }
+    }
+    Ok(())
+}
+
+/// 原子还原单个 underlay 文件（重建父目录链）。
+fn restore_one(live: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = live.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(live, bytes)
+}
+
+/// 落 `.undone` 标记（空文件 + fsync 文件与父目录）到目标代次 stash：防二次误触（再敲 undo 认出已消费）。
+fn write_undone_marker(marker: &Path) -> io::Result<()> {
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    File::create(marker)?.sync_all()?;
+    if let Some(parent) = marker.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
