@@ -109,11 +109,13 @@
 
 memory 本应是**单份透传软链**：ingest 在 backing 按软链重建、shadow store 透明服务 `readlink` → 挂载时读写只落唯一 canonical。停用期软链缺失才写出第二副本。重合并须**恢复单份透传**：
 
-- 写目标前：`canonicalize` 目标，校验其**存在且可写**、解析后仍在允许根内（**拒 `../` 穿越**）；目标不可写/悬空/被前次半截 reconcile 物化成真实目录 → **不删** underlay memory、报告待人工（防向外部 live git 仓注入 / 递归 split-brain）。
-- underlay 里目标**不存在**的新文件 → 复制进目标（找回停用期新增记忆）。
-- underlay 里与目标**同名异内容**者（如 `MEMORY.md`）→ **不合并**；underlay 版本改名保留两份，**用内容哈希做后缀**（`MEMORY.md.underlay-<hash8>`）而非时间戳，保证重复中断重跑**幂等**、不产生多副本。
-- 目标加锁/活跃检测防与别的 worktree/Claude 竞态。
-- 处置完删 underlay 的 `memory/` → 软链重新生效。canonical 原版始终不动。
+- **先判 underlay 形态（短路，用户 2026-07-05 定）**：若 underlay 的 `memory` 条目**整体就是 symlink**（且目标与 backing 同名软链一致）→ 说明写入当时软链在、已透传到 canonical，**无 split-brain、无任何数据要合并**——数据层面零操作；仅把这个**冗余 symlink 从 underlay 移除**（backing 上有同样软链，挂载时照常透传），好让 `underlay_has_fallthrough` 放行、remount 不被拒（否则 `walk_snapshot` 跳过 symlink → 该软链既不进快照被处理、又被顶层守卫判非空 → 卡挂，即终审 M3 的 symlink 具化）。若目标与 backing 软链**不一致**（异常）→ 保守不删、报告待人工。
+- 仅当 underlay 的 `memory` 是**真实目录**（split-brain）才走下述 relocate：
+  - 写目标前：`canonicalize` 目标，校验其**存在且可写**、解析后仍在允许根内（**拒 `../` 穿越**）；目标不可写/悬空/被前次半截 reconcile 物化成真实目录 → **不删** underlay memory、报告待人工（防向外部 live git 仓注入 / 递归 split-brain）。
+  - underlay 里目标**不存在**的新文件 → 复制进目标（找回停用期新增记忆）。
+  - underlay 里与目标**同名异内容**者（如 `MEMORY.md`）→ **不合并**；underlay 版本改名保留两份，**用内容哈希做后缀**（`MEMORY.md.underlay-<hash8>`）而非时间戳，保证重复中断重跑**幂等**、不产生多副本。
+  - 目标加锁/活跃检测防与别的 worktree/Claude 竞态。
+  - 处置完删 underlay 的 `memory/` → 软链重新生效。canonical 原版始终不动。
 
 ## 7. 错误处理与数据安全
 
