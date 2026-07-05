@@ -1762,6 +1762,11 @@ pub fn reconcile(
     set_reconciling(paths, name, false)?;
 
     // 5. rebuild：清标记后委托 reingest 从 orig 全量重建 backing + 重挂（committed 全程不变满足其前提）。
+    // 评审 W2（已知窄窗口，未修）：此处必须先清标记——lifecycle::reingest 的重挂经 mounter.spawn →
+    // ensure_mountable，marker 在则拒挂，故 reingest 的自我重挂要求标记已清。代价：重建+重挂窗口内
+    // 标记已清 + underlay 已空，外部 systemd 自启理论上可挂到半重建 backing / 双挂载。彻底修复需
+    // 「可信重挂」路径（区分 reconcile 自身重挂 vs 外部自启），属较大改动，留后续；无数据丢失（orig
+    // 权威、单文件 reingest 原子）。
     if opts.rebuild {
         let msg = crate::enable::lifecycle::reingest(paths, name, opts.force, mounter)?;
         entries.push(EntryReport {
