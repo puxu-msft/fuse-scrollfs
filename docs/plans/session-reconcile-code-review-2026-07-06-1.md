@@ -54,3 +54,18 @@
 3. **W1（Medium wedge）** check_preconditions 清陈旧 marker
 4. **R-I1（Important）** 空 uuid 降级 NoUuid
 5. **W2 / R-I2 / W3 / W4** 后续
+
+## 修复状态（2026-07-06 同会话落地）
+
+均 TDD RED→GREEN、精确 pathspec 提交、370 lib 测试全绿：
+
+- ✅ **R-I1**（`fix(reconcile): 空串/非字符串 uuid 降级 NoUuid`）：`record.rs` `classify_record` 仅非空字符串 uuid 算 transcript 键，空串/缺失/非字符串走整行去重全保 distinct。
+- ✅ **R-C1**（`fix(reconcile): apply_entry/subagents 补 base 侧超集铁律门`）：新 `merge::base_covered_by_merged`（**uuid 级** transcript + 行级 no-uuid，故不误判 §4.1 同 uuid 取更长者），在 Union/subagents 落 orig 前 fail-fast，不覆盖则中止、不删 underlay、保两份。
+- ✅ **R-lock**（`fix(reconcile): reingest_one_file/undo 删 backing 取 backing 锁`）：`reingest_one_file` + `undo_remove_orig` 取 `acquire_backing_retry`，与 compact/seal/守护同一把 `.zipfs.lock` 硬互锁；`reingest_one_file_blocked_while_backing_locked` 回归。锁短持、不跨 rebuild 的 remount（无自死锁）。
+- ✅ **W1**（`fix(reconcile): check_preconditions 见 underlay 空+陈旧 marker 清标记收敛`）：解崩溃 wedge，兑现「重跑自恢复」。
+- ✅ **R-I2**（`fix(reconcile): 同 uuid 分叉 conflicts 携落败整行`）：落败字节可从报告复原（merge 输出仍按 §4.1 取更长者）。
+- ⚠️ **W2（未修，已记为已知窄窗口）**：rebuild 前必须清 marker——`lifecycle::reingest` 的自我重挂经 `mounter.spawn → ensure_mountable`，marker 在则拒挂。保持 marker 会**破坏 rebuild 自身重挂**（比 W2 race 更糟）。彻底修需「可信重挂」路径区分 reconcile 自身重挂 vs 外部自启，属较大改动。无数据丢失（orig 权威、单文件 reingest 原子）。
+- ☐ **W3（Low）**：崩溃续跑用已 merged 的 orig 当前镜像，undo 只回到已合并态（无丢失）。
+- ☐ **W4（Low）**：`write_manifest` 失败后 undo 文案称"未完成"（实已完成）且连带挡更早代次 undo（纯可用性）。
+
+**结论**：CRITICAL + HIGH + Important + 一个 wedge 已收口，reconcile 的**双向超集删除门 + backing 硬互锁 + wedge 自恢复**补齐；余 W2（需可信重挂路径）+ W3/W4（Low）留后续。
