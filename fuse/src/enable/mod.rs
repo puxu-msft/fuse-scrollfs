@@ -264,41 +264,88 @@ pub fn run(action: Option<EnableAction>, home: PathBuf) -> std::io::Result<()> {
     }
 }
 
-/// `list`：状态表（NAME / STATUS / RATIO / 物理大小）。
+/// `list`：状态表（NAME / STATUS / BACKEND / RATIO / 备注）。
 fn cmd_list(paths: &Paths) -> std::io::Result<()> {
     let infos = discovery::scan(paths)?;
     if infos.is_empty() {
         println!("（{} 下无项目）", paths.projects_root.display());
         return Ok(());
     }
-    println!(
-        "{:<46} {:<24} {:<10} {:>8}  META",
+    print!("{}", format_list_table(&infos));
+    Ok(())
+}
+
+/// 渲染 list 状态表为字符串。**列宽据实际数据动态计算**：长 path-encoded 项目名会撑破固定列宽、
+/// 把其后各列顶到错位（用户实测），故 NAME/STATUS/BACKEND 各取「表头与所有行的最大宽度」对齐。
+/// 这三列均 ASCII（path-encoded 名 / 英文状态标签 / 后端名），`chars().count()` == 终端显示宽度，
+/// 无需 unicode-width。抽纯函数便于单测。
+fn format_list_table(infos: &[discovery::ProjectInfo]) -> String {
+    use std::fmt::Write;
+    struct Row {
+        name: String,
+        status: String,
+        backend: String,
+        ratio: String,
+        note: &'static str,
+    }
+    let rows: Vec<Row> = infos
+        .iter()
+        .map(|info| {
+            // Plain 但有遗留 backing（restore 后未 purge）→ 标 purgeable，不显示旧 ratio（易误解）。
+            let (ratio, note) = match (info.status, &info.meta) {
+                (ProjectStatus::Plain, Some(_)) => ("-".to_string(), "purgeable backing"),
+                (ProjectStatus::Plain, None) => ("-".to_string(), ""),
+                (_, Some(m)) if m.committed => (format!("{:.2}x", m.ratio()), "committed"),
+                (_, Some(_)) => ("-".to_string(), "UNCOMMITTED"),
+                (_, None) => ("-".to_string(), ""),
+            };
+            let backend = if info.meta.is_some() {
+                info.backend().flag()
+            } else {
+                "-"
+            };
+            Row {
+                name: info.name.clone(),
+                status: info.status_display(),
+                backend: backend.to_string(),
+                ratio,
+                note,
+            }
+        })
+        .collect();
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let status_w = rows
+        .iter()
+        .map(|r| r.status.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(6);
+    let backend_w = rows
+        .iter()
+        .map(|r| r.backend.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+
+    let mut out = String::new();
+    let header = format!(
+        "{:<name_w$} {:<status_w$} {:<backend_w$} {:>8}  META",
         "NAME", "STATUS", "BACKEND", "RATIO"
     );
-    for info in &infos {
-        // Plain 但有遗留 backing（restore 后未 purge）→ 标 purgeable，不显示其旧 ratio（易误解）。
-        let (ratio, note) = match (info.status, &info.meta) {
-            (ProjectStatus::Plain, Some(_)) => ("-".to_string(), "purgeable backing"),
-            (ProjectStatus::Plain, None) => ("-".to_string(), ""),
-            (_, Some(m)) if m.committed => (format!("{:.2}x", m.ratio()), "committed"),
-            (_, Some(_)) => ("-".to_string(), "UNCOMMITTED"),
-            (_, None) => ("-".to_string(), ""),
-        };
-        let backend = if info.meta.is_some() {
-            info.backend().flag()
-        } else {
-            "-"
-        };
-        println!(
-            "{:<46} {:<24} {:<10} {:>8}  {}",
-            info.name,
-            info.status_display(),
-            backend,
-            ratio,
-            note
+    let _ = writeln!(out, "{}", header.trim_end());
+    for r in &rows {
+        let line = format!(
+            "{:<name_w$} {:<status_w$} {:<backend_w$} {:>8}  {}",
+            r.name, r.status, r.backend, r.ratio, r.note
         );
+        let _ = writeln!(out, "{}", line.trim_end());
     }
-    Ok(())
+    out
 }
 
 /// `status <name>`：单项目详情 + 活跃判定。
@@ -762,6 +809,36 @@ fn write_needs_reconcile_sentinel(sentinel: &std::path::Path, name: &str) -> std
 mod tests {
     use super::*;
     use crate::reconcile::advisor::{Action, Confidence};
+
+    #[test]
+    fn format_list_table_aligns_columns_despite_long_names() {
+        // 用户实测：长 path-encoded 名撑破固定列宽 → 其后各列错位。动态列宽须让所有行的 STATUS
+        // 起始列对齐，无论名字长短。
+        use crate::enable::discovery::ProjectInfo;
+        let mk = |name: &str| ProjectInfo {
+            name: name.to_string(),
+            status: ProjectStatus::Plain,
+            meta: None,
+            reconciling: false,
+            needs_reconcile: false,
+        };
+        let infos = vec![
+            mk("-home-xp-src-neighbors"),
+            mk("-home-xp-src-neighbors--claude-worktrees-storage-2-redis"),
+        ];
+        let table = format_list_table(&infos);
+        let lines: Vec<&str> = table.lines().collect();
+        // 每行 STATUS（"PLAIN"）应从同一字节偏移开始（NAME 列已按最长名对齐）。
+        let status_col = |line: &str| line.find("PLAIN").expect("每行应含 STATUS PLAIN");
+        let c1 = status_col(lines[1]);
+        let c2 = status_col(lines[2]);
+        assert_eq!(c1, c2, "长短名两行的 STATUS 列必须对齐：\n{table}");
+        // 且 NAME 列宽 >= 最长名长度（长名未被截断、未挤占 STATUS）。
+        assert!(
+            c1 >= "-home-xp-src-neighbors--claude-worktrees-storage-2-redis".len(),
+            "STATUS 列须在最长名之后：\n{table}"
+        );
+    }
 
     #[test]
     fn parse_confirm_maps_first_char_case_insensitive() {
