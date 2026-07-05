@@ -344,7 +344,13 @@ pub fn delete_permitted(
 pub fn reingest_one_file(paths: &Paths, name: &str, rel: &str) -> io::Result<()> {
     validate_name(name)?;
     let orig_file = paths.orig(name).join(rel);
-    let backing_file = paths.backing(name, Backend::Shadow).join(rel);
+    let backing = paths.backing(name, Backend::Shadow);
+    let backing_file = backing.join(rel);
+    // 评审 R-lock：取 backing 排他锁（与 compact/seal/守护同一把 `.zipfs.lock`）保护本次 temp+rename
+    // 覆盖 `backing/<rel>`——否则并发 compact/seal 与 reconcile 交错写同一 archive 致损坏（A3 类）。
+    // reconcile 前提是未挂载（守护未持锁），故可取；有界重试兜住释放→重取瞬态。函数内短持、
+    // 不跨 rebuild 的 remount（那由 lifecycle::reingest 自管），无自死锁。
+    let _backing_lock = crate::store::lock::acquire_backing_retry(&backing)?;
     let opts: ApplyOptions = discovery::read_meta(&paths.meta_path(name))
         .ok()
         .flatten()
@@ -2087,7 +2093,10 @@ fn undo_restore_orig(paths: &Paths, name: &str, stash_root: &Path, rel: &str) ->
 /// new 增出的孤儿。
 fn undo_remove_orig(paths: &Paths, name: &str, rel: &str) -> io::Result<()> {
     remove_file_if_exists(&paths.orig(name).join(rel))?;
-    remove_file_if_exists(&paths.backing(name, Backend::Shadow).join(rel))
+    // 评审 R-lock：删 backing/<rel> 也取 backing 锁，与 compact/seal/守护互斥（同 reingest_one_file）。
+    let backing = paths.backing(name, Backend::Shadow);
+    let _backing_lock = crate::store::lock::acquire_backing_retry(&backing)?;
+    remove_file_if_exists(&backing.join(rel))
 }
 
 /// RemoveQuarantine 反做：`quarantine(name,ts)/<rel>` 副本先逐字节校验 == `stash/<ts>/underlay/<rel>`
@@ -2826,6 +2835,27 @@ mod tests {
         let backing_file = paths.backing("demo", Backend::Shadow).join(rel);
         assert_eq!(read_archive(&backing_file), incoming);
         assert!(report.action.contains("underlay-removed"));
+    }
+
+    #[test]
+    fn reingest_one_file_blocked_while_backing_locked() {
+        // 评审 R-lock：reconcile 改写 backing 须与活守护/compact/seal 互斥（同一把 .zipfs.lock）。
+        // 持 backing 锁时 reingest_one_file 应 WouldBlock（有界重试耗尽后），杜绝交错写损坏。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let rel = "f.jsonl";
+        write_orig(&paths, "demo", rel, b"{\"uuid\":\"a\"}\n");
+        let backing = paths.backing("demo", Backend::Shadow);
+        std::fs::create_dir_all(&backing).unwrap();
+        // 模拟活守护/compact 持有同一把 backing 锁。
+        let _held = crate::store::lock::acquire_backing(&backing).unwrap();
+        let res = reingest_one_file(&paths, "demo", rel);
+        assert_eq!(
+            res.as_ref().map_err(|e| e.kind()),
+            Err(io::ErrorKind::WouldBlock),
+            "backing 被持锁时 reingest 应 WouldBlock，实际：{res:?}"
+        );
     }
 
     #[test]
