@@ -422,14 +422,75 @@ pub enum EntryPlan {
     Identical,
 }
 
+/// 逆转类：一次 reconcile 对某条目所做落盘变更的**反做类别**（undo 依赖，§10.1）。写入 per-generation
+/// manifest（`rel\tclass` 行格式），供 Task 4 `reconcile_undo` 逐条目反向还原。
+///
+/// - `RestoreOrig`：改过 orig（union/new-with-preimage），有前镜像 → 从 `stash/<ts>/orig/<rel>` 原子还原。
+/// - `RemoveOrig`：新增了 orig（New，无前镜像）→ 删 orig + backing。
+/// - `RemoveQuarantine`：把 underlay 副本隔离进 quarantine（KeepSeparate）→ byte-check 后删 quarantine 副本。
+/// - `ReportMemory`：memory 透传实际 relocate 了 → undo 只报告待人工 git 回退（绝不触碰外部 target）。
+/// - `Noop`：无需反做（identical/skip/deferred/透传路径安全闸拦截等，underlay 快照全局还原即可）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReversalClass {
+    RestoreOrig,
+    RemoveOrig,
+    RemoveQuarantine,
+    ReportMemory,
+    Noop,
+}
+
+impl ReversalClass {
+    /// 稳定的 manifest 序列化标签（`as_str`/`parse` 互逆）。
+    fn as_str(self) -> &'static str {
+        match self {
+            ReversalClass::RestoreOrig => "RestoreOrig",
+            ReversalClass::RemoveOrig => "RemoveOrig",
+            ReversalClass::RemoveQuarantine => "RemoveQuarantine",
+            ReversalClass::ReportMemory => "ReportMemory",
+            ReversalClass::Noop => "Noop",
+        }
+    }
+
+    /// 解析 manifest 标签（未知标签 → `None`，由调用方决定容错策略）。Task 4 `reconcile_undo` 经
+    /// `read_manifest` 消费。
+    #[allow(dead_code)] // 由 Task 4 undo 消费；本任务只落盘 manifest。
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "RestoreOrig" => ReversalClass::RestoreOrig,
+            "RemoveOrig" => ReversalClass::RemoveOrig,
+            "RemoveQuarantine" => ReversalClass::RemoveQuarantine,
+            "ReportMemory" => ReversalClass::ReportMemory,
+            "Noop" => ReversalClass::Noop,
+            _ => return None,
+        })
+    }
+}
+
+/// has_preimage 布尔 → 逆转类：改 orig 前有前镜像（union/merge）→ `RestoreOrig`（可原子还原）；无前镜像
+/// （New，orig 是新增出来的）→ `RemoveOrig`（undo 删 orig + backing，防孤儿）。判别子就是 has_preimage。
+fn reversal_for_preimage(has_preimage: bool) -> ReversalClass {
+    if has_preimage {
+        ReversalClass::RestoreOrig
+    } else {
+        ReversalClass::RemoveOrig
+    }
+}
+
+/// 合成审计条目（非真实 rel）判定：`<prune>`/`<meta>`/`<rebuild>`/`<prune-symlinks>` 等以 `<` 开头的占位
+/// 名，仅供人类审计、无对应磁盘 rel，一律不写入 manifest（评审 I-plan1）。
+fn is_synthetic_rel(rel: &str) -> bool {
+    rel.starts_with('<')
+}
+
 /// 单条目落盘报告（人类可读审计）。`decision`/`action` 是短标签，`notes` 记 stash 路径、
-/// delete_permitted 未通过原因等细节。
+/// delete_permitted 未通过原因等细节。`reversal` 记该条目的逆转类（undo 依赖）。
 #[derive(Debug, Clone)]
 pub struct EntryReport {
     pub name: String,
     pub decision: String,
     pub action: String,
     pub notes: Vec<String>,
+    pub reversal: ReversalClass,
 }
 
 /// 一次 reconcile 的整体报告：逐条目报告 + 快照 stash 目录（供审计/回滚定位）。
@@ -669,7 +730,7 @@ pub fn reconcile_subagents_dir(
     let orig_file = paths.orig(name).join(&rel);
     let mut notes: Vec<String> = vec!["subagents：强制无损并集（绝不按 mtime 取舍）".into()];
 
-    stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
+    let has_preimage = stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
     if let Some(parent) = orig_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -690,6 +751,7 @@ pub fn reconcile_subagents_dir(
         SupersetMode::LinesSuperset,
         mp,
         "subagents-union",
+        reversal_for_preimage(has_preimage),
         notes,
     )
 }
@@ -1056,18 +1118,26 @@ pub fn apply_entry(
             let notes = passthrough_restore_memory(&underlay_dir, &target, &stash_dir)?;
             // 据结果如实报 action（评审 M4）：路径安全闸未过时 underlay 未动，不能谎报 restored。
             let action = passthrough_action(&notes);
+            // 实际 relocate（memory-restored）→ ReportMemory（undo 只报告待人工 git 回退）；透传 noop 或
+            // 路径安全闸拦截（underlay 未动）→ Noop。
+            let reversal = if action == "memory-restored" {
+                ReversalClass::ReportMemory
+            } else {
+                ReversalClass::Noop
+            };
             return Ok(EntryReport {
                 name: rel,
                 decision: "passthrough".into(),
                 action: action.into(),
                 notes,
+                reversal,
             });
         }
     }
 
     match plan {
         EntryPlan::Union => {
-            stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
+            let has_preimage = stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
             let base_bytes = std::fs::read(&orig_file)?;
             let base_str = String::from_utf8_lossy(&base_bytes);
             let inc_str = String::from_utf8_lossy(&snap_entry.bytes);
@@ -1081,11 +1151,12 @@ pub fn apply_entry(
                 SupersetMode::LinesSuperset,
                 mp,
                 "union",
+                reversal_for_preimage(has_preimage),
                 notes,
             )
         }
         EntryPlan::New => {
-            stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
+            let has_preimage = stash_orig_preimage(paths, name, &rel, ts, &mut notes)?;
             if let Some(parent) = orig_file.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -1097,6 +1168,7 @@ pub fn apply_entry(
                 SupersetMode::LinesSuperset,
                 mp,
                 "new",
+                reversal_for_preimage(has_preimage),
                 notes,
             )
         }
@@ -1111,12 +1183,14 @@ pub fn apply_entry(
                 ));
                 reingest_one_file(paths, name, &rel)?;
             }
+            // orig 未改、backing 已有 incoming：undo 无需反做（underlay 快照全局还原即可）。
             finish_delete(
                 snap_entry,
                 &orig_file,
                 SupersetMode::ByteEqual,
                 mp,
                 "identical",
+                ReversalClass::Noop,
                 notes,
             )
         }
@@ -1130,6 +1204,7 @@ pub fn apply_entry(
                 SupersetMode::ByteEqual,
                 mp,
                 "keep-separate",
+                ReversalClass::RemoveQuarantine,
                 notes,
             )
         }
@@ -1142,13 +1217,16 @@ pub fn apply_entry(
                 decision: format!("{other:?}"),
                 action: "deferred".into(),
                 notes,
+                reversal: ReversalClass::Noop,
             })
         }
     }
 }
 
 /// 把当前 `orig/<rel>` 拷进 `reconcile_stash(name,ts)/orig/<rel>` 并 fsync（评审 I-3，改 orig 前留底）。
-/// orig 不存在（New 条目）→ 无前镜像可 stash，记 note 后返回。stash 路径记入 `notes`（回滚定位）。
+/// **返回是否真拷了前镜像**（= orig 预存）：orig 不存在（New 条目）→ 无前镜像可 stash，记 note 返回
+/// `false`；实际拷贝 → 返回 `true`。该布尔是 union/subagents 伞下精确区分 merge（`RestoreOrig`）与
+/// new（`RemoveOrig`）的判别子（防 undo 孤儿）。stash 路径记入 `notes`（回滚定位）。
 ///
 /// `ts` 是**贯穿整个 reconcile run 的单一时间戳**（= `UnderlaySnapshot::ts`，Task7 Minor2）：一次
 /// reconcile 内所有条目的前镜像与快照落同一 `reconcile_stash(name,ts)` 代次，便于审计/回滚定位，
@@ -1159,11 +1237,11 @@ fn stash_orig_preimage(
     rel: &str,
     ts: &str,
     notes: &mut Vec<String>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let orig_file = paths.orig(name).join(rel);
     if !orig_file.exists() {
         notes.push(format!("orig/{rel} 不存在，无前镜像可 stash（New 条目）"));
-        return Ok(());
+        return Ok(false);
     }
     let stash_root = paths.reconcile_stash(name, ts);
     let dst = stash_root.join("orig").join(rel);
@@ -1176,7 +1254,7 @@ fn stash_orig_preimage(
         fsync_dir_chain(parent, &stash_root)?;
     }
     notes.push(format!("stash-preimage={}", dst.display()));
-    Ok(())
+    Ok(true)
 }
 
 /// 落盘尾闸：`delete_permitted` 通过才删 underlay 条目（唯一删除入口），否则保留并记原因。
@@ -1187,6 +1265,7 @@ fn finish_delete(
     mode: SupersetMode,
     mp: &Path,
     kind: &str,
+    reversal: ReversalClass,
     mut notes: Vec<String>,
 ) -> io::Result<EntryReport> {
     let rel = snap_entry.rel.clone();
@@ -1213,7 +1292,76 @@ fn finish_delete(
         decision: kind.into(),
         action,
         notes,
+        reversal,
     })
+}
+
+// ── per-generation manifest（undo 依赖，§10.1） ───────────────────────────────
+
+/// 落盘一次 reconcile run 的 per-generation manifest 到 `reconcile_manifest(name,ts)`：首行 `ts`，其后
+/// 每行真实 `rel\tclass`（逆转类）。**过滤合成审计条目**（`<prune>`/`<meta>` 等非真实 rel）与 `Noop`
+/// 条目（identical/skip 等无需反做，underlay 快照全局还原即可覆盖），只写 undo 真正需要逐条反做的条目。
+///
+/// 原子写 + fsync（`atomic_write`）：manifest 存在即代表该代次可 undo；不完整写入绝不半落盘。best-effort
+/// 由调用方兜底（写失败该 run 不可 undo，但不阻断收尾）。
+fn write_manifest(paths: &Paths, name: &str, ts: &str, entries: &[EntryReport]) -> io::Result<()> {
+    validate_name(name)?;
+    let mut body = String::new();
+    body.push_str(ts);
+    body.push('\n');
+    for e in entries {
+        if is_synthetic_rel(&e.name) || e.reversal == ReversalClass::Noop {
+            continue;
+        }
+        body.push_str(&e.name);
+        body.push('\t');
+        body.push_str(e.reversal.as_str());
+        body.push('\n');
+    }
+    let dst = paths.reconcile_manifest(name, ts);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(&dst, body.as_bytes())
+}
+
+/// 读回 `reconcile_manifest(name,ts)`：manifest 不存在 → `Ok(None)`（该代次无 undo 依据）；存在则解析
+/// 首行 `ts` 之后的每行 `rel\tclass` 为 `(rel, ReversalClass)`。空行跳过；无法解析的行（缺 tab / 未知
+/// class）→ `Err`（fail-closed：宁可拒绝 undo 也不静默漏条）。Task 4 `reconcile_undo` 消费。
+#[allow(dead_code)] // 由 Task 4 undo 消费；本任务只落盘 manifest。
+fn read_manifest(
+    paths: &Paths,
+    name: &str,
+    ts: &str,
+) -> io::Result<Option<Vec<(String, ReversalClass)>>> {
+    validate_name(name)?;
+    let path = paths.reconcile_manifest(name, ts);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    // 首行是 ts 头，跳过。
+    for line in content.lines().skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        let (rel, class) = line.split_once('\t').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest 行缺 tab 分隔：{line:?}"),
+            )
+        })?;
+        let reversal = ReversalClass::parse(class).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manifest 未知逆转类：{class:?}"),
+            )
+        })?;
+        out.push((rel.to_owned(), reversal));
+    }
+    Ok(Some(out))
 }
 
 // ── 顶层 reconcile 编排（Task 9） ──────────────────────────────────────────────
@@ -1420,6 +1568,7 @@ pub fn reconcile(
                 decision: format!("{plan:?}"),
                 action: "dry-run".into(),
                 notes: vec![rec.rationale],
+                reversal: ReversalClass::Noop,
             })
             .collect();
         return Ok(ReconcileReport { entries, stash_dir });
@@ -1438,6 +1587,7 @@ pub fn reconcile(
                 decision: "skip".into(),
                 action: "unmatched-snapshot".into(),
                 notes: vec!["plan 条目在快照中无对应项（不可达），防御跳过、underlay 不动".into()],
+                reversal: ReversalClass::Noop,
             });
             continue;
         };
@@ -1452,6 +1602,7 @@ pub fn reconcile(
                 decision: "skip".into(),
                 action: "skipped+underlay-kept".into(),
                 notes: vec!["用户跳过此条：underlay 原样保留、orig 不动".into()],
+                reversal: ReversalClass::Noop,
             },
         };
         entries.push(report);
@@ -1470,6 +1621,7 @@ pub fn reconcile(
             notes: vec![format!(
                 "剪除空 underlay 子目录失败（仅影响重挂门禁，非数据安全）：{e}"
             )],
+            reversal: ReversalClass::Noop,
         });
     }
 
@@ -1484,6 +1636,7 @@ pub fn reconcile(
                 decision: "prune-redundant-symlinks".into(),
                 action: "kept-anomaly".into(),
                 notes: sym_notes,
+                reversal: ReversalClass::Noop,
             });
         }
         Ok(_) => {}
@@ -1495,6 +1648,7 @@ pub fn reconcile(
                 notes: vec![format!(
                     "清除冗余 underlay 软链失败（仅影响重挂门禁，非数据安全）：{e}"
                 )],
+                reversal: ReversalClass::Noop,
             });
         }
     }
@@ -1516,8 +1670,16 @@ pub fn reconcile(
                 notes: vec![format!(
                     "meta 字节数收尾失败（仅影响 list 显示，非数据安全）：{e}"
                 )],
+                reversal: ReversalClass::Noop,
             });
         }
+    }
+    // per-generation manifest（undo 依赖，§10.1）：在条目循环后、清标记前落盘（评审 M3），记每条真实
+    // 条目的逆转类供 Task 4 `reconcile_undo` 消费。best-effort：写失败仅 warn（该 run 不可 undo，但绝不
+    // 阻断清标记——否则 reconciling 标记永久卡住把维护拦死，与 meta finalize 同策）。合成条目由
+    // write_manifest 内部过滤，不入 manifest。
+    if let Err(e) = write_manifest(paths, name, &ts, &entries) {
+        log::warn!("{name} reconcile manifest 落盘失败（该 run 不可 undo，非数据安全）：{e}");
     }
     // 关闭半改写窗口：逐条 apply 已各自原子完成，orig 处于一致态。崩溃续跑靠「标记在→重跑幂等」，
     // 故仅在正常收尾时清标记（中途崩溃则标记留存，让生命周期维护让路、下次 reconcile 续做）。
@@ -1531,6 +1693,7 @@ pub fn reconcile(
             decision: "rebuild".into(),
             action: "reingest-delegated".into(),
             notes: vec![msg],
+            reversal: ReversalClass::Noop,
         });
     }
 
@@ -3391,5 +3554,115 @@ mod tests {
             "真实目录 memory（split-brain）绝不被此步误删"
         );
         assert!(notes.is_empty(), "非 symlink 条目不产生报告：{notes:?}");
+    }
+
+    /// per-generation manifest：一次含 union（orig 预存）+ new（orig 缺）+ keep-separate（疑 reuse）
+    /// 的 reconcile 后，`read_manifest` 逐条逆转类正确、合成条目（`<prune>`/`<meta>` 等）不入 manifest。
+    #[test]
+    fn reconcile_writes_manifest_with_per_entry_reversal_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        write_committed_meta(&paths, "demo");
+        let mp = paths.mountpoint("demo");
+        std::fs::create_dir_all(&mp).unwrap();
+
+        // union：orig 预存 .jsonl + LogOnly incoming → Union（有前镜像）→ RestoreOrig。
+        let rel_union = "s.jsonl";
+        write_orig(&paths, "demo", rel_union, BASE_LOG.as_bytes());
+        reingest_one_file(&paths, "demo", rel_union).unwrap();
+        write_underlay(&mp, rel_union, INCOMING_LOG.as_bytes());
+
+        // new：orig 缺 → New（无前镜像）→ RemoveOrig。
+        let rel_new = "new.jsonl";
+        write_underlay(&mp, rel_new, INCOMING_LOG.as_bytes());
+
+        // keep-separate：orig 预存、disjoint uuid + 时间窗不交 → SuspectReuse → KeepSeparate →
+        // RemoveQuarantine。
+        let rel_keep = "3f2a-b1c2-uuid.jsonl";
+        let keep_base = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"a1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-24T00:00:00.000Z\"}\n"
+        );
+        let keep_incoming = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"b1\",\"parentUuid\":null,",
+            "\"timestamp\":\"2026-06-30T00:00:00.000Z\"}\n"
+        );
+        write_orig(&paths, "demo", rel_keep, keep_base.as_bytes());
+        reingest_one_file(&paths, "demo", rel_keep).unwrap();
+        write_underlay(&mp, rel_keep, keep_incoming.as_bytes());
+
+        let m = FakeMounter::default();
+        let opts = ReconcileOptions {
+            dry_run: false,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+
+        // run ts = stash_dir 末段。
+        let ts = report
+            .stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let manifest = read_manifest(&paths, "demo", &ts)
+            .unwrap()
+            .expect("reconcile 后 manifest 应存在");
+        let map: std::collections::HashMap<String, ReversalClass> = manifest.into_iter().collect();
+
+        assert_eq!(
+            map.get(rel_union),
+            Some(&ReversalClass::RestoreOrig),
+            "union（orig 预存）→ RestoreOrig：{map:?}"
+        );
+        assert_eq!(
+            map.get(rel_new),
+            Some(&ReversalClass::RemoveOrig),
+            "new（orig 缺）→ RemoveOrig：{map:?}"
+        );
+        assert_eq!(
+            map.get(rel_keep),
+            Some(&ReversalClass::RemoveQuarantine),
+            "keep-separate → RemoveQuarantine：{map:?}"
+        );
+        // 合成条目（`<prune>`/`<meta>`/`<rebuild>`/`<prune-symlinks>`）绝不入 manifest。
+        assert!(
+            map.keys().all(|k| !k.starts_with('<')),
+            "合成条目不应出现在 manifest：{map:?}"
+        );
+    }
+
+    /// dry_run 不写 manifest（零改动）。
+    #[test]
+    fn reconcile_dry_run_writes_no_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+
+        let opts = ReconcileOptions {
+            dry_run: true,
+            force: true,
+            rebuild: false,
+            confirm: accept_all(),
+        };
+        let report = reconcile(&paths, "demo", opts, &m).unwrap();
+        let ts = report
+            .stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            read_manifest(&paths, "demo", &ts).unwrap().is_none(),
+            "dry_run 不应写 manifest"
+        );
     }
 }
