@@ -524,27 +524,50 @@ fn build_confirm(dry_run: bool, is_tty: bool) -> std::io::Result<Box<ConfirmFn>>
     Ok(Box::new(interactive_confirm))
 }
 
-/// 交互裁决单条目：打印 rel + 推荐动作/置信度/理由，循环从 stdin 读直至合法 `a`/`k`/`s`。
-/// EOF/读错 → `Skip`（策略 B 保守：宁可不动也不误落盘）。
+/// 交互裁决单条目：打印 rel + 推荐动作/置信度/理由，循环从 stdin 读直至合法输入。
+/// **High 置信度下空行（回车）默认 Accept**（快速采纳证据确凿项）；Medium/Low 空行重问，
+/// 逼人工对不确定项显式决策（策略 B 精神）。EOF/读错 → `Skip`（保守：宁可不动也不误落盘）。
 fn interactive_confirm(rel: &str, rec: &Recommendation) -> Confirm {
     use std::io::Write;
+    let high = matches!(rec.confidence, crate::reconcile::advisor::Confidence::High);
     println!("\n条目: {rel}");
     println!(
         "  推荐: {:?}（置信度 {:?}）— {}",
         rec.action, rec.confidence, rec.rationale
     );
+    let prompt = if high {
+        "  采纳？[A]ccept / [k]eep-both / [s]kip （回车=accept）> "
+    } else {
+        "  采纳？[a]ccept / [k]eep-both / [s]kip > "
+    };
     loop {
-        print!("  采纳？[a]ccept / [k]eep-both / [s]kip > ");
+        print!("{prompt}");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
             Ok(0) | Err(_) => return Confirm::Skip,
-            Ok(_) => match parse_confirm(&line) {
+            Ok(_) => match confirm_from_input(&line, high) {
                 Some(c) => return c,
-                None => eprintln!("  无法识别（请输入 a/k/s）"),
+                None => eprintln!(
+                    "  无法识别（请输入 a/k/s{}）",
+                    if high { "，或回车采纳推荐" } else { "" }
+                ),
             },
         }
     }
+}
+
+/// 一行输入 → 决策，含置信度感知默认。空行（回车）：`high_confidence` 时默认 `Accept`，否则 `None`
+/// （调用方重问）。非空则委托 [`parse_confirm`]。抽成纯函数便于单测（CLI 交互靠手验）。
+fn confirm_from_input(input: &str, high_confidence: bool) -> Option<Confirm> {
+    if input.trim().is_empty() {
+        return if high_confidence {
+            Some(Confirm::Accept)
+        } else {
+            None
+        };
+    }
+    parse_confirm(input)
 }
 
 /// 把用户一行输入映射到 `Confirm`：取首个非空白字符、大小写不敏感。`a`→Accept、`k`→KeepBoth、
@@ -685,6 +708,20 @@ mod tests {
         assert_eq!(parse_confirm("skip\n"), Some(Confirm::Skip));
         assert_eq!(parse_confirm(""), None);
         assert_eq!(parse_confirm("x"), None);
+    }
+
+    #[test]
+    fn confirm_from_input_high_confidence_enter_defaults_accept() {
+        // 高置信度：空行（回车）默认 Accept；Medium/Low 空行返 None（重问，逼人工显式决策）。
+        assert_eq!(confirm_from_input("", true), Some(Confirm::Accept));
+        assert_eq!(confirm_from_input("\n", true), Some(Confirm::Accept));
+        assert_eq!(confirm_from_input("  \n", true), Some(Confirm::Accept));
+        assert_eq!(confirm_from_input("", false), None);
+        assert_eq!(confirm_from_input("\n", false), None);
+        // 显式输入始终优先于置信度默认（即便高置信度也能选 skip/keep-both）。
+        assert_eq!(confirm_from_input("s", true), Some(Confirm::Skip));
+        assert_eq!(confirm_from_input("k\n", false), Some(Confirm::KeepBoth));
+        assert_eq!(confirm_from_input("a", false), Some(Confirm::Accept));
     }
 
     #[test]
