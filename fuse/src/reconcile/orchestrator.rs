@@ -1765,7 +1765,8 @@ pub struct UndoReport {
 ///    byte-equal，比 mtime 更强）。任一 live 已变（存在且字节不同）→ **拒绝整个 undo**、报告该 rel、零改动。
 ///
 /// **逆转（§10.3）：** `set_reconciling(true)`（半改写窗口保护）→ 逐条目按 manifest `ReversalClass` 反做
-/// → 统一还原 underlay（逐条守卫）→ 落 `.undone` → `set_reconciling(false)` → 剪空目录。逆转/还原任一步
+/// → 统一还原 underlay（逐条守卫）→ `set_reconciling(false)` **先于** 落 `.undone`（闭合崩溃 wedge 窗口，
+/// Task4 Important）→ 剪空目录。逆转/还原任一步
 /// 出错即传播 `Err` 而**不清 marker**（marker 留存 → 生命周期维护让路、可修复后重跑，重跑幂等）。
 pub fn reconcile_undo(paths: &Paths, name: &str) -> io::Result<UndoReport> {
     validate_name(name)?;
@@ -1814,6 +1815,11 @@ pub fn reconcile_undo(paths: &Paths, name: &str) -> io::Result<UndoReport> {
     // 幂等：该代次已 `.undone` → no-op（返回回填 ts 的空报告，防二次误触）。
     let undone_marker = stash_root.join(".undone");
     if undone_marker.exists() {
+        // 防御性清 marker（闭合崩溃 wedge 窗口，Task4）：若上一次 undo 在「.undone 已落、marker 未清」
+        // 两次 fsync 之间崩溃，reconciling marker 会滞留、经 bail_if_reconciling 永久挡住 remount/维护
+        // （数据已还原、无丢失，但项目卡死）。此处在短路 return 前顺手清——幂等：正常二次 undo 时 marker
+        // 已不在、无副作用；若因旧崩溃滞留则顺手闭合窗口。no-op 报告不变。
+        set_reconciling(paths, name, false)?;
         return Ok(UndoReport {
             ts,
             ..Default::default()
@@ -1868,9 +1874,13 @@ pub fn reconcile_undo(paths: &Paths, name: &str) -> io::Result<UndoReport> {
     // 统一还原 underlay：stash/<ts>/underlay/** 逐文件拷回 mp/<rel>，逐条守卫记 skipped_live_changed。
     restore_underlay_from_snapshot(&stash_underlay, &mp, &mut report.skipped_live_changed)?;
 
-    // 落 .undone 标记（防二次误触）→ 清 marker → 剪除还原可能留的空目录。
-    write_undone_marker(&undone_marker)?;
+    // 先清 marker 再落 .undone（Task4 Important：闭合崩溃 wedge 窗口）→ 剪除还原可能留的空目录。
+    // 次序理由：先清 marker 后若两次 fsync 间崩溃，.undone 缺失 → 重跑重做幂等 undo 并再清 marker，
+    // 收敛；且此空档 underlay 已还原为非空 → ensure_underlay_empty 仍挡自启挂载，不误挂。反之（旧序）
+    // 先落 .undone 后崩溃 → .undone 在而 marker 滞留 → 短路直接 return 永不清 marker、永久 wedge
+    //（上方 `.undone` 短路已补防御清 marker，双保险）。
     set_reconciling(paths, name, false)?;
+    write_undone_marker(&undone_marker)?;
     prune_empty_underlay_dirs(&mp)?;
 
     Ok(report)
@@ -4494,6 +4504,101 @@ mod tests {
             latest_generation(&paths, "demo").unwrap().as_deref(),
             Some("100"),
             "数值最大而非字典序最大"
+        );
+    }
+
+    // ── Task4：前置门禁 + 崩溃窗口 ─────────────────────────────────────────────
+
+    #[test]
+    fn reconcile_undo_rejects_non_shadow_backend() {
+        // 前置门禁 1b：container 后端（无 fall-through / per-file 语义）→ 拒，错误含 "shadow"。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        std::fs::create_dir_all(paths.back_root()).unwrap();
+        let meta = discovery::Meta::from_apply(
+            &ApplyOptions {
+                backend: Backend::Container,
+                ..ApplyOptions::default()
+            },
+            0,
+            0,
+            0,
+        );
+        discovery::write_meta(&paths.meta_path("demo"), &meta).unwrap();
+
+        let e = reconcile_undo(&paths, "demo").unwrap_err();
+        assert!(
+            e.to_string().contains("shadow"),
+            "container 后端应拒绝 reconcile-undo：{e}"
+        );
+    }
+
+    #[test]
+    fn reconcile_undo_rejects_without_meta() {
+        // 前置门禁 1b：无 meta（未 apply / 无可回退记录）→ 拒。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+
+        let e = reconcile_undo(&paths, "demo").unwrap_err();
+        assert!(
+            e.to_string().contains("meta"),
+            "无 meta 应拒绝 reconcile-undo：{e}"
+        );
+    }
+
+    // 前置门禁 1a（已挂载 → 拒）依赖 `discovery::is_mounted` 读真实 `/proc/self/mountinfo`，
+    // 无法在 tempdir 单测里注入一个真实 fuse 挂载态（tempdir 路径永非 fuse 挂载点），故不硬造。
+    // 该门在「未挂载」方向由本文件所有 undo 测试隐式覆盖（均在未挂载态跑通、未被此门误拒）；
+    // 「已挂载 → Err」需真实 fuse mount 的集成测试环境，此处退化说明、不写脆弱断言。
+
+    #[test]
+    fn reconcile_undo_short_circuit_clears_lingering_marker() {
+        // 崩溃窗口回归（Task4 Important）：模拟上一次 undo 在「.undone 已落、marker 未清」两次 fsync
+        // 之间崩溃 → marker 滞留。再调 reconcile_undo 命中 `.undone` 短路 → 短路防御必须顺手清 marker，
+        // 闭合 wedge 窗口。RED-before（旧码短路直接 return、永不清 marker）/ GREEN-after。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rel = "s.jsonl";
+        setup_committed(&paths, "demo", rel, BASE_LOG.as_bytes());
+        let mp = paths.mountpoint("demo");
+        write_underlay(&mp, rel, INCOMING_LOG.as_bytes());
+        let m = FakeMounter::default();
+        let rec = reconcile(&paths, "demo", accept_opts(), &m).unwrap();
+        let ts = rec
+            .stash_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // 首次 undo：正常收尾（清 marker + 落 .undone）。
+        reconcile_undo(&paths, "demo").unwrap();
+        assert!(
+            paths.reconcile_stash("demo", &ts).join(".undone").exists(),
+            "首次 undo 应落 .undone"
+        );
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "首次 undo 应已清 marker"
+        );
+
+        // 模拟崩溃窗口：.undone 已在，但 reconciling marker 被（旧序崩溃）重新滞留。
+        set_reconciling(&paths, "demo", true).unwrap();
+        assert!(
+            paths.reconciling_marker("demo").exists(),
+            "前提：marker 滞留（模拟崩溃窗口）"
+        );
+
+        // 再调 undo → 命中 .undone 短路，短路防御清 marker。
+        let report = reconcile_undo(&paths, "demo").unwrap();
+        assert_eq!(report.ts, ts, "短路仍回填 ts");
+        assert!(report.reversed.is_empty(), "短路 no-op → 空 reversed");
+        assert!(
+            !paths.reconciling_marker("demo").exists(),
+            "短路防御必须清滞留 marker（闭合崩溃 wedge 窗口）"
         );
     }
 }
