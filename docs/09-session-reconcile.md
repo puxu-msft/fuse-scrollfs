@@ -140,39 +140,46 @@ memory 本应是**单份透传软链**：ingest 在 backing 按软链重建、sh
 
 ## 10. reconcile-undo（回退最近一次重合并，供重选）
 
-> 增补（2026-07-05）：`reconcile` 是 stash-backed、非破坏的，故一次 run 可被完整回退，让用户"重选"每条目的处置。`enable reconcile-undo <name>` 把项目还原到该 run **之前**的状态（underlay + orig + backing），随后可换选项重跑 `reconcile`。
+> 增补（2026-07-05，据 subagent 评审重构）：`reconcile` 是 stash-backed、非破坏的，故一次 run 可被完整回退，让用户"重选"每条目的处置。`enable reconcile-undo <name>` 把项目还原到该 run **之前**的状态（underlay + orig + backing），随后可换选项重跑 `reconcile`。undo 本身也须满足零丢失铁律 + 与 reconcile 对称的挂载互斥。
 
-### 10.1 依赖：per-generation manifest
+### 10.1 依赖：per-generation manifest（记**逆转类**，非展示串）
 
-undo 要按各条目当初的**动作**分别逆转，故 `reconcile` 落盘时须在该代次 stash 里持久化一份 **manifest**：`reconcile_stash(name,ts)/manifest`，记录 `ts` 与每条目 `rel → action`（`union` / `new` / `keep-separate` / `passthrough` / `identical` / `skipped` / `keep-both`）。manifest 由 `ReconcileReport` 的各 `EntryReport` 派生，随 run 结束写入（best-effort：写失败仅告警，不影响 reconcile 数据安全，但该 run 将不可 undo，需手动从 stash 恢复）。
+undo 要按各条目当初的处置分别逆转，故 `reconcile` 落盘时须在该代次 stash 里持久化 **manifest**：`reconcile_stash(name,ts)/manifest`，记录 `ts` 与每条目 `rel → 逆转类`。**逆转类不是展示用的 action 字符串，而是"undo 该怎么反做"的精确分类**（评审 C3：`reconcile_subagents_dir` 对 new 与 merge 都报同一 `subagents-union`，展示串抹平了 new-vs-merge，会致孤儿残留）——由 `apply_entry` 在处置时**据实际是否落了 orig 前镜像**判定：
 
-### 10.2 前置门禁
+| 逆转类 | 何时记 | undo 逆转动作 |
+|---|---|---|
+| `restore-orig` | union / subagents-merge：orig 预先存在、落了前镜像 | 从 `stash/<ts>/orig/<rel>` 原子还原 `orig/<rel>` → `reingest_one_file(rel)` 重建 `backing/<rel>` |
+| `remove-orig` | new / subagents-new：orig 原不存在、新增 | 删 `orig/<rel>` + 删 `backing/<rel>`（NotFound 容忍）→ prune 空父目录 |
+| `remove-quarantine` | keep-separate | orig/backing **不碰**；删本代次 `quarantine/<ts>/<rel>`（删前逐字节校验其内容 == `stash/<ts>/underlay/<rel>` 快照，非 live） |
+| `report-memory` | passthrough（真实目录 relocate） | orig/backing 不碰；**不触碰外部 memory 目标**，仅报告本代次往目标写过的文件（新文件 + `.underlay-<crc>` 变体）供用户 git 回退 |
+| `noop` | identical / skipped / keep-both / memory-symlink 短路（§6） | orig/backing 不碰 |
 
-- 项目 **未挂载**（与 reconcile 同理：挂载态下往 underlay 还原无意义/误导）、**shadow** 后端。
+manifest 随 run 结束写入（best-effort：写失败仅告警，但该 run **不可 undo**，需手动从 stash 恢复）。
+
+### 10.2 前置门禁（缺一即拒）
+
+- 项目 **未挂载** + **shadow** 后端。
 - 取 **reconcile 锁**（与 reconcile / 其他 undo 互斥）。
-- `reconcile_stash(name)` 下存在 ≥1 代次；取 **ts 最大**的一代作为回退目标。无代次 → Err（"无可回退的 reconcile 记录"）。
+- **目标代次 = ts 最大且 manifest 存在** 的一代（评审 I2）。若最新代次**无 manifest**（崩溃未完成的 run）→ **拒绝**并指明"该 run 未完成、不可 undo，请查 stash 手动恢复"；**绝不清除属于崩溃 run 的 `.reconciling` marker**。无任何代次 → Err（"无可回退的 reconcile 记录"）。
+- **陈旧门（评审 C1）**：`detect_activity` 判空闲；且 underlay 里**没有**晚于 manifest ts 的新 append（逐条目 `live_entry_unchanged` 式对比：live 条目要么缺失、要么与 `stash/<ts>/underlay/<rel>` 快照 mtime/size/ino 一致）。任一 live 条目**已变**（reconcile 后 Claude 又写了）→ **拒绝整个 undo**并报告哪些条目已有新写，指引用户先 `reconcile` 收编新写、或手动处理——绝不用旧快照覆盖新数据。
 
-### 10.3 逆转机制（按 manifest 逐条目）
+### 10.3 逆转机制（置 marker → 逐条目 → 还原 underlay → 清 marker）
 
-真源仍是 stash 快照。逐条目按 action 逆转：
+1. **`set_reconciling(true)`**（评审 C2）：undo 改 orig/backing 是与 reconcile 等价的半改写窗口；reconcile 锁按 `model.rs` **不 gate 挂载**，挂载/维护让路唯一靠 `.reconciling` marker（`bail_if_reconciling` 守 remount/reingest/restore/compact/seal + 挂载守卫）。故 undo 全程必须持 marker，收尾才清。
+2. **逐条目按 manifest 逆转类**处置（表见 §10.1）。orig 还原走原子 `tmp→rename`；backing 走 `reingest_one_file` 原子替换 / 删除，与 reconcile 同原语。删除均 **NotFound 容忍**（保证幂等重跑，评审 I3）。
+3. **统一还原 underlay**：把 `stash/<ts>/underlay/**` 逐文件拷回 `mp/<rel>`（重建目录结构）。**逐条目守卫（承 C1）**：仅当 `mp/<rel>` **缺失**或与快照**逐字节一致**才覆盖还原；若 live 已存在且不同（reconcile 后新写）→ **不覆盖、保留 live、报告**。还原后 underlay 非空 → `list` 重标 `NEEDS-RECONCILE`（正确：又回待处理态）。
+4. **`set_reconciling(false)`**。目标代次 stash 落 `.undone` 标记（评审 I3：防二次误触；再敲 undo 认出已消费）。
 
-| 当初 action | 逆转动作 |
-|---|---|
-| `union` | 从 `stash/<ts>/orig/<rel>` 前镜像**原子还原** `orig/<rel>` → `reingest_one_file(rel)` 重建 `backing/<rel>` |
-| `new` | 删 `orig/<rel>` + 删 `backing/<rel>`（当初是新增） |
-| `keep-separate` | orig/backing 不动（base 本就没改）；删本代次 `quarantine/<ts>/<rel>`（还原 underlay 后已是重复） |
-| `passthrough`（memory-restored） | orig/backing 不动；**不触碰外部 memory 目标**（用户选定：报告写入过哪些文件，由其 git `checkout`/`clean` 或冷备份回退） |
-| `identical` / `skipped` / `keep-both` | orig/backing 不动 |
-
-之后**统一还原 underlay**：把 `stash/<ts>/underlay/**` 逐文件拷回 `mp/<rel>`（重建目录结构、覆盖）。这一步恢复该 run 之前挂载点里的全部回落写（含 memory/、subagents/、各 jsonl）。还原后 underlay 非空 → `list` 重新标 `NEEDS-RECONCILE`（正确：又回到待处理态）。清 reconciling 标记（若在）。
+**幂等 & 层级**：undo **只回退最近一代**（latest run），不逐级回溯多代。声明幂等——所有删除 NotFound 容忍、还原覆盖对一致内容无害；已 `.undone` 的代次再 undo → no-op 提示。
 
 ### 10.4 零丢失与安全
 
-- undo **只还原/新增**数据（拷回 underlay、还原 orig 前镜像）；它删除的只有：被合并覆盖的 orig（由前镜像还原、且 underlay 快照另存）、new 增出的 orig/backing、quarantine 重复副本（删前**逐字节校验**其内容已在还原后的 underlay 里）。故 undo 自身零丢失。
-- orig 还原走原子 `tmp→rename`；backing 走 `reingest_one_file` 原子替换（与 reconcile 同原语）。
-- undo **绝不写外部 memory 目标**（例外，用户定）：仅报告本代次往目标写过的文件（新文件 + `.underlay-<crc>` 变体，canonical 从未被覆盖），指引用户用其 git 或冷备份回退。
-- 代次 stash 在 undo 成功后**保留**（不删；供再核对/多级回退），由后续 GC 策略处理。
+- undo **只还原/新增**数据（拷回 underlay、还原 orig 前镜像）；它删除的只有：被合并覆盖的 orig（由前镜像原子还原）、new 增出的 orig/backing、quarantine 重复副本（删前**逐字节校验 == stash underlay 快照**，与 live 还原解耦，评审 I1）。undo 自身零丢失。
+- **陈旧门 + 逐条目覆盖守卫**是 C1 的双保险：reconcile 之后的任何新 append 绝不被旧快照覆盖。
+- **marker 对称**（C2）保证 undo 半改写窗口内 systemd 自启 / lifecycle 维护全部让路。
+- undo **绝不写外部 memory 目标**（用户 2026-07-05 定）：仅报告本代次往目标写过的文件，指引用户用其 git（目标本就是 git 仓）或冷备份回退；再跑 reconcile 的 memory 幂等由 `place_memory_files` 内容哈希去重保证，不会重复注入。
+- **非 bit-exact 但更安全的偏差**（评审 M1）：reconcile 的 `Identical` 分支在"orig 有、backing 缺"时会补建 backing；undo 的 `noop` 不动 → backing 保持存在（reconcile 前是缺的）。无数据丢失、反而修了潜在不一致，记录备案。
 
 ### 10.5 CLI
 
-`zipfs enable reconcile-undo <name>`（前导 `-` 项目名须 `--` 分隔）。打印逐条目逆转报告 + memory 目标待手动回退清单。之后可重跑 `enable reconcile` 换选项。
+`zipfs enable reconcile-undo <name>`（前导 `-` 项目名须 `--` 分隔）。打印：**实际选中的代次 ts**、逐条目逆转报告、被守卫跳过（reconcile 后新写）的条目清单、memory 外部目标待手动回退清单。拒绝时（已挂载 / 无 manifest / 陈旧门未过）给明确文案与下一步指引。之后可重跑 `enable reconcile` 换选项。
