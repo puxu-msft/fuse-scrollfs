@@ -17,6 +17,6 @@ clap = { version = "4.6.1", features = ["derive"] }
 tempfile = "3.27.0"
 hdrhistogram = "7.5.4"
 
-[profile.release]
-opt-level = 3
-lto = "thin"
+# 注：原 [profile.release]（opt-level=3 + lto="thin"）已上提到 workspace 根 Cargo.toml。
+# workspace 下 profile 只在根生效，member crate 的 [profile.*] 会被忽略。opt-level=3 本就是
+# release 默认；lto 交由根 profile 统一。

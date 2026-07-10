@@ -1,0 +1,40 @@
+[package]
+name = "zipfs-bench"
+version = "0.0.0"
+edition = "2021"
+description = "zipfs 基准二进制集：append / ratio / ldm-ratio / discovery 微基准，直接驱动 zipfs 公有 lib（Core+Store+codec），免 FUSE 挂载噪声。"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# 依赖产品 crate 的公有 lib API（core / store / archive）。这些 bin 原住在 zipfs crate 的
+# src/bin/，P（骨架整改）拆出到本 crate，使产品 crate 的 [[bin]] 只留 zipfs + mkfixture。
+zipfs = { path = "../zipfs" }
+# 四个 bin 均 clap derive 解析参数；libc 供 discovery-bench 调 posix_fadvise 清页缓存；
+# env_logger 供 ratio/ldm bin 初始化日志；fuser 供 bin 构造 FileType 等 FUSE 类型。
+# 传递依赖不可直接 use，故在此显式声明（与产品 crate 版本对齐，workspace 统一解析）。
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+env_logger = "0.11"
+fuser = { version = "0.17", default-features = false }
+
+# append 优化微基准（§1.1）：逐行 append 小记录 + 周期 fsync，量 before/after（尾块缓冲 on/off）
+# 的吞吐 / 封块（重压）次数 / 压缩比。
+[[bin]]
+name = "append-bench"
+path = "src/bin/append-bench.rs"
+
+# 压缩比矩阵基准（T3）：把真实语料经实际 Store+Core 路径写入，量「块大小×等级×字典」组合的物理压缩比。
+[[bin]]
+name = "ratio-bench"
+path = "src/bin/ratio-bench.rs"
+
+# LDM 压缩比补测（M2）：对真实语料逐块 compress_with_params，只切换 enable_ldm 一个变量。
+[[bin]]
+name = "ldm-ratio"
+path = "src/bin/ldm-ratio.rs"
+
+# 会话发现读 micro-bench（docs/02 §6.1，head 缓存门控）：量发现读成本差，零格式改动。
+[[bin]]
+name = "discovery-bench"
+path = "src/bin/discovery-bench.rs"

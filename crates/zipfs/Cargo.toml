@@ -22,30 +22,9 @@ path = "src/main.rs"
 name = "mkfixture"
 path = "src/bin/mkfixture.rs"
 
-# append 优化微基准（§1.1）：逐行 append 小记录 + 周期 fsync，量 before/after（尾块缓冲 on/off）
-# 的吞吐 / 封块（重压）次数 / 压缩比。直接驱动 Core+Store，免 FUSE 挂载噪声。
-[[bin]]
-name = "append-bench"
-path = "src/bin/append-bench.rs"
-
-# 压缩比矩阵基准（T3）：把真实语料经实际 Store+Core 路径写入，量「块大小×等级×字典」组合的
-# 物理压缩比。回答「字典能否在真实数据 + 真实代码路径上交付 16x」（docs 优化分析）。
-[[bin]]
-name = "ratio-bench"
-path = "src/bin/ratio-bench.rs"
-
-# LDM 压缩比补测（M2）：对真实语料逐块 compress_with_params，只切换 enable_ldm 一个变量，量
-# 「>8MiB 封存块开 LDM 相比不开，比值提升多少」。区别于 ratio-bench（走 live 路径，不含 LDM），
-# 本 bin 直接测 codec 的 LDM 分支，作为「是否调大默认 DEFAULT_SEAL_CHUNK」的决策依据。
-[[bin]]
-name = "ldm-ratio"
-path = "src/bin/ldm-ratio.rs"
-
-# 会话发现读 micro-bench（docs/02 §6.1，head 缓存门控）：量「open 解析 + 块 0 解压」vs
-# 「open 解析 + 独立 head 流解压」的发现读成本差，零格式改动。决定是否值得落 archive v2。
-[[bin]]
-name = "discovery-bench"
-path = "src/bin/discovery-bench.rs"
+# 注：append-bench / ratio-bench / ldm-ratio / discovery-bench 四个基准 bin 已迁出到
+# 独立的 `zipfs-bench` crate（crates/zipfs-bench/），依赖本 crate 的公有 lib API，
+# 使产品 crate 的 [[bin]] 只留 zipfs 主程序与 mkfixture 离线工具。
 
 # 故障注入测试门控（docs/05 §6）：`FaultIo` 确定性崩溃模拟器经 `#[cfg(any(test, feature =
 # "fault-injection"))]` 门控。`#[cfg(test)]` 对 tests/ 独立 crate 不可见，集成测试唯一途径是
@@ -100,11 +79,8 @@ loom = "0.7"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
-# 发布构建优化（perf #3）：compress/decompress 是纯 CPU 热点，lto + 单 codegen-unit 让跨
-# crate 内联/优化生效。**不设 panic="abort"**：守护进程中单个 FUSE worker panic 不应 abort
-# 整个挂载，保留 unwind。代价是 release 编译变慢（单 crate 构建可接受）。
-[profile.release]
-lto = "thin"
-codegen-units = 1
+# 注：发布构建优化 profile（lto="thin" + codegen-units=1）已上提到 workspace 根 Cargo.toml
+# 的 [profile.release]——workspace 下 profile 只在根生效，member crate 的 [profile.*] 会被忽略。
+# **不设 panic="abort"**：守护进程中单个 FUSE worker panic 不应 abort 整个挂载，保留 unwind。
 
 # P2/P3 引入 redb；lz4_flex / rusqlite 仍留待后续（codec lz4 对照 / 空间敏感备选）。
