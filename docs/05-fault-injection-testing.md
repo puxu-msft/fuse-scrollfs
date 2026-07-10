@@ -1,5 +1,7 @@
 # 05 · 故障注入测试 / Fault Injection Testing — 设计 Spec
 
+> 类型：测试 spec · 状态：**已实现**（下方正文为当时的设计 spec，已落地；BlockIo/FaultIo + dm-* 脚本，见 ROADMAP T1）。文档索引见 [README.md](./README.md)。
+
 > 状态：设计已定（经 architect + rust-reviewer + 代码事实核查三方评审）。日期：2026-06-29。
 > 上游动机见 [04-crash-safe-commit.md](./04-crash-safe-commit.md)（§8.3 双 superblock + 两 barrier 提交、§8.4 尾日志）。本文是「如何系统性地把这套崩溃安全协议变成可回归的故障注入测试」的规格。
 

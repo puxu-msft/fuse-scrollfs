@@ -1,5 +1,7 @@
 # 08 · 可观测性（指标 / Observability）
 
+> 类型：参考（可观测性）· 状态：**部分实现**（statfs 压缩比 + sd-notify；吞吐/比值监控待扩，见 ROADMAP T4）。文档索引见 [README.md](./README.md)。
+
 > zipfs 的运行时指标子系统：统一注册表、单一 Prometheus `.prom` 出口、扩展配方、指标目录、PromQL 示例，以及一条**解读教训**。
 >
 > 相关：[01-zipfs-design](01-zipfs-design.md)（架构）、[02-layered-chunking](02-layered-chunking.md)（块大小与解压缓存）。

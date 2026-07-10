@@ -1,5 +1,7 @@
 # 07 — Hang-free 分档卸载
 
+> 类型：特性设计（how）· 状态：**已实现**（clean/lazy/abort/auto 分档卸载已合入 main）。文档索引见 [README.md](./README.md)。
+
 > 设计文档。目标：把 zipfs 的卸载做成**不会被死/卡 daemon 拖住的分档升级梯**，用户按需选择档位，systemd 默认自动升级，正常关闭仍走会 flush 的耐久路径。
 
 ## 1. 背景与触发

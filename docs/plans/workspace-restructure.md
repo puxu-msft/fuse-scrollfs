@@ -2,7 +2,7 @@
 
 ## Context
 
-zipfs 起源是一次「btrfs+zstd vs FUSE 透明压缩」的横向评测实验（见 [docs/00-overview.md](../../src/zipfs/docs/00-overview.md)）。FUSE 路线转正为整个产品后，顶层工程骨架仍带着 PoC 时代的形态，与内部已相当规整的模块化（`core/`、`store/`、`enable/`、`reconcile/`）不匹配。全面扫描发现四类骨架债务：
+zipfs 起源是一次「btrfs+zstd vs FUSE 透明压缩」的横向评测实验（见 [docs/00-overview.md](../00-overview.md)）。FUSE 路线转正为整个产品后，顶层工程骨架仍带着 PoC 时代的形态，与内部已相当规整的模块化（`core/`、`store/`、`enable/`、`reconcile/`）不匹配。全面扫描发现四类骨架债务：
 
 1. **无 Cargo workspace** —— `fuse/` 与 `microbench/` 是两个独立 crate，各有 `Cargo.lock` 和 `target/`（16G + 239M，互不共享），共享依赖解析两遍且无版本对齐保证，仓库根无法一键 build/test。
 2. **`fuse/` 目录名是 PoC 化石** —— 它是当年「方案四 FUSE 路线」的目录，如今装的是整个产品（crate 名 `zipfs`），"fuse" 只是实现细节却占着顶层要名。

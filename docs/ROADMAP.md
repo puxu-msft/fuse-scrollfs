@@ -1,6 +1,6 @@
 # zipfs 路线图 / Roadmap
 
-> 单一信息源：把散落在 [01-zipfs-design.md](./01-zipfs-design.md) §14.4、各 `bench/results/*/` 报告里的待办收敛于此。
+> 单一信息源：把散落在 [CHANGELOG.md](./CHANGELOG.md)、各 `bench/results/*/` 报告里的待办收敛于此。
 > 优先级 **T0→T4** 递减；状态 ☐ 未开始 / ◐ 进行中 / ☑ 完成。动机一律落到目标负载（`~/.claude/projects`：追加为主、高冗余、运行时活跃写）或已有实测依据。
 > 日期：2026-06-28。
 > 缺陷侧（两轮审查已修 / 未做 + 判断依据）见 [archive/06-defect-audit.md](./archive/06-defect-audit.md)——已核验闭环、归档。

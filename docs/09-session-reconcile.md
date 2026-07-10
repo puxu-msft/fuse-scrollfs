@@ -1,5 +1,7 @@
 # 09 — 会话感知的回落写重合并（Session-aware Reconcile）
 
+> 类型：特性设计（how）· 状态：**已实现**（reconcile / reconcile-undo 已落地，见 CHANGELOG）。文档索引见 [README.md](./README.md)。
+
 > 设计文档。目标：当影子挂载**处于停用/卸载态**时，Claude Code 会把会话数据直接写进裸挂载点（回落写 fall-through），archive 完全不知情。本特性提供**会话感知、无损**的重合并，把回落写安全并回 archive，并在**真正执行挂载的入口**加"失败即拒"守卫，杜绝"挂上就静默盖住回落写"的丢数据陷阱。
 >
 > 意图见 [00-overview.md](./00-overview.md) / [03-target-data-scope.md](./03-target-data-scope.md)，可逆生命周期见 `enable/lifecycle.rs`，卸载引擎见 [07-hangfree-umount.md](./07-hangfree-umount.md)。

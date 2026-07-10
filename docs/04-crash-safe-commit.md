@@ -1,5 +1,7 @@
 # 崩溃安全提交协议：双 superblock + 不可变块 + in-archive 尾日志（设计 spec）
 
+> 类型：实现 spec（how）· 状态：**已实现**（下方正文为当时的设计 spec，协议已落地；见 ROADMAP T1 / CHANGELOG）。文档索引见 [README.md](./README.md)。
+
 > 文档性质：**实现设计（how）**，根治 `bench/results/crash-durability/REPORT.md` 实测到的 durability bug。
 > 承接 [01-zipfs-design.md](./01-zipfs-design.md) §7（archive 格式）、§10（一致性），并**吸收并取代** [02-layered-chunking.md](./02-layered-chunking.md) 的 footer v2 head-cache 字段（合入本协议的 superblock，避免双格式分叉）。
 > 日期：2026-06-28。状态：草案，**格式改动前的 gate**；实现以崩溃 harness（`bench/scripts/crash-test.sh`）40%→0% 为验收门。

@@ -189,6 +189,8 @@ zipfs/
 
 ## 9. 决策记录
 
+> **本节是 2026-06-27 的决策快照（历史记录）。决策的当前汇总与后续演进见运行台账 [decisions.md](./decisions.md)——含被实测推翻/取代的项。**
+
 ### 已定（2026-06-27）
 
 1. **路线 B 形态**：用 **Rust 自研**（无成熟成品，见 §6），以成熟积木 `fuser` + `zstd`/`lz4_flex`（+ 可选 `redb`/`rusqlite`）为地基。两种磁盘布局都做：**布局 V（容器/虚拟盘）** 与 **布局 S（影子树/每文件压缩包）**，详见 [01-zipfs-design.md](./01-zipfs-design.md)。
@@ -205,6 +207,6 @@ zipfs/
 
 ## 10. 下一步
 
-> **进展更新**：本总纲是设计/对照框架（2026-06-27 锁定「比什么、怎么比、判据」）。实现与首批实测已完成——五条件对照见 [../bench/results/20260628-1212/CONSOLIDATED.md](../bench/results/20260628-1212/CONSOLIDATED.md)，实现进展见 [01-zipfs-design.md](./01-zipfs-design.md) §14。
+> **进展更新**：本总纲是设计/对照框架（2026-06-27 锁定「比什么、怎么比、判据」）。实现与首批实测已完成——五条件对照见 [../bench/results/20260628-1212/CONSOLIDATED.md](../bench/results/20260628-1212/CONSOLIDATED.md)，实现进展见 [CHANGELOG.md](./CHANGELOG.md)。
 >
 > **未来方向与遗留项统一收敛于 [ROADMAP.md](./ROADMAP.md)**（T0–T4 优先级 + 决策门，单一信息源）。本文不再单独维护「下一步」清单，避免散落。

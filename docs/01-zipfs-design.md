@@ -250,6 +250,8 @@ crates/zipfs/
 
 ## 13. 开放项与已定
 
+> **本节是 2026-06-27 设计快照里的决策。当前汇总（含后续演进与被推翻项）见运行台账 [decisions.md](./decisions.md)；开放决策门详情见 [ROADMAP.md](./ROADMAP.md)。**
+
 **已定（2026-06-27）**：压缩算法 = zstd 多等级 + **lz4（`lz4_flex`）对照**，`--algo` 切换；**仅 Linux/WSL 原生目录，不覆盖 `/mnt/c`**。
 
 **仍开放**：
@@ -258,55 +260,7 @@ crates/zipfs/
 2. mmap 写支持优先级（默认后置）。
 3. 全局去重：**保留可能性，不急做**（设计上为 V 预留内容寻址的位置，但首版不实现）；日后开启时跑分单列「V+dedup」。
 
-## 14. 实现与实测进展（2026-06-28）
 
-> 本节是「实际建成 + 实测」的进展日志；上文 §1–§13 保留为 2026-06-27 的**设计快照**，不回改。
+## 14. 实现进展 → 见 CHANGELOG
 
-### 14.1 实际模块布局（与 §11 计划略有出入）
-
-```text
-crates/zipfs/src/
-├── main.rs            # 挂载 + `compact` 子命令；--backend {passthrough|shadow|container} --chunk-size
-├── passthrough.rs     # P0 透传（B0）
-├── rwfs.rs            # 读写 FUSE 层（对应 §11 计划的 fuse_fs.rs），持 TailSessions
-├── archive.rs         # 布局 S 每文件分块压缩包（footer 索引 + 尾块 slot 复用）
-├── core/{mod,rmw,codec,chunk,inode,wsession}.rs
-└── store/{mod,shadow,container,tests_support}.rs
-```
-
-### 14.2 计划外/超出计划的关键实现
-
-- **open-tail buffer（`core/wsession.rs::TailSessions`）**：append 路径的「未压缩开放尾块缓冲」，落在 Core 写会话（per-inode），两布局共享。把尾块重压从「每次 append」降到「每满块/每 fsync」一次。
-- **fsync 抗碎片（`archive.rs` 尾块 slot 原地复用）**：fsync 封部分尾块后续写**同一逻辑块**，不另起新块——块数/压缩比不随 fsync 频率劣化。配套**崩溃 fail-closed**：复用覆盖前先 `set_len+sync_data` 铲除旧 footer，杜绝崩溃后读出「新前缀+旧残尾」的 Frankenstein 块（archive 无 per-block 校验，故构造性 fail-closed）。
-- **BS reader 缓存（`store/shadow.rs`）**：per-inode `ArchiveReader` 缓存 + epoch 失效，修复「每次 read 重开 reader 重解析全量 footer 索引」导致的随机读病态（1.4→37 MiB/s）。
-- **BV `compact` 子命令**：`zipfs compact --backend container --backing <redb>`，调 redb compact 回收 MVCC 未引用页。
-
-### 14.3 实测结论（指针，勿在此重复数字）
-
-- **选型**：`exp/container-backend-selection/REPORT.md` —— redb 全包 + **64KiB 块** + 批事务；256KiB 触发膨胀红线。
-- **五条件大对照**：`bench/results/20260628-1212/CONSOLIDATED.md` —— BS 读修复后**与内核 btrfs 同档**、压缩比最高（5.42x）；BV 干净写 3.84x（compact 仅对「随机覆盖写的 MVCC 膨胀」有意义，对追加/干净写无关）；**写尾延迟是 FUSE 对内核的结构性劣势**（FUSE 三条 ms 级 vs btrfs 亚毫秒）。
-- **append 优化**：`bench/results/append-opt/REPORT.md` —— 尾块缓冲重压 40x↓、吞吐 BV +2.5x；fsync 抗碎片后块数/压缩比/物理体积**与 fsync 频率无关**。
-- **早期对照与修复**：`bench/results/20260627-1641/{FIRST-RUN,FIXES-ADDENDUM}.md`。
-
-### 14.4 遗留 TODO
-
-> **完整路线图（含优先级 T0–T4 与决策门）见 [ROADMAP.md](./ROADMAP.md)——单一信息源。** 下列为摘要。
-
-1. **A(btrfs) 压缩比待补**：compsize 需 root，本轮失败；用 `bench/scripts/measure-a-ratio.sh`（含 sudo）补齐。
-2. **B2（`fuse-zstd` 整文件对照）未跑**：§9 矩阵里的消融项尚缺。
-3. **冷缓存复跑**：当前全热缓存（无免密 sudo drop_caches），偏乐观。
-4. **archive per-block 校验**：当前靠 `set_len+sync` 构造性 fail-closed；更彻底是每块加 CRC。
-5. **FUSE 写尾延迟优化**：BV/BS 对 btrfs 的最大劣势（异步/批量 commit 等方向待探）。
-6. **去重 / mmap 写 / WSL 启动自挂载**：按需推进。
-
-### 14.5 工程骨架整改（2026-07-11）
-
-> PoC 转正遗留的顶层骨架现代化。**不回改 §11/§14.1 的历史快照**；本节记录当前实际布局，供后续读者对齐「是什么/在哪里」。
-
-- **Cargo workspace**：仓库根新增 `Cargo.toml`（`[workspace]`），统一 `Cargo.lock` 与 `target/`；`[profile.release]` 上提到根（member profile 被 workspace 忽略）。`default-members` 只含产品 + 基准 crate，日常 `cargo build/test` 跳过归档 PoC。
-- **目录迁移（git mv 保历史）**：`fuse/` → `crates/zipfs/`（产品 crate，"fuse" 是 PoC 时代路线名）；4 个基准 bin（append/ratio/ldm-ratio/discovery）→ 新 crate `crates/zipfs-bench/`（依赖 zipfs 公有 lib）；`mkfixture` 留产品 crate；`microbench/` → `exp/container-backend-selection/`（归档 redb-vs-sqlite 选型 PoC）。
-- **巨型文件拆分（保历史 + 测试就近 + `pub(crate)` 提升，测试数不变）**：
-  - `archive.rs`（2018 行）→ `archive/{mod,format,superblock,journal,reader,writer,updater}.rs`。
-  - `reconcile/orchestrator.rs`（4832 行）→ `orchestrator/{mod,preconditions,io,delete_gate,reingest,plan,quarantine,apply,manifest,prune,driver,undo,routes/{subagents,memory_passthrough}}.rs`。两 pub 入口 `reconcile`（driver）/`reconcile_undo`（undo）+ 类型集中在 `mod.rs`。
-  - `rwfs.rs`/`store/{shadow,container}.rs`/`enable/lifecycle.rs` **不拆**：33–46% 为尾部测试，各自内聚单一 trait-impl/命令集，拆分只会散落共享 helper。
-- 详见计划文档 [`plan/2026-07-11-workspace-restructure.md`](./plans/workspace-restructure.md)。
+> 原 §14「实现与实测进展」已抽出到独立的 [CHANGELOG.md](./CHANGELOG.md)（避免设计文档兼作变更日志）。§1–§13 保留为 2026-06-27 冻结设计快照。当前决策状态见 [decisions.md](./decisions.md)，下一步见 [ROADMAP.md](./ROADMAP.md)。
