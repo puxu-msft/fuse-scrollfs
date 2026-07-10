@@ -19,7 +19,7 @@
 
 ## 2. 现状与缺口
 
-现状（[mod.rs](../crates/zipfs/src/core/mod.rs) / [archive.rs](../crates/zipfs/src/archive.rs) / [wsession.rs](../crates/zipfs/src/core/wsession.rs) / [rwfs.rs](../crates/zipfs/src/rwfs.rs)）：
+现状（[mod.rs](../crates/zipfs/src/core/mod.rs) / [archive.rs](../crates/zipfs/src/archive/mod.rs) / [wsession.rs](../crates/zipfs/src/core/wsession.rs) / [rwfs.rs](../crates/zipfs/src/rwfs.rs)）：
 
 - **正文块 = 均匀 1MiB**（`DEFAULT_CHUNK_SIZE`，已按 algo-compare 实测从 64KiB 退役），每块独立 zstd 压。
 - **开放尾块缓冲**（`TailSessions`）：活跃尾块未压缓冲，append 成本与块大小解耦。

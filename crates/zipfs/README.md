@@ -53,10 +53,11 @@
 
 - `src/core/`：`chunk`（分块数学）、`codec`（zstd + 不可压缩启发式 + 可选共享字典；lz4 仍 TODO）、`rmw`（读-改-写 / 零填充 / 截断）、`wsession`（脏块写会话）、`blockcache`（解压明文块缓存，压力感知）、`inode`（逻辑属性）。
 - `src/store/`：`Store` trait（§5 签名，含 `get_block`/`put_block`/`truncate_blocks`/尾日志 `append_tail`/`seal_tail_block`/head 缓存 `set/read_head_cache`/`fsync`/`sync_all`）；`ContainerStore`（redb）、`ShadowStore`（影子树）两实现 + `lock`（跨进程 flock）。
-- `src/archive.rs`：布局 S 的每文件 archive 格式——双 superblock 原子提交、per-block CRC、append-only 尾日志、head 缓存区。
+- `src/archive/`：布局 S 的每文件 archive 格式——双 superblock 原子提交、per-block CRC、append-only 尾日志、head 缓存区。按职责拆为 `format`（crc32/整数编解码）、`superblock`、`journal`、`reader`、`writer`、`updater` 子模块。
 - `src/blockio.rs`：`BlockIo` 接缝 + `FaultIo` 确定性崩溃模拟器（`fault-injection` feature，见测试）。
 - 离线工具：`compact`（回收 MVCC / append-only 空洞）、`seal`（冷文件大块高等级重编码）、`ingest`（迁移灌入 + `--verify`）、`fixture`（测试预置数据）。
 - `src/enable/`：Claude projects 透明压缩启用器（可逆切换 / systemd 自挂载 / TUI），取代旧 `bench/scripts/zipfs-*.sh`。
+- `src/reconcile/`：停用期回落写重合并。`orchestrator/` 按流水线阶段拆为 `preconditions`/`io`/`delete_gate`/`reingest`/`plan`/`quarantine`/`routes`/`apply`/`manifest`/`prune`/`driver`（`reconcile` 主入口）/`undo`（`reconcile_undo` 入口）等子模块。
 
 ## 构建与测试
 

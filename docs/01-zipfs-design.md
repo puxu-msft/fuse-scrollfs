@@ -298,3 +298,15 @@ crates/zipfs/src/
 4. **archive per-block 校验**：当前靠 `set_len+sync` 构造性 fail-closed；更彻底是每块加 CRC。
 5. **FUSE 写尾延迟优化**：BV/BS 对 btrfs 的最大劣势（异步/批量 commit 等方向待探）。
 6. **去重 / mmap 写 / WSL 启动自挂载**：按需推进。
+
+### 14.5 工程骨架整改（2026-07-11）
+
+> PoC 转正遗留的顶层骨架现代化。**不回改 §11/§14.1 的历史快照**；本节记录当前实际布局，供后续读者对齐「是什么/在哪里」。
+
+- **Cargo workspace**：仓库根新增 `Cargo.toml`（`[workspace]`），统一 `Cargo.lock` 与 `target/`；`[profile.release]` 上提到根（member profile 被 workspace 忽略）。`default-members` 只含产品 + 基准 crate，日常 `cargo build/test` 跳过归档 PoC。
+- **目录迁移（git mv 保历史）**：`fuse/` → `crates/zipfs/`（产品 crate，"fuse" 是 PoC 时代路线名）；4 个基准 bin（append/ratio/ldm-ratio/discovery）→ 新 crate `crates/zipfs-bench/`（依赖 zipfs 公有 lib）；`mkfixture` 留产品 crate；`microbench/` → `exp/container-backend-selection/`（归档 redb-vs-sqlite 选型 PoC）。
+- **巨型文件拆分（保历史 + 测试就近 + `pub(crate)` 提升，测试数不变）**：
+  - `archive.rs`（2018 行）→ `archive/{mod,format,superblock,journal,reader,writer,updater}.rs`。
+  - `reconcile/orchestrator.rs`（4832 行）→ `orchestrator/{mod,preconditions,io,delete_gate,reingest,plan,quarantine,apply,manifest,prune,driver,undo,routes/{subagents,memory_passthrough}}.rs`。两 pub 入口 `reconcile`（driver）/`reconcile_undo`（undo）+ 类型集中在 `mod.rs`。
+  - `rwfs.rs`/`store/{shadow,container}.rs`/`enable/lifecycle.rs` **不拆**：33–46% 为尾部测试，各自内聚单一 trait-impl/命令集，拆分只会散落共享 helper。
+- 详见计划文档 [`plan/2026-07-11-workspace-restructure.md`](./plans/workspace-restructure.md)。
