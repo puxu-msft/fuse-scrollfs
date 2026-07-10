@@ -17,7 +17,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
-BIN="${BIN:-$REPO_DIR/fuse/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
 
 LINES="${1:-100000}"          # 写够多让 kill 大概率落在写中途
 KILL_AFTER="${2:-1.5}"        # 守护起来后多少秒 kill -9
@@ -43,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[ -x "$BIN" ] || fail "未找到 zipfs 二进制：$BIN（先 cd fuse && cargo build --release）"
+[ -x "$BIN" ] || fail "未找到 zipfs 二进制：$BIN（先 cargo build --release -p zipfs）"
 [ -c /dev/fuse ] || { log "SKIP：/dev/fuse 不存在，FUSE 不可用"; exit 0; }
 
 # 确定性行内容：seq + 可压缩 payload，便于逐行核对字节完好。

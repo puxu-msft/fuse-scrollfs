@@ -16,7 +16,7 @@
 # 参数（环境变量）:
 #   BACKING     redb 容器文件路径（必须在 ext4 上）   默认 bench/.bv-backing/zipfs.redb
 #   MNT         BV 挂载点                              默认 bench/.mnt/bv
-#   BIN         zipfs 二进制路径                       默认 fuse/target/release/zipfs
+#   BIN         zipfs 二进制路径                       默认 target/release/zipfs
 #   CHUNK_SIZE  逻辑块大小（字节）                     默认 65536（64KiB，§6.1 裁决）
 #   FOREGROUND  置 1 则前台阻塞运行；否则后台启动并写 PID 文件
 #
@@ -34,7 +34,7 @@ REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
 
 BACKING="${BACKING:-$BENCH_DIR/.bv-backing/zipfs.redb}"
 MNT="${MNT:-$BENCH_DIR/.mnt/bv}"
-BIN="${BIN:-$REPO_DIR/fuse/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
 FOREGROUND="${FOREGROUND:-0}"
 PIDFILE="$BENCH_DIR/.mnt/bv.pid"
@@ -47,9 +47,9 @@ die()  { printf '[mount-bv] ERROR: %s\n' "$*" >&2; exit 1; }
 if [ ! -x "$BIN" ]; then
   cat >&2 <<EOF
 [mount-bv] ERROR: 未找到 zipfs 二进制: $BIN
-  请先在 fuse/ crate 构建:
-      ( cd "$REPO_DIR/fuse" && cargo build --release )
-  产物应为 fuse/target/release/zipfs。构建后重跑本脚本。
+  请先构建 zipfs（crates/zipfs）:
+      ( cd "$REPO_DIR" && cargo build --release -p zipfs )
+  产物应为 target/release/zipfs。构建后重跑本脚本。
 EOF
   exit 1
 fi

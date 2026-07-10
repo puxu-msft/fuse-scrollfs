@@ -19,10 +19,10 @@ LVL="${3:-19}"
 # max_bytes=0 视为「不限」：ldm-ratio 的 --max-bytes 取一个极大值放行全语料。
 if [ "$CAP" = "0" ]; then CAP=1099511627776; fi   # 1TiB，实为不限
 
-FUSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../fuse" && pwd)"
-BIN="$FUSE_DIR/target/release/ldm-ratio"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BIN="$REPO_DIR/target/release/ldm-ratio"
 
-[ -x "$BIN" ] || { echo "先构建：( cd fuse && cargo build --release --bin ldm-ratio )"; exit 1; }
+[ -x "$BIN" ] || { echo "先构建：( cargo build --release -p zipfs-bench --bin ldm-ratio )"; exit 1; }
 [ -d "$IN" ]  || { echo "语料目录不存在：$IN"; exit 1; }
 
 echo "# LDM 压缩比矩阵  语料=$IN  max_bytes=$CAP  level=$LVL"

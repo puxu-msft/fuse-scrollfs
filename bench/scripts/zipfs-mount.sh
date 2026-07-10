@@ -3,14 +3,14 @@
 # 长期运行 zipfs（布局 S）用：起前清残留、已挂则跳过、写 PID、随 WSL/systemd 重挂。
 #
 # 用法：zipfs-mount.sh <backing-dir> <mountpoint> [chunk_size]
-# 环境：ZIPFS_BIN（默认 fuse/target/release/zipfs）、ZIPFS_LEVEL（默认 3）。
+# 环境：ZIPFS_BIN（默认 target/release/zipfs）、ZIPFS_LEVEL（默认 3）。
 set -uo pipefail
 
 BACKING="${1:?需 backing 目录}"
 MNT="${2:?需挂载点}"
 CHUNK="${3:-1048576}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="${ZIPFS_BIN:-$SCRIPT_DIR/../../fuse/target/release/zipfs}"
+BIN="${ZIPFS_BIN:-$SCRIPT_DIR/../../target/release/zipfs}"
 LEVEL="${ZIPFS_LEVEL:-3}"
 PID_FILE="$MNT.zipfs.pid"
 

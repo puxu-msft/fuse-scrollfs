@@ -17,7 +17,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$REPO_DIR/fuse/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
 LINES="${1:-20000}"
 CHUNK_SIZE="${CHUNK_SIZE:-1048576}"
 
@@ -31,7 +31,7 @@ for t in dmsetup losetup mkfs.ext4 mountpoint fusermount3; do
   command -v "$t" >/dev/null 2>&1 || skip "缺工具：$t"
 done
 dmsetup targets 2>/dev/null | grep -qiw flakey || skip "内核无 dm-flakey target"
-[ -x "$BIN" ] || skip "未找到 zipfs 二进制：$BIN（先 cd fuse && cargo build --release）"
+[ -x "$BIN" ] || skip "未找到 zipfs 二进制：$BIN（先 cargo build --release -p zipfs）"
 
 # 唯一命名，避免与系统现有 dm/loop 冲突；cleanup 只认这些名字。
 UNIQ="zipfsdm$$"

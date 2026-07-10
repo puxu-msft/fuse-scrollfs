@@ -141,7 +141,7 @@ V 的定义性特征是「整棵树落到一个后端对象」，这把三件事
 
 > **「专门虚拟盘」的隐患**：手写 superblock + bitmap/extent + inode 表 = 写迷你文件系统，控制力最强但易滑向「一个更差的 btrfs」（重造其变长 extent 分配却不如它成熟）。**默认不先做**，以 §6.1 末「大 BLOB 随机更新 microbench」为闸门。
 
-> **闸门已跑（microbench 实测 2026-06-27，redb 4.1 vs sqlite，详见 `microbench/REPORT.md`）**：
+> **闸门已跑（microbench 实测 2026-06-27，redb 4.1 vs sqlite，详见 `exp/container-backend-selection/REPORT.md`）**：
 > - **吞吐够用**：redb 批量事务比每块一事务快 **8–18x**；首版选 **redb 全包**，无需为性能自写数据区。
 > - **写批处理是必备项**（非优化）：一次 `write` 回调内多块合并一事务、`fsync`/`flush` 才 commit——否则重蹈 `sqlitefs`「每写 COW sync」覆辙。
 > - **空间是红灯且与块大小强相关**：redb 大 BLOB 膨胀——**256KiB 块 → 稳态 2.75x / compact 后 1.48x**；**64KiB 块 → compact 后 1.34x**。sqlite 几乎零浪费(1.01x) 但吞吐低一截。
@@ -214,10 +214,10 @@ V 的定义性特征是「整棵树落到一个后端对象」，这把三件事
 - 正确性优先于性能：先正确再优化 RMW/空闲位。
 - **物理占用 / 压缩比口径（两布局不同，须标注）**：V 的容器文件含 redb MVCC 未回收页与预分配，应取**compact/reclaim 后的容器大小**；S 受 ext4 4KiB 最小块向上取整影响，用 `du`（含 block 取整）。两者口径不同会给压缩比带来系统性偏差，报告须分别声明。
 
-## 11. 模块布局（`fuse/`）
+## 11. 模块布局（`crates/zipfs/`）
 
 ```text
-fuse/
+crates/zipfs/
 ├── Cargo.toml          # fuser, zstd, lz4_flex, redb(可选), rusqlite(可选), clap
 └── src/
     ├── main.rs         # 挂载 + 参数：--backend {container|shadow} --chunk-size --algo --level
@@ -265,7 +265,7 @@ fuse/
 ### 14.1 实际模块布局（与 §11 计划略有出入）
 
 ```text
-fuse/src/
+crates/zipfs/src/
 ├── main.rs            # 挂载 + `compact` 子命令；--backend {passthrough|shadow|container} --chunk-size
 ├── passthrough.rs     # P0 透传（B0）
 ├── rwfs.rs            # 读写 FUSE 层（对应 §11 计划的 fuse_fs.rs），持 TailSessions
@@ -283,7 +283,7 @@ fuse/src/
 
 ### 14.3 实测结论（指针，勿在此重复数字）
 
-- **选型**：`microbench/REPORT.md` —— redb 全包 + **64KiB 块** + 批事务；256KiB 触发膨胀红线。
+- **选型**：`exp/container-backend-selection/REPORT.md` —— redb 全包 + **64KiB 块** + 批事务；256KiB 触发膨胀红线。
 - **五条件大对照**：`bench/results/20260628-1212/CONSOLIDATED.md` —— BS 读修复后**与内核 btrfs 同档**、压缩比最高（5.42x）；BV 干净写 3.84x（compact 仅对「随机覆盖写的 MVCC 膨胀」有意义，对追加/干净写无关）；**写尾延迟是 FUSE 对内核的结构性劣势**（FUSE 三条 ms 级 vs btrfs 亚毫秒）。
 - **append 优化**：`bench/results/append-opt/REPORT.md` —— 尾块缓冲重压 40x↓、吞吐 BV +2.5x；fsync 抗碎片后块数/压缩比/物理体积**与 fsync 频率无关**。
 - **早期对照与修复**：`bench/results/20260627-1641/{FIRST-RUN,FIXES-ADDENDUM}.md`。

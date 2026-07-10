@@ -13,12 +13,12 @@ set -euo pipefail
 IN="${1:?用法: ratio-matrix.sh <语料目录> [max_bytes]}"
 CAP="${2:-134217728}"   # 默认 128MiB 控时
 
-FUSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../fuse" && pwd)"
-RB="$FUSE_DIR/target/release/zipfs"
-BIN="$FUSE_DIR/target/release/ratio-bench"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RB="$REPO_DIR/target/release/zipfs"
+BIN="$REPO_DIR/target/release/ratio-bench"
 
-[ -x "$BIN" ] || { echo "先构建：( cd fuse && cargo build --release --bin ratio-bench )"; exit 1; }
-[ -x "$RB" ]  || { echo "先构建：( cd fuse && cargo build --release --bin zipfs )"; exit 1; }
+[ -x "$BIN" ] || { echo "先构建：( cargo build --release -p zipfs-bench --bin ratio-bench )"; exit 1; }
+[ -x "$RB" ]  || { echo "先构建：( cargo build --release -p zipfs --bin zipfs )"; exit 1; }
 [ -d "$IN" ]  || { echo "语料目录不存在：$IN"; exit 1; }
 
 DICT="$(mktemp -t zipfs-matrix-dict.XXXXXX)"

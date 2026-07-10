@@ -10,7 +10,7 @@
 |---|---|---|---|
 | C0 | 裸 ext4（无压缩，吞吐地板） | 在 ext4 后端建个普通子目录即可 | **就绪**：建目录就能跑 |
 | A | btrfs + zstd:N（loop image） | `setup-btrfs.sh` 建并挂 | **就绪（需 root + 先 modprobe btrfs）** |
-| B0 | FUSE 透传（不压缩，隔离纯 FUSE 开销） | `fuse/` 下 Rust passthrough 二进制 `zipfs`，由 `mount-b0.sh` 挂起 | **就绪**：`cargo build --release` 后 `mount-b0.sh` 即可挂 |
+| B0 | FUSE 透传（不压缩，隔离纯 FUSE 开销） | zipfs（crates/zipfs）的 Rust passthrough 二进制 `zipfs`，由 `mount-b0.sh` 挂起 | **就绪**：`cargo build --release` 后 `mount-b0.sh` 即可挂 |
 | B2 | FUSE + zstd 整文件（`fuse-zstd`） | 待构建/安装 `fuse-zstd` 并挂载 | **待装**：`fuse-zstd` 未在 PATH |
 
 脚手架对「待实现/待装」的条件是**优雅跳过 + 显式 log**，不会因为某条不在而中断其余条件。
@@ -25,10 +25,10 @@
 | **btrfs-progs**（条件 A） | `mkfs.btrfs` 建 loop image | `brew install btrfs-progs` | 7.0；`mkfs.btrfs` **可非 root** 对 image 执行，仅 `mount` 需 sudo 且走**内核模块** |
 | **btrfs-compsize**（测 A 压缩比） | 量 btrfs 真实物理 vs 逻辑 | `sudo apt install btrfs-compsize` | 走系统包；读 btrfs 元数据 |
 | **python3**（汇总） | `collect.py` 解析 fio JSON | 通常自带 | 标准库即可 |
-| **Rust toolchain**（B0） | 构建 `fuse/` 透传二进制 | 项目已有 `cargo` | `cargo build --release` 于 `fuse/`，产物 `fuse/target/release/zipfs` |
+| **Rust toolchain**（B0） | 构建 zipfs 透传二进制 | 项目已有 `cargo` | `cargo build --release -p zipfs`（仓库根），产物 `target/release/zipfs` |
 | **fuse-zstd**（B2，待装） | 整文件 zstd 对照 | 从源码构建（见待办） | 未在 PATH 时 `probe-env.sh` 会报 |
 
-> **libfuse3-dev 不需要**：`fuse/` crate 用 `fuser` 且 `default-features = false`，挂载走 `fusermount3` 二进制而非链接 libfuse3，故无需 `libfuse3-dev`/`fuse3.pc`。
+> **libfuse3-dev 不需要**：zipfs（crates/zipfs）crate 用 `fuser` 且 `default-features = false`，挂载走 `fusermount3` 二进制而非链接 libfuse3，故无需 `libfuse3-dev`/`fuse3.pc`。
 >
 > **跑前一次性准备（条件 A，需内核模块）**：`sudo modprobe btrfs`（WSL 每次启动都要重加载，见总纲 §7）。脚本遵循「不擅自 modprobe」，未加载会显式提示退出。
 >
@@ -49,7 +49,7 @@ bash bench/scripts/probe-env.sh
 | `scripts/mount-bv.sh` / `mount-bs.sh` | 把 backing 挂成 BV(容器/redb) / BS(影子树) 读写挂载点 | 否（用户 FUSE，无需 root） |
 | `scripts/umount-bv.sh` / `umount-bs.sh` | 卸载 BV / BS | 否 |
 | `scripts/measure-a-ratio.sh` | 测 A(btrfs) 真实压缩比：写数据集进探针 → `sudo compsize` → 算比值 → 清理 | 部分（compsize 需 sudo） |
-| `scripts/mount-b0.sh` | 用 `fuse/` 透传二进制把 backing 目录挂成 B0 挂载点 | 否（普通用户 FUSE，无需 root） |
+| `scripts/mount-b0.sh` | 用 zipfs 透传二进制把 backing 目录挂成 B0 挂载点 | 否（普通用户 FUSE，无需 root） |
 | `scripts/umount-b0.sh` | 卸载 B0（`fusermount3 -u` + 收尾守护进程） | 否（无需 root） |
 | `scripts/teardown.sh` | 安全卸载 btrfs（A），可选删 image（重重设防，绝不通配符 rm） | 是（需 root） |
 | `datasets/fetch-claude-projects.sh` | 把 `~/.claude/projects` 的**只读副本**取到 `datasets/claude-projects/`（默认代表性子集） | 否（只读源，cp -a/rsync -a） |
@@ -85,7 +85,7 @@ SIZE=20G MNT=/mnt/zipfs-btrfs ZSTD_LEVEL=3 \
 **B0（FUSE 透传）**——先构建二进制，再挂起 backing 目录（backing 应在 ext4 上）：
 
 ```bash
-( cd /home/xp/src/zipfs/fuse && cargo build --release )   # 产物 fuse/target/release/zipfs
+( cd /home/xp/src/zipfs && cargo build --release -p zipfs )   # 产物 target/release/zipfs
 bash bench/scripts/mount-b0.sh                            # 默认 backing=bench/.b0-backing, MNT=bench/.mnt/b0
 # 自定: BACKING=/path/on/ext4 MNT=/path/mnt bash bench/scripts/mount-b0.sh
 # 卸载: bash bench/scripts/umount-b0.sh
@@ -182,9 +182,9 @@ bash bench/datasets/fetch-claude-projects.sh --size-cap 3G
 针对目标负载「逐行 append 小记录到增长文件 + 周期 fsync」的专项微基准，量化**未压缩开放尾块缓冲**优化前后的差异（吞吐 / 尾块重压次数 / 压缩比）。直接驱动 Core+Store（免 FUSE 挂载噪声），跑在 BS（影子树）与 BV（容器）上：
 
 ```bash
-( cd fuse && cargo build --release --bin append-bench )
-fuse/target/release/append-bench                                   # 默认 64KiB 块 / 1KB 行 / 20000 行，两后端各跑 on/off
-fuse/target/release/append-bench --chunk-size 4096 --line-size 512 # 小块场景
+( cargo build --release -p zipfs-bench --bin append-bench )
+target/release/append-bench                                   # 默认 64KiB 块 / 1KB 行 / 20000 行，两后端各跑 on/off
+target/release/append-bench --chunk-size 4096 --line-size 512 # 小块场景
 # 可调：--lines --line-size --chunk-size --fsync-every --level --backend {shadow|container|both}
 ```
 
@@ -200,7 +200,7 @@ fuse/target/release/append-bench --chunk-size 4096 --line-size 512 # 小块场�
 
 ## 当前待办 / 风险
 
-- **B0（FUSE 透传）已就绪**：`fuse/` 下 Rust `fuser` passthrough 二进制 `zipfs`，`cargo build --release` 后由 `mount-b0.sh` 挂起、`umount-b0.sh` 卸载，已纳入 `CONDITIONS`。隔离「纯 FUSE 税」的关键条件。
+- **B0（FUSE 透传）已就绪**：zipfs（crates/zipfs）的 Rust `fuser` passthrough 二进制 `zipfs`，`cargo build --release` 后由 `mount-b0.sh` 挂起、`umount-b0.sh` 卸载，已纳入 `CONDITIONS`。隔离「纯 FUSE 税」的关键条件。
 - **B2（fuse-zstd）待安装**：`probe-env.sh` 若报 `fuse-zstd 未在 PATH`，需先 `cargo install` 或从 `Big-Dig-Data/fuse-zstd` 源码构建，挂载后纳入。
 - **冷缓存依赖 root**：非 root 且无免密 sudo 时会降级热缓存，跨条件对比会偏乐观——严格对比请整体以 root 跑。
 - **WSL btrfs 模块不持久**：每次 `wsl --shutdown` 后需重新 `sudo modprobe btrfs`。`setup-btrfs.sh` 检测未加载会直接退出并提示，不擅自加载。

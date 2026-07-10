@@ -15,7 +15,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$REPO_DIR/fuse/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
 LINES="${1:-40000}"
 KILL_AFTER="${2:-1.5}"
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
@@ -40,7 +40,7 @@ cleanup() {
 trap cleanup EXIT
 fail() { printf '[crash-ctr] FAIL：%s\n' "$*" >&2; exit 1; }
 
-[ -x "$BIN" ] || skip "未找到 zipfs 二进制：$BIN（先 cd fuse && cargo build --release）"
+[ -x "$BIN" ] || skip "未找到 zipfs 二进制：$BIN（先 cargo build --release -p zipfs）"
 [ -c /dev/fuse ] || skip "/dev/fuse 不存在，FUSE 不可用"
 
 mount_ctr() {

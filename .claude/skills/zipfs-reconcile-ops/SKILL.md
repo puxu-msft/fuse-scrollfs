@@ -24,7 +24,7 @@ description: 操作 zipfs 的停用期回落写重合并——诊断 NEEDS-RECON
 ## 标准流程
 
 ```bash
-cd /path/to/zipfs/fuse   # 或用已装好的 zipfs
+cd /path/to/zipfs   # 或用已装好的 zipfs
 # 1) 先 dry-run 看建议单（零改动，只读）
 ./target/release/zipfs enable reconcile -- <name> --dry-run
 # 2) 逐条确认实跑。每条打印 推荐动作/置信度/理由：

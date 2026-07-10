@@ -2,7 +2,7 @@
 # mount-b0.sh — 用 zipfs 透传二进制把一个 backing 目录挂成 B0 挂载点。
 #
 # B0 = FUSE 透传（不压缩），隔离「纯 FUSE 税」（见 docs/00-overview.md §4.1）。
-# 二进制来自 fuse/ crate：cargo build --release，产物 fuse/target/release/zipfs。
+# 二进制来自 zipfs crate（crates/zipfs）：cargo build --release，产物 target/release/zipfs。
 # passthrough 用法：zipfs --backing <dir> --mountpoint <mnt>（mount2 阻塞至卸载）。
 #
 # 用法:
@@ -13,7 +13,7 @@
 # 参数（环境变量）:
 #   BACKING     后端目录（必须在 ext4 上；见 §4.5 受控变量）  默认 bench/.b0-backing
 #   MNT         B0 挂载点                                       默认 bench/.mnt/b0
-#   BIN         zipfs 二进制路径                                默认 fuse/target/release/zipfs
+#   BIN         zipfs 二进制路径                                默认 target/release/zipfs
 #   FOREGROUND  置 1 则前台阻塞运行；否则后台启动并写 PID 文件
 #
 # 安全/健壮:
@@ -30,7 +30,7 @@ REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
 
 BACKING="${BACKING:-$BENCH_DIR/.b0-backing}"
 MNT="${MNT:-$BENCH_DIR/.mnt/b0}"
-BIN="${BIN:-$REPO_DIR/fuse/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
 FOREGROUND="${FOREGROUND:-0}"
 PIDFILE="$BENCH_DIR/.mnt/b0.pid"
 
@@ -42,9 +42,9 @@ die()  { printf '[mount-b0] ERROR: %s\n' "$*" >&2; exit 1; }
 if [ ! -x "$BIN" ]; then
   cat >&2 <<EOF
 [mount-b0] ERROR: 未找到 zipfs 透传二进制: $BIN
-  请先在 fuse/ crate 构建（约 18s）:
-      ( cd "$REPO_DIR/fuse" && cargo build --release )
-  产物应为 fuse/target/release/zipfs。构建后重跑本脚本。
+  请先构建 zipfs（crates/zipfs）（约 18s）:
+      ( cd "$REPO_DIR" && cargo build --release -p zipfs )
+  产物应为 target/release/zipfs。构建后重跑本脚本。
 EOF
   exit 1
 fi

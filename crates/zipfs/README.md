@@ -1,7 +1,7 @@
-# zipfs `fuse/` —— 路线 B（用户态 FUSE）Rust 实现
+# zipfs（crates/zipfs）—— 路线 B（用户态 FUSE）Rust 实现
 
-> 实验背景见 [`../docs/00-overview.md`](../docs/00-overview.md)，磁盘布局与分阶段设计见 [`../docs/01-zipfs-design.md`](../docs/01-zipfs-design.md)。
-> **进度与缺陷的单一信息源**是 [`../docs/ROADMAP.md`](../docs/ROADMAP.md)（T0–T4 优先级）与 [`../docs/06-defect-audit.md`](../docs/06-defect-audit.md)（两轮审查台账）。本 README 只描述「这个 crate 现在是什么、怎么用」，不重复路线图的优先级排序。
+> 实验背景见 [`../../docs/00-overview.md`](../../docs/00-overview.md)，磁盘布局与分阶段设计见 [`../../docs/01-zipfs-design.md`](../../docs/01-zipfs-design.md)。
+> **进度与缺陷的单一信息源**是 [`../../docs/ROADMAP.md`](../../docs/ROADMAP.md)（T0–T4 优先级）与 [`../../docs/06-defect-audit.md`](../../docs/06-defect-audit.md)（两轮审查台账）。本 README 只描述「这个 crate 现在是什么、怎么用」，不重复路线图的优先级排序。
 
 本 crate 是 zipfs「方案四 / 路线 B」的 Rust 实现。设计文档 §12 的分阶段骨架 **P0–P4 已全部落地**（P0 透传基线 + P1 只读/顺序读 + P2 顺序写/截断 + P3 随机写 RMW + P4 元数据 POSIX 语义），代码内 **无 `todo!()` 占位**；当前投入已转向 ROADMAP 的 **T1 可靠性 / T2 性能 / T3 空间 / T4 生产化**。
 
@@ -63,7 +63,7 @@
 环境前提：Linux / WSL，`/dev/fuse` 存在，`fusermount3`（或 `fusermount`）在 `PATH` 中。
 
 ```bash
-cd fuse
+cd crates/zipfs
 cargo build                              # 编译
 cargo test                               # 229 个测试（202 单元 + 27 集成）
 cargo test --features fault-injection    # 额外 8 个故障注入测试（共 237）
@@ -75,7 +75,7 @@ cargo clippy --all-targets
 
 - **单元测试（202）**：inode 映射 / lookup-count / forget、`block_range` 分块数学、codec 启发式与 flag、RMW 各分支、archive 双 SB 提交与 CRC、head 缓存、Store 不变量、name 校验等。纯逻辑，不需挂载。
 - **集成测试（27）**：`passthrough` / `mount_rw`（真实挂载 round-trip，环境受限则**优雅跳过**不 panic）、`model_based`（随机操作序列 vs 内存参照模型差分，覆盖随机写/截断/越 EOF/可压缩与不可压缩两路）、`append_growth` / `append_tail_buffer`（尾日志增长边界）、`enable` / `systemd_mount`（启用器与托管挂载）。
-- **故障注入（8，feature 门控）**：`FaultIo` × archive 双 superblock 提交协议的格式层不变量穷举（EIO / 撕裂 / 掉电 / 乱序 × barrier 软化），独立 oracle 复用生产 reader，见 [`../docs/05-fault-injection-testing.md`](../docs/05-fault-injection-testing.md)。崩溃端到端门由 `bench/scripts/crash-test.sh`（10/10）与 Tier 2 `dm-flakey`/`dm-log-writes` 脚本（root 门控）覆盖。
+- **故障注入（8，feature 门控）**：`FaultIo` × archive 双 superblock 提交协议的格式层不变量穷举（EIO / 撕裂 / 掉电 / 乱序 × barrier 软化），独立 oracle 复用生产 reader，见 [`../../docs/05-fault-injection-testing.md`](../../docs/05-fault-injection-testing.md)。崩溃端到端门由 `bench/scripts/crash-test.sh`（10/10）与 Tier 2 `dm-flakey`/`dm-log-writes` 脚本（root 门控）覆盖。
 
 落地遵循 **TDD**（先写测试 RED → 实现 GREEN → 重构），正确性优先用 model-based 差分测试。
 

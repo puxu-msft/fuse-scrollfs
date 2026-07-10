@@ -5,7 +5,7 @@
 set -uo pipefail
 TARGET="${1:?需目标目录}"; BACKING="${2:?需 backing}"; CHUNK="${3:-1048576}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="${ZIPFS_BIN:-$SCRIPT_DIR/../../fuse/target/release/zipfs}"
+BIN="${ZIPFS_BIN:-$SCRIPT_DIR/../../target/release/zipfs}"
 ORIG="$TARGET.zipfs-orig"
 
 [ -e "$ORIG" ] && { echo "[cutover] $ORIG 已存在，疑似已切换；先 rollback" >&2; exit 1; }

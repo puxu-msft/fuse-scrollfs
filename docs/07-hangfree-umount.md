@@ -61,7 +61,7 @@
 
 ## 4. 组件与接口
 
-### 4.1 新模块 `fuse/src/enable/force_umount.rs`
+### 4.1 新模块 `crates/zipfs/src/enable/force_umount.rs`
 
 单一职责：按档位驱动一次卸载，全程 hang-free。
 
@@ -92,7 +92,7 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 - `endpoint_ok(mountpoint) -> bool`（复用 `discovery`）：daemon 存活探测，`auto` 升 abort 的守卫（见 §3.1）。
 - `still_mounted(mountpoint) -> bool`：复用 `discovery::is_mounted`（hang-free）。
 
-### 4.2 hang-free 探测基础 `fuse/src/enable/hang_free.rs`（新模块）+ `discovery.rs` 硬化
+### 4.2 hang-free 探测基础 `crates/zipfs/src/enable/hang_free.rs`（新模块）+ `discovery.rs` 硬化
 
 新增小模块 `hang_free.rs`（单一职责，~40 行）承载通用 hang-free 原语，供 `discovery` 与 `force_umount` 共用：
 
@@ -104,7 +104,7 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 - `endpoint_ok`：`with_timeout(PROBE_TIMEOUT, || symlink_metadata(path))`；`Some(Ok)`→true，`Some(Err(ENOTCONN))`→false，`None`（超时=hung）→false。
 - `canonicalized_target`：**不再对叶子 `canonicalize`**；仅 `with_timeout` 包 `canonicalize(parent)` 再拼回叶子名，超时/失败回退未规范化原路径。`is_mounted` 经它间接 hang-free；语义不变（现有 `canonicalized_target_*` 测试保持绿）。
 
-### 4.3 CLI `fuse/src/main.rs`
+### 4.3 CLI `crates/zipfs/src/main.rs`
 
 - 新增顶层子命令 `Umount(UmountArgs)`：`zipfs umount --name <inst> [--level clean|lazy|abort|auto]`（默认 `auto`）。解析实例名 → `Paths::resolve` 算挂载点 → `force_umount::umount`。面向用户。
 - `umount-managed`（`ExecStop` 用，内部）改为接受可选 `--level`（默认 `auto`），复用同一引擎；`run_umount_managed` 从 `RealMounter.unmount` 切到 `force_umount::umount(mp, level)`，并对错误 `.map_err` 附 `%i`/解码名上下文（与 `run_mount_managed` 一致，便于 ExecStop 失败日志定位实例）。
@@ -114,7 +114,7 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 
 **托管实例警告（C1）**：`zipfs umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop zipfs@<esc>.service`（`<esc>` 由 `systemd_escape(raw)` 反算）；`zipfs umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
 
-### 4.4 systemd 模板 `fuse/src/enable/autostart.rs`
+### 4.4 systemd 模板 `crates/zipfs/src/enable/autostart.rs`
 
 `ExecStop` 由 `{exe} umount-managed --name %i` 改为 `{exe} umount-managed --name %i --level auto`。既有单元升级：文档说明 `enable autostart install` 会重写模板（现存实例需 `systemctl --user daemon-reload` + 重装）。
 

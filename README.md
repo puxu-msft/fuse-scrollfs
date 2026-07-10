@@ -11,15 +11,16 @@
 | **V（容器 / 虚拟盘）** | 整棵树落进一个容器 | redb 全包（64KiB 块 + 批事务） |
 | **S（影子树）** | 每文件一个分块压缩包，目录沿用底层 FS | ext4 上的镜像目录树 + footer 索引 archive |
 
-两者共享同一「分块 + 压缩 + 索引」内核（`fuse/src/core/`），仅在 `Store` 接缝处不同。
+两者共享同一「分块 + 压缩 + 索引」内核（`crates/zipfs/src/core/`），仅在 `Store` 接缝处不同。
 
 ## 目录结构
 
 ```
-fuse/        Rust FUSE 实现（核心）
-bench/       基准脚本、fio job、结果报告
-microbench/  redb 容器后端选型 microbench
-docs/        设计与对照文档
+crates/zipfs/        Rust FUSE 实现（产品 crate：lib + zipfs + mkfixture）
+crates/zipfs-bench/  基准二进制（append / ratio / ldm-ratio / discovery）
+exp/                 归档 PoC（container-backend-selection：redb 容器后端选型）
+bench/               基准脚本、fio job、结果报告
+docs/                设计与对照文档
 ```
 
 ## 文档入口
@@ -35,7 +36,7 @@ docs/        设计与对照文档
 ## 构建 / 测试
 
 ```bash
-cd fuse
+# 仓库根一键构建/测试（workspace default-members = 产品 crate + 基准 crate）
 cargo build --release
 cargo test --release          # 单元 + model-based 差分（两后端）+ 真实挂载集成测试
 ```
@@ -44,11 +45,11 @@ cargo test --release          # 单元 + model-based 差分（两后端）+ 真�
 
 ```bash
 # 布局 S（影子树，读写）
-fuse/target/release/zipfs --backend shadow    --backing <底层目录> --mountpoint <挂载点> --chunk-size 65536
+target/release/zipfs --backend shadow    --backing <底层目录> --mountpoint <挂载点> --chunk-size 65536
 # 布局 V（容器，读写）
-fuse/target/release/zipfs --backend container --backing <redb文件> --mountpoint <挂载点> --chunk-size 65536
+target/release/zipfs --backend container --backing <redb文件> --mountpoint <挂载点> --chunk-size 65536
 # 容器离线压实（回收 redb MVCC 旧页）
-fuse/target/release/zipfs compact --backend container --backing <redb文件>
+target/release/zipfs compact --backend container --backing <redb文件>
 ```
 
 ## 启用到 Claude projects（`zipfs enable`，TUI / 子命令）
@@ -57,14 +58,14 @@ fuse/target/release/zipfs compact --backend container --backing <redb文件>
 失败回滚、零丢失；backing 内 `.zipfs.meta` 提交标记使半灌可检测、绝不当权威挂出。
 
 ```bash
-fuse/target/release/zipfs enable                 # 交互式 TUI（列表/状态/切换/还原/重挂/选项/批量）
-fuse/target/release/zipfs enable list            # 状态总览（PLAIN/ZIPFS/STOPPED/BROKEN + NEEDS-RECONCILE + 压缩比）
-fuse/target/release/zipfs enable apply  <name>   # 切换（活跃会话默认拦截，需 --force）
-fuse/target/release/zipfs enable restore <name>  # 还原（backing 保留，可 `enable purge` 清理）
-fuse/target/release/zipfs enable remount --all   # 守护崩溃/重启后重挂所有 STOPPED
-fuse/target/release/zipfs enable reconcile      -- <name>   # 停用期回落写重合并（详见 docs/09；须先卸载；逐条确认，高置信回车即采纳）
-fuse/target/release/zipfs enable reconcile-undo -- <name>   # 回退最近一次 reconcile 供重选（docs/09 §10）
-fuse/target/release/zipfs enable autostart install   # systemd user 登录自挂载（WSL 用 `autostart print`）
+target/release/zipfs enable                 # 交互式 TUI（列表/状态/切换/还原/重挂/选项/批量）
+target/release/zipfs enable list            # 状态总览（PLAIN/ZIPFS/STOPPED/BROKEN + NEEDS-RECONCILE + 压缩比）
+target/release/zipfs enable apply  <name>   # 切换（活跃会话默认拦截，需 --force）
+target/release/zipfs enable restore <name>  # 还原（backing 保留，可 `enable purge` 清理）
+target/release/zipfs enable remount --all   # 守护崩溃/重启后重挂所有 STOPPED
+target/release/zipfs enable reconcile      -- <name>   # 停用期回落写重合并（详见 docs/09；须先卸载；逐条确认，高置信回车即采纳）
+target/release/zipfs enable reconcile-undo -- <name>   # 回退最近一次 reconcile 供重选（docs/09 §10）
+target/release/zipfs enable autostart install   # systemd user 登录自挂载（WSL 用 `autostart print`）
 ```
 
 > 项目名前导 `-`（path-encoded）在子命令里须用 `--` 分隔，如 `enable reconcile -- -home-xp-src-foo`。停用期若 Claude 直接写进裸挂载点（回落写），`enable list` 标 `NEEDS-RECONCILE`、remount 被守卫拒；先 `enable reconcile` 无损并回 backing（详见 [docs/09-session-reconcile.md](docs/09-session-reconcile.md)）。

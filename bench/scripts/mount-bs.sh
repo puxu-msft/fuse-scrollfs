@@ -2,7 +2,7 @@
 # mount-bs.sh — 用 zipfs 布局 S（shadow，影子树/每文件压缩包）读写挂载。
 #
 # BS = FUSE + zstd 分块（每文件 archive），读写。隔离「分块压缩税」（见 docs/00-overview.md §4.1）。
-# 二进制来自 fuse/ crate：cargo build --release，产物 fuse/target/release/zipfs。
+# 二进制来自 zipfs crate（crates/zipfs）：cargo build --release，产物 target/release/zipfs。
 # 用法：zipfs --backend shadow --backing <dir> --mountpoint <mnt> --chunk-size 65536。
 #
 # 用法:
@@ -13,7 +13,7 @@
 # 参数（环境变量）:
 #   BACKING     后端 archive 树目录（必须在 ext4 上）  默认 bench/.bs-backing
 #   MNT         BS 挂载点                               默认 bench/.mnt/bs
-#   BIN         zipfs 二进制路径                        默认 fuse/target/release/zipfs
+#   BIN         zipfs 二进制路径                        默认 target/release/zipfs
 #   CHUNK_SIZE  逻辑块大小（字节）                      默认 65536（64KiB，§6.1 裁决）
 #   FOREGROUND  置 1 则前台阻塞运行；否则后台启动并写 PID 文件
 #
@@ -31,7 +31,7 @@ REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
 
 BACKING="${BACKING:-$BENCH_DIR/.bs-backing}"
 MNT="${MNT:-$BENCH_DIR/.mnt/bs}"
-BIN="${BIN:-$REPO_DIR/fuse/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
 FOREGROUND="${FOREGROUND:-0}"
 PIDFILE="$BENCH_DIR/.mnt/bs.pid"
@@ -44,9 +44,9 @@ die()  { printf '[mount-bs] ERROR: %s\n' "$*" >&2; exit 1; }
 if [ ! -x "$BIN" ]; then
   cat >&2 <<EOF
 [mount-bs] ERROR: 未找到 zipfs 二进制: $BIN
-  请先在 fuse/ crate 构建:
-      ( cd "$REPO_DIR/fuse" && cargo build --release )
-  产物应为 fuse/target/release/zipfs。构建后重跑本脚本。
+  请先构建 zipfs（crates/zipfs）:
+      ( cd "$REPO_DIR" && cargo build --release -p zipfs )
+  产物应为 target/release/zipfs。构建后重跑本脚本。
 EOF
   exit 1
 fi
