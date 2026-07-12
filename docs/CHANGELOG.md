@@ -14,7 +14,7 @@
   - `archive.rs`（2018 行）→ `archive/{mod,format,superblock,journal,reader,writer,updater}.rs`。
   - `reconcile/orchestrator.rs`（4832 行）→ `orchestrator/{mod,preconditions,io,delete_gate,reingest,plan,quarantine,apply,manifest,prune,driver,undo,routes/{subagents,memory_passthrough}}.rs`。两 pub 入口 `reconcile`（driver）/`reconcile_undo`（undo）+ 类型集中在 `mod.rs`。
   - `rwfs.rs`/`store/{shadow,container}.rs`/`enable/lifecycle.rs` **不拆**：33–46% 为尾部测试，各自内聚单一 trait-impl/命令集，拆分只会散落共享 helper。
-- 详见计划文档 [plans/workspace-restructure.md](./plans/workspace-restructure.md)。
+- 详见计划文档 [plan/workspace-restructure.md](./plan/workspace-restructure.md)。
 
 ## 2026-06-28 · 首批实现与实测
 

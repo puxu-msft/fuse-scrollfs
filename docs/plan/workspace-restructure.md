@@ -72,7 +72,7 @@ codegen-units = 1
   （注：代码生成的 systemd 单元用 `current_exe()`，不受影响 —— 已核实。）
 - **README**：根 `README.md`（目录树 + `cd fuse` + 11 行命令示例）、`crates/zipfs/README.md`（`../docs/` 相对链接因多嵌一层 → `../../docs/`）、`bench/README.md`（构建提示与产物路径）。
 - **docs（仅活文档）**：`docs/02-layered-chunking.md:22` 的真实 MD 链接 `../fuse/src/...` → `../crates/zipfs/src/...`；`docs/{00-overview,01-zipfs-design,05-fault-injection-testing,07-hangfree-umount}.md` 的 `fuse/src/...` 散文引用与 `microbench/REPORT.md` 引用批量改写。`.claude/skills/zipfs-reconcile-ops/SKILL.md:27` 的 `cd .../fuse`。
-  - **不改冻结历史**：`docs/archive/*.md`（已归档评审快照）与**已完成的** `docs/plans/*kickoff*.md`、`bench/results/**/REPORT.md` 里 `cd fuse && ...`、`git add fuse/src/...` 是当时真实执行过的命令，按项目文档规则属冻结快照，重写会篡改历史且对命令块做无差别替换有损坏风险。保持原样；如需可加一行「目录已迁移至 crates/zipfs/」批注，不动命令。
+  - **不改冻结历史**：`docs/archive/*.md`（已归档评审快照）与**已完成的** `docs/plan/*kickoff*.md`、`bench/results/**/REPORT.md` 里 `cd fuse && ...`、`git add fuse/src/...` 是当时真实执行过的命令，按项目文档规则属冻结快照，重写会篡改历史且对命令块做无差别替换有损坏风险。保持原样；如需可加一行「目录已迁移至 crates/zipfs/」批注，不动命令。
 - **微移引用**：`README.md:21`、`docs/01-zipfs-design.md:144,286`（`microbench/REPORT.md` → `exp/container-backend-selection/REPORT.md`）；`exp/.../REPORT.md` 内 `../docs/` 链接因多嵌一层 → `../../docs/`。
 - **本地配置** `.claude/settings.local.json:11-17`：按旧路径的许可 glob（`Read(.../fuse/**)`、`Bash(ls -1 fuse/)`、`Bash(./fuse/target/debug/zipfs *)`）随迁移改为 `crates/zipfs`（否则仅多几次授权提示，无功能损坏）。
 - `.gitignore:1` 注释「子目录另有更细规则：fuse/、microbench/」更新为新路径。

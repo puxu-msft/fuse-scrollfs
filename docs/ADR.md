@@ -33,7 +33,7 @@
 | D9 | 2026(定调) | **hardlink 正式不支持**（保持 `ENOTSUP`，布局 S 一文件=一 archive，无 inode-id 命名层） | 命名层成本 vs 收益不划算 | ROADMAP T1 |
 | D10 | 2026-07(实测后) | **LDM（zstd 长程匹配）保守 opt-in**：`DEFAULT_SEAL_CHUNK=8MiB` 不变，LDM 仅在 `seal --seal-chunk >8MiB` 时开 | 64MiB 档 +5~16% 兑现，但默认档收益≈0 且冷读 RMW 放大 | ROADMAP T3、提交 e9643b6/993ed72、[bench/results/ldm-ratio/REPORT.md](../bench/results/ldm-ratio/REPORT.md) |
 | D11 | 2026-06-28 | **共享字典默认关**（opt-in `--dict`/`train-dict`） | 真实路径收益次于纯大块 | ROADMAP T3、提交 96e69a9/df47794 |
-| D12 | 2026-07-11 | **Cargo workspace + crates/zipfs + zipfs-bench + exp/**；`archive.rs`/`orchestrator.rs` 拆子模块；rwfs/shadow/container/lifecycle 不拆 | PoC 转正遗留骨架现代化 | [plans/workspace-restructure.md](./plans/workspace-restructure.md)、[CHANGELOG.md](./CHANGELOG.md)（2026-07-11） |
+| D12 | 2026-07-11 | **Cargo workspace + crates/zipfs + zipfs-bench + exp/**；`archive.rs`/`orchestrator.rs` 拆子模块；rwfs/shadow/container/lifecycle 不拆 | PoC 转正遗留骨架现代化 | [plan/workspace-restructure.md](./plan/workspace-restructure.md)、[CHANGELOG.md](./CHANGELOG.md)（2026-07-11） |
 
 ## 2. 开放决策门（详情与状态在 ROADMAP）
 

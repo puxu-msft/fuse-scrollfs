@@ -71,9 +71,9 @@ docs/
 `ADR.md`→`ADR.md`、`plans/`→`plan/` 改名后需全库改引用。已知引用点：
 - `docs/README.md`（索引，多处）
 - `docs/CHANGELOG.md`、`docs/ADR.md` 自身、各编号专题里指向 `ADR.md §x` 的链接
-- `docs/plans/README.md` 及 `plans/` 内部相对链接
+- `docs/plan/README.md` 及 `plans/` 内部相对链接
 - `docs/archive/*` 内引用
-- 代码/README 里对 `docs/ADR.md`、`docs/plans/` 的引用（需 grep 全仓）
+- 代码/README 里对 `docs/ADR.md`、`docs/plan/` 的引用（需 grep 全仓）
 - memory 索引中的路径（`workspace-restructure` 等条目提到 `plans/`）
 
 ## 4b. Subagent 评审纪要（2026-07-11，两路并行：务实 + 对抗）

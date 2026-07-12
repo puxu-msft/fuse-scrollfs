@@ -44,7 +44,7 @@
 
 | 位置 | 内容 |
 |---|---|
-| [plans/](./plans/) | 各特性的实施计划 / kickoff（含已完成的历史计划，原样保留） |
+| [plan/](./plan/) | 各特性的实施计划 / kickoff（含已完成的历史计划，原样保留） |
 | [archive/](./archive/) | 归档快照：`06-defect-audit.md`（两轮缺陷审查台账）、reconcile 专项评审报告等，**冻结不改** |
 
 > 注：编号缺 `06`——原缺陷审查台账已核验闭环、移入 `archive/06-defect-audit.md`。
