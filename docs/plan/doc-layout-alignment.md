@@ -1,7 +1,8 @@
-# 文档布局对齐迁移方案（草案 · 待审查）
+# 文档布局对齐迁移方案（已执行）
 
 > 目标：把 zipfs 现有文档布局全面对齐更新后的用户级指令 `70-project-doc-mgmt.md` 推荐的扁平根布局与 ADR/ARCH/DESIGN/TRACKING/BACKLOG 职责划分。
-> 状态：草案，待 subagent 审查后执行。
+> 状态：**已执行**（用户选定「字面全面对齐 + 本次一并抽 CONFIG」）。两轮 subagent 评审纪要见 §4b。
+> 执行结果：`decisions.md→ADR.md`、`plans/→plan/`、新建 `ARCH.md`/`DESIGN.md`/`TRACKING.md`/`BACKLOG.md`/`CONFIG.md`、`README.md` 索引重写、`ROADMAP.md` Stretch 段收敛。ARCH/DESIGN 写实质内容非索引壳（吸收评审一致意见）。
 > 日期：2026-07-11。
 
 ## 1. 指令推荐的目标布局（扁平根）

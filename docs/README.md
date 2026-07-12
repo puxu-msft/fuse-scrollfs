@@ -1,14 +1,19 @@
 # zipfs 文档索引 / Docs Index
 
-> 按**种类**分组；编号 `00–09` 只标阅读顺序，不代表同类。想找「决定了什么」看 [ADR.md](./ADR.md)、「下一步」看 [ROADMAP.md](./ROADMAP.md)、「建成了什么」看 [CHANGELOG.md](./CHANGELOG.md)。
+> 本文是**唯一总索引入口**。顶层职责文档回答固定问题，编号专题（`00–09`）是各领域的设计/spec 领域知识，由 [ARCH.md](./ARCH.md) / [DESIGN.md](./DESIGN.md) 分别从「是什么」「怎么做」两个角度索引。
 
-## 运行文档（live，持续更新）
+## 顶层职责文档（按问题定位）
 
 | 文档 | 回答 | 状态 |
 |---|---|---|
-| [ADR.md](./ADR.md) | 决定了什么 / 为什么 / 现在还算不算数（含被推翻项） | 运行中 |
-| [ROADMAP.md](./ROADMAP.md) | 下一步做什么（T0–T4 优先级 + 开放决策门 G1–G3） | 运行中 |
+| [ARCH.md](./ARCH.md) | 是什么 / 在哪里（当前架构骨架：组件 / 模块地图 / 数据流 / 技术栈） | 运行中 |
+| [DESIGN.md](./DESIGN.md) | 怎么做（跨模块内部设计导航 + 各专题核心契约） | 运行中 |
+| [ADR.md](./ADR.md) | 为什么 / 决定了什么 / 现在还算不算数（含被推翻项） | 运行中 |
+| [ROADMAP.md](./ROADMAP.md) | 下一步做什么（T0–T4 优先级 + 决策门 G1–G3） | 运行中 |
+| [TRACKING.md](./TRACKING.md) | 正在做什么（跨会话 WIP 指针，不镜像状态） | 运行中 |
+| [BACKLOG.md](./BACKLOG.md) | 推迟做什么（搁置 / 门控 / 研究） | 运行中 |
 | [CHANGELOG.md](./CHANGELOG.md) | 建成了什么、何时（实现/实测进展日志） | 运行中 |
+| [CONFIG.md](./CONFIG.md) | 有哪些配置项、默认、怎么设 | 运行中 |
 
 ## 总纲与范围（intent / what）
 
@@ -18,7 +23,7 @@
 | [03-target-data-scope.md](./03-target-data-scope.md) | 目标数据范围（Tier 1 jsonl / Tier 2 file-history / 排除项） | 生效范围决策 |
 | [environment-snapshot.md](./environment-snapshot.md) | 实测环境事实（会随系统漂移，跑前 `probe-env.sh` 刷新） | 参考 |
 
-## 实现设计（how）
+## 编号专题（领域知识 / spec，由 ARCH/DESIGN 索引）
 
 | 文档 | 内容 | 状态 |
 |---|---|---|
@@ -44,7 +49,7 @@
 
 | 位置 | 内容 |
 |---|---|
-| [plan/](./plan/) | 各特性的实施计划 / kickoff（含已完成的历史计划，原样保留） |
+| [plan/](./plan/) | 各特性的实施计划 / kickoff（含已完成的历史计划，原样保留）；[plan/README.md](./plan/README.md) 有 topic↔原随机名索引 |
 | [archive/](./archive/) | 归档快照：`06-defect-audit.md`（两轮缺陷审查台账）、reconcile 专项评审报告等，**冻结不改** |
 
 > 注：编号缺 `06`——原缺陷审查台账已核验闭环、移入 `archive/06-defect-audit.md`。
