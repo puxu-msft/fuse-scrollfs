@@ -149,7 +149,10 @@ pub enum EnableAction {
     /// 字符串**（escaped `%i`，同 mount-managed），Rust 侧 unescape 回原名。
     #[command(hide = true)]
     GuardCheck {
-        #[arg(long)]
+        // 名以 `-` 开头（如 `-home-xp-src-foo`），`allow_hyphen_values` 让 clap 接受前导短横值；
+        // 缺此则 systemd `ExecCondition=... guard-check --name %i` 里 `%i` 展开成 `-...` 被 clap
+        // 当 flag 拒绝 → ExecCondition 报错 → unit 被 skip（与 MountManagedArgs.name 保持一致）。
+        #[arg(long, allow_hyphen_values = true)]
         name: String,
     },
 }

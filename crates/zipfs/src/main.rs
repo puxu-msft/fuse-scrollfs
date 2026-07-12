@@ -930,7 +930,29 @@ mod cli_tests {
     #[test]
     fn parses_enable_guard_check_hidden_subcommand() {
         // Task 12：隐藏子命令 `enable guard-check --name %i`（systemd ExecCondition 调用）。
-        // hide 只隐藏 help，仍可解析。%i 为 escaped 实例串（无前导 -）。
+        // hide 只隐藏 help，仍可解析。%i 实例串以 `-` 开头（path-encoded 项目名），故 name arg
+        // 须 `allow_hyphen_values`，否则 systemd `--name -home-...` 被 clap 当 flag 拒绝 → unit skip。
+        let cli = Cli::parse_from([
+            "zipfs",
+            "enable",
+            "guard-check",
+            "--name",
+            "-home-xp-src-foo",
+        ]);
+        match cli.command {
+            Some(Command::Enable(a)) => match a.action {
+                Some(zipfs::enable::EnableAction::GuardCheck { name }) => {
+                    assert_eq!(name, "-home-xp-src-foo");
+                }
+                _ => panic!("应解析为 EnableAction::GuardCheck"),
+            },
+            _ => panic!("应解析为 Enable 子命令"),
+        }
+    }
+
+    #[test]
+    fn parses_enable_guard_check_escaped_name() {
+        // 兼容 escaped 形态实例串（含反斜杠 `\x2d`）：clap 同样接受。
         let cli = Cli::parse_from([
             "zipfs",
             "enable",
