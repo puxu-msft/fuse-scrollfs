@@ -19,7 +19,7 @@
 | 缺陷 | 现象与位置 | 修复方向 | 状态 |
 |---|---|---|---|
 | **D-seal-drops-journal**（高） | `seal_file` 只遍历 `0..chunk_count()`，不读尾日志；未满尾块若只存在于 journal，seal 后丢失尾部、`uncompressed_size` 被算小。对照 `compact_file` 已 `read_tail()` 折叠末块。`seal.rs:133-160` vs `compact.rs:95-110` | 与 compact 对齐：seal 流式读完普通块后把 `read_tail()` 明文加入重切缓冲；加「含 journal 的 archive 经 seal 后逐字节不变」回归测试 | ✅ 已修复（含幂等缺口：目标块已达但仍有尾日志 raw 时不再跳过、`max(cur,seal)` 防降级；2 回归测试） |
-| **D-shadow-lost-session**（高） | `commit_session` 先 `sessions.remove(&ino)` 再 open updater/写块/barrier；任一步失败则已移除的 `WriteSession` 不放回，已返回应用的 RMW 写在内存层消失、无法重试。`shadow.rs:352-425` | 改「提交成功后再删」或「失败时并回且新写优先」（对齐 Container active/flushing 协议）；补 barrier 前失败的 fault test | ☐ 待做 |
+| **D-shadow-lost-session**（高） | `commit_session` 先 `sessions.remove(&ino)` 再 open updater/写块/barrier；任一步失败则已移除的 `WriteSession` 不放回，已返回应用的 RMW 写在内存层消失、无法重试。`shadow.rs:352-425` | commit 前错误与 commit 后 `up.sync()` 错误分型；前者把失败会话并回且并发新写优先，后者不并回；FaultIo 覆盖 barrier1 失败重试及 sync#3 既有语义 | ✅ 已修复 |
 | **D-journal-corrupt-no-fallback**（中高） | Reader 级联校验只验 journal 物理范围，不验每条 record 可重放；`replay_journal` 遇错只返回最近完整前缀、不报损坏，较新 SB 即使指向 CRC 坏 journal 仍被选中 → 读到截短尾块被补零成错误数据。`reader.rs:151-227`、`journal.rs:22-45` | 让 journal replay 返回「完整消费字节数/错误位置」，纳入 `load_active` 槽可用性校验 | ☐ 待做 |
 
 ## 开放决策门（待触发，详情在 ROADMAP / ADR）

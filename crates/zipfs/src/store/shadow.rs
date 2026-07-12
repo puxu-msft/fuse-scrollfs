@@ -102,6 +102,29 @@ struct WriteSession {
     head_cache: Option<(Vec<u8>, bool, u64)>,
 }
 
+impl WriteSession {
+    /// commit 前失败回滚：把旧失败会话并回当前 active 会话。当前会话是在提交 IO 期间产生的
+    /// 更新写，故同一块及其 size/truncate/head-cache 均优先；旧会话只补齐当前缺失的状态。
+    fn merge_from_failed(&mut self, failed: WriteSession) {
+        for (idx, block) in failed.dirty {
+            self.dirty.entry(idx).or_insert(block);
+        }
+        if self.truncate_to.is_none() {
+            self.truncate_to = failed.truncate_to;
+        }
+        if self.head_cache.is_none() {
+            self.head_cache = failed.head_cache;
+        }
+    }
+}
+
+/// 写会话提交失败发生在 durable commit 点之前还是之后。commit 前失败必须恢复会话；commit 后仅
+/// `up.sync()` 失败时新版本已经 durable，不得恢复会话，否则下次 fsync 会重复追加。
+enum CommitSessionError {
+    BeforeCommit(io::Error),
+    AfterCommit(io::Error),
+}
+
 /// 影子树后端（布局 S）。`backing` 为底层目录根（archive 树）。
 pub struct ShadowStore {
     backing: PathBuf,
@@ -148,11 +171,10 @@ pub struct ShadowStore {
     /// `run_mount` 用其把 shadow 后端埋点接进统一 `.prom` 出口。埋点均为无锁 `Relaxed` 自增，
     /// 不参与任何锁序、不改控制流，与死锁不变量正交（见结构体各锁注释）。
     metrics: Arc<crate::core::metrics::Metrics>,
-    /// 故障注入（docs/05 §4 / 任务 2.6，仅 test/feature）：置位则下次 `commit_session` 走 `FaultIo`
-    /// 并令末尾 `up.sync()` 返 EIO，验证「`invalidate_reader` 先于 `up.sync()`」不变量在 sync 失败时
-    /// 仍成立。
+    /// 故障注入（docs/05 §4，仅 test/feature）：非零则下次 `commit_session` 走 `FaultIo`，
+    /// 并令指定序号的 sync 返 EIO。1 = commit 内 barrier1；3 = 末尾 `up.sync()`。
     #[cfg(any(test, feature = "fault-injection"))]
-    fault_commit_sync: std::sync::atomic::AtomicBool,
+    fault_commit_sync_at: std::sync::atomic::AtomicUsize,
 }
 
 /// backing 的锁文件路径由 [`super::lock::backing_lock_path`] 统一提供（守护 open 与离线
@@ -192,7 +214,7 @@ impl ShadowStore {
             default_chunk_size,
             metrics: crate::core::metrics::Metrics::new(),
             #[cfg(any(test, feature = "fault-injection"))]
-            fault_commit_sync: std::sync::atomic::AtomicBool::new(false),
+            fault_commit_sync_at: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -350,6 +372,7 @@ impl ShadowStore {
     }
 
     /// 把某 ino 的脏会话落盘到底层 archive，并移除会话。无会话则只 fsync 文件。
+    /// 提交 IO 期间不持 `sessions` 锁；durable commit 点前失败时把会话短锁合并回表供重试。
     fn commit_session(&self, ino: Ino) -> io::Result<()> {
         let session = self.sessions.lock().remove(&ino);
         let Some(session) = session else {
@@ -365,39 +388,64 @@ impl ShadowStore {
             }
             return Ok(());
         };
-        let abs = self
-            .abs_of_ino(ino)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
 
-        // 故障注入钩子（docs/05 §4 / 任务 2.6，仅 test/feature）：用 FaultIo 重放 commit 并令末尾
-        // `up.sync()` 返 EIO，验证「invalidate_reader 先于 up.sync()」不变量在 sync 失败时仍成立。
-        // FaultIo 为内存盘面（不落真实 archive），仅检验缓存失效时序，故此分支不更新真实文件内容。
-        #[cfg(any(test, feature = "fault-injection"))]
-        if self
-            .fault_commit_sync
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            let bytes = fs::read(&abs)?;
-            let fio = crate::blockio::FaultIo::from_bytes(bytes);
-            fio.fail_sync_in(3); // commit 内 barrier1/2（sync #1/#2）+ 末尾 up.sync()（#3）失败
-            let mut up = ArchiveUpdater::from_io(fio)?;
-            return self.commit_with_updater(ino, session, &mut up);
+        let result = (|| {
+            let abs = self.abs_of_ino(ino).ok_or_else(|| {
+                CommitSessionError::BeforeCommit(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "ino 无映射",
+                ))
+            })?;
+
+            // 故障注入钩子（docs/05 §4，仅 test/feature）：用 FaultIo 重放 commit 并令指定 sync
+            // 返 EIO。FaultIo 为内存盘面（不落真实 archive），仅检验失败时的内存状态与缓存时序。
+            #[cfg(any(test, feature = "fault-injection"))]
+            {
+                let fail_sync_at = self
+                    .fault_commit_sync_at
+                    .swap(0, std::sync::atomic::Ordering::AcqRel);
+                if fail_sync_at != 0 {
+                    let bytes = fs::read(&abs).map_err(CommitSessionError::BeforeCommit)?;
+                    let fio = crate::blockio::FaultIo::from_bytes(bytes);
+                    fio.fail_sync_in(fail_sync_at);
+                    let mut up =
+                        ArchiveUpdater::from_io(fio).map_err(CommitSessionError::BeforeCommit)?;
+                    return self.commit_with_updater(ino, &session, &mut up);
+                }
+            }
+
+            let mut up = ArchiveUpdater::open(&abs).map_err(CommitSessionError::BeforeCommit)?;
+            self.commit_with_updater(ino, &session, &mut up)
+        })();
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(CommitSessionError::BeforeCommit(error)) => {
+                let mut sessions = self.sessions.lock();
+                match sessions.entry(ino) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().merge_from_failed(session);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(session);
+                    }
+                }
+                Err(error)
+            }
+            Err(CommitSessionError::AfterCommit(error)) => Err(error),
         }
-
-        let mut up = ArchiveUpdater::open(&abs)?;
-        self.commit_with_updater(ino, session, &mut up)
     }
 
     /// 把脏会话应用到 updater 并提交：截断 → 升序应用脏块 → head 缓存 → `commit` → **失效 reader
-    /// 缓存** → `up.sync()`。泛型于 `BlockIo`（生产为 `File`，任务 2.6 故障注入为 `FaultIo`）。
+    /// 缓存** → `up.sync()`。泛型于 `BlockIo`（生产为 `File`，故障注入为 `FaultIo`）。
     /// **失效点必须在 `up.sync()` 之前**：即便 sync 失败提前返回，盘上已是新版本（commit 内部 barrier
     /// 已落），缓存也不残留旧 reader（rust-review L3）。
     fn commit_with_updater<W: BlockIo>(
         &self,
         ino: Ino,
-        session: WriteSession,
+        session: &WriteSession,
         up: &mut ArchiveUpdater<W>,
-    ) -> io::Result<()> {
+    ) -> Result<(), CommitSessionError> {
         // 先截断（若有）。
         if let Some(keep_from) = session.truncate_to {
             up.truncate(keep_from, session.size);
@@ -407,14 +455,15 @@ impl ShadowStore {
         idxs.sort_unstable();
         for idx in idxs {
             let blk = &session.dirty[&idx];
-            up.set_block(idx, &blk.bytes, blk.stored_verbatim, session.size)?;
+            up.set_block(idx, &blk.bytes, blk.stored_verbatim, session.size)
+                .map_err(CommitSessionError::BeforeCommit)?;
         }
         // 本会话若更新了 head 缓存（Core 在块 0 封块时交来），写入 updater；否则 updater 沿用
         // open 时从盘上 footer 载入的既有缓存（块 0 未变时保持有效）。docs/02 §4.3。
-        if let Some((bytes, verbatim, rawlen)) = session.head_cache {
-            up.set_head_cache(bytes, verbatim, rawlen);
+        if let Some((bytes, verbatim, rawlen)) = &session.head_cache {
+            up.set_head_cache(bytes.clone(), *verbatim, *rawlen);
         }
-        up.commit()?;
+        up.commit().map_err(CommitSessionError::BeforeCommit)?;
         // 一个脏会话已真正提交（commit 内部 barrier 已落新 footer/index）。埋点放在 commit 成功之后、
         // invalidate_reader 之前——纯 Relaxed 原子自增，不改锁序、不改控制流，绝不影响
         // 「invalidate_reader 先于 up.sync()」这一 durability 不变量的相对顺序。
@@ -422,7 +471,7 @@ impl ShadowStore {
         // 底层 archive 已变更（commit 内部已 sync 落新 footer/index）。在 up.sync() 之前就失效缓存：
         // 即便随后的 sync() 失败提前返回，盘上已是新版本，缓存也不会残留旧 reader（rust-review L3）。
         self.invalidate_reader(ino);
-        up.sync()?;
+        up.sync().map_err(CommitSessionError::AfterCommit)?;
         Ok(())
     }
 
@@ -430,8 +479,15 @@ impl ShadowStore {
     /// `up.sync()` 返 EIO。`pub` 以便 feature 构建下集成测试亦可调用（与导出的 `FaultIo` 一致）。
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn fault_next_commit_sync(&self) {
-        self.fault_commit_sync
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.fault_commit_sync_at
+            .store(3, std::sync::atomic::Ordering::Release);
+    }
+
+    /// 故障注入（仅 test/feature）：令下一次 `commit_session` 的 commit barrier1 返 EIO。
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn fault_next_commit_barrier1(&self) {
+        self.fault_commit_sync_at
+            .store(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -911,6 +967,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_session_merge_preserves_newer_writes_and_fills_missing_state() {
+        let mut failed = WriteSession {
+            size: 16,
+            chunk_size: 8,
+            truncate_to: Some(2),
+            head_cache: Some((b"old-head".to_vec(), false, 8)),
+            ..WriteSession::default()
+        };
+        failed.dirty.insert(0, mk_block(b"OLD00000"));
+        failed.dirty.insert(1, mk_block(b"OLD11111"));
+
+        let mut active = WriteSession {
+            size: 24,
+            chunk_size: 8,
+            truncate_to: Some(3),
+            head_cache: Some((b"new-head".to_vec(), true, 8)),
+            ..WriteSession::default()
+        };
+        active.dirty.insert(1, mk_block(b"NEW11111"));
+        active.merge_from_failed(failed);
+
+        assert_eq!(active.size, 24, "并发新会话的 size 优先");
+        assert_eq!(active.truncate_to, Some(3), "并发新截断意图优先");
+        assert_eq!(
+            active.head_cache.as_ref().map(|h| h.0.as_slice()),
+            Some(&b"new-head"[..]),
+            "并发新 head cache 优先"
+        );
+        let block = &active.dirty[&1];
+        assert_eq!(
+            decompress(&block.bytes, Algo::Zstd, block.stored_verbatim).unwrap(),
+            b"NEW11111",
+            "同 idx 的并发新块不得被失败会话覆盖"
+        );
+        assert!(active.dirty.contains_key(&0), "失败会话独有的块必须补回");
+
+        let mut empty_active = WriteSession::default();
+        let failed = WriteSession {
+            size: 16,
+            chunk_size: 8,
+            truncate_to: Some(2),
+            head_cache: Some((b"old-head".to_vec(), false, 8)),
+            ..WriteSession::default()
+        };
+        empty_active.merge_from_failed(failed);
+        assert_eq!(empty_active.truncate_to, Some(2));
+        assert_eq!(empty_active.head_cache.unwrap().0, b"old-head");
+    }
+
     /// 经 Store API 读回某块的逻辑字节（解压）。
     fn read_plain(store: &ShadowStore, ino: u64, idx: u64) -> Option<Vec<u8>> {
         store
@@ -1114,7 +1220,41 @@ mod tests {
         );
     }
 
-    // ----- 故障注入：commit_session 的 up.sync() 失败后 reader 缓存仍失效（docs/05 §4 / 任务 2.6）-----
+    // ----- 故障注入：commit_session 各 durability 阶段失败后的会话与缓存不变量 -----
+
+    #[test]
+    fn commit_session_barrier1_failure_preserves_session_for_retry() {
+        let cs = 8u32;
+        let (store, _d, ino) = store_with_file(cs);
+
+        // 先提交 baseline A，确保失败时盘上有可辨识的旧版本。
+        store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
+        store.fsync(ino).unwrap();
+
+        // 写入 B 后令下一次 commit 的 barrier1 失败。此时旧 superblock 仍是 active，B 尚未提交。
+        store.put_block(ino, 0, mk_block(b"BBBBBBBB"), 8).unwrap();
+        store.fault_next_commit_barrier1();
+        let res = store.fsync(ino);
+        assert!(res.is_err(), "注入 barrier1 故障后 fsync 应返回 Err");
+        assert!(
+            store.sessions.lock().contains_key(&ino),
+            "commit 前失败必须保留脏会话供下次 fsync 重试"
+        );
+        assert_eq!(
+            read_plain(&store, ino, 0).as_deref(),
+            Some(&b"BBBBBBBB"[..]),
+            "失败后读路径仍应从保留的会话读到已确认写入 B"
+        );
+
+        // 不再注入故障：同一会话应可重试提交，随后读回 durable 的 B。
+        store.fsync(ino).unwrap();
+        assert!(!store.sessions.lock().contains_key(&ino));
+        assert_eq!(
+            read_plain(&store, ino, 0).as_deref(),
+            Some(&b"BBBBBBBB"[..]),
+            "重试 fsync 成功后应从 archive 读回 B"
+        );
+    }
 
     #[test]
     fn commit_session_sync_failure_still_invalidates_reader_cache_no_stale() {
@@ -1145,6 +1285,10 @@ mod tests {
         assert!(
             !store.readers.lock().contains_key(&ino),
             "sync 失败后旧 reader 缓存必已失效（invalidate 先于 up.sync）"
+        );
+        assert!(
+            !store.sessions.lock().contains_key(&ino),
+            "commit 已 durable 后的末尾 sync 失败不得恢复会话"
         );
     }
 
