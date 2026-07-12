@@ -112,7 +112,7 @@ cargo fmt --check               # clean
 
 ## §8 相关 / See Also
 
-- [04-crash-safe-commit.md](./04-crash-safe-commit.md) — 双 superblock + 尾日志（A3/B3 的格式基础）
-- [05-fault-injection-testing.md](./05-fault-injection-testing.md) — 故障注入两层架构
-- [ROADMAP.md](./ROADMAP.md) — T0–T4 路线图（本台账是其缺陷侧输入）
+- [04-crash-safe-commit.md](../04-crash-safe-commit.md) — 双 superblock + 尾日志（A3/B3 的格式基础）
+- [05-fault-injection-testing.md](../05-fault-injection-testing.md) — 故障注入两层架构
+- [ROADMAP.md](../ROADMAP.md) — T0–T4 路线图（本台账是其缺陷侧输入）
 - 第一轮 A/B/C/D：提交 `95775d3..e70bed9`
