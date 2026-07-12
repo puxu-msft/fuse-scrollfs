@@ -191,6 +191,11 @@ mod fault {
         pub fn history(&self) -> Vec<Vec<u8>> {
             self.state.lock().unwrap().history.clone()
         }
+
+        /// 当前 durable 镜像，不含尚未成功 sync 的 dirty 写。供故障测试验证 commit 点后的可读版本。
+        pub fn durable_bytes(&self) -> Vec<u8> {
+            self.state.lock().unwrap().durable.clone()
+        }
     }
 
     impl BlockIo for FaultIo {

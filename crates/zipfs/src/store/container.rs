@@ -157,8 +157,15 @@ impl Pending {
     /// commit 失败回滚：把 `flushing` 的条目并回（self=active）。**active 已有的键不覆盖**——
     /// active 是 swap 之后更新的写，优先级高于回滚的旧 flushing 内容（D1 lost-update 修复）。
     fn merge_from_flushing(&mut self, flushing: Pending) {
-        for (k, v) in flushing.blocks {
-            self.blocks.entry(k).or_insert(v);
+        for (k @ (ino, idx), v) in flushing.blocks {
+            // active 的较新 truncate 是操作序列中的后继，范围外旧块不得在失败回滚时复活。
+            if self
+                .truncations
+                .get(&ino)
+                .is_none_or(|&keep_from| idx < keep_from)
+            {
+                self.blocks.entry(k).or_insert(v);
+            }
         }
         for (k, v) in flushing.sizes {
             self.sizes.entry(k).or_insert(v);
@@ -1248,6 +1255,22 @@ mod tests {
 
     /// torn-read 自洽：构造「flushing 有块、active 无、redb 无」的中间态（swap 后未 commit），
     /// 断言 get_block 仍返回该块、block_geometry 返回正确 size（验证读路径查三层 active∪flushing∪redb）。
+    #[test]
+    fn failed_commit_merge_does_not_revive_blocks_removed_by_newer_truncate() {
+        let mut flushing = Pending::default();
+        flushing.blocks.insert((7, 3), mk_block(b"OLD-HIGH-BLOCK"));
+        flushing.sizes.insert(7, 32);
+
+        let mut active = Pending::default();
+        active.truncations.insert(7, 2);
+        active.sizes.insert(7, 16);
+        active.merge_from_flushing(flushing);
+
+        assert!(!active.blocks.contains_key(&(7, 3)));
+        assert_eq!(active.sizes.get(&7), Some(&16));
+        assert_eq!(active.truncations.get(&7), Some(&2));
+    }
+
     #[test]
     fn get_block_reads_from_flushing_buffer_mid_commit() {
         let cs = 4096u32;

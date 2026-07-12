@@ -87,7 +87,15 @@ impl InodeMap {
 }
 
 /// per-inode 写会话：累积脏块 + 当前逻辑大小 + 截断标记（写批处理，§6.1）。
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
+enum HeadCacheUpdate {
+    #[default]
+    Keep,
+    Set(Vec<u8>, bool, u64),
+    Clear,
+}
+
+#[derive(Clone, Debug, Default)]
 struct WriteSession {
     /// 脏块：idx → 压缩块。fsync 时按 idx 升序应用到 ArchiveUpdater。
     dirty: HashMap<u64, StoredBlock>,
@@ -99,23 +107,37 @@ struct WriteSession {
     truncate_to: Option<u64>,
     /// 本会话内 Core 交来的新 head 缓存（已压缩字节, verbatim, 覆盖前缀长度），发现读快路径，
     /// docs/02。None = 本会话未更新 head 缓存（提交时 ArchiveUpdater 沿用盘上既有缓存）。
-    head_cache: Option<(Vec<u8>, bool, u64)>,
+    head_cache: HeadCacheUpdate,
 }
 
 impl WriteSession {
-    /// commit 前失败回滚：把旧失败会话并回当前 active 会话。当前会话是在提交 IO 期间产生的
-    /// 更新写，故同一块及其 size/truncate/head-cache 均优先；旧会话只补齐当前缺失的状态。
-    fn merge_from_failed(&mut self, failed: WriteSession) {
-        for (idx, block) in failed.dirty {
-            self.dirty.entry(idx).or_insert(block);
+    /// commit 前失败回滚：把旧 flushing 会话并回当前 active 会话。active 是在 flushing 可见期间
+    /// 基于其逻辑几何产生的新操作，故 size 与同 idx 块优先；active 截断范围外的旧块不得复活。
+    fn merge_from_flushing(&mut self, flushing: WriteSession) {
+        let active_truncate = self.truncate_to;
+        for (idx, block) in flushing.dirty {
+            if active_truncate.is_none_or(|keep_from| idx < keep_from) {
+                self.dirty.entry(idx).or_insert(block);
+            }
         }
         if self.truncate_to.is_none() {
-            self.truncate_to = failed.truncate_to;
+            self.truncate_to = flushing.truncate_to;
         }
-        if self.head_cache.is_none() {
-            self.head_cache = failed.head_cache;
+        // HeadCacheUpdate 是操作而非可独立拼接的字段：active 显式 Set/Clear 一律优先；仅 Keep
+        // 可继承 flushing。active 改块 0 时 put_block 会转为 Clear，避免旧前缀与最终块 0 不一致。
+        if matches!(self.head_cache, HeadCacheUpdate::Keep) {
+            self.head_cache = match flushing.head_cache {
+                HeadCacheUpdate::Set(_, _, rawlen) if self.size < rawlen => HeadCacheUpdate::Clear,
+                update => update,
+            };
         }
     }
+}
+
+#[derive(Default)]
+struct SessionBuffers {
+    active: HashMap<u64, WriteSession>,
+    flushing: HashMap<u64, WriteSession>,
 }
 
 /// 写会话提交失败发生在 durable commit 点之前还是之后。commit 前失败必须恢复会话；commit 后仅
@@ -142,8 +164,11 @@ pub struct ShadowStore {
     /// 调用的辅助（`rel_of`/`abs_of_ino`/`invalidate_reader` 等）只取细锁，与锁序一致。
     ns: Mutex<()>,
     inodes: Mutex<InodeMap>,
-    /// per-inode 写会话表。键为 ino，值为挂起的脏块缓冲。fsync/flush 落盘后移除。
-    sessions: Mutex<HashMap<u64, WriteSession>>,
+    /// 写会话双缓冲。active 接收新写；flushing 在 commit IO 期间继续供读路径查询。
+    sessions: Mutex<SessionBuffers>,
+    /// 串行化 archive 提交。与 sessions 分离，IO 期间不持 sessions 锁；全局锁比 per-inode 锁简单，
+    /// 并同时保护直接改 archive 的 tail journal / seal 路径不与普通 commit 交错。
+    commit_lock: Mutex<()>,
     /// per-inode 已打开的 `ArchiveReader` 缓存（性能关键，FIRST-RUN §3.2 修复）。
     ///
     /// 修复前：每次 `get_block` 都 `ArchiveReader::open`（重读尾部 footer + 全量解析索引 +
@@ -175,6 +200,10 @@ pub struct ShadowStore {
     /// 并令指定序号的 sync 返 EIO。1 = commit 内 barrier1；3 = 末尾 `up.sync()`。
     #[cfg(any(test, feature = "fault-injection"))]
     fault_commit_sync_at: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    last_fault_durable: Mutex<Option<Vec<u8>>>,
+    #[cfg(test)]
+    commit_pause: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
 /// backing 的锁文件路径由 [`super::lock::backing_lock_path`] 统一提供（守护 open 与离线
@@ -208,13 +237,18 @@ impl ShadowStore {
             _lock: lock,
             ns: Mutex::new(()),
             inodes: Mutex::new(InodeMap::new()),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(SessionBuffers::default()),
+            commit_lock: Mutex::new(()),
             readers: Mutex::new(HashMap::new()),
             reader_epoch: AtomicU64::new(0),
             default_chunk_size,
             metrics: crate::core::metrics::Metrics::new(),
             #[cfg(any(test, feature = "fault-injection"))]
             fault_commit_sync_at: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            last_fault_durable: Mutex::new(None),
+            #[cfg(test)]
+            commit_pause: Mutex::new(None),
         })
     }
 
@@ -245,11 +279,14 @@ impl ShadowStore {
             // 脏会话优先（写后读一致）。**先快照再放锁**：绝不在持 `sessions` 时调
             // `read_footer_geometry`（含 `ArchiveReader::open` 阻塞 IO）——否则每次冷元数据读都
             // 把全局 `sessions` 锁按住一次 archive 解析，饿死所有并发写者。
-            let dirty = self
-                .sessions
-                .lock()
-                .get(&ino)
-                .map(|s| (s.size, s.chunk_size));
+            let dirty = {
+                let sessions = self.sessions.lock();
+                sessions
+                    .active
+                    .get(&ino)
+                    .or_else(|| sessions.flushing.get(&ino))
+                    .map(|s| (s.size, s.chunk_size))
+            };
             match dirty {
                 Some(geom) => geom,
                 None => read_footer_geometry(abs)
@@ -273,36 +310,6 @@ impl ShadowStore {
         }
     }
 
-    /// 确保某 ino 有写会话，没有则从 archive footer 初始化（懒建）。返回该会话的可变借用守卫。
-    /// 一般经 [`Self::with_session`] 的慢路径调用（`abs` 由调用方在锁 `sessions` **之前**算好传入）。
-    ///
-    /// **锁序纪律（死锁根治）**：本函数**不再自取 `inodes` 锁**——`abs` 由调用方在锁 `sessions`
-    /// **之前**算好传入。否则「持 `sessions` 经 `abs_of_ino→rel_of` 取 `inodes`」会与 `unlink`
-    /// 的「持 `inodes` 取 `sessions`」构成 AB-BA 死锁（`inodes` 是所有 lookup/getattr/readdir 必经，
-    /// 锁死即整挂载 wedge）。不变量：**绝不同时持有两把 store 锁**（`inodes`/`sessions`/`readers`）。
-    fn ensure_session<'a>(
-        &self,
-        ino: Ino,
-        sessions: &'a mut HashMap<u64, WriteSession>,
-        abs: &Path,
-    ) -> &'a mut WriteSession {
-        use std::collections::hash_map::Entry;
-        match sessions.entry(ino) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(slot) => {
-                let (size, chunk_size) =
-                    read_footer_geometry(abs).unwrap_or((0, self.default_chunk_size));
-                slot.insert(WriteSession {
-                    dirty: HashMap::new(),
-                    size,
-                    chunk_size,
-                    truncate_to: None,
-                    head_cache: None,
-                })
-            }
-        }
-    }
-
     /// 取 `ino` 写会话的可变引用并执行 `f`，返回其结果。**双检懒建**（性能）：会话已存在——
     /// 即热路径主体（文件首次写后会话一直在，直到 fsync/commit 清空）——时只锁一次 `sessions`，
     /// **不碰 `inodes`、不算 `abs`、不堆分配**；仅首次写（Vacant）才付 `abs`：放 `sessions` 后取
@@ -315,7 +322,7 @@ impl ShadowStore {
         // 快路径：会话已存在，单锁 sessions，零 inodes 流量、零分配。
         {
             let mut sessions = self.sessions.lock();
-            if let Some(s) = sessions.get_mut(&ino) {
+            if let Some(s) = sessions.active.get_mut(&ino) {
                 return Ok(f(s));
             }
         }
@@ -324,8 +331,30 @@ impl ShadowStore {
             .abs_of_ino(ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
         let mut sessions = self.sessions.lock();
-        let s = self.ensure_session(ino, &mut sessions, &abs);
-        Ok(f(s))
+        if !sessions.active.contains_key(&ino) {
+            let session = sessions.flushing.get(&ino).cloned().unwrap_or_else(|| {
+                let (size, chunk_size) =
+                    read_footer_geometry(&abs).unwrap_or((0, self.default_chunk_size));
+                WriteSession {
+                    size,
+                    chunk_size,
+                    ..WriteSession::default()
+                }
+            });
+            sessions.active.insert(
+                ino,
+                WriteSession {
+                    // flushing 已由三层读路径提供旧块；active 只记录更新操作，避免失败合并时
+                    // 把复制的旧状态误判成新写。但几何必须继承 flushing，保证 new_size 基于最新状态。
+                    dirty: HashMap::new(),
+                    size: session.size,
+                    chunk_size: session.chunk_size,
+                    truncate_to: None,
+                    head_cache: HeadCacheUpdate::Keep,
+                },
+            );
+        }
+        Ok(f(sessions.active.get_mut(&ino).expect("active 已插入")))
     }
 
     /// 取该 ino 的缓存 `ArchiveReader`；未缓存则打开+解析一次并存入。`NotFound`（文件不存在）
@@ -371,23 +400,32 @@ impl ShadowStore {
         self.readers.lock().remove(&ino);
     }
 
-    /// 把某 ino 的脏会话落盘到底层 archive，并移除会话。无会话则只 fsync 文件。
-    /// 提交 IO 期间不持 `sessions` 锁；durable commit 点前失败时把会话短锁合并回表供重试。
+    /// 把某 ino 的 active 会话移入 flushing 后提交。`commit_lock` 串行化 archive 修改；IO 期间
+    /// 不持 `sessions` 锁，读路径仍从 flushing 看见该代。commit 未确认时合并回 active，已确认后清除。
     fn commit_session(&self, ino: Ino) -> io::Result<()> {
-        let session = self.sessions.lock().remove(&ino);
-        let Some(session) = session else {
-            // 无脏数据：仍对底层文件 fsync（POSIX fsync 语义）。
-            // 注意：这条 `fs::File::open + sync_all` 是一条**独立的 durable 写点**，**有意留在
-            // `BlockIo` 接缝之外**（不经 `ArchiveUpdater`）——它不参与 archive 字节流提交协议，
-            // 故障注入归 crash-test.sh / Tier 2 覆盖，勿误以为 shadow 全部 durable 写已收口 BlockIo
-            // （docs/05 §9 / 任务 1.3）。
-            if let Some(abs) = self.abs_of_ino(ino) {
-                if let Ok(f) = fs::File::open(&abs) {
-                    f.sync_all()?;
+        let _commit_guard = self.commit_lock.lock();
+        let session = {
+            let mut sessions = self.sessions.lock();
+            let Some(session) = sessions.active.remove(&ino) else {
+                drop(sessions);
+                // 无脏数据：仍对底层文件 fsync（POSIX fsync 语义）。
+                if let Some(abs) = self.abs_of_ino(ino) {
+                    if let Ok(f) = fs::File::open(&abs) {
+                        f.sync_all()?;
+                    }
                 }
-            }
-            return Ok(());
+                return Ok(());
+            };
+            debug_assert!(!sessions.flushing.contains_key(&ino));
+            sessions.flushing.insert(ino, session.clone());
+            session
         };
+
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.commit_pause.lock().take() {
+            entered.wait();
+            resume.wait();
+        }
 
         let result = (|| {
             let abs = self.abs_of_ino(ino).ok_or_else(|| {
@@ -397,8 +435,6 @@ impl ShadowStore {
                 ))
             })?;
 
-            // 故障注入钩子（docs/05 §4，仅 test/feature）：用 FaultIo 重放 commit 并令指定 sync
-            // 返 EIO。FaultIo 为内存盘面（不落真实 archive），仅检验失败时的内存状态与缓存时序。
             #[cfg(any(test, feature = "fault-injection"))]
             {
                 let fail_sync_at = self
@@ -408,9 +444,14 @@ impl ShadowStore {
                     let bytes = fs::read(&abs).map_err(CommitSessionError::BeforeCommit)?;
                     let fio = crate::blockio::FaultIo::from_bytes(bytes);
                     fio.fail_sync_in(fail_sync_at);
-                    let mut up =
-                        ArchiveUpdater::from_io(fio).map_err(CommitSessionError::BeforeCommit)?;
-                    return self.commit_with_updater(ino, &session, &mut up);
+                    let mut up = ArchiveUpdater::from_io(fio.clone())
+                        .map_err(CommitSessionError::BeforeCommit)?;
+                    let result = self.commit_with_updater(ino, &session, &mut up);
+                    #[cfg(test)]
+                    {
+                        *self.last_fault_durable.lock() = Some(fio.durable_bytes());
+                    }
+                    return result;
                 }
             }
 
@@ -418,16 +459,20 @@ impl ShadowStore {
             self.commit_with_updater(ino, &session, &mut up)
         })();
 
+        let mut sessions = self.sessions.lock();
+        let flushing = sessions
+            .flushing
+            .remove(&ino)
+            .expect("当前提交代必须仍在 flushing");
         match result {
             Ok(()) => Ok(()),
             Err(CommitSessionError::BeforeCommit(error)) => {
-                let mut sessions = self.sessions.lock();
-                match sessions.entry(ino) {
+                match sessions.active.entry(ino) {
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        entry.get_mut().merge_from_failed(session);
+                        entry.get_mut().merge_from_flushing(flushing);
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(session);
+                        entry.insert(flushing);
                     }
                 }
                 Err(error)
@@ -460,8 +505,12 @@ impl ShadowStore {
         }
         // 本会话若更新了 head 缓存（Core 在块 0 封块时交来），写入 updater；否则 updater 沿用
         // open 时从盘上 footer 载入的既有缓存（块 0 未变时保持有效）。docs/02 §4.3。
-        if let Some((bytes, verbatim, rawlen)) = &session.head_cache {
-            up.set_head_cache(bytes.clone(), *verbatim, *rawlen);
+        match &session.head_cache {
+            HeadCacheUpdate::Keep => {}
+            HeadCacheUpdate::Set(bytes, verbatim, rawlen) => {
+                up.set_head_cache(bytes.clone(), *verbatim, *rawlen);
+            }
+            HeadCacheUpdate::Clear => up.clear_head_cache(),
         }
         up.commit().map_err(CommitSessionError::BeforeCommit)?;
         // 一个脏会话已真正提交（commit 内部 barrier 已落新 footer/index）。埋点放在 commit 成功之后、
@@ -488,6 +537,41 @@ impl ShadowStore {
     pub fn fault_next_commit_barrier1(&self) {
         self.fault_commit_sync_at
             .store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn test_pause_next_commit(&self) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *self.commit_pause.lock() = Some((entered.clone(), resume.clone()));
+        (entered, resume)
+    }
+
+    #[cfg(test)]
+    fn test_move_active_to_flushing(&self, ino: Ino) {
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .active
+            .remove(&ino)
+            .expect("测试前置：active 会话存在");
+        sessions.flushing.insert(ino, session);
+    }
+
+    #[cfg(test)]
+    fn test_fail_flushing_commit(&self, ino: Ino) {
+        let mut sessions = self.sessions.lock();
+        let flushing = sessions
+            .flushing
+            .remove(&ino)
+            .expect("测试前置：flushing 会话存在");
+        match sessions.active.entry(ino) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().merge_from_flushing(flushing);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(flushing);
+            }
+        }
     }
 }
 
@@ -572,6 +656,7 @@ impl Store for ShadowStore {
     fn unlink(&self, parent: Ino, name: &str) -> io::Result<()> {
         // ns 锁全程持有：使「remove_file → 清 sessions/readers/inodes 三表」原子（阶段 D3）。
         let _ns = self.ns.lock();
+        let _commit_guard = self.commit_lock.lock();
         let parent_rel = self
             .rel_of(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "父目录不存在"))?;
@@ -583,7 +668,11 @@ impl Store for ShadowStore {
         // `inodes` 时取 `sessions`（否则与数据路径 put_block 的 sessions→inodes 构成 AB-BA）。
         let victim = self.inodes.lock().by_path.get(&child_rel).copied();
         if let Some(ino) = victim {
-            self.sessions.lock().remove(&ino);
+            {
+                let mut sessions = self.sessions.lock();
+                sessions.active.remove(&ino);
+                sessions.flushing.remove(&ino);
+            }
             self.invalidate_reader(ino);
         }
         self.inodes.lock().remove_path(&child_rel);
@@ -606,6 +695,7 @@ impl Store for ShadowStore {
         // ns 锁全程持有：overwritten_ino 快照与 fs::rename 同临界区取得（消除快照过期），
         // 「失效 victim 三表 → rename_path」整段原子（阶段 D3）。
         let _ns = self.ns.lock();
+        let _commit_guard = self.commit_lock.lock();
         super::validate_name(old.1)?;
         super::validate_name(new.1)?;
         let old_parent_rel = self
@@ -621,7 +711,11 @@ impl Store for ShadowStore {
         let overwritten_ino = self.inodes.lock().by_path.get(&new_rel).copied();
         fs::rename(self.abs_of(&old_rel), self.abs_of(&new_rel))?;
         if let Some(victim) = overwritten_ino {
-            self.sessions.lock().remove(&victim);
+            {
+                let mut sessions = self.sessions.lock();
+                sessions.active.remove(&victim);
+                sessions.flushing.remove(&victim);
+            }
             self.invalidate_reader(victim);
             self.inodes.lock().remove_path(&new_rel);
         }
@@ -702,14 +796,17 @@ impl Store for ShadowStore {
     }
 
     fn get_block(&self, ino: Ino, idx: u64) -> io::Result<Option<StoredBlock>> {
-        // 1) read-through 脏会话。
-        if let Some(s) = self.sessions.lock().get(&ino) {
-            if let Some(blk) = s.dirty.get(&idx) {
-                return Ok(Some(blk.clone()));
-            }
-            // 会话内若已 truncate 掉该块，视作越界。
-            if let Some(keep_from) = s.truncate_to {
-                if idx >= keep_from {
+        // 1) read-through 双缓冲：active 更新优先，随后 flushing，最后 archive。
+        {
+            let sessions = self.sessions.lock();
+            for s in [sessions.active.get(&ino), sessions.flushing.get(&ino)]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(blk) = s.dirty.get(&idx) {
+                    return Ok(Some(blk.clone()));
+                }
+                if s.truncate_to.is_some_and(|keep_from| idx >= keep_from) {
                     return Ok(None);
                 }
             }
@@ -735,9 +832,16 @@ impl Store for ShadowStore {
     }
 
     fn block_geometry(&self, ino: Ino) -> Option<(u64, u32)> {
-        // 脏会话优先。
-        if let Some(s) = self.sessions.lock().get(&ino) {
-            return Some((s.size, s.chunk_size));
+        // active 优先于 flushing。
+        {
+            let sessions = self.sessions.lock();
+            if let Some(s) = sessions
+                .active
+                .get(&ino)
+                .or_else(|| sessions.flushing.get(&ino))
+            {
+                return Some((s.size, s.chunk_size));
+            }
         }
         // 经缓存 reader 取 footer 几何，避免每次 read 都重开 archive（rwfs::read_range 每读一次）。
         let reader = self.cached_reader(ino).ok().flatten()?;
@@ -751,6 +855,9 @@ impl Store for ShadowStore {
         self.with_session(ino, |s| {
             s.dirty.insert(idx, blk);
             s.size = new_size;
+            if idx == 0 {
+                s.head_cache = HeadCacheUpdate::Clear;
+            }
         })
     }
 
@@ -763,6 +870,9 @@ impl Store for ShadowStore {
                 None => keep_from,
             });
             s.size = new_size;
+            if keep_from == 0 {
+                s.head_cache = HeadCacheUpdate::Clear;
+            }
         })
     }
 
@@ -775,6 +885,7 @@ impl Store for ShadowStore {
     /// append_journal(delta) → commit_journal（不重写 index、双段 barrier）。绕开脏会话直接落盘，
     /// 故 reader 缓存随之失效（盘上 SB/journal 已变）。
     fn append_tail(&self, ino: Ino, delta: &[u8], new_size: u64) -> io::Result<()> {
+        let _commit_guard = self.commit_lock.lock();
         let abs = self
             .abs_of_ino(ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
@@ -796,6 +907,7 @@ impl Store for ShadowStore {
         blk: StoredBlock,
         new_size: u64,
     ) -> io::Result<()> {
+        let _commit_guard = self.commit_lock.lock();
         let abs = self
             .abs_of_ino(ino)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ino 无映射"))?;
@@ -815,15 +927,18 @@ impl Store for ShadowStore {
         rawlen: u64,
     ) -> io::Result<()> {
         self.with_session(ino, |s| {
-            s.head_cache = Some((stored_bytes, verbatim, rawlen));
+            s.head_cache = HeadCacheUpdate::Set(stored_bytes, verbatim, rawlen);
         })
     }
 
     fn read_head_cache(&self, ino: Ino, off: u64, len: u64) -> io::Result<Option<(Vec<u8>, bool)>> {
         // 有挂起写会话时跳过快路径：脏块 0 可能与盘上 head 缓存不一致（如块 0 刚被 RMW 尚未
         // 提交）→ 回退逐块路径（get_block read-through 脏块）。fsync 后会话移除、快路径恢复。
-        if self.sessions.lock().contains_key(&ino) {
-            return Ok(None);
+        {
+            let sessions = self.sessions.lock();
+            if sessions.active.contains_key(&ino) || sessions.flushing.contains_key(&ino) {
+                return Ok(None);
+            }
         }
         let Some(reader) = self.cached_reader(ino)? else {
             return Ok(None);
@@ -850,7 +965,7 @@ impl Store for ShadowStore {
     }
 
     fn sync_all(&self) -> io::Result<()> {
-        let inos: Vec<u64> = self.sessions.lock().keys().copied().collect();
+        let inos: Vec<u64> = self.sessions.lock().active.keys().copied().collect();
         for ino in inos {
             self.commit_session(ino)?;
         }
@@ -973,7 +1088,7 @@ mod tests {
             size: 16,
             chunk_size: 8,
             truncate_to: Some(2),
-            head_cache: Some((b"old-head".to_vec(), false, 8)),
+            head_cache: HeadCacheUpdate::Set(b"old-head".to_vec(), false, 8),
             ..WriteSession::default()
         };
         failed.dirty.insert(0, mk_block(b"OLD00000"));
@@ -983,17 +1098,16 @@ mod tests {
             size: 24,
             chunk_size: 8,
             truncate_to: Some(3),
-            head_cache: Some((b"new-head".to_vec(), true, 8)),
+            head_cache: HeadCacheUpdate::Set(b"new-head".to_vec(), true, 8),
             ..WriteSession::default()
         };
         active.dirty.insert(1, mk_block(b"NEW11111"));
-        active.merge_from_failed(failed);
+        active.merge_from_flushing(failed);
 
         assert_eq!(active.size, 24, "并发新会话的 size 优先");
         assert_eq!(active.truncate_to, Some(3), "并发新截断意图优先");
-        assert_eq!(
-            active.head_cache.as_ref().map(|h| h.0.as_slice()),
-            Some(&b"new-head"[..]),
+        assert!(
+            matches!(&active.head_cache, HeadCacheUpdate::Set(bytes, true, 8) if bytes == b"new-head"),
             "并发新 head cache 优先"
         );
         let block = &active.dirty[&1];
@@ -1004,17 +1118,147 @@ mod tests {
         );
         assert!(active.dirty.contains_key(&0), "失败会话独有的块必须补回");
 
-        let mut empty_active = WriteSession::default();
+        let mut empty_active = WriteSession {
+            size: 16,
+            chunk_size: 8,
+            ..WriteSession::default()
+        };
         let failed = WriteSession {
             size: 16,
             chunk_size: 8,
             truncate_to: Some(2),
-            head_cache: Some((b"old-head".to_vec(), false, 8)),
+            head_cache: HeadCacheUpdate::Set(b"old-head".to_vec(), false, 8),
             ..WriteSession::default()
         };
-        empty_active.merge_from_failed(failed);
+        empty_active.merge_from_flushing(failed);
         assert_eq!(empty_active.truncate_to, Some(2));
-        assert_eq!(empty_active.head_cache.unwrap().0, b"old-head");
+        assert!(matches!(
+            empty_active.head_cache,
+            HeadCacheUpdate::Set(bytes, false, 8) if bytes == b"old-head"
+        ));
+    }
+
+    #[test]
+    fn concurrent_fsync_waits_while_first_commit_is_in_flushing_io() {
+        let cs = 8u32;
+        let (store, _d, ino) = store_with_file(cs);
+        let store = Arc::new(store);
+        store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
+        let (entered, resume) = store.test_pause_next_commit();
+
+        let first = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.fsync(ino))
+        };
+        entered.wait();
+        assert!(store.sessions.lock().flushing.contains_key(&ino));
+        assert_eq!(
+            read_plain(&store, ino, 0).as_deref(),
+            Some(&b"AAAAAAAA"[..])
+        );
+
+        store.put_block(ino, 0, mk_block(b"BBBBBBBB"), 8).unwrap();
+        let second_started = Arc::new(std::sync::Barrier::new(2));
+        let second_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second = {
+            let store = Arc::clone(&store);
+            let started = Arc::clone(&second_started);
+            let done = Arc::clone(&second_done);
+            std::thread::spawn(move || {
+                started.wait();
+                let result = store.fsync(ino);
+                done.store(true, std::sync::atomic::Ordering::Release);
+                result
+            })
+        };
+        second_started.wait();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !second_done.load(std::sync::atomic::Ordering::Acquire),
+            "第二个同 inode fsync 必须被 commit_lock 阻塞"
+        );
+
+        resume.wait();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        let reader = ArchiveReader::open(&store.abs_of_ino(ino).unwrap()).unwrap();
+        let (bytes, entry) = reader.read_block(0).unwrap().unwrap();
+        assert_eq!(
+            decompress(&bytes, Algo::Zstd, entry.is_verbatim()).unwrap(),
+            b"BBBBBBBB"
+        );
+    }
+
+    #[test]
+    fn flushing_interleaving_is_visible_and_failure_merge_preserves_operation_order() {
+        let cs = 8u32;
+        let (store, _d, ino) = store_with_file(cs);
+        store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
+        store.put_block(ino, 1, mk_block(b"BBBBBBBB"), 16).unwrap();
+
+        // 确定性交错 T1：提交线程已把 active 移入 flushing，但尚未开始 archive IO。
+        store.test_move_active_to_flushing(ino);
+        assert_eq!(
+            read_plain(&store, ino, 1).as_deref(),
+            Some(&b"BBBBBBBB"[..])
+        );
+        assert_eq!(store.block_geometry(ino), Some((16, cs)));
+        assert!(store.read_head_cache(ino, 0, 1).unwrap().is_none());
+
+        // T2：并发新操作基于 flushing 几何建 active，并截断掉块 1。
+        store.truncate_blocks(ino, 1, 8).unwrap();
+        // T3：另一个 fsync 会被 commit_lock 串行；这里确定性模拟 T1 commit 前失败后的协调锁合并。
+        store.test_fail_flushing_commit(ino);
+        assert!(
+            store.get_block(ino, 1).unwrap().is_none(),
+            "较新 truncate 不得复活旧高位块"
+        );
+        assert_eq!(store.block_geometry(ino), Some((8, cs)));
+        store.fsync(ino).unwrap();
+        assert!(ArchiveReader::open(&store.abs_of_ino(ino).unwrap())
+            .unwrap()
+            .read_block(1)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn failed_extension_then_active_overwrite_keeps_flushing_geometry() {
+        let cs = 8u32;
+        let (store, _d, ino) = store_with_file(cs);
+        store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
+        store.fsync(ino).unwrap();
+        store.put_block(ino, 1, mk_block(b"BBBBBBBB"), 16).unwrap();
+        store.test_move_active_to_flushing(ino);
+
+        // active 首次建立必须继承 flushing size=16，而不是旧 archive size=8。
+        store.put_block(ino, 0, mk_block(b"ZZZZZZZZ"), 16).unwrap();
+        store.test_fail_flushing_commit(ino);
+        assert_eq!(store.block_geometry(ino), Some((16, cs)));
+        store.fsync(ino).unwrap();
+        let reader = ArchiveReader::open(&store.abs_of_ino(ino).unwrap()).unwrap();
+        assert_eq!(reader.footer().uncompressed_size, 16);
+        assert!(reader.read_block(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn active_block0_overwrite_clears_flushing_head_cache() {
+        let mut flushing = WriteSession {
+            size: 16,
+            chunk_size: 8,
+            head_cache: HeadCacheUpdate::Set(b"OLD-HEAD".to_vec(), true, 8),
+            ..WriteSession::default()
+        };
+        flushing.dirty.insert(0, mk_block(b"OLD00000"));
+        let mut active = WriteSession {
+            size: 16,
+            chunk_size: 8,
+            head_cache: HeadCacheUpdate::Clear,
+            ..WriteSession::default()
+        };
+        active.dirty.insert(0, mk_block(b"NEW00000"));
+        active.merge_from_flushing(flushing);
+        assert!(matches!(active.head_cache, HeadCacheUpdate::Clear));
     }
 
     /// 经 Store API 读回某块的逻辑字节（解压）。
@@ -1227,9 +1471,15 @@ mod tests {
         let cs = 8u32;
         let (store, _d, ino) = store_with_file(cs);
 
-        // 先提交 baseline A，确保失败时盘上有可辨识的旧版本。
+        // 先提交并读取 baseline A，建立可辨识的旧版本和 reader cache。
         store.put_block(ino, 0, mk_block(b"AAAAAAAA"), 8).unwrap();
         store.fsync(ino).unwrap();
+        assert_eq!(
+            read_plain(&store, ino, 0).as_deref(),
+            Some(&b"AAAAAAAA"[..])
+        );
+        assert!(store.readers.lock().contains_key(&ino));
+        let abs = store.abs_of_ino(ino).unwrap();
 
         // 写入 B 后令下一次 commit 的 barrier1 失败。此时旧 superblock 仍是 active，B 尚未提交。
         store.put_block(ino, 0, mk_block(b"BBBBBBBB"), 8).unwrap();
@@ -1237,7 +1487,7 @@ mod tests {
         let res = store.fsync(ino);
         assert!(res.is_err(), "注入 barrier1 故障后 fsync 应返回 Err");
         assert!(
-            store.sessions.lock().contains_key(&ino),
+            store.sessions.lock().active.contains_key(&ino),
             "commit 前失败必须保留脏会话供下次 fsync 重试"
         );
         assert_eq!(
@@ -1245,14 +1495,27 @@ mod tests {
             Some(&b"BBBBBBBB"[..]),
             "失败后读路径仍应从保留的会话读到已确认写入 B"
         );
-
-        // 不再注入故障：同一会话应可重试提交，随后读回 durable 的 B。
-        store.fsync(ino).unwrap();
-        assert!(!store.sessions.lock().contains_key(&ino));
+        assert!(
+            store.readers.lock().contains_key(&ino),
+            "barrier1 失败不得失效旧 reader"
+        );
+        let disk = ArchiveReader::open(&abs).unwrap();
+        let (bytes, entry) = disk.read_block(0).unwrap().unwrap();
         assert_eq!(
-            read_plain(&store, ino, 0).as_deref(),
-            Some(&b"BBBBBBBB"[..]),
-            "重试 fsync 成功后应从 archive 读回 B"
+            decompress(&bytes, Algo::Zstd, entry.is_verbatim()).unwrap(),
+            b"AAAAAAAA",
+            "barrier1 失败后真实 archive 必须仍是 A"
+        );
+
+        // 不再注入故障：同一会话应可重试提交，随后直接从 archive 读回 durable 的 B。
+        store.fsync(ino).unwrap();
+        assert!(!store.sessions.lock().active.contains_key(&ino));
+        let disk = ArchiveReader::open(&abs).unwrap();
+        let (bytes, entry) = disk.read_block(0).unwrap().unwrap();
+        assert_eq!(
+            decompress(&bytes, Algo::Zstd, entry.is_verbatim()).unwrap(),
+            b"BBBBBBBB",
+            "重试 fsync 成功后真实 archive 应 durable 为 B"
         );
     }
 
@@ -1287,8 +1550,18 @@ mod tests {
             "sync 失败后旧 reader 缓存必已失效（invalidate 先于 up.sync）"
         );
         assert!(
-            !store.sessions.lock().contains_key(&ino),
+            !store.sessions.lock().active.contains_key(&ino),
             "commit 已 durable 后的末尾 sync 失败不得恢复会话"
+        );
+        let durable = store.last_fault_durable.lock().take().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), durable).unwrap();
+        let reader = ArchiveReader::open(tmp.path()).unwrap();
+        let (bytes, entry) = reader.read_block(0).unwrap().unwrap();
+        assert_eq!(
+            decompress(&bytes, Algo::Zstd, entry.is_verbatim()).unwrap(),
+            b"ZZZZZZZZ",
+            "sync#3 失败时 FaultIo durable 版本必须已是 Z"
         );
     }
 
@@ -1612,7 +1885,7 @@ mod tests {
             // 残存映射项对应的 ino 不应留有孤儿写会话（被清/被覆盖的 ino 不得悬挂在 sessions）。
             let live: std::collections::HashSet<u64> =
                 store.inodes.lock().by_ino.keys().copied().collect();
-            let sess: Vec<u64> = store.sessions.lock().keys().copied().collect();
+            let sess: Vec<u64> = store.sessions.lock().active.keys().copied().collect();
             for ino in sess {
                 assert!(
                     live.contains(&ino),

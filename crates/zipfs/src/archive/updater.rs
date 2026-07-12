@@ -188,6 +188,12 @@ impl<W: BlockIo> ArchiveUpdater<W> {
         self.head_cache = Some((stored_bytes, verbatim, raw_len));
     }
 
+    /// 明确清除 head 缓存。用于块 0 已改变但调用方没有提供对应新缓存的提交，避免沿用旧前缀。
+    pub fn clear_head_cache(&mut self) {
+        self.head_cache = None;
+        self.committed_head_cache = None;
+    }
+
     /// 当前 head 缓存覆盖的逻辑前缀长度（无则 0）。
     pub fn head_cache_rawlen(&self) -> u64 {
         self.head_cache.as_ref().map(|(_, _, r)| *r).unwrap_or(0)
