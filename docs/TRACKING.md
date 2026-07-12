@@ -6,13 +6,13 @@
 
 ## 进行中（◐，链接回 ROADMAP 权威行）
 
-| 工作 | 现状一句 | 权威源 |
+| 工作 | 待推进（剩余动作，状态见权威源） | 权威源 |
 |---|---|---|
-| FUSE 写尾延迟优化 | 多线程派发已落地；writeback/passthrough 待 `fuser` 升级 | [ROADMAP.md](./ROADMAP.md) T2 |
-| mmap 跨 fd 并发写陈旧页 | 只读 fd 已启 mmap；写 fd 仍 direct_io，跨 fd 陈旧页待 `notify_inval` | [ROADMAP.md](./ROADMAP.md) T2 |
-| algo/chunk 自适应 | 块大小已定 1MiB + `--level` 可配；lz4 codec 仍 unimplemented、自动选择未做 | [ROADMAP.md](./ROADMAP.md) T3 |
-| 可观测性扩展 | statfs 压缩比 + sd-notify 健康已有；吞吐/比值监控待扩 | [ROADMAP.md](./ROADMAP.md) T4、[08-observability.md](./08-observability.md) |
-| enable 分层批量灌入 + 活跃会话长压测 | `zipfs enable` 切换工具已落地；分层批量策略与长压测待续 | [ROADMAP.md](./ROADMAP.md) T4 |
+| FUSE 写尾延迟优化 | 待 `fuser` 升级后接 writeback/passthrough | [ROADMAP.md](./ROADMAP.md) T2 |
+| mmap 跨 fd 并发写陈旧页 | 待 `notify_inval` | [ROADMAP.md](./ROADMAP.md) T2 |
+| algo/chunk 自适应 | lz4 codec 实现 + 自动选择 | [ROADMAP.md](./ROADMAP.md) T3 |
+| 可观测性扩展 | 吞吐/比值监控 | [ROADMAP.md](./ROADMAP.md) T4、[08-observability.md](./08-observability.md) |
+| enable 分层批量灌入 + 活跃会话长压测 | 分层批量策略 + 长压测 | [ROADMAP.md](./ROADMAP.md) T4 |
 
 ## 开放决策门（待触发，详情在 ROADMAP / ADR）
 

@@ -34,7 +34,7 @@ zipfs 是自研的 Rust FUSE 透明压缩文件系统，目标负载 = `~/.claud
 | `store/`（`container` `shadow` `lock`） | 两布局后端 + per-inode 标记锁 | [01](./01-zipfs-design.md) §6/§7 |
 | `archive/`（`format` `writer` `reader` `updater` `journal` `superblock`） | 布局 S 每文件分块包：格式、尾日志、双 superblock、head 缓存 | [04-crash-safe-commit.md](./04-crash-safe-commit.md)、[02](./02-layered-chunking.md) |
 | `seal.rs` `compact.rs` | 冷文件封存（大块重压 + LDM）、append-only 空洞压实 | [ADR.md](./ADR.md) D10 |
-| `ingest.rs` `blockio.rs` `fixture.rs` | 灌入 + 校验、可注入块 IO 接缝、测试夹具 | [05-fault-injection-testing.md](./05-fault-injection-testing.md) |
+| `ingest.rs` `blockio.rs` `fixture.rs` `bin/mkfixture.rs` | 灌入 + 校验、可注入块 IO 接缝、测试夹具 + 夹具生成工具 | [05-fault-injection-testing.md](./05-fault-injection-testing.md) |
 | `enable/`（`discovery` `lifecycle` `daemon` `systemd` `autostart` `force_umount` `hang_free` `config` `model`） | 生产化启用器：发现 / 可逆切换 / 守护 / systemd / 分档卸载 | [07-hangfree-umount.md](./07-hangfree-umount.md)、[reversible-switch-prometheus.md](./plan/reversible-switch-prometheus.md) |
 | `reconcile/`（`merge` `advisor` `guard` `record` `orchestrator/`） | 会话感知的停用期回落写重合并 | [09-session-reconcile.md](./09-session-reconcile.md) |
 

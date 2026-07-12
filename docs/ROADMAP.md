@@ -38,7 +38,7 @@
 | 方向 | 为什么 | 工作量/风险 | 状态 |
 |---|---|---|---|
 | **FUSE 写尾延迟优化** | CONSOLIDATED 指认：FUSE 三条写 p99 ms 级 vs btrfs 亚毫秒，是对内核**最大结构劣势**。方向：异步/批量 commit、writeback cache、FUSE passthrough/io_uring | 大/中 | ◐ 多线程派发（--threads，per-inode RwLock）；writeback/passthrough 待 fuser 升级 |
-| **BV 写尾抖动定位** | rand-write-64k p99 抖到 28ms，疑 redb commit/MVCC；profile 定位（曾叫停，待需要时再做） | 中 | ☐（搁置） |
+| **BV 写尾抖动定位** | rand-write-64k p99 抖到 28ms，疑 redb commit/MVCC；profile 定位（曾叫停，待需要时再做） | 中 | ☐（搁置 → [BACKLOG](./BACKLOG.md)） |
 | **读写锁粒度** | append 修复让 `read_range` 持 per-inode 写锁、读写串行；高并发读需改 RwLock/更细粒度 | 中 | ✅ per-inode RwLock（多读并发、写排他堵 torn-read） |
 | **mmap（至少只读）** | 与 `direct_io` 互斥，需定写模型后回填；overview 列为 B 核查项 | 中 | ✅ 只读 fd KEEP_CACHE 启 mmap、写 fd 仍 direct_io；跨 fd 并发写陈旧页未保证（待 notify_inval） |
 
@@ -54,7 +54,7 @@
 | **S 压实（append-only 空洞回收）** | §8.4 尾日志 raw + 旧块成空洞、文件增长；temp+rename 整文件重写回收 | 小/中 | ✅ `zipfs compact --backend shadow`（实测 16x 收缩） |
 | **编码侧 zstd `--long`/更大窗口（长程匹配）** | 冗余主在**文件内长程**、重复点常 ≫1MiB 块距，放大 LDM 窗口是逼近 18–21x 单流上限**最便宜**的杠杆；ROI 高于去重 | 中 | ✅ **机制已落地 + 真实语料已实测 + 默认已定**（提交 e9643b6/993ed72；seal >8MiB 块自动开 LDM，windowLog clamp ≤27，热路径不开、零回归）。M2 实测（[results/ldm-ratio/REPORT.md](../bench/results/ldm-ratio/REPORT.md)）：64MiB 档 LDM 净增 **+5.26%**（21.72x→22.86x），**每大 transcript +8~16%**；8MiB 默认档几乎为零（+0.07%）。**决策 C（保守）**：保持 `DEFAULT_SEAL_CHUNK=8MiB` 不变，LDM 仅在用户显式 `seal --seal-chunk >8MiB` 时 opt-in——收益兑现，零默认风险。**未采纳** A（默认 8→64MiB+LDM，本语料 -11.9% 但代价冷读 RMW 放大、且收益绑定大文件主导 backing）/ B（默认 16–32MiB）：重开 A/B 前须补冷读放大实测 |
 | **V 全局去重（内容寻址）—— 价值待证实** | 概念上跨会话共享前缀，但**实测定长块 0% 命中、同目录拼接增益仅 1.0x**，冗余主在文件内；须 CDC 且命中率未测 | 大 | ☐（G3 门控；**先做编码侧 --long**，dedup 价值由 CDC 命中率实测裁定） |
-| **BV compact 自动化** | 覆盖写产生 MVCC 膨胀，需卸载时/后台 GC 兜底 | 小/中 | ☐ |
+| **BV compact 自动化** | 覆盖写产生 MVCC 膨胀，需卸载时/后台 GC 兜底 | 小/中 | ☐ → [BACKLOG](./BACKLOG.md) |
 
 ## T4 · 生产化 / 迁移（把它真正用起来）
 
@@ -62,7 +62,7 @@
 |---|---|---|---|
 | **迁移 `~/.claude/projects`（分层）** | 目标范围已分层界定（[03-target-data-scope.md](./03-target-data-scope.md)）：**Tier 1a** projects/*.jsonl(8GB)→**1b** append 日志→**Tier 2** file-history(524MB)；plugins/已压缩类排除。灌入、校验、切换工具，可逆零丢失，活跃会话实时追加压测 | 中 | ☑ **切换工具落地** `zipfs enable`（TUI + list/apply/restore/remount/status/purge/autostart 子命令；`ingest --verify` + sidecar 提交标记使半灌可检测 + 活跃会话默认拦截 + 失败回滚到 Plain；`src/enable/`，取代旧 `bench/scripts/zipfs-*.sh`）；分层批量灌入策略与活跃会话长压测待续 |
 | **可观测性** | 守护健康、实时压缩比、append 吞吐的监控，便于长期运行排障 | 中 | ◐ statfs 显压缩比（df）+ sd-notify 健康；吞吐/比值监控待扩 |
-| **物理空间回收** | 压缩省的是逻辑量；WSL `ext4.vhdx` 物理回收需 `wsl --shutdown` + `Optimize-VHD`，需文档化/脚本化 | 小 | ☐ |
+| **物理空间回收** | 压缩省的是逻辑量；WSL `ext4.vhdx` 物理回收需 `wsl --shutdown` + `Optimize-VHD`，需文档化/脚本化 | 小 | ☐ → [BACKLOG](./BACKLOG.md) |
 
 ## 决策门汇总
 

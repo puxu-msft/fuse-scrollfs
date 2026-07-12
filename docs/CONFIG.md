@@ -21,7 +21,7 @@
 
 | 键 | 类型 | 默认 | 含义 |
 |---|---|---|---|
-| `backend` | `shadow` \| `container` | 见代码 | 后端布局（S=影子树 / V=容器） |
+| `backend` | `shadow` \| `container` | `shadow`（`model.rs` `Backend::Shadow`） | 后端布局（S=影子树 / V=容器） |
 | `chunk_size` | 字节 | `1048576`（1MiB，`DEFAULT_CHUNK_SIZE`） | 逻辑块大小，见 [ADR.md](./ADR.md) D8 |
 | `level` | i32 | `3`（`DEFAULT_ZSTD_LEVEL`） | zstd 等级（1/3/9/19） |
 | `dict` | 路径 \| 空 | 空（关） | 共享 zstd 字典（`zipfs train-dict` 产出），见 [ADR.md](./ADR.md) D11 |
@@ -42,7 +42,7 @@
 | `zipfs seal` | `--level` | `19`（`DEFAULT_SEAL_LEVEL`） | 封存 zstd 等级 |
 | 挂载/守护 | `--cache-bytes` | `134217728`（128MiB，`DEFAULT_CACHE_BYTES`） | 解压块缓存上限，见 [DESIGN.md](./DESIGN.md) §1 |
 
-> 完整命令与子命令清单以 `zipfs --help` 为准。CLI 参数详解与 enable TUI 用法见 [plan/enable-tool.md](./plan/enable-tool.md)。
+> 完整命令与子命令清单（`enable` 的 list/apply/restore/remount/status/purge/autostart 等）以 `zipfs --help` / `zipfs enable --help` 为准（权威）。enable TUI 用法与设计背景见 [plan/enable-tool.md](./plan/enable-tool.md)（非稳态计划文档，仅作背景）。
 
 ## 4. 环境变量
 

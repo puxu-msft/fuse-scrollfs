@@ -26,3 +26,4 @@
 | [hangfree-umount.md](./hangfree-umount.md) | hang-free 分档卸载 TDD 实施计划 | — |
 | [fault-injection-kickoff.md](./fault-injection-kickoff.md) | 故障注入两层测试架构 kick-off 提示词 | — |
 | [8.4b-tail-journal-kickoff.md](./8.4b-tail-journal-kickoff.md) | §8.4b 尾日志接线 kick-off 提示词 | — |
+| [doc-layout-alignment.md](./doc-layout-alignment.md) | 文档布局对齐迁移方案（本会话产出，非 Plan Mode） | — |
