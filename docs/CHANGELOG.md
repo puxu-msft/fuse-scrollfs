@@ -1,6 +1,6 @@
 # zipfs 变更日志 / CHANGELOG
 
-> **本文回答「建成了什么、何时」**——实现与实测的进展日志。设计意图见 [01-zipfs-design.md](./01-zipfs-design.md)（§1–§13 为 2026-06-27 冻结设计快照）；决策状态见 [decisions.md](./decisions.md)；下一步见 [ROADMAP.md](./ROADMAP.md)。
+> **本文回答「建成了什么、何时」**——实现与实测的进展日志。设计意图见 [01-zipfs-design.md](./01-zipfs-design.md)（§1–§13 为 2026-06-27 冻结设计快照）；决策状态见 [ADR.md](./ADR.md)；下一步见 [ROADMAP.md](./ROADMAP.md)。
 >
 > 原为 `01-zipfs-design.md` §14，2026-07-11 抽出独立，避免设计文档一身三任。以时间倒序追加。
 
@@ -48,4 +48,4 @@ crates/zipfs/src/
 - **append 优化**：[../bench/results/append-opt/REPORT.md](../bench/results/append-opt/REPORT.md) —— 尾块缓冲重压 40x↓、吞吐 BV +2.5x；fsync 抗碎片后块数/压缩比/物理体积**与 fsync 频率无关**。
 - **早期对照与修复**：[../bench/results/20260627-1641/](../bench/results/20260627-1641/) 的 `FIRST-RUN.md` / `FIXES-ADDENDUM.md`。
 
-> 后续的块大小/seal/字典/LDM/head 缓存等**空间优化的实测与决策**收敛在 [ROADMAP.md](./ROADMAP.md) T3 与 [decisions.md](./decisions.md)，不在此重复。
+> 后续的块大小/seal/字典/LDM/head 缓存等**空间优化的实测与决策**收敛在 [ROADMAP.md](./ROADMAP.md) T3 与 [ADR.md](./ADR.md)，不在此重复。

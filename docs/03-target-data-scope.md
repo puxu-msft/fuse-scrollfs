@@ -1,6 +1,6 @@
 # zipfs 目标数据范围（Target Data Scope）
 
-> 类型：范围决策（what）· 状态：**生效**（用户 2026-06-28 定，见 §4；决策台账 [decisions.md](./decisions.md) D7）。文档索引见 [README.md](./README.md)。
+> 类型：范围决策（what）· 状态：**生效**（用户 2026-06-28 定，见 §4；决策台账 [ADR.md](./ADR.md) D7）。文档索引见 [README.md](./README.md)。
 
 > 文档性质：**界定 zipfs 承载什么数据、分几期**。意图见 [00-overview.md](./00-overview.md)，实现见 [01-zipfs-design.md](./01-zipfs-design.md) 与 [02-layered-chunking.md](./02-layered-chunking.md)，路线见 [ROADMAP.md](./ROADMAP.md)。
 > 实测日期：2026-06-28（`~/.claude` 全量扫描）。

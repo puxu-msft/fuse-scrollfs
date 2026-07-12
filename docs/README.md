@@ -1,12 +1,12 @@
 # zipfs 文档索引 / Docs Index
 
-> 按**种类**分组；编号 `00–09` 只标阅读顺序，不代表同类。想找「决定了什么」看 [decisions.md](./decisions.md)、「下一步」看 [ROADMAP.md](./ROADMAP.md)、「建成了什么」看 [CHANGELOG.md](./CHANGELOG.md)。
+> 按**种类**分组；编号 `00–09` 只标阅读顺序，不代表同类。想找「决定了什么」看 [ADR.md](./ADR.md)、「下一步」看 [ROADMAP.md](./ROADMAP.md)、「建成了什么」看 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 运行文档（live，持续更新）
 
 | 文档 | 回答 | 状态 |
 |---|---|---|
-| [decisions.md](./decisions.md) | 决定了什么 / 为什么 / 现在还算不算数（含被推翻项） | 运行中 |
+| [ADR.md](./ADR.md) | 决定了什么 / 为什么 / 现在还算不算数（含被推翻项） | 运行中 |
 | [ROADMAP.md](./ROADMAP.md) | 下一步做什么（T0–T4 优先级 + 开放决策门 G1–G3） | 运行中 |
 | [CHANGELOG.md](./CHANGELOG.md) | 建成了什么、何时（实现/实测进展日志） | 运行中 |
 

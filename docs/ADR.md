@@ -1,10 +1,18 @@
-# zipfs 决策台账 / Decision Log
+# zipfs 架构决策记录 / ADR（Decision Log 形态）
 
-> **本文回答「决定了什么、为什么、现在还算不算数」**——把散落在 [00-overview.md](./00-overview.md) §9、[01-zipfs-design.md](./01-zipfs-design.md) §13、[03-target-data-scope.md](./03-target-data-scope.md) §4、[ROADMAP.md](./ROADMAP.md) 决策门里的「已定/裁决」收敛成一处运行台账。
+> **本文回答「为什么」**——决定了什么、为什么、现在还算不算数。把散落在 [00-overview.md](./00-overview.md) §9、[01-zipfs-design.md](./01-zipfs-design.md) §13、[03-target-data-scope.md](./03-target-data-scope.md) §4、[ROADMAP.md](./ROADMAP.md) 决策门里的「已定/裁决」收敛成一处运行台账。
+>
+> **形态说明**：采用 flat ledger（一行一决策）而非 adr/NNNN 一决策一文件——因本项目决策多为**工程实测裁定**（如去重 31x、字典 16x 均被实测推翻），台账形态更利于高频增补与推翻标注。语义上等同 ADR，故文件名对齐为 `ADR.md`。
+>
+> **改动约束**：源于**用户决策**的条目（如 G1–G3 布局取向、范围分层）改动需用户明确同意；源于**实测裁定**的条目可由工程复测更新，但须在 §3 留存旧结论与推翻原因。
 >
 > **职责边界（避免再造「单一信息源」冲突）**：
-> - 本文 = **决策的当前状态**（flat ledger，一行一决策）。
-> - [ROADMAP.md](./ROADMAP.md) = **下一步做什么**（T0–T4 优先级 + 开放决策门的详情）。
+> - 本文（ADR）= **为什么** / 决策的当前状态（flat ledger，一行一决策）。
+> - [ARCH.md](./ARCH.md) = **是什么 / 在哪里**（当前架构骨架视图）。
+> - [DESIGN.md](./DESIGN.md) = **怎么做**（跨模块内部设计导航）。
+> - [ROADMAP.md](./ROADMAP.md) = **下一步做什么**（T0–T4 优先级 + 开放决策门）。
+> - [TRACKING.md](./TRACKING.md) = **正在做什么**（跨会话 WIP 指针，不复制状态）。
+> - [BACKLOG.md](./BACKLOG.md) = **推迟做什么**（Stretch / 研究 / 低优先搁置）。
 > - [CHANGELOG.md](./CHANGELOG.md) = **建成了什么、何时**（实现/实测进展日志）。
 > - 编号 docs（00/01/…）= 各自领域的 intent / 设计 / spec 快照（多为冻结历史，不回改）。
 >

@@ -250,7 +250,7 @@ crates/zipfs/
 
 ## 13. 开放项与已定
 
-> **本节是 2026-06-27 设计快照里的决策。当前汇总（含后续演进与被推翻项）见运行台账 [decisions.md](./decisions.md)；开放决策门详情见 [ROADMAP.md](./ROADMAP.md)。**
+> **本节是 2026-06-27 设计快照里的决策。当前汇总（含后续演进与被推翻项）见运行台账 [ADR.md](./ADR.md)；开放决策门详情见 [ROADMAP.md](./ROADMAP.md)。**
 
 **已定（2026-06-27）**：压缩算法 = zstd 多等级 + **lz4（`lz4_flex`）对照**，`--algo` 切换；**仅 Linux/WSL 原生目录，不覆盖 `/mnt/c`**。
 
@@ -263,4 +263,4 @@ crates/zipfs/
 
 ## 14. 实现进展 → 见 CHANGELOG
 
-> 原 §14「实现与实测进展」已抽出到独立的 [CHANGELOG.md](./CHANGELOG.md)（避免设计文档兼作变更日志）。§1–§13 保留为 2026-06-27 冻结设计快照。当前决策状态见 [decisions.md](./decisions.md)，下一步见 [ROADMAP.md](./ROADMAP.md)。
+> 原 §14「实现与实测进展」已抽出到独立的 [CHANGELOG.md](./CHANGELOG.md)（避免设计文档兼作变更日志）。§1–§13 保留为 2026-06-27 冻结设计快照。当前决策状态见 [ADR.md](./ADR.md)，下一步见 [ROADMAP.md](./ROADMAP.md)。
