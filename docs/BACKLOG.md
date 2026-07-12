@@ -10,6 +10,7 @@
 |---|---|---|
 | BV 写尾抖动定位 | rand-write-64k p99 抖到 28ms，疑 redb commit/MVCC；曾叫停，待需要时再 profile | [ROADMAP.md](./ROADMAP.md) T2 |
 | BV compact 自动化 | 覆盖写产生 MVCC 膨胀，需卸载时/后台 GC 兜底；布局 V 非当前生产主路径 | [ROADMAP.md](./ROADMAP.md) T3 |
+| shadow commit_lock 等待的确定性测试 | 现「第二个 fsync 被阻塞」中间断言靠 20ms 负断言（只证明未完成、非严格证明已阻塞在 commit_lock）；欲严格证明需仅测试用「到达取锁前」钩子或把 commit 序列抽成可注入协调器。最终 archive=B 断言 + 无歧义锁结构已足够，此为测试完备性改进 | reviewer 2026-07-13 Minor |
 | 物理空间回收脚本化 | WSL `ext4.vhdx` 物理回收需 `wsl --shutdown` + `Optimize-VHD`，待文档化/脚本化 | [ROADMAP.md](./ROADMAP.md) T4 |
 
 ## 实现语义缺口（来自 2026-07-13 gpt-souls 分析，低频/非阻塞，非数据正确性）

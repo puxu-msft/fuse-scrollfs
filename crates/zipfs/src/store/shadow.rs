@@ -159,9 +159,12 @@ pub struct ShadowStore {
     /// 数据路径（get_block/put_block/lookup/getattr/readdir/append_tail/seal/flush 等 by-ino、
     /// 不改命名空间）**不取** ns，故高频 get_block 不被慢目录 syscall 串行化。
     ///
-    /// **锁序（严格遵守，防死锁）**：`ns < inodes < sessions < readers`。即持 ns 时才可再取
-    /// 细锁；任何细锁路径**不得**反过来取 ns（数据路径不取 ns，自然满足）。目录方法持 ns 期间
-    /// 调用的辅助（`rel_of`/`abs_of_ino`/`invalidate_reader` 等）只取细锁，与锁序一致。
+    /// **锁序（严格遵守，防死锁）**：`ns < commit_lock < inodes < sessions < readers`。即按此序
+    /// 获取，持前序锁时才可再取后序细锁；任何路径**不得**反向获取（如持 sessions/inodes/readers
+    /// 时再取 commit_lock，或数据路径反取 ns——数据路径不取 ns/commit_lock 之外的写路径锁，自然
+    /// 满足）。目录方法持 ns 期间调用的辅助（`rel_of`/`abs_of_ino`/`invalidate_reader` 等）只取
+    /// 后序细锁，与锁序一致。`commit_session` 取 commit_lock 后再短持 sessions 移入 flushing，
+    /// 亦符合此序。
     ns: Mutex<()>,
     inodes: Mutex<InodeMap>,
     /// 写会话双缓冲。active 接收新写；flushing 在 commit IO 期间继续供读路径查询。
