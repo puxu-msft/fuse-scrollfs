@@ -72,6 +72,4 @@
 
 ## Stretch / 研究
 
-- bcachefs / ZFS 透明压缩横向对照（内核态另一参照）。
-- 静态加密层叠加（compression-then-encryption 顺序与安全）。
-- `/mnt/c`（Windows 侧）用例——当前明确不在范围，未来若需另开。
+> 已移至 [BACKLOG.md](./BACKLOG.md)「研究 / Stretch」段。T2–T4 表内的搁置项（BV 抖动、BV compact、物理回收）保留原位以维持优先级叙事，并在 BACKLOG 单向汇总。
