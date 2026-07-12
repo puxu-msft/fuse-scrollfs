@@ -124,10 +124,15 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
         Err(_) => return Ok(None),
     };
     let cur_chunk = reader.footer().chunk_size;
-    // 幂等：已是 >= 目标块的文件无需再封（避免重复重压；相等也跳过）。
-    if cur_chunk >= seal_chunk {
+    // 先读尾日志：即使已达目标块，只要仍有未封的尾日志 raw，就必须重写以折叠它、清 journal 碎片
+    // （封存后重挂再追加的会话属正常可达状态）。tail 最多 ~cur_chunk，纳入内存峰值可接受。
+    let tail = reader.read_tail()?.unwrap_or_default();
+    // 幂等：已达目标块**且**无尾日志 raw 才跳过（避免重复重压）。
+    if cur_chunk >= seal_chunk && tail.is_empty() {
         return Ok(None);
     }
+    // 不把更大的现有块降级为较小的目标块：有效封存块取二者较大值。
+    let effective_chunk = cur_chunk.max(seal_chunk);
     let size_before = std::fs::metadata(path)?.len();
 
     // 临时文件写新 archive（同目录，便于原子 rename）。**流式封存**（rust-review H1）：逐源块解压、
@@ -135,10 +140,10 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
     // （会话日志单文件可达数百 MB～GB，全量驻留 + 重切峰值 ~2× 文件大小会 OOM）。
     let tmp = tmp_sibling(path);
     {
-        let mut writer = ArchiveWriter::create(&tmp, seal_chunk)?;
-        let seal = seal_chunk as usize;
+        let mut writer = ArchiveWriter::create(&tmp, effective_chunk)?;
+        let seal = effective_chunk as usize;
         // 封存压缩参数：>8MiB 块自动开 LDM + 更大 windowLog（已 clamp ≤27）；≤8MiB 等价 plain。
-        let params = CompressParams::sealed(level, seal_chunk);
+        let params = CompressParams::sealed(level, effective_chunk);
         let mut buf: Vec<u8> = Vec::with_capacity(seal + cur_chunk as usize);
         let nblocks = reader.chunk_count();
         for idx in 0..nblocks {
@@ -156,9 +161,7 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
         // 折叠未封尾块（尾日志 raw）：与 compact 一致。fsync/release 可能让未满尾块只以尾日志 raw
         // 存在、而非普通 chunk；若不读 read_tail() 就 seal，会丢失这段已 fsync 的尾部、且新 archive
         // 的 uncompressed_size 被按较小值重算（Bug：seal 丢尾日志）。并入缓冲后随普通块统一重切。
-        if let Some(tail) = reader.read_tail()? {
-            buf.extend_from_slice(&tail);
-        }
+        buf.extend_from_slice(&tail);
         // 并入尾日志后可能又攒满整块，再 drain 一轮。
         while buf.len() >= seal {
             let (stored, verbatim) = compress_with_params(&buf[..seal], Algo::Zstd, &params)?;
@@ -380,6 +383,73 @@ mod tests {
         );
         let got = read_whole(&store, attr.ino, attr.size);
         assert_eq!(got, expected, "seal 后读回必须含尾日志、逐字节一致");
+    }
+
+    /// 评审 Important #1 回归：已达目标块大小、但仍有尾日志 raw 的文件（封存后重挂再追加的会话），
+    /// seal 不应因幂等判断提前跳过；应折叠尾日志、清 journal 碎片，且内容逐字节不变、read_tail 变空。
+    #[test]
+    fn seal_folds_tail_even_when_chunk_already_at_target() {
+        use crate::core::wsession::WriteSession;
+        let dir = tempfile::tempdir().unwrap();
+        let cs = 1024 * 1024u32; // 目标块 == 当前块，触发幂等分支
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let params = crate::core::rmw::CodecParams {
+            algo: Algo::Zstd,
+            level: 3,
+            dict: None,
+        };
+        let mut expected = Vec::new();
+        {
+            let store = ShadowStore::open_with_chunk_size(backing.clone(), cs).unwrap();
+            let attr = Attr {
+                ino: 0,
+                size: 0,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                atime: std::time::SystemTime::UNIX_EPOCH,
+                ctime: std::time::SystemTime::UNIX_EPOCH,
+                chunk_size: cs,
+            };
+            let ino = store.create(1, "t.jsonl", attr).unwrap();
+            let mut ws = WriteSession::new(true);
+            for i in 0..200u32 {
+                let line = format!("evt {i:04} .....\n").into_bytes();
+                let off = ws.geometry(&store, ino).unwrap().0;
+                ws.write_at(&store, ino, off, &line, &params).unwrap();
+                expected.extend_from_slice(&line);
+                ws.seal(&store, ino, &params).unwrap(); // 追加尾日志 raw
+                store.fsync(ino).unwrap();
+            }
+        }
+        let path = backing.join("t.jsonl");
+        // 前置：存在非空尾日志。
+        let r = ArchiveReader::open(&path).unwrap();
+        assert!(
+            r.read_tail().unwrap().map(|t| !t.is_empty()).unwrap_or(false),
+            "前置：应存在非空尾日志"
+        );
+        drop(r);
+
+        // 目标块 == 当前块（1MiB）：修复前会因 cur_chunk >= seal_chunk 直接跳过、留下 journal 碎片。
+        let stats = seal_shadow_tree(&backing, cs, 19).unwrap();
+        assert_eq!(stats.sealed, 1, "有尾日志时不应幂等跳过：{:?}", stats.errors);
+
+        // seal 后尾日志应被折叠进普通块、read_tail 变空，内容逐字节一致。
+        let r = ArchiveReader::open(&path).unwrap();
+        assert!(
+            r.read_tail().unwrap().map(|t| t.is_empty()).unwrap_or(true),
+            "seal 后尾日志应已折叠为普通块（read_tail 空）"
+        );
+        drop(r);
+        let store = ShadowStore::open_with_chunk_size(backing.clone(), cs).unwrap();
+        let attr = store.lookup(1, "t.jsonl").unwrap();
+        assert_eq!(attr.size as usize, expected.len());
+        let got = read_whole(&store, attr.ino, attr.size);
+        assert_eq!(got, expected, "折叠尾日志后读回逐字节一致");
     }
 
     #[test]
