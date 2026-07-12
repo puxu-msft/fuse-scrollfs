@@ -153,6 +153,18 @@ fn seal_file(path: &Path, seal_chunk: u32, level: i32) -> io::Result<Option<(u64
                 buf.drain(..seal);
             }
         }
+        // 折叠未封尾块（尾日志 raw）：与 compact 一致。fsync/release 可能让未满尾块只以尾日志 raw
+        // 存在、而非普通 chunk；若不读 read_tail() 就 seal，会丢失这段已 fsync 的尾部、且新 archive
+        // 的 uncompressed_size 被按较小值重算（Bug：seal 丢尾日志）。并入缓冲后随普通块统一重切。
+        if let Some(tail) = reader.read_tail()? {
+            buf.extend_from_slice(&tail);
+        }
+        // 并入尾日志后可能又攒满整块，再 drain 一轮。
+        while buf.len() >= seal {
+            let (stored, verbatim) = compress_with_params(&buf[..seal], Algo::Zstd, &params)?;
+            writer.append_block(&stored, verbatim, seal as u64)?;
+            buf.drain(..seal);
+        }
         // 末尾不足一个 seal 块的余量（空文件则 buf 空，写 0 块 archive）。
         if !buf.is_empty() {
             let (stored, verbatim) = compress_with_params(&buf, Algo::Zstd, &params)?;
@@ -302,6 +314,72 @@ mod tests {
 
         let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
         assert_eq!(mtime, past, "seal 重写后应保留原 archive 文件 mtime");
+    }
+
+    /// Bug 回归：含尾日志（未封尾块只以 journal raw 存在）的 archive 经 seal 后必须逐字节不变。
+    /// 用 WriteSession 每行 fsync 制造尾日志 raw（未满尾块不重压、只追加 journal），再 seal，
+    /// 读回须与原始内容一致——修复前 seal 只遍历 chunk_count() 会丢掉尾日志尾部。
+    #[test]
+    fn seal_preserves_tail_journal_content() {
+        use crate::core::wsession::WriteSession;
+        let dir = tempfile::tempdir().unwrap();
+        let cs = 1024 * 1024u32; // 大尾块：400 短行远不足一块，全部滞留尾日志 raw
+        let backing = dir.path().join("backing");
+        std::fs::create_dir(&backing).unwrap();
+        let params = crate::core::rmw::CodecParams {
+            algo: Algo::Zstd,
+            level: 3,
+            dict: None,
+        };
+        let mut expected = Vec::new();
+        {
+            let store = ShadowStore::open_with_chunk_size(backing.clone(), cs).unwrap();
+            let attr = Attr {
+                ino: 0,
+                size: 0,
+                kind: fuser::FileType::RegularFile,
+                perm: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+                atime: std::time::SystemTime::UNIX_EPOCH,
+                ctime: std::time::SystemTime::UNIX_EPOCH,
+                chunk_size: cs,
+            };
+            let ino = store.create(1, "t.jsonl", attr).unwrap();
+            let mut ws = WriteSession::new(true);
+            for i in 0..400u32 {
+                let line = format!("line {i:04} payload............\n").into_bytes();
+                let off = ws.geometry(&store, ino).unwrap().0;
+                ws.write_at(&store, ino, off, &line, &params).unwrap();
+                expected.extend_from_slice(&line);
+                ws.seal(&store, ino, &params).unwrap(); // 每行 fsync → 追加尾日志 raw
+                store.fsync(ino).unwrap();
+            }
+        }
+        // 前置：确认尾日志确实非空（否则测试无意义）。
+        let path = backing.join("t.jsonl");
+        let r = ArchiveReader::open(&path).unwrap();
+        assert!(
+            r.read_tail().unwrap().map(|t| !t.is_empty()).unwrap_or(false),
+            "前置：seal 前 archive 应存在非空尾日志"
+        );
+        drop(r);
+
+        // 封存到 4MiB 块（> 1MiB，触发）。
+        let stats = seal_shadow_tree(&backing, 4 * 1024 * 1024, 19).unwrap();
+        assert_eq!(stats.sealed, 1, "应封存 1 个文件：{:?}", stats.errors);
+
+        // 读回：seal 后尾日志内容必须并入普通块、逐字节一致。
+        let store = ShadowStore::open_with_chunk_size(backing.clone(), cs).unwrap();
+        let attr = store.lookup(1, "t.jsonl").unwrap();
+        assert_eq!(
+            attr.size as usize,
+            expected.len(),
+            "seal 后逻辑大小须含尾日志（修复前会被算小）"
+        );
+        let got = read_whole(&store, attr.ino, attr.size);
+        assert_eq!(got, expected, "seal 后读回必须含尾日志、逐字节一致");
     }
 
     #[test]
