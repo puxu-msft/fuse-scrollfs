@@ -15,7 +15,7 @@
 | [corruption-fix.md](./corruption-fix.md) | 数据损坏事故根因修复（TDD，A+B+C+D） | `cheeky-hatching-clock` |
 | [corruption-fix-handoff.md](./corruption-fix-handoff.md) | 上者的会话交接文档（已完成，留档） | `cheeky-hatching-clock-handoff` |
 | [concurrency-remediation.md](./concurrency-remediation.md) | 并发正确性整改（D1-D6） | `peppy-waddling-raven` |
-| [enable-tool.md](./enable-tool.md) | `zipfs enable` 透明压缩启用器 TUI | `sequential-juggling-leaf` |
+| [enable-tool.md](./enable-tool.md) | `scrollz enable` 透明压缩启用器 TUI | `sequential-juggling-leaf` |
 | [enable-probe-hardening.md](./enable-probe-hardening.md) | enable 探测层加固（熔断缓存 + 三态健康 + 探测编排反转） | `abundant-stargazing-mango` |
 | [decompress-cache.md](./decompress-cache.md) | 压力感知解压块缓存 + release profile 调优 | `rosy-puzzling-karp` |
 | [reversible-switch-prometheus.md](./reversible-switch-prometheus.md) | T4 可逆切换 + Prometheus 监控 + writeback | `polymorphic-wishing-shell` |

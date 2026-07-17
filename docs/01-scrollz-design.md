@@ -1,4 +1,4 @@
-# zipfs 实现设计：自研 Rust FUSE 透明压缩文件系统（两种磁盘布局）
+# scrollz 实现设计：自研 Rust FUSE 透明压缩文件系统（两种磁盘布局）
 
 > 文档性质：**实现设计（how）**。意图与对照框架见 [00-overview.md](./00-overview.md)，实测环境见 [environment-snapshot.md](./environment-snapshot.md)。
 > 日期：2026-06-27。状态：设计草案，待 architect 审查 + 首轮验证。
@@ -16,7 +16,7 @@ Rust 无成熟读写透明压缩 FUSE 成品（见 overview §6），故**自研
 
 ### 1.1 目标工作负载（驱动设计，实测 2026-06-27）
 
-最终目标之一：用 zipfs 承载 **`~/.claude/projects`** 的会话 transcript。**目标数据范围已正式分层界定**（见 [03-target-data-scope.md](./03-target-data-scope.md)）：**首要 = `projects/*.jsonl` + append 日志**（8 GB 的 append-only 可压缩核心）；**后续 = `file-history`**（524 MB）；**排除 = plugins（1.8 GB 可重装代码）与已压缩媒体（`.pack/.png/.pdf`）**。实测画像（针对首要目标）：
+最终目标之一：用 scrollz 承载 **`~/.claude/projects`** 的会话 transcript。**目标数据范围已正式分层界定**（见 [03-target-data-scope.md](./03-target-data-scope.md)）：**首要 = `projects/*.jsonl` + append 日志**（8 GB 的 append-only 可压缩核心）；**后续 = `file-history`**（524 MB）；**排除 = plugins（1.8 GB 可重装代码）与已压缩媒体（`.pack/.png/.pdf`）**。实测画像（针对首要目标）：
 
 | 维度 | 实测 | 对设计的影响 |
 |---|---|---|
@@ -165,7 +165,7 @@ V 的定义性特征是「整棵树落到一个后端对象」，这把三件事
 - **追加路径（本负载主路径）**：尾块若满则在末尾**追加新压缩块**，重写尾部 footer（小）；尾块未满则只 RMW 尾块 + 重写 footer。**不触碰前部数据**，对 838MB 文件追加仅写增量。
 - 文件尾部 footer 含 `index_offset`，打开时先读尾部定位索引，O(1) 找到 index，无需扫全文。
 
-- **目录** = 底层真实目录。**属性来源**：mode/uid/gid/mtime **直接复用底层 inode 的 stat**，仅 `uncompressed_size` 与 `chunk_size` 放 **xattr（`user.zipfs.*`）或包头**。避免「为读属性而 open+解析每个 header」——否则 `ls -l`/`find` 在海量小文件下退化成 N 次 open，会让 BS 的元数据跑分不必要地难看（注意 ext4 xattr 大小限制，且 WSL 需确认 user xattr 已启用）。
+- **目录** = 底层真实目录。**属性来源**：mode/uid/gid/mtime **直接复用底层 inode 的 stat**，仅 `uncompressed_size` 与 `chunk_size` 放 **xattr（`user.scrollz.*`）或包头**。避免「为读属性而 open+解析每个 header」——否则 `ls -l`/`find` 在海量小文件下退化成 N 次 open，会让 BS 的元数据跑分不必要地难看（注意 ext4 xattr 大小限制，且 WSL 需确认 user xattr 已启用）。
 - **名字映射**：逻辑 `/a/b.txt` ↔ 后端 `BACKING/a/b.txt`（1:1）。须定义：超过 ext4 255 字节文件名、含特殊字节的逻辑名如何编码（建议对非法/超长名做可逆编码）。
 - **hardlink**：「逻辑路径=后端路径」模型天然无法表达「一份数据两个名字」。**首版 `link` 返回 `ENOTSUP`** 并在 P4 文档化（`cp -al`/git 会触发）；若日后要支持需引入 inode-id 命名 + 目录项表，会让 S 退化成「半个 V」，权衡后再定。
 - **特殊条目三分决策**（`enable` 迁移落地后定，shadow 布局）：
@@ -201,8 +201,8 @@ V 的定义性特征是「整棵树落到一个后端对象」，这把三件事
 | C0 | 裸 ext4 | 吞吐地板 |
 | A | btrfs + zstd:{1,3,9,15} | 内核态参照 |
 | B0 | `fuser` 透传（不压缩） | 隔离纯 FUSE 税 |
-| **BV** | zipfs 布局 V（容器） | 自研对照项之一 |
-| **BS** | zipfs 布局 S（影子树） | 自研对照项之二 |
+| **BV** | scrollz 布局 V（容器） | 自研对照项之一 |
+| **BS** | scrollz 布局 S（影子树） | 自研对照项之二 |
 | B2 | `fuse-zstd`（整文件不分块） | 消融参照：BS vs B2 = 分块 vs 整文件 |
 
 `CHUNK_SIZE` 与 zstd 等级扫描同时施加于 BV/BS。**BV vs BS 是核心实验**；BS vs B2 验证「分块的价值」。
@@ -214,10 +214,10 @@ V 的定义性特征是「整棵树落到一个后端对象」，这把三件事
 - 正确性优先于性能：先正确再优化 RMW/空闲位。
 - **物理占用 / 压缩比口径（两布局不同，须标注）**：V 的容器文件含 redb MVCC 未回收页与预分配，应取**compact/reclaim 后的容器大小**；S 受 ext4 4KiB 最小块向上取整影响，用 `du`（含 block 取整）。两者口径不同会给压缩比带来系统性偏差，报告须分别声明。
 
-## 11. 模块布局（`crates/zipfs/`）
+## 11. 模块布局（`crates/scrollz/`）
 
 ```text
-crates/zipfs/
+crates/scrollz/
 ├── Cargo.toml          # fuser, zstd, lz4_flex, redb(可选), rusqlite(可选), clap
 └── src/
     ├── main.rs         # 挂载 + 参数：--backend {container|shadow} --chunk-size --algo --level

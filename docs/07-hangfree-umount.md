@@ -2,11 +2,11 @@
 
 > 类型：特性设计（how）· 状态：**已实现**（clean/lazy/abort/auto 分档卸载已合入 main）。文档索引见 [README.md](./README.md)。
 
-> 设计文档。目标：把 zipfs 的卸载做成**不会被死/卡 daemon 拖住的分档升级梯**，用户按需选择档位，systemd 默认自动升级，正常关闭仍走会 flush 的耐久路径。
+> 设计文档。目标：把 scrollz 的卸载做成**不会被死/卡 daemon 拖住的分档升级梯**，用户按需选择档位，systemd 默认自动升级，正常关闭仍走会 flush 的耐久路径。
 
 ## 1. 背景与触发
 
-一次真实事故：`zipfs@-home-xp-src-neighbors.service` 的守护被 `SIGTERM` 杀死，但 `ExecStop`（`zipfs umount-managed`）退出码 1 失败，留下一个**陈旧 FUSE 挂载**。任何进程（如 Claude 读该项目目录）访问该挂载点即在不可中断 I/O 上 hang。人工用 `fusermount -uz` 才摘除。
+一次真实事故：`scrollz@-home-xp-src-neighbors.service` 的守护被 `SIGTERM` 杀死，但 `ExecStop`（`scrollz umount-managed`）退出码 1 失败，留下一个**陈旧 FUSE 挂载**。任何进程（如 Claude 读该项目目录）访问该挂载点即在不可中断 I/O 上 hang。人工用 `fusermount -uz` 才摘除。
 
 ### 1.1 根因（经代码核对，纠正初判）
 
@@ -31,7 +31,7 @@
 - 提供**用户可选的卸载档位**：从耐久（会 flush）到强制（与 daemon 存活彻底解耦）。
 - 卸载引擎自身**永不 hang**：所有可能阻塞的步骤（外部 `fusermount`、`canonicalize`）均有超时上界。
 - systemd `ExecStop` 默认走**自动升级**：正常关闭耐久，卡死场景自动升级到强制摘除，不再留陈旧挂载。
-- 面向用户的手动兜底命令 `zipfs umount --name <inst> --level abort`。
+- 面向用户的手动兜底命令 `scrollz umount --name <inst> --level abort`。
 
 **非目标**
 
@@ -63,7 +63,7 @@
 
 ## 4. 组件与接口
 
-### 4.1 新模块 `crates/zipfs/src/enable/force_umount.rs`
+### 4.1 新模块 `crates/scrollz/src/enable/force_umount.rs`
 
 单一职责：按档位驱动一次卸载，全程 hang-free。
 
@@ -94,7 +94,7 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 - `endpoint_ok(mountpoint) -> bool`（复用 `discovery`）：daemon 存活探测，`auto` 升 abort 的守卫（见 §3.1）。
 - `still_mounted(mountpoint) -> bool`：复用 `discovery::is_mounted`（hang-free）。
 
-### 4.2 hang-free 探测基础 `crates/zipfs/src/enable/hang_free.rs`（新模块）+ `discovery.rs` 硬化
+### 4.2 hang-free 探测基础 `crates/scrollz/src/enable/hang_free.rs`（新模块）+ `discovery.rs` 硬化
 
 新增小模块 `hang_free.rs`（单一职责，~40 行）承载通用 hang-free 原语，供 `discovery` 与 `force_umount` 共用：
 
@@ -106,24 +106,24 @@ pub fn umount(mountpoint: &Path, level: UmountLevel) -> std::io::Result<UmountRe
 - `endpoint_ok`：`with_timeout(PROBE_TIMEOUT, || symlink_metadata(path))`；`Some(Ok)`→true，`Some(Err(ENOTCONN))`→false，`None`（超时=hung）→false。
 - `canonicalized_target`：**不再对叶子 `canonicalize`**；仅 `with_timeout` 包 `canonicalize(parent)` 再拼回叶子名，超时/失败回退未规范化原路径。`is_mounted` 经它间接 hang-free；语义不变（现有 `canonicalized_target_*` 测试保持绿）。
 
-### 4.3 CLI `crates/zipfs/src/main.rs`
+### 4.3 CLI `crates/scrollz/src/main.rs`
 
-- 新增顶层子命令 `Umount(UmountArgs)`：`zipfs umount --name <inst> [--level clean|lazy|abort|auto]`（默认 `auto`）。解析实例名 → `Paths::resolve` 算挂载点 → `force_umount::umount`。面向用户。
+- 新增顶层子命令 `Umount(UmountArgs)`：`scrollz umount --name <inst> [--level clean|lazy|abort|auto]`（默认 `auto`）。解析实例名 → `Paths::resolve` 算挂载点 → `force_umount::umount`。面向用户。
 - `umount-managed`（`ExecStop` 用，内部）改为接受可选 `--level`（默认 `auto`），复用同一引擎；`run_umount_managed` 从 `RealMounter.unmount` 切到 `force_umount::umount(mp, level)`，并对错误 `.map_err` 附 `%i`/解码名上下文（与 `run_mount_managed` 一致，便于 ExecStop 失败日志定位实例）。
 - `Mounter::unmount` trait 与其 `RealMounter`/`SystemdMounter` 实现**本次不动**（仍供 lifecycle 的 restore/remount/compact/reingest/seal 调用）；见 §9 已知债务。
 
-**`--name` 约定**：与既有 `enable apply/restore/status` 一致，`zipfs umount --name` 收 **RAW project 名**（projects 目录名，如 `-home-xp-src-foo`），**不 `systemd_unescape`**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 用 `allow_hyphen_values` 让 clap 接受前导短横值。（`systemd_unescape` 对裸 `-` 有损——解成 `/`——故绝不能拿它处理 raw 名；只有 `umount-managed` 收 systemd 的 escaped `%i` 才 unescape。）
+**`--name` 约定**：与既有 `enable apply/restore/status` 一致，`scrollz umount --name` 收 **RAW project 名**（projects 目录名，如 `-home-xp-src-foo`），**不 `systemd_unescape`**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 用 `allow_hyphen_values` 让 clap 接受前导短横值。（`systemd_unescape` 对裸 `-` 有损——解成 `/`——故绝不能拿它处理 raw 名；只有 `umount-managed` 收 systemd 的 escaped `%i` 才 unescape。）
 
-**托管实例警告（C1）**：`zipfs umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop zipfs@<esc>.service`（`<esc>` 由 `systemd_escape(raw)` 反算）；`zipfs umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
+**托管实例警告（C1）**：`scrollz umount` **不** `systemctl stop`。对由 systemd 模板托管（`Restart=on-failure`）的实例，直接跑引擎与 systemd 的自动重挂可能竞态。命令输出显式提示：托管实例请优先 `systemctl --user stop scrollz@<esc>.service`（`<esc>` 由 `systemd_escape(raw)` 反算）；`scrollz umount --level abort` 仅作 systemd 也失效时的强制兜底。`umount-managed`（ExecStop 用）本就运行在 `systemctl stop` 生命周期内，直调引擎无此竞态。
 
-### 4.4 systemd 模板 `crates/zipfs/src/enable/autostart.rs`
+### 4.4 systemd 模板 `crates/scrollz/src/enable/autostart.rs`
 
 `ExecStop` 由 `{exe} umount-managed --name %i` 改为 `{exe} umount-managed --name %i --level auto`。既有单元升级：文档说明 `enable autostart install` 会重写模板（现存实例需 `systemctl --user daemon-reload` + 重装）。
 
 ## 5. 数据流
 
 ```
-zipfs umount --name X --level auto
+scrollz umount --name X --level auto
   → Paths::resolve → mountpoint(X)
   → force_umount::umount(mp, Auto)
        ├─ id = mount_connection_id(mp)                  # /proc/self/mountinfo，不碰挂载点
@@ -155,7 +155,7 @@ systemd 路径 `umount-managed --name %i --level auto` 走同一引擎。
 
 **集成（`tests/umount_levels.rs`，参照 `tests/systemd_mount.rs` 真挂载）**
 
-- 真起一个 zipfs 挂载 → `--level clean` 干净卸载成功、mountinfo 清零。
+- 真起一个 scrollz 挂载 → `--level clean` 干净卸载成功、mountinfo 清零。
 - 真挂载 → `--level lazy` 摘除、mountinfo 清零。
 - **wedge 模拟**：挂载后杀 daemon（SIGKILL）留陈旧挂载。**显式 `--level abort`** → 摘除、mountinfo 清零、`report.aborted == true`；**`auto`** → 摘除、mountinfo 清零（daemon 死后 `lazy` 通常即摘除，故 `level_reached ∈ {Lazy, Abort}`，不锁定 abort——真实事故正是 `fusermount -uz` 生效）。**helper 需新写**（现有 `mount_rw.rs`/`systemd_mount.rs` 起挂载不带 pid-file）：起挂载时传 `--pid-file <tmp>`，从中读 daemon PID 供 SIGKILL；加 skip 门控（`/dev/fuse` + fusermount + `/sys/fs/fuse/connections` 可写，对齐 `systemd_mount.rs` 的 `skip_reason`）。
 - `auto` 在健康挂载上停在 `clean`（`level_reached == Clean`，`aborted == false`）——验证正常关闭不误触 abort。
@@ -179,4 +179,4 @@ systemd 路径 `umount-managed --name %i --level auto` 走同一引擎。
 
 **并发合并点（已知）** — 另一会话在 `discovery.rs` 未提交 WIP 里独立硬化 `endpoint_ok`/`canonicalized_target` 并内联加了 `with_timeout`/`PROBE_TIMEOUT`。本分支把原语模块化到 `hang_free.rs` 并硬化同两函数；合入 main 时两函数体冲突、且可能出现两份 `with_timeout`（对方内联于 discovery、本方在 hang_free）。解冲突策略：保留 `hang_free.rs` 单份原语，删对方内联副本，两函数体取任一等价实现即可（契约一致）。这是并行重复硬化的固有冲突，非设计缺陷。
 
-**后续债务（本次不收敛）** — `Mounter::unmount`（`daemon.rs`）及 `RealMounter`/`SystemdMounter` 实现仍走**可 hang 的旧路径**（`unmount_path` 的非-lazy `fusermount -u` + `.status()` 同步等待，无超时/无 abort），被 `lifecycle.rs` 的 restore/remount/compact/reingest/seal 共 5 处调用。用户可见后果是：经 `enable restore/remount/compact/reingest/seal` 触达的 wedge 挂载仍会无限期 hang（这些路径走 `daemon.rs` 的 `unmount_path`＝非-lazy `fusermount -u` + `.status()`，无超时/无 abort），直到人工清理；本轮只修好了事故路径（systemd `ExecStop` + `zipfs umount`）。本次只修好 `ExecStop`/用户 `umount`；后续应把这些回退分支收敛到 `force_umount::umount(mp, Clean)` 消除双路径漂移。
+**后续债务（本次不收敛）** — `Mounter::unmount`（`daemon.rs`）及 `RealMounter`/`SystemdMounter` 实现仍走**可 hang 的旧路径**（`unmount_path` 的非-lazy `fusermount -u` + `.status()` 同步等待，无超时/无 abort），被 `lifecycle.rs` 的 restore/remount/compact/reingest/seal 共 5 处调用。用户可见后果是：经 `enable restore/remount/compact/reingest/seal` 触达的 wedge 挂载仍会无限期 hang（这些路径走 `daemon.rs` 的 `unmount_path`＝非-lazy `fusermount -u` + `.status()`，无超时/无 abort），直到人工清理；本轮只修好了事故路径（systemd `ExecStop` + `scrollz umount`）。本次只修好 `ExecStop`/用户 `umount`；后续应把这些回退分支收敛到 `force_umount::umount(mp, Clean)` 消除双路径漂移。

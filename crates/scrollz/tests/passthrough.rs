@@ -4,7 +4,7 @@
 //! 做 create/write/read/readdir/mkdir/unlink round-trip 校验后卸载。
 //! 若挂载失败（权限/环境），优雅跳过并打印原因，不 panic 让整个 test 套失败。
 //!
-//! 见 docs/01-zipfs-design.md §12 P0。测试通过「启动已编译的 zipfs 二进制」来挂载，
+//! 见 docs/01-scrollz-design.md §12 P0。测试通过「启动已编译的 zipfs 二进制」来挂载，
 //! 贴近真实使用路径，也避免引入 lib target。
 
 use std::fs;

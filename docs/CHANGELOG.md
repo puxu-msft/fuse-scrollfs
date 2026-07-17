@@ -1,8 +1,14 @@
-# zipfs 变更日志 / CHANGELOG
+# scrollz 变更日志 / CHANGELOG
 
-> **本文回答「建成了什么、何时」**——实现与实测的进展日志。设计意图见 [01-zipfs-design.md](./01-zipfs-design.md)（§1–§13 为 2026-06-27 冻结设计快照）；决策状态见 [ADR.md](./ADR.md)；下一步见 [ROADMAP.md](./ROADMAP.md)。
+> **本文回答「建成了什么、何时」**——实现与实测的进展日志。设计意图见 [01-scrollz-design.md](./01-scrollz-design.md)（§1–§13 为 2026-06-27 冻结设计快照）；决策状态见 [ADR.md](./ADR.md)；下一步见 [ROADMAP.md](./ROADMAP.md)。
 >
-> 原为 `01-zipfs-design.md` §14，2026-07-11 抽出独立，避免设计文档一身三任。以时间倒序追加。
+> 原为 `01-zipfs-design.md`（项目原名 zipfs）§14，2026-07-11 抽出独立，避免设计文档一身三任。以时间倒序追加。
+
+## 2026-07-18 · 项目改名为 scrollz
+
+- 项目由原名 `zipfs` 改为 `scrollz`；构建标识、CLI/FUSE 身份、Prometheus 指标、磁盘 sidecar 后缀、环境变量、systemd 托管、文档与基准脚本同步改名。
+- 归档格式魔数 `ZIPFSAR\x01` 与 `ZSB2` 为存量兼容永久冻结，不随品牌改名；详见 [ADR.md](./ADR.md) D13–D14。
+- 仓库根路径保留 `/home/xp/src/zipfs`，systemd 模板改由安装时 `current_exe()` 解析，避免把仓库路径烤入服务定义。
 
 ## 2026-07-11 · 工程骨架整改
 
@@ -18,7 +24,7 @@
 
 ## 2026-06-28 · 首批实现与实测
 
-> 「实际建成 + 实测」的进展。上文之后的设计快照见 01-zipfs-design.md §1–§13（不回改）。
+> 「实际建成 + 实测」的进展。上文之后的设计快照现为 01-scrollz-design.md §1–§13；当时项目原名 zipfs（不回改历史事实）。
 
 ### 实际模块布局（与设计 §11 计划略有出入，且早于骨架整改）
 

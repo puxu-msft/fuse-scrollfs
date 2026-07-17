@@ -1,6 +1,6 @@
 //! inode 属性 / 句柄表占位（P1+ 填充压缩相关元数据）。
 //!
-//! 设计见 docs/01-zipfs-design.md §4「FUSE 层」。inode 分配、内存 attr 缓存、打开句柄表、
+//! 设计见 docs/01-scrollz-design.md §4「FUSE 层」。inode 分配、内存 attr 缓存、打开句柄表、
 //! lookup-count / forget 延迟回收、每-inode 锁都属此层职责。
 //! P0 透传阶段在 `passthrough.rs` 内自带一份精简实现；这里保留压缩文件系统专用的
 //! 「逻辑大小 + chunk_size + chunk 索引」属性骨架，供 P1+ 的 V/S 两布局复用。
@@ -23,6 +23,6 @@ pub struct LogicalAttr {
 impl LogicalAttr {
     #[allow(unused_variables)]
     pub fn new(ino: Ino, chunk_size: u32) -> Self {
-        todo!("P1+：构造逻辑属性，见 docs/01-zipfs-design.md §4")
+        todo!("P1+：构造逻辑属性，见 docs/01-scrollz-design.md §4")
     }
 }

@@ -1,6 +1,6 @@
-# zipfs 架构决策记录 / ADR（Decision Log 形态）
+# scrollz 架构决策记录 / ADR（Decision Log 形态）
 
-> **本文回答「为什么」**——决定了什么、为什么、现在还算不算数。把散落在 [00-overview.md](./00-overview.md) §9、[01-zipfs-design.md](./01-zipfs-design.md) §13、[03-target-data-scope.md](./03-target-data-scope.md) §4、[ROADMAP.md](./ROADMAP.md) 决策门里的「已定/裁决」收敛成一处运行台账。
+> **本文回答「为什么」**——决定了什么、为什么、现在还算不算数。把散落在 [00-overview.md](./00-overview.md) §9、[01-scrollz-design.md](./01-scrollz-design.md) §13、[03-target-data-scope.md](./03-target-data-scope.md) §4、[ROADMAP.md](./ROADMAP.md) 决策门里的「已定/裁决」收敛成一处运行台账。
 >
 > **形态说明**：采用 flat ledger（一行一决策）而非 adr/NNNN 一决策一文件——因本项目决策多为**工程实测裁定**（如去重 31x、字典 16x 均被实测推翻），台账形态更利于高频增补与推翻标注。语义上等同 ADR，故文件名对齐为 `ADR.md`。
 >
@@ -34,6 +34,8 @@
 | D10 | 2026-07(实测后) | **LDM（zstd 长程匹配）保守 opt-in**：`DEFAULT_SEAL_CHUNK=8MiB` 不变，LDM 仅在 `seal --seal-chunk >8MiB` 时开 | 64MiB 档 +5~16% 兑现，但默认档收益≈0 且冷读 RMW 放大 | ROADMAP T3、提交 e9643b6/993ed72、[bench/results/ldm-ratio/REPORT.md](../bench/results/ldm-ratio/REPORT.md) |
 | D11 | 2026-06-28 | **共享字典默认关**（opt-in `--dict`/`train-dict`） | 真实路径收益次于纯大块 | ROADMAP T3、提交 96e69a9/df47794 |
 | D12 | 2026-07-11 | **Cargo workspace + crates/zipfs + zipfs-bench + exp/**；`archive.rs`/`orchestrator.rs` 拆子模块；rwfs/shadow/container/lifecycle 不拆 | PoC 转正遗留骨架现代化 | [plan/workspace-restructure.md](./plan/workspace-restructure.md)、[CHANGELOG.md](./CHANGELOG.md)（2026-07-11） |
+| D13 | 2026-07-18 | 项目由原名 `zipfs` 改名为 `scrollz`；构建/FUSE/指标/磁盘后缀/env/systemd/docs/bench 全量跟随；仓库根仍为 `/home/xp/src/zipfs`；`CLAUDE_PROJECTS` 保留；`ZIPFS_HOME` 仅兼容回落；backing 默认迁至 `~/.local/claude-scrollz` | 避免名称与通用 ZIP/文件系统概念混淆，同时以一次性一致改名消除长期双品牌；六项分叉均由用户定稿 | [scrollz-rename-plan.md](./scrollz-rename-plan.md) §0.2/§2 |
+| D14 | 2026-07-18 | 归档 `MAGIC=b"ZIPFSAR\x01"` 与 `SB_MAGIC=b"ZSB2"` 永久兼容冻结，品牌改名不得改字节 | 改魔数会使全部存量归档拒读，等价于数据不可访问 | [scrollz-rename-plan.md](./scrollz-rename-plan.md) §1.2/§2.G |
 
 ## 2. 开放决策门（详情与状态在 ROADMAP）
 

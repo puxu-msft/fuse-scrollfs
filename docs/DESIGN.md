@@ -1,4 +1,4 @@
-# zipfs 跨模块内部设计 / DESIGN
+# scrollz 跨模块内部设计 / DESIGN
 
 > **本文回答「怎么做」**——跨模块的内部机制、算法、数据模型、内部契约。随项目复杂度增长，内部机制越来越不直观，本文集中导航「机制在哪、核心契约是什么」，细节正文留在各编号专题（它们是随实现演进的领域知识文档）。
 >
@@ -8,7 +8,7 @@
 
 逻辑文件 = 定长逻辑块序列（`DEFAULT_CHUNK_SIZE=1MiB`，见 [ADR.md](./ADR.md) D8）。每块独立压缩记录压缩后长度；随机读定位覆盖块→解压→切片；随机写走 **RMW**（解压整块→打补丁→重压→写回），首尾部分块 RMW、整块覆盖跳读。不可压缩启发式：`clen >= raw*阈值` 则原样存 + flag。
 
-- 核心契约与块大小权衡：[01-zipfs-design.md](./01-zipfs-design.md) §3。
+- 核心契约与块大小权衡：[01-scrollz-design.md](./01-scrollz-design.md) §3。
 - 分层分块（head/body/tail 按访问模式分层）+ head 缓存快路径：[02-layered-chunking.md](./02-layered-chunking.md)。
 - 解压块缓存（压力感知）：[08-observability.md](./08-observability.md) 命中率指标 + [plan/decompress-cache.md](./plan/decompress-cache.md)。
 
@@ -16,7 +16,7 @@
 
 底层目录树镜像逻辑树，每个后端文件是**分块压缩包**（非单 zstd 流），索引置尾部 footer，使 append 只需末尾增量写。
 
-- 格式 / 追加路径 / footer 结构：[01-zipfs-design.md](./01-zipfs-design.md) §7。
+- 格式 / 追加路径 / footer 结构：[01-scrollz-design.md](./01-scrollz-design.md) §7。
 - **崩溃安全提交协议**（双 superblock + 不可变块 + in-archive 尾日志 + 写序 barrier）：[04-crash-safe-commit.md](./04-crash-safe-commit.md)。这是 archive 模块的核心内部契约。
 - 冷文件封存 seal（大块重压 + LDM opt-in）与 append-only 压实 compact：[ADR.md](./ADR.md) D10/D11。
 
@@ -24,7 +24,7 @@
 
 整棵树落一个后端对象，把「命名空间/元数据 + 变长 blob 存储 + 空闲管理/崩溃一致」逼进同一文件。redb 全包默认，写批处理是必备项（一次 write 回调多块合一事务，fsync/flush 才 commit）。
 
-- 三档形态 + microbench 裁决：[01-zipfs-design.md](./01-zipfs-design.md) §6、[ADR.md](./ADR.md) D6、[exp/container-backend-selection/REPORT.md](../exp/container-backend-selection/REPORT.md)。
+- 三档形态 + microbench 裁决：[01-scrollz-design.md](./01-scrollz-design.md) §6、[ADR.md](./ADR.md) D6、[exp/container-backend-selection/REPORT.md](../exp/container-backend-selection/REPORT.md)。
 
 ## 4. 并发与锁纪律（`store/lock.rs` + `core/`）
 

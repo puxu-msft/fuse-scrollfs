@@ -1,8 +1,8 @@
-# 修复 zipfs 挂载文件时间戳全为 1970
+# 修复 scrollz 挂载文件时间戳全为 1970
 
 ## Context（为什么做这个改动）
 
-在 `~/.claude/projects/-home-xp-src-neighbors`（`fuse.zipfs-shadow` 挂载）上，`ls` 显示**所有文件**的 atime/mtime/ctime 都是 `1970-01-01 08:00`（UNIX_EPOCH+08 时区），而底层原始目录 `…neighbors.zipfs-orig/` 里的真实日期（如 `2026-06-24 04:47`）完好无损。
+在 `~/.claude/projects/-home-xp-src-neighbors`（`fuse.scrollz-shadow` 挂载）上，`ls` 显示**所有文件**的 atime/mtime/ctime 都是 `1970-01-01 08:00`（UNIX_EPOCH+08 时区），而底层原始目录 `…neighbors.scrollz-orig/` 里的真实日期（如 `2026-06-24 04:47`）完好无损。
 
 根因（已实证定位，非推测）：
 
@@ -57,14 +57,14 @@
 cargo test -p <fuse-crate>           # 全套件含新增时间用例
 cargo clippy -- -D warnings && cargo fmt --check
 ```
-重挂 neighbors（或临时挂 .zipfs-orig 子集）后：
+重挂 neighbors（或临时挂 .scrollz-orig 子集）后：
 ```
 ls -la --time-style=long-iso <挂载点>    # 应显示 2026-… 真实日期，非 1970
 touch -d '2025-01-02 03:04' <挂载点>/某文件 && ls -la …   # 写回生效
 ```
-对照底层 `…neighbors.zipfs-orig/` 同名文件日期应一致。
+对照底层 `…neighbors.scrollz-orig/` 同名文件日期应一致。
 
 ## 风险
 
-- 容器 `INODE_ROW_LEN` 变更属磁盘格式演进：靠 decode 长度容忍保持对旧 V 档案**只读兼容、可逆**；新写出的档案旧版本 zipfs 无法读（向后不兼容，符合「加字段」预期）。用户部署为 shadow 后端，不受影响。
+- 容器 `INODE_ROW_LEN` 变更属磁盘格式演进：靠 decode 长度容忍保持对旧 V 档案**只读兼容、可逆**；新写出的档案旧版本 scrollz 无法读（向后不兼容，符合「加字段」预期）。用户部署为 shadow 后端，不受影响。
 - `system_time_from` 提取为共享助手时勿改 passthrough 现有行为（保持 `secs<0 → epoch`）。

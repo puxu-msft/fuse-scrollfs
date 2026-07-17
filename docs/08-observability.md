@@ -2,16 +2,16 @@
 
 > 类型：参考（可观测性）· 状态：**部分实现**（statfs 压缩比 + sd-notify；吞吐/比值监控待扩，见 ROADMAP T4）。文档索引见 [README.md](./README.md)。
 
-> zipfs 的运行时指标子系统：统一注册表、单一 Prometheus `.prom` 出口、扩展配方、指标目录、PromQL 示例，以及一条**解读教训**。
+> scrollz 的运行时指标子系统：统一注册表、单一 Prometheus `.prom` 出口、扩展配方、指标目录、PromQL 示例，以及一条**解读教训**。
 >
-> 相关：[01-zipfs-design](01-zipfs-design.md)（架构）、[02-layered-chunking](02-layered-chunking.md)（块大小与解压缓存）。
+> 相关：[01-scrollz-design](01-scrollz-design.md)（架构）、[02-layered-chunking](02-layered-chunking.md)（块大小与解压缓存）。
 
 ## 1. 开关与采集
 
 指标默认**不输出**。挂载时给 `--metrics-file <path>` 即启用：一个后台线程每 **15s** 把全部指标以 **Prometheus text 格式**原子写入该文件（写 `<path>.prom.tmp` 后 `rename`，避免采集方读到半截）。
 
 ```bash
-zipfs --backend shadow --backing <dir> --mountpoint <mnt> --metrics-file /run/zipfs/m.prom
+scrollz --backend shadow --backing <dir> --mountpoint <mnt> --metrics-file /run/scrollz/m.prom
 ```
 
 用 Prometheus 的 **node_exporter textfile collector**（或 grok_exporter 等）抓这个文件即可。`enable`（systemd 托管）路径经 sidecar meta 透传 `metrics_file`，守护重启后仍生效。
@@ -24,10 +24,10 @@ zipfs --backend shadow --backing <dir> --mountpoint <mnt> --metrics-file /run/zi
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `zipfs_commit_ok_total` | counter | `commit_pending` 成功落 redb 的次数 |
-| `zipfs_commit_failed_total` | counter | 提交失败并**合并回 active**（数据未丢、待重试）的次数 |
-| `zipfs_blocks_flushed_total` | counter | 累计落 redb 的块数 |
-| `zipfs_flushing_bytes_peak` | gauge | flushing 缓冲字节峰值 |
+| `scrollz_commit_ok_total` | counter | `commit_pending` 成功落 redb 的次数 |
+| `scrollz_commit_failed_total` | counter | 提交失败并**合并回 active**（数据未丢、待重试）的次数 |
+| `scrollz_blocks_flushed_total` | counter | 累计落 redb 的块数 |
+| `scrollz_flushing_bytes_peak` | gauge | flushing 缓冲字节峰值 |
 
 `commit_failed_total` 增长即「一次数据丢失被双缓冲避免」——**它非 0 是好事的证据，也是磁盘/后端异常的信号**。
 
@@ -35,34 +35,34 @@ zipfs --backend shadow --backing <dir> --mountpoint <mnt> --metrics-file /run/zi
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `zipfs_fuse_read_ops_total` / `zipfs_fuse_read_bytes_total` | counter | read handler 次数 / 累计返回字节 |
-| `zipfs_fuse_write_ops_total` / `zipfs_fuse_write_bytes_total` | counter | write handler 次数 / 累计写入字节 |
-| `zipfs_fuse_fsync_ops_total` | counter | fsync + flush 同步操作次数 |
-| `zipfs_fuse_errors_total` | counter | read/write/fsync/flush 返回错误次数 |
+| `scrollz_fuse_read_ops_total` / `scrollz_fuse_read_bytes_total` | counter | read handler 次数 / 累计返回字节 |
+| `scrollz_fuse_write_ops_total` / `scrollz_fuse_write_bytes_total` | counter | write handler 次数 / 累计写入字节 |
+| `scrollz_fuse_fsync_ops_total` | counter | fsync + flush 同步操作次数 |
+| `scrollz_fuse_errors_total` | counter | read/write/fsync/flush 返回错误次数 |
 
 ### 2.3 缓存命中率（两级）
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `zipfs_blockcache_hits_total` / `_misses_total` | counter | 解压块缓存（读路径内部块免整块重解压）命中/未命中 |
-| `zipfs_shadow_reader_hits_total` / `_misses_total` | counter | shadow ArchiveReader 解析缓存（免每次 get_block 重解析索引）命中/未命中 |
+| `scrollz_blockcache_hits_total` / `_misses_total` | counter | 解压块缓存（读路径内部块免整块重解压）命中/未命中 |
+| `scrollz_shadow_reader_hits_total` / `_misses_total` | counter | shadow ArchiveReader 解析缓存（免每次 get_block 重解析索引）命中/未命中 |
 
 ### 2.4 写放大 / 后端
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `zipfs_seals_total` | counter | 尾块封块/重压落后端次数 |
-| `zipfs_recompressions_total` | counter | 块级重压次数（进程级，出口按需读 `rmw::block_compress_count`） |
-| `zipfs_shadow_commits_total` | counter | shadow 脏会话经 ArchiveUpdater 提交次数 |
-| `zipfs_shadow_tail_appends_total` | counter | shadow 尾日志增量追加次数 |
+| `scrollz_seals_total` | counter | 尾块封块/重压落后端次数 |
+| `scrollz_recompressions_total` | counter | 块级重压次数（进程级，出口按需读 `rmw::block_compress_count`） |
+| `scrollz_shadow_commits_total` | counter | shadow 脏会话经 ArchiveUpdater 提交次数 |
+| `scrollz_shadow_tail_appends_total` | counter | shadow 尾日志增量追加次数 |
 
 ### 2.5 延迟直方图（p50/p99）
 
-`zipfs_read_latency_seconds`、`zipfs_write_latency_seconds`、`zipfs_fsync_latency_seconds`——各含 `_bucket{le="…"}`（累积桶，`+Inf` 恒等于 `_count`）、`_sum`（秒）、`_count`。桶：50µs–100ms + `+Inf`。计时含取锁+seal+IO 全链路，成功与失败路径都观测。
+`scrollz_read_latency_seconds`、`scrollz_write_latency_seconds`、`scrollz_fsync_latency_seconds`——各含 `_bucket{le="…"}`（累积桶，`+Inf` 恒等于 `_count`）、`_sum`（秒）、`_count`。桶：50µs–100ms + `+Inf`。计时含取锁+seal+IO 全链路，成功与失败路径都观测。
 
 ### 2.6 压缩比（昂贵按需 gauge，仅 shadow 有数据）
 
-`zipfs_logical_bytes` / `zipfs_physical_bytes` / `zipfs_compression_ratio`——出口线程调 `Store::compression_stats()`（遍历目录树，非廉价计数）按需算。container 后端无此三项。
+`scrollz_logical_bytes` / `scrollz_physical_bytes` / `scrollz_compression_ratio`——出口线程调 `Store::compression_stats()`（遍历目录树，非廉价计数）按需算。container 后端无此三项。
 
 ## 3. 架构
 
@@ -93,22 +93,22 @@ flowchart LR
 
 ```promql
 # read p99 延迟（秒）
-histogram_quantile(0.99, rate(zipfs_read_latency_seconds_bucket[5m]))
+histogram_quantile(0.99, rate(scrollz_read_latency_seconds_bucket[5m]))
 
 # 解压块缓存命中率
-rate(zipfs_blockcache_hits_total[5m])
-  / (rate(zipfs_blockcache_hits_total[5m]) + rate(zipfs_blockcache_misses_total[5m]))
+rate(scrollz_blockcache_hits_total[5m])
+  / (rate(scrollz_blockcache_hits_total[5m]) + rate(scrollz_blockcache_misses_total[5m]))
 
 # 写吞吐（MiB/s）
-rate(zipfs_fuse_write_bytes_total[5m]) / 1048576
+rate(scrollz_fuse_write_bytes_total[5m]) / 1048576
 
 # 提交失败率（应恒 0；非 0 = 后端异常，双缓冲正在兜底）
-rate(zipfs_commit_failed_total[5m])
+rate(scrollz_commit_failed_total[5m])
 ```
 
 ## 5. 解读教训（务必先证伪再告警）
 
-**事件**：全景 `.prom` 里 `zipfs_blockcache_hits_total 0`（整文件重读、命中为零）。第一反应告警「解压块缓存没起效，值得查」。
+**事件**：全景 `.prom` 里 `scrollz_blockcache_hits_total 0`（整文件重读、命中为零）。第一反应告警「解压块缓存没起效，值得查」。
 
 **真相**：那次测试用了 `--chunk-size 4096`。BlockCache 的作用是**消除解压放大**——只有当 `chunk_size > 内核读粒度(~128KiB)` 时，一个大压缩块才会被多个小内核读**重复覆盖**，缓存才有可命中的重复。chunk=4KiB 时一个 128KiB 内核读跨 32 个块、每块只读一次，**天然没有可命中的重复**，0 命中是**正确**的。换 1MiB 大块同负载实测 **13 hits / 11 misses**，缓存正常工作。
 

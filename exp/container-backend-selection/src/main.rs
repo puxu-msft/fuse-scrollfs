@@ -1,7 +1,7 @@
 //! zipfs microbench 驱动。
 //!
 //! 设计闸门问题：「redb 作为布局 V 容器、存变长压缩 chunk blob 并做随机更新，
-//! 性能是否够用，还是需要自写数据区」（见 docs/01-zipfs-design.md §6/§6.1）。
+//! 性能是否够用，还是需要自写数据区」（见 docs/01-scrollz-design.md §6/§6.1）。
 //!
 //! 用法：
 //!   cargo run --release                        # 默认参数全跑（约 1-2GB）

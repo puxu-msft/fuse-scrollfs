@@ -45,7 +45,7 @@
 | `gcc` | `/usr/bin/gcc` |
 | `zstd` (CLI) | `/home/linuxbrew/.linuxbrew/bin/zstd` |
 
-→ 自研 FUSE zipfs 用 **Rust（`fuser` + `zstd` crate）** 或 **Go（`hanwen/go-fuse` + `klauspost/compress`）** 都具备条件。
+→ 自研 FUSE scrollz 用 **Rust（`fuser` + `zstd` crate）** 或 **Go（`hanwen/go-fuse` + `klauspost/compress`）** 都具备条件。
 
 ## 一键补齐依赖（草案，待核对版本）
 

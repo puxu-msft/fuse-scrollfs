@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实施。步骤用 `- [ ]` 复选框跟踪。
 
-**Goal:** 给 zipfs 加一个会话感知、无损的重合并能力，把影子挂载停用期落进裸挂载点的回落写安全并回 archive，并在真挂载入口加失败即拒守卫。
+**Goal:** 给 scrollz 加一个会话感知、无损的重合并能力，把影子挂载停用期落进裸挂载点的回落写安全并回 archive，并在真挂载入口加失败即拒守卫。
 
-**Architecture:** 纯合并核（record 解析 → 无损并集 merge → advisor 推荐，全无 IO、全单测）+ orchestrator（活跃门禁 / 快照 / 锁 / 原子替换 / 通用超集删除许可）+ 真挂载入口守卫（`ensure_underlay_empty`）+ CLI/systemd 接线。真源 = `.zipfs-orig` 明文，backing 按文件派生。
+**Architecture:** 纯合并核（record 解析 → 无损并集 merge → advisor 推荐，全无 IO、全单测）+ orchestrator（活跃门禁 / 快照 / 锁 / 原子替换 / 通用超集删除许可）+ 真挂载入口守卫（`ensure_underlay_empty`）+ CLI/systemd 接线。真源 = `.scrollz-orig` 明文，backing 按文件派生。
 
 **Tech Stack:** Rust，`serde_json`，现有 `fuse` crate（`enable/*`、`ingest.rs`、`archive.rs`、`store/shadow.rs`）。
 
@@ -20,7 +20,7 @@
 - **原子替换**：orig / backing archive 一律 `tmp→fsync→rename→fsync_dir`，绝不就地 `O_TRUNC` 写金源。
 - Rust：`cargo fmt` + `cargo clippy -- -D warnings`；`unwrap()` 仅测试；`unsafe` 附 `// SAFETY:`。
 - 提交遵循 conventional commits；不加 `Co-authored-by`。
-- 测试 backing 用 tempdir **子目录**（避免 `.zipfs.lock` 落共享 temp 根 flaky）。
+- 测试 backing 用 tempdir **子目录**（避免 `.scrollz.lock` 落共享 temp 根 flaky）。
 
 ## File Structure
 
@@ -121,7 +121,7 @@ mod tests {
 
 - [ ] **Step 3: 运行确认失败**
 
-Run: `cd fuse && cargo test -p zipfs reconcile::record 2>&1 | tail -20`
+Run: `cd fuse && cargo test -p scrollz reconcile::record 2>&1 | tail -20`
 Expected: 编译失败（`classify_record` 等未定义）。
 
 - [ ] **Step 4: 最小实现**
@@ -190,7 +190,7 @@ pub fn parse_lines(content: &str) -> Vec<(RawRecord, RecordKind)> {
 
 - [ ] **Step 5: 运行确认通过 + fmt/clippy**
 
-Run: `cd fuse && cargo test -p zipfs reconcile::record 2>&1 | tail -20 && cargo fmt && cargo clippy -p zipfs -- -D warnings 2>&1 | tail -5`
+Run: `cd fuse && cargo test -p scrollz reconcile::record 2>&1 | tail -20 && cargo fmt && cargo clippy -p scrollz -- -D warnings 2>&1 | tail -5`
 Expected: 测试 PASS，clippy 无警告。
 
 - [ ] **Step 6: 提交**
@@ -325,7 +325,7 @@ mod tests {
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `cd fuse && cargo test -p zipfs reconcile::merge 2>&1 | tail -20`
+Run: `cd fuse && cargo test -p scrollz reconcile::merge 2>&1 | tail -20`
 Expected: 编译失败（`session_merge` 未定义）。
 
 - [ ] **Step 3: 实现 merge 核**
@@ -490,7 +490,7 @@ pub fn session_merge(base: &str, incoming: &str) -> MergeResult {
 
 - [ ] **Step 4: 运行确认通过 + fmt/clippy**
 
-Run: `cd fuse && cargo test -p zipfs reconcile::merge 2>&1 | tail -20 && cargo fmt && cargo clippy -p zipfs -- -D warnings 2>&1 | tail -5`
+Run: `cd fuse && cargo test -p scrollz reconcile::merge 2>&1 | tail -20 && cargo fmt && cargo clippy -p scrollz -- -D warnings 2>&1 | tail -5`
 Expected: 全 PASS，无 clippy 警告。
 
 - [ ] **Step 5: 提交**
@@ -549,7 +549,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cd fuse && cargo test -p zipfs reconcile::advisor 2>&1 | tail -20` → 编译失败。
+- [ ] **Step 2: 确认失败** — Run: `cd fuse && cargo test -p scrollz reconcile::advisor 2>&1 | tail -20` → 编译失败。
 
 - [ ] **Step 3: 实现**
 
@@ -598,7 +598,7 @@ pub fn recommend(r: &MergeResult) -> Recommendation {
 ```
 `mod.rs` 加 `pub mod advisor;`。
 
-- [ ] **Step 4: 确认通过 + fmt/clippy** — Run: `cd fuse && cargo test -p zipfs reconcile 2>&1 | tail && cargo fmt && cargo clippy -p zipfs -- -D warnings 2>&1 | tail -5`
+- [ ] **Step 4: 确认通过 + fmt/clippy** — Run: `cd fuse && cargo test -p scrollz reconcile 2>&1 | tail && cargo fmt && cargo clippy -p scrollz -- -D warnings 2>&1 | tail -5`
 
 - [ ] **Step 5: 提交**
 ```bash
@@ -653,7 +653,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cd fuse && cargo test -p zipfs reconcile::guard 2>&1 | tail -20`
+- [ ] **Step 2: 确认失败** — Run: `cd fuse && cargo test -p scrollz reconcile::guard 2>&1 | tail -20`
 
 - [ ] **Step 3: 实现 guard**
 
@@ -689,7 +689,7 @@ pub fn underlay_has_fallthrough(mp: &Path) -> io::Result<bool> {
 pub fn ensure_underlay_empty(mp: &Path) -> io::Result<()> {
     if underlay_has_fallthrough(mp)? {
         return Err(io::Error::other(format!(
-            "{} 挂载点 underlay 含停用期回落写，拒绝挂载（防静默盖住）；先 `zipfs enable reconcile` 重合并",
+            "{} 挂载点 underlay 含停用期回落写，拒绝挂载（防静默盖住）；先 `scrollz enable reconcile` 重合并",
             mp.display()
         )));
     }
@@ -708,11 +708,11 @@ pub fn ensure_underlay_empty(mp: &Path) -> io::Result<()> {
 
 - [ ] **Step 5: 覆盖 systemd 自启路径确认**
 
-systemd 自启 `ExecStart=zipfs mount-managed --name %i` → `resolve_managed_spec`（`systemd.rs`）建 spec → 经 `SystemdMounter::spawn` 挂载。Step 4 已在 `SystemdMounter::spawn` 内加守卫 → 自启路径被覆盖（评审 C1，主威胁）。grep 确认 `mount-managed` handler 确实经 `SystemdMounter::spawn`（而非绕过直接 `run_mount`）；若绕过，则守卫改加在该直接挂载点前。
+systemd 自启 `ExecStart=scrollz mount-managed --name %i` → `resolve_managed_spec`（`systemd.rs`）建 spec → 经 `SystemdMounter::spawn` 挂载。Step 4 已在 `SystemdMounter::spawn` 内加守卫 → 自启路径被覆盖（评审 C1，主威胁）。grep 确认 `mount-managed` handler 确实经 `SystemdMounter::spawn`（而非绕过直接 `run_mount`）；若绕过，则守卫改加在该直接挂载点前。
 
 - [ ] **Step 6: 运行 + 全量测试 + fmt/clippy**
 
-Run: `cd fuse && cargo test -p zipfs reconcile 2>&1 | tail && cargo test -p zipfs enable 2>&1 | tail && cargo fmt && cargo clippy -p zipfs -- -D warnings 2>&1 | tail -5`
+Run: `cd fuse && cargo test -p scrollz reconcile 2>&1 | tail && cargo test -p scrollz enable 2>&1 | tail && cargo fmt && cargo clippy -p scrollz -- -D warnings 2>&1 | tail -5`
 Expected: 新测试 PASS；既有 enable 测试不回归。
 
 - [ ] **Step 7: 提交**
@@ -737,8 +737,8 @@ git commit -m "feat(reconcile): 挂载前 underlay 守卫下沉 Mounter::spawn �
 **Interfaces:**
 - Consumes: `enable::model::{Paths, Backend}`, `enable::discovery`
 - Produces:
-  - `Paths::reconcile_stash(&self, name, ts) -> PathBuf`（`zipfs_home/reconcile-stash/<name>/<ts>`）
-  - `Paths::quarantine(&self, name, ts) -> PathBuf`（`zipfs_home/reconcile-quarantine/<name>/<ts>`）
+  - `Paths::reconcile_stash(&self, name, ts) -> PathBuf`（`scrollz_home/reconcile-stash/<name>/<ts>`）
+  - `Paths::quarantine(&self, name, ts) -> PathBuf`（`scrollz_home/reconcile-quarantine/<name>/<ts>`）
   - `Paths::reconcile_lock(&self, name) -> PathBuf`（`back_root/<name>.reconcile.lock`）
   - `const MAX_MERGE_FILE_BYTES: u64`（size cap，spec §5.1；orchestrator 读文件前施加，超限该条目降级 KeepBoth）
   - `struct EntrySnapshot { rel: String, bytes: Vec<u8>, mtime: SystemTime, size: u64, ino: u64 }`
@@ -758,7 +758,7 @@ mod tests {
     use std::path::Path;
 
     fn paths_in(root: &Path) -> Paths {
-        Paths { projects_root: root.join("projects"), zipfs_home: root.join("zip") }
+        Paths { projects_root: root.join("projects"), scrollz_home: root.join("zip") }
     }
 
     #[test]
@@ -782,7 +782,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 确认失败** — Run: `cd fuse && cargo test -p zipfs reconcile::orchestrator 2>&1 | tail -20`
+- [ ] **Step 2: 确认失败** — Run: `cd fuse && cargo test -p scrollz reconcile::orchestrator 2>&1 | tail -20`
 
 - [ ] **Step 3: 实现路径 + 门禁 + 快照**
 
@@ -791,7 +791,7 @@ mod tests {
 - `live_entry_unchanged`：对 `mp/rel` 重新 `symlink_metadata`，比 mtime/size/ino 与快照是否全等（评审 C-a：活跃门禁是时间点检查、jsonl fd 可能轮次间关闭，故删前必须再复核 live 未变）。
 - `const MAX_MERGE_FILE_BYTES: u64 = 256 * 1024 * 1024;`（读文件前 cap，超限降级 KeepBoth 由 Task 7 用）。
 
-> **锁语义澄清（评审 Minor）**：`reconcile_lock` 与 backing `.zipfs.lock` 是**两把不同的锁**。挂载入口并不取 reconcile_lock；reconcile 与挂载的互斥实际靠「underlay-empty 守卫 + reconciling 标记」达成，reconcile_lock 只串行化并发 reconcile 彼此。
+> **锁语义澄清（评审 Minor）**：`reconcile_lock` 与 backing `.scrollz.lock` 是**两把不同的锁**。挂载入口并不取 reconcile_lock；reconcile 与挂载的互斥实际靠「underlay-empty 守卫 + reconciling 标记」达成，reconcile_lock 只串行化并发 reconcile 彼此。
 
 - [ ] **Step 4: 确认通过 + fmt/clippy**
 
@@ -995,7 +995,7 @@ git commit -am "feat(enable): list 标 NEEDS-RECONCILE / reconciling"
 - Modify: `fuse/src/enable/systemd.rs`（sentinel 落盘/清理）
 
 - [ ] **TDD/steps**：
-  - 单元模板加 `ExecStartPre=zipfs enable guard-check %i`（非空 underlay → 落 `NEEDS-RECONCILE` sentinel + 非 0 退出，但**不进 Restart 循环**：`ExecStartPre` 失败使 unit 直接 failed 而非 watchdog 重启风暴）。
+  - 单元模板加 `ExecStartPre=scrollz enable guard-check %i`（非空 underlay → 落 `NEEDS-RECONCILE` sentinel + 非 0 退出，但**不进 Restart 循环**：`ExecStartPre` 失败使 unit 直接 failed 而非 watchdog 重启风暴）。
   - 加 `enable guard-check <name>` 隐藏子命令：调 `ensure_underlay_empty`，失败落 sentinel + 明确 stderr。
   - 测试 `mount_argv`/单元渲染含 `ExecStartPre`；`guard-check` 对非空 underlay 返回非 0 且落 sentinel。
   - 提交。
@@ -1013,19 +1013,19 @@ git commit -am "feat(autostart): ExecStartPre guard-check + NEEDS-RECONCILE sent
 
 - [ ] **Step 1: 冷备份真实数据**（防万一）
 ```bash
-cp -a ~/.claude/projects/-home-xp-src-neighbors.zipfs-orig /tmp/neighbors-orig-backup-$(date +%s)
+cp -a ~/.claude/projects/-home-xp-src-neighbors.scrollz-orig /tmp/neighbors-orig-backup-$(date +%s)
 ```
 Expected: 备份完成，`du -sh` 与源相当。
 
 - [ ] **Step 2: dry-run 出建议单**
 ```bash
-cd /home/xp/src/zipfs/fuse && ./target/release/zipfs enable reconcile -home-xp-src-neighbors --dry-run
+cd /home/xp/src/scrollz/fuse && ./target/release/scrollz enable reconcile -home-xp-src-neighbors --dry-run
 ```
 Expected: 373e2835/de756008 = LogOnly→UnionIntoBase(High)；925fc3a1 = SuspectReuse→KeepSeparate(Low)；memory = Passthrough。零改动。
 
 - [ ] **Step 3: 逐条确认实跑**
 ```bash
-./target/release/zipfs enable reconcile -home-xp-src-neighbors
+./target/release/scrollz enable reconcile -home-xp-src-neighbors
 ```
 按建议逐条确认（925fc3a1 采纳 keep-separate 隔离）。
 
@@ -1033,14 +1033,14 @@ Expected: 373e2835/de756008 = LogOnly→UnionIntoBase(High)；925fc3a1 = Suspect
 ```bash
 # orig 中 373e2835 应重新含完整正文 + 新标题；925fc3a1 隔离副本保原 UUID 名
 ls ~/.claude-zip/reconcile-quarantine/-home-xp-src-neighbors/*/
-python3 -c "import json,sys; [json.loads(l) for l in open(sys.argv[1])]" ~/.claude/projects/-home-xp-src-neighbors.zipfs-orig/373e2835-c5a4-4822-a8b9-23d9d3cbd667.jsonl
+python3 -c "import json,sys; [json.loads(l) for l in open(sys.argv[1])]" ~/.claude/projects/-home-xp-src-neighbors.scrollz-orig/373e2835-c5a4-4822-a8b9-23d9d3cbd667.jsonl
 ```
 Expected: 隔离目录含 `925fc3a1-….jsonl`（原名）；orig 各文件合法 jsonl。
 
 - [ ] **Step 5: 重挂 + 确认 ACTIVE**
 ```bash
-./target/release/zipfs enable remount -home-xp-src-neighbors
-./target/release/zipfs enable list | grep neighbors
+./target/release/scrollz enable remount -home-xp-src-neighbors
+./target/release/scrollz enable list | grep neighbors
 ```
 Expected: 守卫放行（underlay 已清空）、状态 ZIPFS(Active)。
 
@@ -1048,7 +1048,7 @@ Expected: 守卫放行（underlay 已清空）、状态 ZIPFS(Active)。
 ```bash
 F=373e2835-c5a4-4822-a8b9-23d9d3cbd667.jsonl
 diff <(cat ~/.claude/projects/-home-xp-src-neighbors/$F) \
-     ~/.claude/projects/-home-xp-src-neighbors.zipfs-orig/$F && echo "BYTE-MATCH"
+     ~/.claude/projects/-home-xp-src-neighbors.scrollz-orig/$F && echo "BYTE-MATCH"
 ```
 Expected: `BYTE-MATCH`（挂载点透明服务 == golden；用完整 UUID 避免 glob 歧义）。
 

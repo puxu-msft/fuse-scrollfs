@@ -2,7 +2,7 @@
 # mount-bv.sh — 用 zipfs 布局 V（container，redb 全包容器）读写挂载。
 #
 # BV = FUSE + zstd 分块，redb 容器（单文件 ACID B-tree 当变长 blob 分配器），读写。
-# 见 docs/00-overview.md §4.1、docs/01-zipfs-design.md §6.1。
+# 见 docs/00-overview.md §4.1、docs/01-scrollz-design.md §6.1。
 # 用法：zipfs --backend container --backing <redb 容器文件> --mountpoint <mnt> --chunk-size 65536。
 #
 # 关键差异（与 BS）：container 的 --backing 是【redb 容器文件路径】（不存在则创建），

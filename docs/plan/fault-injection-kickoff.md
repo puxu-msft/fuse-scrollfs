@@ -1,11 +1,11 @@
-# Kick-off Prompt — zipfs 故障注入测试（两层）
+# Kick-off Prompt — scrollz 故障注入测试（两层）
 
 > 复制下面「===PROMPT===」之间的内容到新会话即可启动。**自包含**：新会话无需本会话上下文，照此执行。
 > 完整设计见 `docs/05-fault-injection-testing.md`（三方评审定稿）；本文是其可执行计划。
 
 ===PROMPT===
 
-你在 `/home/xp/src/zipfs`（Rust FUSE 透明压缩文件系统，布局 S = 每文件一个 archive）。任务：实现**故障注入测试两层架构**，把已落地的崩溃安全协议（双 superblock + append-only + 尾日志）变成可回归的故障注入测试。**你是实施者，按 TDD 一步步来，每个绿阶段单独提交。**
+你在 `/home/xp/src/scrollz`（Rust FUSE 透明压缩文件系统，布局 S = 每文件一个 archive）。任务：实现**故障注入测试两层架构**，把已落地的崩溃安全协议（双 superblock + append-only + 尾日志）变成可回归的故障注入测试。**你是实施者，按 TDD 一步步来，每个绿阶段单独提交。**
 
 ## 背景（已完成，勿重做）
 
@@ -86,7 +86,7 @@ pub struct FileIo(pub std::fs::File);   // 用 FileExt::{write_all_at, read_exac
 [features]
 fault-injection = []
 ```
-`FaultIo` 门控 `#[cfg(any(test, feature = "fault-injection"))]` 且 **`pub`、经 `lib.rs` `pub mod blockio;` 导出**（否则 `tests/` 用不到）。**引用 `FaultIo` 的集成测试文件首行加 inner attribute `#![cfg(feature = "fault-injection")]`**——使不带 feature 的那趟 `cargo test`（测试网第 3 行）整文件消失、不致 `use zipfs::blockio::FaultIo` 找不到符号而红。运行带 `--features fault-injection`（`cfg(test)` 对 `tests/` 独立 crate 不可见）。
+`FaultIo` 门控 `#[cfg(any(test, feature = "fault-injection"))]` 且 **`pub`、经 `lib.rs` `pub mod blockio;` 导出**（否则 `tests/` 用不到）。**引用 `FaultIo` 的集成测试文件首行加 inner attribute `#![cfg(feature = "fault-injection")]`**——使不带 feature 的那趟 `cargo test`（测试网第 3 行）整文件消失、不致 `use scrollz::blockio::FaultIo` 找不到符号而红。运行带 `--features fault-injection`（`cfg(test)` 对 `tests/` 独立 crate 不可见）。
 
 **任务 2.1：`FaultIo` 页模型（durable + dirty，sync 合并，crash 可产乱序子集）。**
 1. 失败测试：① `write_at` 后未 `sync` → `crash()` 镜像不含该写；`sync` 后含。② **乱序能力存在性**：两次未 sync 的 `write_at`（A、B）后，`crash()` 能产出「含 A 不含 B」的镜像（钉死模型未退化成「全丢 dirty」——否则 2.5 剪枝可能悄悄废掉整条链）。

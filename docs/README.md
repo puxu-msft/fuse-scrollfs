@@ -1,4 +1,4 @@
-# zipfs 文档索引 / Docs Index
+# scrollz 文档索引 / Docs Index
 
 > 本文是**唯一总索引入口**。顶层职责文档回答固定问题，编号专题（`00–09`）是各领域的设计/spec 领域知识，由 [ARCH.md](./ARCH.md) / [DESIGN.md](./DESIGN.md) 分别从「是什么」「怎么做」两个角度索引。
 
@@ -27,7 +27,7 @@
 
 | 文档 | 内容 | 状态 |
 |---|---|---|
-| [01-zipfs-design.md](./01-zipfs-design.md) | 核心实现设计（两布局 / Store 接缝 / 分块内核） | §1–13 为 2026-06-27 冻结快照 |
+| [01-scrollz-design.md](./01-scrollz-design.md) | 核心实现设计（两布局 / Store 接缝 / 分块内核） | §1–13 为 2026-06-27 冻结快照 |
 | [02-layered-chunking.md](./02-layered-chunking.md) | 分层分块 / head 缓存 / 发现读快路径 | 部分实现（head 缓存已落地） |
 
 ## 崩溃安全 / 测试 spec

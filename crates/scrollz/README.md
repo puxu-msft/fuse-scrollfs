@@ -1,6 +1,6 @@
 # zipfs（crates/zipfs）—— 路线 B（用户态 FUSE）Rust 实现
 
-> 实验背景见 [`../../docs/00-overview.md`](../../docs/00-overview.md)，磁盘布局与分阶段设计见 [`../../docs/01-zipfs-design.md`](../../docs/01-zipfs-design.md)。
+> 实验背景见 [`../../docs/00-overview.md`](../../docs/00-overview.md)，磁盘布局与分阶段设计见 [`../../docs/01-scrollz-design.md`](../../docs/01-scrollz-design.md)。
 > **进度与缺陷的单一信息源**是 [`../../docs/ROADMAP.md`](../../docs/ROADMAP.md)（T0–T4 优先级）与 [`../../docs/06-defect-audit.md`](../../docs/06-defect-audit.md)（两轮审查台账）。本 README 只描述「这个 crate 现在是什么、怎么用」，不重复路线图的优先级排序。
 
 本 crate 是 zipfs「方案四 / 路线 B」的 Rust 实现。设计文档 §12 的分阶段骨架 **P0–P4 已全部落地**（P0 透传基线 + P1 只读/顺序读 + P2 顺序写/截断 + P3 随机写 RMW + P4 元数据 POSIX 语义），代码内 **无 `todo!()` 占位**；当前投入已转向 ROADMAP 的 **T1 可靠性 / T2 性能 / T3 空间 / T4 生产化**。

@@ -17,7 +17,7 @@
 
 ### HIGH
 
-**R-lock · reconcile 改写 backing 全程不取 backing `.zipfs.lock`，与 compact/seal TOCTOU**
+**R-lock · reconcile 改写 backing 全程不取 backing `.scrollz.lock`，与 compact/seal TOCTOU**
 `acquire_backing` 在 orchestrator 出现 **0 次**（**已核实** grep）；只取独立 `reconcile_lock`（`model.rs:119` 注释自承与 backing 锁"是两把锁"）。`reingest_one_file:344`、undo 反做均无锁 rewrite `backing/<rel>`。
 - 情景：STOPPED+NEEDS-RECONCILE（backing 锁空闲）下并发 `enable compact` + `enable reconcile`：compact 取 backing 锁重编码，reconcile 走另一把锁无锁 rename 覆盖同一 archive → 交错写损坏。marker 只挡"reconcile 先置标记"半边，反向 TOCTOU 无锁拦截。对活守护的同类缺口被"非空 underlay + mount 守卫"补偿，但 compact/seal 不查 underlay，无补偿。
 - 修复：reconcile 的 backing 变更区（reingest_one_file / undo 反做 / finalize 前）取 `acquire_backing_retry`，与 compact/seal/守护共用一把 backing 锁硬互锁；marker 保留作 mount 门禁/UX。
@@ -62,7 +62,7 @@
 
 - ✅ **R-I1**（`fix(reconcile): 空串/非字符串 uuid 降级 NoUuid`）：`record.rs` `classify_record` 仅非空字符串 uuid 算 transcript 键，空串/缺失/非字符串走整行去重全保 distinct。
 - ✅ **R-C1**（`fix(reconcile): apply_entry/subagents 补 base 侧超集铁律门`）：新 `merge::base_covered_by_merged`（**uuid 级** transcript + 行级 no-uuid，故不误判 §4.1 同 uuid 取更长者），在 Union/subagents 落 orig 前 fail-fast，不覆盖则中止、不删 underlay、保两份。
-- ✅ **R-lock**（`fix(reconcile): reingest_one_file/undo 删 backing 取 backing 锁`）：`reingest_one_file` + `undo_remove_orig` 取 `acquire_backing_retry`，与 compact/seal/守护同一把 `.zipfs.lock` 硬互锁；`reingest_one_file_blocked_while_backing_locked` 回归。锁短持、不跨 rebuild 的 remount（无自死锁）。
+- ✅ **R-lock**（`fix(reconcile): reingest_one_file/undo 删 backing 取 backing 锁`）：`reingest_one_file` + `undo_remove_orig` 取 `acquire_backing_retry`，与 compact/seal/守护同一把 `.scrollz.lock` 硬互锁；`reingest_one_file_blocked_while_backing_locked` 回归。锁短持、不跨 rebuild 的 remount（无自死锁）。
 - ✅ **W1**（`fix(reconcile): check_preconditions 见 underlay 空+陈旧 marker 清标记收敛`）：解崩溃 wedge，兑现「重跑自恢复」。
 - ✅ **R-I2**（`fix(reconcile): 同 uuid 分叉 conflicts 携落败整行`）：落败字节可从报告复原（merge 输出仍按 §4.1 取更长者）。
 - ⚠️ **W2（未修，已记为已知窄窗口）**：rebuild 前必须清 marker——`lifecycle::reingest` 的自我重挂经 `mounter.spawn → ensure_mountable`，marker 在则拒挂。保持 marker 会**破坏 rebuild 自身重挂**（比 W2 race 更糟）。彻底修需「可信重挂」路径区分 reconcile 自身重挂 vs 外部自启，属较大改动。无数据丢失（orig 权威、单文件 reingest 原子）。

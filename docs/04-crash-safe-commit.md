@@ -3,7 +3,7 @@
 > 类型：实现 spec（how）· 状态：**已实现**（下方正文为当时的设计 spec，协议已落地；见 ROADMAP T1 / CHANGELOG）。文档索引见 [README.md](./README.md)。
 
 > 文档性质：**实现设计（how）**，根治 `bench/results/crash-durability/REPORT.md` 实测到的 durability bug。
-> 承接 [01-zipfs-design.md](./01-zipfs-design.md) §7（archive 格式）、§10（一致性），并**吸收并取代** [02-layered-chunking.md](./02-layered-chunking.md) 的 footer v2 head-cache 字段（合入本协议的 superblock，避免双格式分叉）。
+> 承接 [01-scrollz-design.md](./01-scrollz-design.md) §7（archive 格式）、§10（一致性），并**吸收并取代** [02-layered-chunking.md](./02-layered-chunking.md) 的 footer v2 head-cache 字段（合入本协议的 superblock，避免双格式分叉）。
 > 日期：2026-06-28。状态：草案，**格式改动前的 gate**；实现以崩溃 harness（`bench/scripts/crash-test.sh`）40%→0% 为验收门。
 
 ## 0. 为什么不是缓解而是根治
@@ -90,7 +90,7 @@ SB_LEN 取 128B（对齐、留扩展位）。两个 superblock 各 128B，固定
 
 ## 5. 封块（seal）
 
-尾块原始字节累计达 `chunk_size`（或 `zipfs seal` 显式触发）：压成不可变块 append 到数据区 → 新 index 记该块 → **新 superblock 置 `tail_journal_len=0`（逻辑上忽略旧日志区，旧字节原位不动、由压实回收——绝不物理清零/截断旧日志区，否则旧 superblock 回落时会重放被清空的区间，H2）** → 走 §3 提交。封块提交后该段逻辑字节从 journal 迁到封块，二者在新视图下不同时计入 `uncompressed_size`（由 `sb_crc` 覆盖 `chunk_count`+`tail_journal_len` 保证自洽快照）。
+尾块原始字节累计达 `chunk_size`（或 `scrollz seal` 显式触发）：压成不可变块 append 到数据区 → 新 index 记该块 → **新 superblock 置 `tail_journal_len=0`（逻辑上忽略旧日志区，旧字节原位不动、由压实回收——绝不物理清零/截断旧日志区，否则旧 superblock 回落时会重放被清空的区间，H2）** → 走 §3 提交。封块提交后该段逻辑字节从 journal 迁到封块，二者在新视图下不同时计入 `uncompressed_size`（由 `sb_crc` 覆盖 `chunk_count`+`tail_journal_len` 保证自洽快照）。
 
 ## 6. 空间回收（压实）
 

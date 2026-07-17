@@ -1,14 +1,14 @@
-# zipfs 架构视图 / ARCH
+# scrollz 架构视图 / ARCH
 
-> **本文回答「是什么 / 在哪里」**——zipfs 当前的架构骨架：组件、边界、数据流、技术栈。反映**现状**（`crates/zipfs/` 实态，含 workspace 化、hangfree、reconcile、enable、head 缓存等已落地部分），而非历史设计快照。
+> **本文回答「是什么 / 在哪里」**——scrollz 当前的架构骨架：组件、边界、数据流、技术栈。反映**现状**（`crates/scrollz/` 实态，含 workspace 化、hangfree、reconcile、enable、head 缓存等已落地部分），而非历史设计快照。
 >
 > 职责边界：**为什么**看 [ADR.md](./ADR.md)；**怎么做**（算法/内部契约细节）看 [DESIGN.md](./DESIGN.md) 及其索引的编号专题；**下一步**看 [ROADMAP.md](./ROADMAP.md)。
 >
-> 设计快照（多为 2026-06-27 冻结、含推演背景）见 [01-zipfs-design.md](./01-zipfs-design.md) 等编号文档；本文与之偏差处**以本文为现状准**。
+> 设计快照（多为 2026-06-27 冻结、含推演背景）见 [01-scrollz-design.md](./01-scrollz-design.md) 等编号文档；本文与之偏差处**以本文为现状准**。
 
 ## 1. 定位
 
-zipfs 是自研的 Rust FUSE 透明压缩文件系统，目标负载 = `~/.claude/projects`（append 为主、高冗余、运行时活跃写的会话 jsonl）。起源是一次「btrfs+zstd vs FUSE 透明压缩」横评（见 [00-overview.md](./00-overview.md)），FUSE 路线转正为产品。
+scrollz 是自研的 Rust FUSE 透明压缩文件系统，目标负载 = `~/.claude/projects`（append 为主、高冗余、运行时活跃写的会话 jsonl）。起源是一次「btrfs+zstd vs FUSE 透明压缩」横评（见 [00-overview.md](./00-overview.md)），FUSE 路线转正为产品。
 
 ## 2. 技术栈
 
@@ -23,15 +23,15 @@ zipfs 是自研的 Rust FUSE 透明压缩文件系统，目标负载 = `~/.claud
 
 数据流自上而下：POSIX 调用 → FUSE 内核 → `rwfs`（`impl fuser::Filesystem`：inode 缓存 / 句柄表 / 每-inode RwLock）→ **压缩内核 `core`**（分块数学 · RMW · codec · 块缓存）→ **`trait Store` 接缝**（唯一后端差异面）→ 布局 V（`ContainerStore`，redb/sqlite 容器）或布局 S（`ShadowStore`，底层目录树 + 每文件分块 archive）。
 
-**关键边界**：分块/压缩/codec 全在 `core`；`Store` 只管「不透明已压缩 blob 的放置 + 命名空间 + 空闲管理 + 该后端持久化原语」，不碰压缩。`fsync(ino)` 与 `sync_all()` 分离，保证单文件 fsync 语义可比。详见 [01-zipfs-design.md](./01-zipfs-design.md) §5 的 `Store` trait 定义。
+**关键边界**：分块/压缩/codec 全在 `core`；`Store` 只管「不透明已压缩 blob 的放置 + 命名空间 + 空闲管理 + 该后端持久化原语」，不碰压缩。`fsync(ino)` 与 `sync_all()` 分离，保证单文件 fsync 语义可比。详见 [01-scrollz-design.md](./01-scrollz-design.md) §5 的 `Store` trait 定义。
 
-## 4. 模块地图（`crates/zipfs/src/`）
+## 4. 模块地图（`crates/scrollz/src/`）
 
 | 模块 | 职责 | 边界内文档 |
 |---|---|---|
-| `rwfs.rs` `passthrough.rs` | FUSE 前端：读写文件系统 / 透传 | [01](./01-zipfs-design.md) §4 |
+| `rwfs.rs` `passthrough.rs` | FUSE 前端：读写文件系统 / 透传 | [01](./01-scrollz-design.md) §4 |
 | `core/`（`chunk` `codec` `rmw` `blockcache` `inode` `wsession` `metrics`） | 共享压缩内核：分块、编解码、读改写、解压块缓存、写会话 | [02-layered-chunking.md](./02-layered-chunking.md)、[08-observability.md](./08-observability.md) |
-| `store/`（`container` `shadow` `lock`） | 两布局后端 + per-inode 标记锁 | [01](./01-zipfs-design.md) §6/§7 |
+| `store/`（`container` `shadow` `lock`） | 两布局后端 + per-inode 标记锁 | [01](./01-scrollz-design.md) §6/§7 |
 | `archive/`（`format` `writer` `reader` `updater` `journal` `superblock`） | 布局 S 每文件分块包：格式、尾日志、双 superblock、head 缓存 | [04-crash-safe-commit.md](./04-crash-safe-commit.md)、[02](./02-layered-chunking.md) |
 | `seal.rs` `compact.rs` | 冷文件封存（大块重压 + LDM）、append-only 空洞压实 | [ADR.md](./ADR.md) D10 |
 | `ingest.rs` `blockio.rs` `fixture.rs` `bin/mkfixture.rs` | 灌入 + 校验、可注入块 IO 接缝、测试夹具 + 夹具生成工具 | [05-fault-injection-testing.md](./05-fault-injection-testing.md) |
@@ -41,9 +41,9 @@ zipfs 是自研的 Rust FUSE 透明压缩文件系统，目标负载 = `~/.claud
 ## 5. Workspace 布局
 
 ```
-zipfs/（Cargo workspace，根 profile.release: lto=thin + codegen-units=1）
-  crates/zipfs/        # 主 crate（FUSE 文件系统 + enable/reconcile）
-  crates/zipfs-bench/  # 基准工具
+scrollz/（Cargo workspace，根 profile.release: lto=thin + codegen-units=1）
+  crates/scrollz/        # 主 crate（FUSE 文件系统 + enable/reconcile）
+  crates/scrollz-bench/  # 基准工具
   exp/                 # 一次性 PoC / 设计闸门（如 container-backend-selection）
 ```
 

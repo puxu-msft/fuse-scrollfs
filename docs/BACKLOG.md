@@ -1,4 +1,4 @@
-# zipfs 推迟待办 / BACKLOG
+# scrollz 推迟待办 / BACKLOG
 
 > **本文回答「推迟做什么」**——已知但当前不做的可选特性、非关键改进、研究性方向。收敛「知道但没做」的信号，避免静默砍潜在需求（`defer-potential-demand-over-cut-it`）。
 >

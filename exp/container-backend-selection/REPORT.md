@@ -1,6 +1,6 @@
 # microbench 报告：redb 作为布局 V 容器存变长压缩 chunk blob 的性能闸门
 
-> 关联设计：[`docs/01-zipfs-design.md`](../docs/01-zipfs-design.md) §6（布局 V）、§6.1（三档形态 / 写批处理陷阱）。
+> 关联设计：[`docs/01-scrollz-design.md`](../docs/01-scrollz-design.md) §6（布局 V）、§6.1（三档形态 / 写批处理陷阱）。
 > 闸门问题：**redb 默认「全包」形态（元数据 + 数据块都进 redb）存变长压缩 chunk blob 并做随机更新，性能与空间是否够用，还是需要触发设计 §6.1 的「redb 元数据 + 自写数据区」档位？**
 > 日期：2026-06-27。数字均为本机实跑（见末尾环境），非估算。
 

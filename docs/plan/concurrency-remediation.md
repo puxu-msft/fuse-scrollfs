@@ -1,8 +1,8 @@
-# zipfs 并发正确性整改计划（最全面 / 长远正确）
+# scrollz 并发正确性整改计划（最全面 / 长远正确）
 
 ## Context（为什么做）
 
-zipfs 是自研多线程 FUSE 透明压缩文件系统（fuser 0.17，`n_threads = available_parallelism`，`clone_fd`）。一次聚焦多线程正确性的审查（4 路并发审查 agent + 逐条源码复核）确认：**前端 per-inode 标记锁本身正确**（`lock_for`/`evict_lock` 同持 `locks` 表锁串行化，互斥成立——reviewer 的「两把不同 RwLock」C1 为误报，已用源码否定），但**两个 Store 后端存在真实的数据丢失 / torn-read / 孤儿块缺陷**，且整套锁纪律「靠注释约定、未被类型系统强制」，长期迭代脆弱。
+scrollz 是自研多线程 FUSE 透明压缩文件系统（fuser 0.17，`n_threads = available_parallelism`，`clone_fd`）。一次聚焦多线程正确性的审查（4 路并发审查 agent + 逐条源码复核）确认：**前端 per-inode 标记锁本身正确**（`lock_for`/`evict_lock` 同持 `locks` 表锁串行化，互斥成立——reviewer 的「两把不同 RwLock」C1 为误报，已用源码否定），但**两个 Store 后端存在真实的数据丢失 / torn-read / 孤儿块缺陷**，且整套锁纪律「靠注释约定、未被类型系统强制」，长期迭代脆弱。
 
 用户定调：**最全面、最正确、不惜代价追求长远正确**；并发修复全量重构（含前端锁 dashmap 化），引入 `parking_lot` + `loom` + `dashmap`。执行 subagent 驱动，按阶段过 code review 与全测试绿门控；我负责编排。
 

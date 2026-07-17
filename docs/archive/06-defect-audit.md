@@ -25,7 +25,7 @@
 
 | 编号 | 位置 | 缺陷 | 提交 |
 |---|---|---|---|
-| A1 | `enable/lifecycle.rs` apply | `rename(mp→orig)` 与 `create_dir(mp)` 之间失败无回滚 → 项目目录"蒸发"到 `.zipfs-orig`（list 扫不到），用户恐慌二次误操作 | `2708ea9` |
+| A1 | `enable/lifecycle.rs` apply | `rename(mp→orig)` 与 `create_dir(mp)` 之间失败无回滚 → 项目目录"蒸发"到 `.scrollz-orig`（list 扫不到），用户恐慌二次误操作 | `2708ea9` |
 | A2 | `store/shadow.rs::create` | 新建 archive 只 fsync 文件、未 fsync 父目录 → 崩溃后新文件整体丢失。新 `core::fsync_dir_of` 助手，seal/compact 统一改用（带 warn，并修 L2 静默吞错） | `b2f91d1` |
 | A3 | `compact.rs`/`seal.rs`/`enable/lifecycle.rs::maintain` | **Bug A 在维护路径复发**：compact/seal 裸函数不取 flock，与活守护并发 temp+rename 互覆盖。`lock::backing_lock_path/acquire_backing` 下沉互斥域；maintain 对 shadow 也要求守护退出 | `d6cec70` |
 | B1/B2 | `archive.rs::truncate` + `store/shadow.rs::read_head_cache` | truncate 不失效越界 head 缓存 → 发现读返回已截掉的旧前缀。truncate 在 `new_size<rawlen` 时清缓存 + 读路径 `covered` clamp 到 `uncompressed_size` | `5750463` |
@@ -46,7 +46,7 @@
 | D2 | `store/container.rs` 删块 | `range((x,0)..(x+1,0))` 在 `x==u64::MAX` 溢出（release 回绕成空范围 → 块漏删）。改 `..=(x, u64::MAX)` RangeInclusive | `e92e841` |
 | H2 | `core/codec.rs::decompress_block` | 解压无 window/输出上限 → 恶意/损坏块可炸成任意大 OOM（CRC 可被蓄意重算）。加 `window_log_max=27` + 256MiB 输出帽，降级为 InvalidData | `06abdf0` |
 | — | `core/mod.rs` + `main.rs` + `enable/lifecycle.rs` | CLI `--chunk-size` 无上限 → `vec![0u8; chunk_size]` 数 GB OOM。`MAX_CHUNK_SIZE=64MiB` 校验入口 | `92efb33` |
-| C2 | `main.rs::run_ingest` | 独立 `zipfs ingest` 退出码不反映 `errors`/`skipped` → 外层脚本据此删源丢数据。非零退出 | `92efb33` |
+| C2 | `main.rs::run_ingest` | 独立 `scrollz ingest` 退出码不反映 `errors`/`skipped` → 外层脚本据此删源丢数据。非零退出 | `92efb33` |
 | B3 | `archive.rs::commit{,_journal}` | 契约仅靠注释维系：index 变更后误走 commit_journal → 新块不可达；journal 未重置走 commit → 陈旧 delta 污染封块。加 `index_dirty` 守卫双不变量 | `f228a53` |
 | — | `tests/append_tail_buffer.rs` | 测试盲区：现有最大 ~200KiB，从不跨 1MiB 默认块。补大文件多块 + 跨块 append 逐字节回归 | `8108aad` |
 

@@ -28,7 +28,7 @@ docs/                设计与对照文档
 > 完整分类索引见 **[docs/README.md](docs/README.md)**。快速指引:决策看 [ADR.md](docs/ADR.md)、下一步看 [ROADMAP.md](docs/ROADMAP.md)、进展看 [CHANGELOG.md](docs/CHANGELOG.md)。
 
 - [docs/00-overview.md](docs/00-overview.md) —— 对照实验总纲（条件 / 指标 / 数据集 / 场景适配框架）
-- [docs/01-zipfs-design.md](docs/01-zipfs-design.md) —— 实现设计（§1–13 为 2026-06-27 冻结快照）
+- [docs/01-scrollz-design.md](docs/01-scrollz-design.md) —— 实现设计（§1–13 为 2026-06-27 冻结快照）
 - [docs/ADR.md](docs/ADR.md) —— **决策台账**（决定了什么/为什么/现在还算不算数，含被推翻项）
 - [docs/CHANGELOG.md](docs/CHANGELOG.md) —— 实现与实测进展日志
 - [docs/02-layered-chunking.md](docs/02-layered-chunking.md) —— 分层分块 / head 缓存 / 发现读快路径设计

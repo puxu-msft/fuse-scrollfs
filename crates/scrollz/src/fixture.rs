@@ -1,7 +1,7 @@
 //! 离线 fixture 构建（§12 P1）：把原始数据 / 源目录转成布局 S 的 BACKING archive 树。
 //!
 //! 只读路径的「鸡生蛋」：没有在线写路径却要有可读数据，故离线生成测试数据
-//! （见 docs/01-zipfs-design.md §12 P1「预置数据由独立离线 fixture 工具生成」）。
+//! （见 docs/01-scrollz-design.md §12 P1「预置数据由独立离线 fixture 工具生成」）。
 //! 本模块被 `mkfixture` 二进制与集成测试共享。
 
 use std::fs;

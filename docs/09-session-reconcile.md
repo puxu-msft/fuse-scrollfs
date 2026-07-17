@@ -24,7 +24,7 @@
 
 ### 1.2 现存缺口
 
-- **真挂载入口无 underlay 守卫**：开机/登录/崩溃自愈的挂载走 systemd 模板单元 `ExecStart=zipfs mount-managed --name %i` → `resolve_managed_spec`（`enable/systemd.rs`），**不经** `lifecycle::remount`。守卫只加在 remount 会被自启完全绕过 → 回落写仍被静默盖住。
+- **真挂载入口无 underlay 守卫**：开机/登录/崩溃自愈的挂载走 systemd 模板单元 `ExecStart=scrollz mount-managed --name %i` → `resolve_managed_spec`（`enable/systemd.rs`），**不经** `lifecycle::remount`。守卫只加在 remount 会被自启完全绕过 → 回落写仍被静默盖住。
 - **无重合并原语**：分歧后无手段把二者并回；`restore` 因挂载点非空会失败（安全但不解决）。
 
 ## 2. 目标 / 非目标
@@ -35,7 +35,7 @@
 - 会话感知的**无损并集**合并核：正确切分 Claude jsonl 记录（§3），带 uuid 记录按 uuid 并集、无 uuid 日志记录整行去重保全 distinct，**绝不折叠**。
 - **智能决策推荐**：对每个分歧给证据 + 置信度 + 理由 + 推荐动作；但**从不自动执行**，逐条确认才落盘（执行策略 B）。因合并本身无损，推荐只在"并入同一文件 vs 保留为两个文件"之间选，永不触发有损。
 - 在**所有真挂载入口**加失败即拒的 underlay 守卫（单点 `ensure_underlay_empty` 复用），永久堵住静默盖住。
-- 增量落盘：只动分歧少数条目，以 `.zipfs-orig` 为真源、按文件**原子替换 + 重灌** backing；全程可逆、可续跑。
+- 增量落盘：只动分歧少数条目，以 `.scrollz-orig` 为真源、按文件**原子替换 + 重灌** backing；全程可逆、可续跑。
 
 **非目标**
 
@@ -85,7 +85,7 @@
 - **活跃检测**：`discovery::detect_activity` 判空闲，活跃即拒（无 `--force`）——STOPPED≠空闲，裸挂载点可写，Claude 可能正 append；
 - 取 **reconcile 锁**（`<name>.reconcile.lock` flock，与挂载入口共享语义）→ 与挂载、彼此互斥。
 
-流程（真源 = `.zipfs-orig` 明文；backing 按变更文件派生）：
+流程（真源 = `.scrollz-orig` 明文；backing 按变更文件派生）：
 1. **快照 underlay 进 stash**，全程对快照运算；stash 落盘并 fsync **成功后**才允许动 orig/backing。
 2. 逐条目分类 + 出建议单 → 逐条确认（策略 B）。
 3. 对确认条目：
@@ -105,7 +105,7 @@
 - 守卫谓词精确：忽略已知无害隐藏项白名单（`.fuse_hidden*`/`.DS_Store`/编辑器锁），只认 fall-through 语义条目，避免残渣永久阻塞挂载。
 - `apply` 的 mount 分支此刻 mp 定义上为空（rename 后 create_dir），**不纳入**守卫（避免误拒正常 apply）。
 
-**5.5 CLI / TUI** —— `zipfs enable reconcile <name> [--dry-run] [--force] [--rebuild]`（`--force` 越过活跃门禁由人确认；`--rebuild` = 全量重灌兜底，backing 可疑时用）；交互逐条 `[a]ccept/[k]eep-both/[s]kip`，**高置信度条目回车即 accept**（快速采纳证据确凿项）；非交互（stdin 非 tty）且非 dry-run → 拒绝（策略 B）。`enable reconcile-undo <name>` 回退最近一次 reconcile（§10）。`enable list`：STOPPED 且 underlay 非空 → 标 `NEEDS-RECONCILE`；reconcile/undo 进行中（`.reconciling` 标记在，`committed` 不变）→ 标 `RECONCILING`（优先于 NEEDS-RECONCILE）。列宽据数据动态对齐（长 path-encoded 名不撑破列）。项目名前导 `-`，CLI 须用 `--` 分隔（如 `enable reconcile -- -home-xp-src-foo`）。TUI 同标记 + 逐条建议复核。
+**5.5 CLI / TUI** —— `scrollz enable reconcile <name> [--dry-run] [--force] [--rebuild]`（`--force` 越过活跃门禁由人确认；`--rebuild` = 全量重灌兜底，backing 可疑时用）；交互逐条 `[a]ccept/[k]eep-both/[s]kip`，**高置信度条目回车即 accept**（快速采纳证据确凿项）；非交互（stdin 非 tty）且非 dry-run → 拒绝（策略 B）。`enable reconcile-undo <name>` 回退最近一次 reconcile（§10）。`enable list`：STOPPED 且 underlay 非空 → 标 `NEEDS-RECONCILE`；reconcile/undo 进行中（`.reconciling` 标记在，`committed` 不变）→ 标 `RECONCILING`（优先于 NEEDS-RECONCILE）。列宽据数据动态对齐（长 path-encoded 名不撑破列）。项目名前导 `-`，CLI 须用 `--` 分隔（如 `enable reconcile -- -home-xp-src-foo`）。TUI 同标记 + 逐条建议复核。
 
 ## 6. memory 透传恢复（例外规则）
 
@@ -138,7 +138,7 @@ memory 本应是**单份透传软链**：ingest 在 backing 按软链重建、sh
 
 ## 9. 落地本次事故（neighbors）
 
-特性合入后：`enable reconcile -home-xp-src-neighbors --dry-run` → 复核建议单（预期 373e2835/de756008 = log-only 并入；925fc3a1 = 疑 reuse 低置信、默认隔离保原 UUID；memory 走透传恢复）→ 逐条确认实跑 → 超集 + 字节校验 → `remount` → 确认 ACTIVE 且内容一致。ghc2api-go 本轮不动（数据安全存于其 `.zipfs-orig`）。
+特性合入后：`enable reconcile -home-xp-src-neighbors --dry-run` → 复核建议单（预期 373e2835/de756008 = log-only 并入；925fc3a1 = 疑 reuse 低置信、默认隔离保原 UUID；memory 走透传恢复）→ 逐条确认实跑 → 超集 + 字节校验 → `remount` → 确认 ACTIVE 且内容一致。ghc2api-go 本轮不动（数据安全存于其 `.scrollz-orig`）。
 
 ## 10. reconcile-undo（回退最近一次重合并，供重选）
 
@@ -184,4 +184,4 @@ manifest 随 run 结束写入（best-effort：写失败仅告警，但该 run **
 
 ### 10.5 CLI
 
-`zipfs enable reconcile-undo <name>`（前导 `-` 项目名须 `--` 分隔）。打印：**实际选中的代次 ts**、逐条目逆转报告、被守卫跳过（reconcile 后新写）的条目清单、memory 外部目标待手动回退清单。拒绝时（已挂载 / 无 manifest / 陈旧门未过）给明确文案与下一步指引。之后可重跑 `enable reconcile` 换选项。
+`scrollz enable reconcile-undo <name>`（前导 `-` 项目名须 `--` 分隔）。打印：**实际选中的代次 ts**、逐条目逆转报告、被守卫跳过（reconcile 后新写）的条目清单、memory 外部目标待手动回退清单。拒绝时（已挂载 / 无 manifest / 陈旧门未过）给明确文案与下一步指引。之后可重跑 `enable reconcile` 换选项。

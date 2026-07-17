@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fetch-claude-projects.sh — 把 ~/.claude/projects 的【只读副本】取到 bench/datasets/claude-projects/。
 #
-# 旗舰真实数据集（见 docs/00-overview.md §4.4 与 01-zipfs-design.md §1.1）：
+# 旗舰真实数据集（见 docs/00-overview.md §4.4 与 01-scrollz-design.md §1.1）：
 # 8.7GB / jsonl·txt·json / 双峰大小 / 追加写为主 / 跨会话高冗余 / zstd:3 实测 31x。
 #
 # 用法:

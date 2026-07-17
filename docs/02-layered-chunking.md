@@ -2,7 +2,7 @@
 
 > 类型：特性设计（how）· 状态：**部分实现**——head 缓存快路径已落地（见 CHANGELOG / ROADMAP T3），完整分层格式改动仍草案。文档索引见 [README.md](./README.md)。
 
-> 文档性质：**实现设计（how）**，承接 [01-zipfs-design.md](./01-zipfs-design.md) §3/§7 的均匀分块与 §1.1 追加硬需求。
+> 文档性质：**实现设计（how）**，承接 [01-scrollz-design.md](./01-scrollz-design.md) §3/§7 的均匀分块与 §1.1 追加硬需求。
 > 日期：2026-06-28。状态：草案，**已过一轮 code-architect 审查（见 §8 审查纪要）**，待发现读 micro-bench 验证后再决定是否落格式改动。
 > 依据：对 Claude Code 2.1.191 研究版源码的实证（项目记忆 `claude-code-session-io-access-pattern`），行号引自 `~/src/neighbors/refs/claude-code-2.1.191/app.pretty.js`。
 
@@ -21,7 +21,7 @@
 
 ## 2. 现状与缺口
 
-现状（[mod.rs](../crates/zipfs/src/core/mod.rs) / [archive.rs](../crates/zipfs/src/archive/mod.rs) / [wsession.rs](../crates/zipfs/src/core/wsession.rs) / [rwfs.rs](../crates/zipfs/src/rwfs.rs)）：
+现状（[mod.rs](../crates/scrollz/src/core/mod.rs) / [archive.rs](../crates/scrollz/src/archive/mod.rs) / [wsession.rs](../crates/scrollz/src/core/wsession.rs) / [rwfs.rs](../crates/scrollz/src/rwfs.rs)）：
 
 - **正文块 = 均匀 1MiB**（`DEFAULT_CHUNK_SIZE`，已按 algo-compare 实测从 64KiB 退役），每块独立 zstd 压。
 - **开放尾块缓冲**（`TailSessions`）：活跃尾块未压缓冲，append 成本与块大小解耦。

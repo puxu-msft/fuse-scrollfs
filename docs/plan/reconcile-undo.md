@@ -32,7 +32,7 @@
 - 在既有排空清理调用点（`prune_empty_underlay_dirs(mp)` 之侧，约 orchestrator.rs:1396）**并列加**一个带 `paths+name` 的清理步 `fn prune_redundant_symlinks(paths,name,mp) -> io::Result<Vec<String>>`（**不改** `prune_empty_underlay_dirs` 的 `mp`-only 签名，评审 M1）：遍历 mp 顶层，**删除与 backing 同名同目标的顶层冗余 symlink**（underlay/`<top>` 是 symlink 且 `paths.backing(name,Backend::Shadow).join(top)` 也是 symlink 且 `read_link` 相等 → 删 underlay 那个）。目标不一致 → 保留 + 报告。返回报告并入 `ReconcileReport`。
 
 - [ ] **Step 1: 写失败测试** —— underlay 顶层放 `memory` symlink → backing 同名 symlink 同目标：清理后 `underlay_has_fallthrough(mp)==false`；目标不一致 → 保留 + 记报告；真实目录 memory（split-brain）不被此步误删（仍走 passthrough）。
-- [ ] **Step 2: 确认失败**（`cd fuse && cargo test -p zipfs reconcile`）。
+- [ ] **Step 2: 确认失败**（`cd fuse && cargo test -p scrollz reconcile`）。
 - [ ] **Step 3: 实现** —— 遍历 mp 顶层：symlink 且 `paths.backing(name,Shadow).join(top)` 同为 symlink 且 target 相等 → `remove_file`；不等 → push 报告。空目录 prune 逻辑保持。
 - [ ] **Step 4: 通过 + fmt/clippy。**
 - [ ] **Step 5: 提交** `feat(reconcile): memory 短路——清与 backing 同目标的冗余 underlay 软链（§6 symlink 路）`。

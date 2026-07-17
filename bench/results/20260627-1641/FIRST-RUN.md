@@ -4,7 +4,7 @@
 >
 > 本轮覆盖四个**无需 sudo** 的条件：**C0**（裸 ext4 目录）、**B0**（FUSE 透传）、**BV**（布局 V 容器 / redb）、**BS**（布局 S 影子树）。
 > 条件 **A**（btrfs + zstd，需 sudo + `modprobe btrfs`）本轮**跳过**，由用户另行测量。
-> 对齐 `docs/00-overview.md` §4（条件/指标/数据集）与 `docs/01-zipfs-design.md` §6.1（默认 64KiB 块）。
+> 对齐 `docs/00-overview.md` §4（条件/指标/数据集）与 `docs/01-scrollz-design.md` §6.1（默认 64KiB 块）。
 
 ## 0. 本轮局限（先声明，避免误读）
 

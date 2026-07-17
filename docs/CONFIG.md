@@ -1,19 +1,19 @@
-# zipfs 配置参考 / CONFIG
+# scrollz 配置参考 / CONFIG
 
 > **本文回答「有哪些配置项、默认值、怎么设」**——集中收敛散落在 CLI 参数、`enable config` 文件、编译期默认常量、环境变量四处的配置面。
 >
-> 权威源是代码（`crates/zipfs/src/enable/{config,model}.rs`、`main.rs`、各 `DEFAULT_*` 常量）；本文是人读汇总，代码变更时同步更新。
+> 权威源是代码（`crates/scrollz/src/enable/{config,model}.rs`、`main.rs`、各 `DEFAULT_*` 常量）；本文是人读汇总，代码变更时同步更新。
 
 ## 1. 配置来源与优先级
 
 | 来源 | 位置 | 作用域 |
 |---|---|---|
-| CLI 参数 | `zipfs <cmd> --<flag>` | 单次命令，最高优先 |
-| enable config 文件 | `$ZIPFS_HOME/config`（默认 `<projects_root>/zip/config`），`key=value` 每行 | `enable apply` 的持久默认 |
+| CLI 参数 | `scrollz <cmd> --<flag>` | 单次命令，最高优先 |
+| enable config 文件 | `$SCROLLZ_HOME/config`（默认 `~/.local/claude-scrollz/config`），`key=value` 每行 | `enable apply` 的持久默认 |
 | 编译期默认 | `DEFAULT_*` 常量 | 兜底 |
-| 环境变量 | `ZIPFS_HOME` | 覆盖 zipfs home 根 |
+| 环境变量 | `SCROLLZ_HOME` | 覆盖 scrollz home 根；旧 `ZIPFS_HOME` 仅作弃用兼容回落 |
 
-管理：`zipfs enable config show` 打印当前生效值 + 文件路径；`zipfs enable config set <key> <value>` 写入（未知键 fail-closed；含换行/回车的值拒绝，防注入伪造配置行）。
+管理：`scrollz enable config show` 打印当前生效值 + 文件路径；`scrollz enable config set <key> <value>` 写入（未知键 fail-closed；含换行/回车的值拒绝，防注入伪造配置行）。
 
 ## 2. enable config 键（= `ApplyOptions` 字段）
 
@@ -24,7 +24,7 @@
 | `backend` | `shadow` \| `container` | `shadow`（`model.rs` `Backend::Shadow`） | 后端布局（S=影子树 / V=容器） |
 | `chunk_size` | 字节 | `1048576`（1MiB，`DEFAULT_CHUNK_SIZE`） | 逻辑块大小，见 [ADR.md](./ADR.md) D8 |
 | `level` | i32 | `3`（`DEFAULT_ZSTD_LEVEL`） | zstd 等级（1/3/9/19） |
-| `dict` | 路径 \| 空 | 空（关） | 共享 zstd 字典（`zipfs train-dict` 产出），见 [ADR.md](./ADR.md) D11 |
+| `dict` | 路径 \| 空 | 空（关） | 共享 zstd 字典（`scrollz train-dict` 产出），见 [ADR.md](./ADR.md) D11 |
 | `threads` | usize | `0`（=CPU 数，下限 4） | FUSE 工作线程数 |
 | `writeback` | bool | `false` | FUSE 写回缓存（合并小写、降写尾 p99） |
 | `max_write` | 字节 | `0`（=内核默认 128KiB） | 协商最大单次 write，调大减大行 append 拆分 |
@@ -37,15 +37,16 @@
 
 | 命令 | 参数 | 默认 | 说明 |
 |---|---|---|---|
-| `zipfs umount` / `umount-managed` | `--level` | `auto` | 分档卸载 clean/lazy/abort/auto，见 [07-hangfree-umount.md](./07-hangfree-umount.md) |
-| `zipfs seal` | `--seal-chunk` | `8388608`（8MiB，`DEFAULT_SEAL_CHUNK`） | 封存块大小；`>8MiB` 时 opt-in LDM，见 [ADR.md](./ADR.md) D10 |
-| `zipfs seal` | `--level` | `19`（`DEFAULT_SEAL_LEVEL`） | 封存 zstd 等级 |
+| `scrollz umount` / `umount-managed` | `--level` | `auto` | 分档卸载 clean/lazy/abort/auto，见 [07-hangfree-umount.md](./07-hangfree-umount.md) |
+| `scrollz seal` | `--seal-chunk` | `8388608`（8MiB，`DEFAULT_SEAL_CHUNK`） | 封存块大小；`>8MiB` 时 opt-in LDM，见 [ADR.md](./ADR.md) D10 |
+| `scrollz seal` | `--level` | `19`（`DEFAULT_SEAL_LEVEL`） | 封存 zstd 等级 |
 | 挂载/守护 | `--cache-bytes` | `134217728`（128MiB，`DEFAULT_CACHE_BYTES`） | 解压块缓存上限，见 [DESIGN.md](./DESIGN.md) §1 |
 
-> 完整命令与子命令清单（`enable` 的 list/apply/restore/remount/status/purge/autostart 等）以 `zipfs --help` / `zipfs enable --help` 为准（权威）。enable TUI 用法与设计背景见 [plan/enable-tool.md](./plan/enable-tool.md)（非稳态计划文档，仅作背景）。
+> 完整命令与子命令清单（`enable` 的 list/apply/restore/remount/status/purge/autostart 等）以 `scrollz --help` / `scrollz enable --help` 为准（权威）。enable TUI 用法与设计背景见 [plan/enable-tool.md](./plan/enable-tool.md)（非稳态计划文档，仅作背景）。
 
 ## 4. 环境变量
 
 | 变量 | 含义 |
 |---|---|
-| `ZIPFS_HOME` | 覆盖 zipfs home 根（config 文件、backing 等所在），默认派生自 projects root |
+| `SCROLLZ_HOME` | 覆盖 scrollz home 根（config 文件、backing 等所在），默认 `~/.local/claude-scrollz` |
+| `ZIPFS_HOME` | 原名 zipfs 的弃用兼容变量；仅当 `SCROLLZ_HOME` 未设置时回落读取并记录 warning。迁移后应 unset，或改用 `SCROLLZ_HOME=~/.local/claude-scrollz` |

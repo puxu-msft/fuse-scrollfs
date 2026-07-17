@@ -1,6 +1,6 @@
 //! 布局 S —— 影子树 / 每文件压缩包（P1 只读 + P2/P3 写路径）。
 //!
-//! 设计见 docs/01-zipfs-design.md §7。底层目录树**镜像**逻辑树：逻辑 `/a/b.txt`
+//! 设计见 docs/01-scrollz-design.md §7。底层目录树**镜像**逻辑树：逻辑 `/a/b.txt`
 //! → 后端 `BACKING/a/b.txt`，该后端文件是一个**分块压缩包**（archive.rs 的 footer 布局）。
 //!
 //! ## 读侧（P1）

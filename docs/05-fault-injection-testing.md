@@ -102,16 +102,16 @@ for crash_after in 0..total_writes {
 
 证明真实内核/fs 真的兑现屏障语义（Tier 1 只验自家逻辑）：
 
-- **首选 dm-log-writes**（xfstests 同级）：loop + dm-log-writes 记录每个 write/flush/fua → ext4 → zipfs `--backing` 指此 → 跑工作负载 → `replay-log` 回放到**每个 flush 边界**，逐个 mount + 跑 zipfs 恢复校验。收窄到 **2–3 个招牌场景**：(a) append+fsync 序列回放、(b) rename 覆盖、(c) create 后崩溃（验目录项 durability）。**不做 xfstests 全量**。
+- **首选 dm-log-writes**（xfstests 同级）：loop + dm-log-writes 记录每个 write/flush/fua → ext4 → scrollz `--backing` 指此 → 跑工作负载 → `replay-log` 回放到**每个 flush 边界**，逐个 mount + 跑 scrollz 恢复校验。收窄到 **2–3 个招牌场景**：(a) append+fsync 序列回放、(b) rename 覆盖、(c) create 后崩溃（验目录项 durability）。**不做 xfstests 全量**。
 - **退路 dm-flakey smoke**：跑中途切 `drop_writes` 表 + kill，重挂校验。粗粒度，证「丢写不致命」，证不了 barrier 排序。
 - **门控**比照现有 `/dev/fuse` 与 `drop_caches`：非 root / 无 device-mapper 即 `SKIP`，不进默认 `cargo test`。
 - 新增脚本 `bench/scripts/crash-test-dm.sh`。
 
 ## §6 模块布局与 feature 门控
 
-- 新增 `crates/zipfs/src/blockio.rs`：`BlockIo` trait + `FileIo`（生产，精简）。
+- 新增 `crates/scrollz/src/blockio.rs`：`BlockIo` trait + `FileIo`（生产，精简）。
 - `FaultIo`：门控 `#[cfg(any(test, feature = "fault-injection"))]`。**关键（评审 HIGH）**：`#[cfg(test)]` 对 `tests/` 独立 crate 不可见，集成测试唯一途径是 feature。
-  - `crates/zipfs/Cargo.toml` 加 `[features] fault-injection = []`。
+  - `crates/scrollz/Cargo.toml` 加 `[features] fault-injection = []`。
   - 运行：`cargo test --features fault-injection`（CI 与本地统一带 flag）。
   - 依赖 `FaultIo` 的集成测试文件加文件级 `#[cfg(feature = "fault-injection")]`，不带 feature 时整文件跳过，免裸跑编译失败。
 - 改 `archive.rs`：`ArchiveUpdater` 泛型化到 `W: BlockIo`，open 读链改吃 `&impl BlockIo`；`ArchiveReader`/`ArchiveWriter` 不动。
@@ -120,7 +120,7 @@ for crash_after in 0..total_writes {
 
 ## §7 验证矩阵（每模型 ↔ 一条不变量）
 
-| 故障模型 | 注入点 | 层 | 断言的 zipfs 不变量 |
+| 故障模型 | 注入点 | 层 | 断言的 scrollz 不变量 |
 |---|---|---|---|
 | EIO/ENOSPC | 第 N 写/sync | T1 | 错误上传不静默吞；archive 仍开为上一版（§8.3 非活跃槽未污染） |
 | 撕裂/部分写（512B 对齐） | index/SB/journal 写一半 | T1 | CRC/双 SB 检损回退；`rec_crc` 拒半条尾日志（§8.4） |
@@ -150,8 +150,8 @@ for crash_after in 0..total_writes {
 **已定**：两层架构；`BlockIo` `&self` + `Send+Sync`；**`impl BlockIo for File`（reader 字段原地满足，弃「包 FileIo」）**；泛型 `ArchiveUpdater<W>` + 双构造；覆盖 open 读链；**superblock 写改 `self.io.write_at`，`write_superblock_slot` 留 ArchiveWriter**；崩溃模型支持乱序子集持久化（重排升为核心）；**乱序枚举须与 barrier-sync 失败注入交叉**；**断言用带外 oracle（FaultIo 每次 sync 快照活跃 seq + 测试侧 expected 历史），不靠 commit/reader 自证**；**注入按语义 offset 区间调度，不钉具体 ErrorKind**；剪枝窗口 = barrier2↔barrier2 间 `write_at`，N≤12 否则定 seed 采样；撕裂 512B 对齐；feature 门控（`pub mod blockio` + pub 类型 + 测试文件 inner `#![cfg]`）；不动 reader/writer；container 仅 smoke；dm-log-writes 2–3 场景；reader 缓存失效世代由 FaultIo 注入 `up.sync()` 失败专项覆盖（任务 2.6）。
 
 **实施已定（as-built，2026-06-29）**：
-- **`FaultIo` 接口**（`crates/zipfs/src/blockio.rs`，门控 `#[cfg(any(test, feature = "fault-injection"))]`、`pub use`）：`from_bytes(initial)` 播种 durable；注入武装 `fail_write_in(lo,hi)`（区间相交即 EIO，fire-once）/ `fail_sync_in(nth_from_now)`（第 N 次 sync EIO）/ `tear_write_in(lo,hi,prefix)`（只落前 prefix 字节，静默成功）/ `soften_syncs(count)`（接下来 count 次 sync 返 Ok 但不合并 dirty，构造乱序窗口）；崩溃镜像 `crash_with_mask(mask)`（durable + 按 bit 选中的 dirty 子集）；穷举阶梯 `history()`（初始 durable + 每次成功 sync 后的 durable 快照）；自检 `dirty_count()`。EIO 用 `io::Error::from_raw_os_error(5)`，断言只钉「is_err / 不静默错读」，**放宽为 `InvalidData | UnexpectedEof`**（spec §10「不钉具体 ErrorKind」，评审 H3）。
-- **带外 oracle 接口**（`crates/zipfs/tests/fault_injection.rs`）：`active_seq_of(&[u8])` 经 pub `parse_superblock` 取两槽较大有效 seq（不经 commit/reader）；`expected: Vec<Vec<u8>>` 历史前缀台账（仿 `append_tail_buffer.rs`）；崩溃镜像经临时文件 + **现有** `ArchiveReader::open` 校验（reader 独立于被测写路径）。
-- **dm-log-writes 脚本形态**（`bench/scripts/crash-test-dm-logwrites.sh`）：loop(data)+loop(log)+dm-log-writes → ext4 → zipfs；在 3 招牌边界 `dmsetup message <dm> 0 mark <label>`（append-a / rename-b / create-c）；撤 dm 层后逐 mark `replay-log --end-mark <label>` 回放到 data 盘 → 直接挂 ext4 + zipfs → per-scenario python 校验（连续前缀 / rename 新内容 / create 目录项 durable）。全部 root 门控、SKIP exit 0。
+- **`FaultIo` 接口**（`crates/scrollz/src/blockio.rs`，门控 `#[cfg(any(test, feature = "fault-injection"))]`、`pub use`）：`from_bytes(initial)` 播种 durable；注入武装 `fail_write_in(lo,hi)`（区间相交即 EIO，fire-once）/ `fail_sync_in(nth_from_now)`（第 N 次 sync EIO）/ `tear_write_in(lo,hi,prefix)`（只落前 prefix 字节，静默成功）/ `soften_syncs(count)`（接下来 count 次 sync 返 Ok 但不合并 dirty，构造乱序窗口）；崩溃镜像 `crash_with_mask(mask)`（durable + 按 bit 选中的 dirty 子集）；穷举阶梯 `history()`（初始 durable + 每次成功 sync 后的 durable 快照）；自检 `dirty_count()`。EIO 用 `io::Error::from_raw_os_error(5)`，断言只钉「is_err / 不静默错读」，**放宽为 `InvalidData | UnexpectedEof`**（spec §10「不钉具体 ErrorKind」，评审 H3）。
+- **带外 oracle 接口**（`crates/scrollz/tests/fault_injection.rs`）：`active_seq_of(&[u8])` 经 pub `parse_superblock` 取两槽较大有效 seq（不经 commit/reader）；`expected: Vec<Vec<u8>>` 历史前缀台账（仿 `append_tail_buffer.rs`）；崩溃镜像经临时文件 + **现有** `ArchiveReader::open` 校验（reader 独立于被测写路径）。
+- **dm-log-writes 脚本形态**（`bench/scripts/crash-test-dm-logwrites.sh`）：loop(data)+loop(log)+dm-log-writes → ext4 → scrollz；在 3 招牌边界 `dmsetup message <dm> 0 mark <label>`（append-a / rename-b / create-c）；撤 dm 层后逐 mark `replay-log --end-mark <label>` 回放到 data 盘 → 直接挂 ext4 + scrollz → per-scenario python 校验（连续前缀 / rename 新内容 / create 目录项 durable）。全部 root 门控、SKIP exit 0。
 - **补强（评审纠偏）**：增「双 SB 非互污 + sb_crc 拒损坏活跃槽 → 回落上一已提交版」用例（钉死真正的单缓冲降级 bug，突变实证有牙）。
 

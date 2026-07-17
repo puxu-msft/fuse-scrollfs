@@ -1,6 +1,6 @@
 //! 压缩 codec + 不可压缩启发式（P1：zstd；lz4 留 TODO）。
 //!
-//! 设计见 docs/01-zipfs-design.md §3。每块独立压缩，记录压缩后长度；若
+//! 设计见 docs/01-scrollz-design.md §3。每块独立压缩，记录压缩后长度；若
 //! `clen >= raw * 阈值`（如 0.95）则原样存 + 置 flag，省解压成本并避免膨胀
 //! （对齐 btrfs 行为）。压缩是 Core 的职责，Store 只搬运不透明字节（§2、§5）。
 //!
@@ -218,7 +218,7 @@ pub fn compress_block_full(
         Algo::None => Ok((raw.to_vec(), true)),
         Algo::Lz4 => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "lz4 codec 尚未实现（P1 仅 zstd），见 docs/01-zipfs-design.md §3",
+            "lz4 codec 尚未实现（P1 仅 zstd），见 docs/01-scrollz-design.md §3",
         )),
         Algo::Zstd => {
             let compressed = match dict {

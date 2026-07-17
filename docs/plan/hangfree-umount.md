@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 给 zipfs 卸载加上用户可选的分档升级梯（clean/lazy/abort/auto），卸载引擎全程 hang-free，systemd `ExecStop` 默认 `auto`——正常关闭走会 flush 的耐久路径，卡死场景自动升级到强制摘除，不再留陈旧挂载。
+**Goal:** 给 scrollz 卸载加上用户可选的分档升级梯（clean/lazy/abort/auto），卸载引擎全程 hang-free，systemd `ExecStop` 默认 `auto`——正常关闭走会 flush 的耐久路径，卡死场景自动升级到强制摘除，不再留陈旧挂载。
 
-**Architecture:** 新增 `force_umount` 模块承载分档引擎与 hang-free 原语（读 `/proc/self/mountinfo` 取 fuse 连接号、写 `/sys/fs/fuse/connections/<id>/abort`、带超时的外部 `fusermount`）。mountinfo 解析合并进 `discovery`（其 octal-unescape/overmount 逻辑所在）。CLI 增 `zipfs umount --name --level`，内部 `umount-managed` 与 systemd `ExecStop` 复用同一引擎。
+**Architecture:** 新增 `force_umount` 模块承载分档引擎与 hang-free 原语（读 `/proc/self/mountinfo` 取 fuse 连接号、写 `/sys/fs/fuse/connections/<id>/abort`、带超时的外部 `fusermount`）。mountinfo 解析合并进 `discovery`（其 octal-unescape/overmount 逻辑所在）。CLI 增 `scrollz umount --name --level`，内部 `umount-managed` 与 systemd `ExecStop` 复用同一引擎。
 
 **Tech Stack:** Rust 2021，clap（`ValueEnum`），std（`process::Command`、`fs`、`mpsc`/`try_wait` 超时），既有 `fuser` FUSE 栈；测试用 `#[cfg(test)]` 单测 + `tests/` 真挂载集成（参照 `tests/systemd_mount.rs`）。
 
@@ -52,7 +52,7 @@
 #[test]
 fn parse_connection_id_takes_minor_from_fuse_line() {
     let target = std::path::Path::new("/mnt/x");
-    let mi = "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.zipfs-shadow zipfs rw,user_id=1000\n";
+    let mi = "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.scrollz-shadow scrollz rw,user_id=1000\n";
     assert_eq!(parse_connection_id(mi, target), Some(44));
 }
 
@@ -66,15 +66,15 @@ fn parse_connection_id_none_for_non_fuse() {
 #[test]
 fn parse_connection_id_overmount_takes_last() {
     let target = std::path::Path::new("/mnt/x");
-    let mi = "36 35 0:44 / /mnt/x rw - fuse.zipfs-shadow z rw\n\
-              37 35 0:55 / /mnt/x rw - fuse.zipfs-shadow z rw\n";
+    let mi = "36 35 0:44 / /mnt/x rw - fuse.scrollz-shadow z rw\n\
+              37 35 0:55 / /mnt/x rw - fuse.scrollz-shadow z rw\n";
     assert_eq!(parse_connection_id(mi, target), Some(55));
 }
 
 #[test]
 fn parse_connection_id_handles_octal_escaped_path() {
     let target = std::path::Path::new("/mnt/a b"); // 含空格
-    let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse zipfs rw\n";
+    let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse scrollz rw\n";
     assert_eq!(parse_connection_id(mi, target), Some(44));
 }
 ```
@@ -335,7 +335,7 @@ mod tests {
     fn run_fusermount_notfound_when_binary_absent() {
         // 用一个不存在的挂载点 + 极短超时；真实 fusermount 会快速失败（非 hang）。
         // 断言不 panic 且返回可判定的 outcome（Failed / NotFound）。
-        let mp = Path::new("/nonexistent/zipfs/mp");
+        let mp = Path::new("/nonexistent/scrollz/mp");
         let out = run_fusermount(&[OsStr::new("-u"), mp.as_os_str()], Duration::from_secs(2));
         assert!(matches!(out, CmdOutcome::Failed | CmdOutcome::NotFound));
     }
@@ -490,7 +490,7 @@ fn next_level_escalation_chain() {
 #[test]
 fn umount_reports_not_mounted_as_success() {
     // 未挂载的路径：was_mounted=false、unmounted=true、不 abort。
-    let mp = Path::new("/definitely/not/mounted/zipfs");
+    let mp = Path::new("/definitely/not/mounted/scrollz");
     let r = umount(mp, UmountLevel::Auto).unwrap();
     assert!(!r.was_mounted);
     assert!(r.unmounted);
@@ -647,17 +647,17 @@ git commit -m "feat(force_umount): 分档卸载引擎 clean/lazy/abort/auto + �
 
 ---
 
-## Task 5: CLI `zipfs umount --level` + `umount-managed --level auto` 接线
+## Task 5: CLI `scrollz umount --level` + `umount-managed --level auto` 接线
 
 **Files:**
 - Modify: `fuse/src/main.rs`（`Command` enum 加 `Umount`；`MountManagedArgs` 加 `--level`；`run_umount_managed` 切引擎；新增 `run_umount`）
 - Test: `fuse/tests/enable.rs` 或 `fuse/src/main.rs` 无法直接单测 clap → 由 Task 6 集成覆盖；本任务加一个 `#[cfg(test)]` 的 clap 解析测试到 main.rs。
 
 **Interfaces:**
-- Consumes: `zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::model::{Paths, validate_name}`、`zipfs::enable::systemd::{systemd_unescape, systemd_escape}`。
-- Produces: 顶层子命令 `zipfs umount --name <raw-project-name> [--level <UmountLevel>]`；`umount-managed` 支持 `--level`（默认 `Auto`）。
+- Consumes: `scrollz::enable::force_umount::{umount, UmountLevel}`、`scrollz::enable::model::{Paths, validate_name}`、`scrollz::enable::systemd::{systemd_unescape, systemd_escape}`。
+- Produces: 顶层子命令 `scrollz umount --name <raw-project-name> [--level <UmountLevel>]`；`umount-managed` 支持 `--level`（默认 `Auto`）。
 
-> **命名约定（关键，勿混淆）**：`systemd_unescape` 对**裸 `-` 会解成 `/`**（有损），故只有 systemd 传的 **escaped `%i`**（形如 `\x2dhome\x2dxp\x2dsrc\x2dfoo`）才可 unescape。与既有 `enable apply/restore/status` 一致，**面向用户的 `zipfs umount --name` 收的是 RAW project 名**（如 `-home-xp-src-foo`，即 projects 目录名），**不 unescape**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 须 `allow_hyphen_values`。仅 `umount-managed`（systemd ExecStop 用，收 escaped `%i`）才 `systemd_unescape`。C1 提示里的 systemd 单元名用 `systemd_escape(raw)` 反算。
+> **命名约定（关键，勿混淆）**：`systemd_unescape` 对**裸 `-` 会解成 `/`**（有损），故只有 systemd 传的 **escaped `%i`**（形如 `\x2dhome\x2dxp\x2dsrc\x2dfoo`）才可 unescape。与既有 `enable apply/restore/status` 一致，**面向用户的 `scrollz umount --name` 收的是 RAW project 名**（如 `-home-xp-src-foo`，即 projects 目录名），**不 unescape**，直接 `validate_name`+`mountpoint`。因 raw 名以 `-` 开头，`UmountArgs.name` 须 `allow_hyphen_values`。仅 `umount-managed`（systemd ExecStop 用，收 escaped `%i`）才 `systemd_unescape`。C1 提示里的 systemd 单元名用 `systemd_escape(raw)` 反算。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -672,11 +672,11 @@ mod cli_tests {
     #[test]
     fn parses_umount_with_default_level() {
         // 面向用户：RAW project 名（以 - 开头，来自 projects 目录名）；默认档 auto。
-        let cli = Cli::parse_from(["zipfs", "umount", "--name", "-home-xp-src-foo"]);
+        let cli = Cli::parse_from(["scrollz", "umount", "--name", "-home-xp-src-foo"]);
         match cli.command {
             Some(Command::Umount(a)) => {
                 assert_eq!(a.name, "-home-xp-src-foo");
-                assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Auto);
+                assert_eq!(a.level, scrollz::enable::force_umount::UmountLevel::Auto);
             }
             _ => panic!("应解析为 Umount 子命令"),
         }
@@ -686,11 +686,11 @@ mod cli_tests {
     fn parses_umount_managed_with_level() {
         // systemd ExecStop：escaped %i（无前导 -）+ 显式档。
         let cli = Cli::parse_from([
-            "zipfs", "umount-managed", "--name", "\\x2dhome\\x2dxp", "--level", "abort",
+            "scrollz", "umount-managed", "--name", "\\x2dhome\\x2dxp", "--level", "abort",
         ]);
         match cli.command {
             Some(Command::UmountManaged(a)) => {
-                assert_eq!(a.level, zipfs::enable::force_umount::UmountLevel::Abort);
+                assert_eq!(a.level, scrollz::enable::force_umount::UmountLevel::Abort);
             }
             _ => panic!("应解析为 UmountManaged"),
         }
@@ -700,7 +700,7 @@ mod cli_tests {
 
 - [ ] **Step 2: 运行确认失败**
 
-Run: `cd fuse && cargo test --bin zipfs cli_tests`
+Run: `cd fuse && cargo test --bin scrollz cli_tests`
 Expected: 编译失败（`Command::Umount` 不存在、`MountManagedArgs` 无 `level`）。
 
 - [ ] **Step 3: 写实现**
@@ -715,7 +715,7 @@ struct MountManagedArgs {
     name: String,
     /// 卸载档位（仅 umount-managed 用；mount-managed 忽略）。默认 auto。
     #[arg(long, value_enum, default_value = "auto")]
-    level: zipfs::enable::force_umount::UmountLevel,
+    level: scrollz::enable::force_umount::UmountLevel,
 }
 ```
 
@@ -724,7 +724,7 @@ struct MountManagedArgs {
 ```rust
     /// 按档位卸载某项目挂载（hang-free）：clean/lazy/abort/auto。见 docs/07。
     ///
-    /// 用法：`zipfs umount --name <项目名> [--level clean|lazy|abort|auto]`。
+    /// 用法：`scrollz umount --name <项目名> [--level clean|lazy|abort|auto]`。
     Umount(UmountArgs),
 ```
 
@@ -738,7 +738,7 @@ struct UmountArgs {
     name: String,
     /// 卸载档位，默认 auto（clean→lazy→abort 升级）。
     #[arg(long, value_enum, default_value = "auto")]
-    level: zipfs::enable::force_umount::UmountLevel,
+    level: scrollz::enable::force_umount::UmountLevel,
 }
 ```
 
@@ -753,9 +753,9 @@ struct UmountArgs {
 ```rust
 /// systemd 托管卸载（ExecStop）：unescape escaped `%i` → 按 --level 走 hang-free 引擎。
 fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
-    let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
-    let name = zipfs::enable::systemd::systemd_unescape(&args.name);
-    zipfs::enable::model::validate_name(&name).map_err(|e| {
+    let paths = scrollz::enable::model::Paths::resolve(&home_or_err()?);
+    let name = scrollz::enable::systemd::systemd_unescape(&args.name);
+    scrollz::enable::model::validate_name(&name).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
@@ -763,7 +763,7 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
     })?;
     let mp = paths.mountpoint(&name);
     // 引擎错误也附 %i/解码名上下文，便于 ExecStop 失败日志定位实例（与 run_mount_managed 对齐）。
-    let report = zipfs::enable::force_umount::umount(&mp, args.level).map_err(|e| {
+    let report = scrollz::enable::force_umount::umount(&mp, args.level).map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
@@ -778,17 +778,17 @@ fn run_umount_managed(args: MountManagedArgs) -> std::io::Result<()> {
 
 /// 面向用户的按档位卸载。`name` 是 RAW project 名（与 enable 一致，不 unescape）。
 fn run_umount(args: UmountArgs) -> std::io::Result<()> {
-    let paths = zipfs::enable::model::Paths::resolve(&home_or_err()?);
+    let paths = scrollz::enable::model::Paths::resolve(&home_or_err()?);
     let name = &args.name;
-    zipfs::enable::model::validate_name(name)?;
+    scrollz::enable::model::validate_name(name)?;
     let mp = paths.mountpoint(name);
     // C1：本命令不 systemctl stop；托管实例（Restart=on-failure）直卸可能与自动重挂竞态。
     eprintln!(
-        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}.service`；\
+        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop scrollz@{}.service`；\
          本命令仅作强制兜底。",
-        zipfs::enable::systemd::systemd_escape(name)
+        scrollz::enable::systemd::systemd_escape(name)
     );
-    let report = zipfs::enable::force_umount::umount(&mp, args.level)?;
+    let report = scrollz::enable::force_umount::umount(&mp, args.level)?;
     info!(
         "umount: name={name} level={:?} reached={:?} aborted={} unmounted={}",
         args.level, report.level_reached, report.aborted, report.unmounted
@@ -797,23 +797,23 @@ fn run_umount(args: UmountArgs) -> std::io::Result<()> {
 }
 ```
 
-> 删掉 `run_umount_managed` 原来的 `use zipfs::enable::daemon::Mounter;` 与 `RealMounter.unmount` 调用（已被引擎取代）。`mount_args_from_spec`/`run_mount_managed` 不动。
+> 删掉 `run_umount_managed` 原来的 `use scrollz::enable::daemon::Mounter;` 与 `RealMounter.unmount` 调用（已被引擎取代）。`mount_args_from_spec`/`run_mount_managed` 不动。
 
 - [ ] **Step 4: 运行确认通过**
 
-Run: `cd fuse && cargo test --bin zipfs cli_tests`
+Run: `cd fuse && cargo test --bin scrollz cli_tests`
 Expected: 2 测试 PASS。
 
 - [ ] **Step 5: 全量构建 + clippy**
 
-Run: `cd fuse && cargo build && cargo clippy --bin zipfs -- -D warnings`
+Run: `cd fuse && cargo build && cargo clippy --bin scrollz -- -D warnings`
 Expected: 构建绿、无告警。
 
 - [ ] **Step 6: 提交**
 
 ```bash
 git add fuse/src/main.rs
-git commit -m "feat(cli): zipfs umount --level + umount-managed 走分档引擎"
+git commit -m "feat(cli): scrollz umount --level + umount-managed 走分档引擎"
 ```
 
 ---
@@ -833,7 +833,7 @@ git commit -m "feat(cli): zipfs umount --level + umount-managed 走分档引擎"
 将 `autostart.rs:179` 断言改为：
 
 ```rust
-        assert!(body.contains("ExecStop=/usr/bin/zipfs umount-managed --name %i --level auto"));
+        assert!(body.contains("ExecStop=/usr/bin/scrollz umount-managed --name %i --level auto"));
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -870,19 +870,19 @@ git commit -m "feat(autostart): ExecStop 默认 --level auto，卡死自动升�
 - 参照：`fuse/tests/systemd_mount.rs`、`fuse/tests/mount_rw.rs`（真挂载起停范式）
 
 **Interfaces:**
-- Consumes: 已构建的 `zipfs` 二进制（`env!("CARGO_BIN_EXE_zipfs")`）、`zipfs::enable::force_umount::{umount, UmountLevel}`、`zipfs::enable::discovery::is_mounted`。
+- Consumes: 已构建的 `scrollz` 二进制（`env!("CARGO_BIN_EXE_scrollz")`）、`scrollz::enable::force_umount::{umount, UmountLevel}`、`scrollz::enable::discovery::is_mounted`。
 
-> **起挂载 helper 需新写**（现有 `tests/systemd_mount.rs`/`tests/mount_rw.rs` 起挂载**不带 `--pid-file`**，无法取 daemon PID）。新 helper `common::mount_shadow()`：起 `zipfs mount --backend shadow ... --pid-file <tmp>`（起停/等就绪范式照抄 `mount_rw.rs`），返回 `{ mountpoint, daemon_pid, _backing, _tmp }`；`daemon_pid` 从 pid-file 读。`common::sigkill(pid)` 发 `SIGKILL`（`libc::kill` 或 `nix`）。整个测试文件加 `skip_reason()` 门控（`/dev/fuse` 可用 + `fusermount(3)` 在 PATH + `/sys/fs/fuse/connections` 可写），对齐 `systemd_mount.rs` 的 skip 范式；无 FUSE 的 CI 上 skip。
+> **起挂载 helper 需新写**（现有 `tests/systemd_mount.rs`/`tests/mount_rw.rs` 起挂载**不带 `--pid-file`**，无法取 daemon PID）。新 helper `common::mount_shadow()`：起 `scrollz mount --backend shadow ... --pid-file <tmp>`（起停/等就绪范式照抄 `mount_rw.rs`），返回 `{ mountpoint, daemon_pid, _backing, _tmp }`；`daemon_pid` 从 pid-file 读。`common::sigkill(pid)` 发 `SIGKILL`（`libc::kill` 或 `nix`）。整个测试文件加 `skip_reason()` 门控（`/dev/fuse` 可用 + `fusermount(3)` 在 PATH + `/sys/fs/fuse/connections` 可写），对齐 `systemd_mount.rs` 的 skip 范式；无 FUSE 的 CI 上 skip。
 
 - [ ] **Step 1: 写测试骨架 + clean/lazy 用例**
 
 ```rust
-//! 分档卸载集成：真起 zipfs 挂载，验证各档摘除与 wedge 恢复。见 docs/07。
+//! 分档卸载集成：真起 scrollz 挂载，验证各档摘除与 wedge 恢复。见 docs/07。
 mod common; // 若现有 tests 有共享 helper，则复用；否则内联最小起挂载 helper（照抄 mount_rw.rs）。
 
 use std::path::Path;
-use zipfs::enable::discovery::is_mounted;
-use zipfs::enable::force_umount::{umount, UmountLevel};
+use scrollz::enable::discovery::is_mounted;
+use scrollz::enable::force_umount::{umount, UmountLevel};
 
 #[test]
 fn clean_level_unmounts_healthy_mount() {

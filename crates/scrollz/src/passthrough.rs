@@ -2,7 +2,7 @@
 //!
 //! 把所有 FUSE 操作转发到一个底层目录（backing dir）。目的：在无压缩复杂度下打通
 //! inode/句柄/并发/lookup-count/锁顺序骨架，把「FUSE 语义 bug」与「压缩/RMW bug」分离。
-//! 对应 docs/01-zipfs-design.md §12 P0、§4「FUSE 层」。这是基准矩阵里的 B0（隔离纯 FUSE 税）。
+//! 对应 docs/01-scrollz-design.md §12 P0、§4「FUSE 层」。这是基准矩阵里的 B0（隔离纯 FUSE 税）。
 //!
 //! 实现策略：经典用户态透传——自维护 `ino ↔ 相对路径` 映射，每个操作对 backing 下对应路径
 //! 或已打开 fd 做真实 syscall。不走 §5 的 Store 接缝（那是 P1+ 压缩布局才需要）。

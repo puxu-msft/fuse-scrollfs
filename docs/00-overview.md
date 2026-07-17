@@ -1,4 +1,4 @@
-# zipfs 前期总纲：方案一（btrfs+zstd）对照方案四（FUSE 透明压缩）
+# scrollz 前期总纲：方案一（btrfs+zstd）对照方案四（FUSE 透明压缩）
 
 > 文档性质：**前期范围与实验设计（intent + 方法）**，不是实现计划。回答「我们要比什么、怎么比、用什么判据」。实测环境另见 [environment-snapshot.md](./environment-snapshot.md)。
 > 日期：2026-06-27。
@@ -7,7 +7,7 @@
 
 需求来源：希望在 WSL 里把某个原始目录以**透明压缩**方式存储——上层是普通 POSIX 读写接口，底层自动压缩/解压，从而省盘且不改变使用方式。
 
-本项目 `zipfs` 要做的，是**横向评测两种实现路线**，据此决定后续投入哪条：
+本项目 `scrollz` 要做的，是**横向评测两种实现路线**，据此决定后续投入哪条：
 
 - **方案一 / 路线 A —— 内核态 btrfs + zstd（loop image）**：成熟、内核速度，作为**参照基线（reference baseline）**。
 - **方案四 / 路线 B —— 用户态 FUSE 透明压缩（Rust，复用成熟积木）**：可控、可移植。语言定为 **Rust**；优先**复用现成成熟库/实现**而非从零造轮子。
@@ -28,7 +28,7 @@ flowchart LR
     VFS_A["VFS"] --> BTRFS["btrfs + zstd 压缩\n(内核, 按 128KiB extent)"] --> Loop["loop image (.img)"] --> Ext4A["ext4 /dev/sdd"]
   end
   subgraph B["路线 B: FUSE（用户态）"]
-    VFS_B["VFS"] --> FUSEK["fuse 内核模块"] --> Daemon["zipfs 用户态守护\n(分块 + zstd)"] --> Ext4B["后端目录 (ext4)"]
+    VFS_B["VFS"] --> FUSEK["fuse 内核模块"] --> Daemon["scrollz 用户态守护\n(分块 + zstd)"] --> Ext4B["后端目录 (ext4)"]
   end
   App --> VFS_A
   App --> VFS_B
@@ -74,11 +74,11 @@ flowchart LR
 | C0 | 裸 ext4（无压缩，直接在 `/dev/sdd` 上） | 原始吞吐地板（control） |
 | A  | btrfs + zstd:{1,3,9,15}（loop image） | 内核态参照基线 |
 | B0 | FUSE **透传**（passthrough，不压缩，基于 `fuser`） | **隔离纯 FUSE 开销** |
-| BV | zipfs 自研，**布局 V（容器/虚拟盘）** | 自研对照项之一，详见 [01-zipfs-design.md](./01-zipfs-design.md) |
-| BS | zipfs 自研，**布局 S（影子树/每文件压缩包）** | 自研对照项之二 |
+| BV | scrollz 自研，**布局 V（容器/虚拟盘）** | 自研对照项之一，详见 [01-scrollz-design.md](./01-scrollz-design.md) |
+| BS | scrollz 自研，**布局 S（影子树/每文件压缩包）** | 自研对照项之二 |
 | B2 | FUSE + zstd（**整文件**，`fuse-zstd`） | 消融参照：BS vs B2 = 分块 vs 整文件 |
 
-> B0 是方法上的关键招：先量「FUSE 本身的税」（B0 − C0），再量「在 FUSE 上加压缩的增量」（BV/BS − B0）。**BV vs BS 是本项目核心实验**（主变量为磁盘布局，但一致性语义 / dedup / 元数据代价等伴生变量不可消除，须分别归因——见 [01-zipfs-design.md](./01-zipfs-design.md) §2）。压缩算法首版 **zstd 多等级 + lz4（`lz4_flex`）速度对照**；**仅 Linux/WSL 原生目录，不覆盖 `/mnt/c`**。
+> B0 是方法上的关键招：先量「FUSE 本身的税」（B0 − C0），再量「在 FUSE 上加压缩的增量」（BV/BS − B0）。**BV vs BS 是本项目核心实验**（主变量为磁盘布局，但一致性语义 / dedup / 元数据代价等伴生变量不可消除，须分别归因——见 [01-scrollz-design.md](./01-scrollz-design.md) §2）。压缩算法首版 **zstd 多等级 + lz4（`lz4_flex`）速度对照**；**仅 Linux/WSL 原生目录，不覆盖 `/mnt/c`**。
 
 ### 4.2 指标
 
@@ -101,7 +101,7 @@ flowchart LR
 
 | 数据集 | 特征 | 考察点 |
 |---|---|---|
-| **★ `~/.claude/projects` 副本（旗舰真实负载）** | 8.7GB，jsonl/txt/json，**单 838MB jsonl 单流 31x**（FS 级实测仅 5.4/13.7x；冗余主在文件内），双峰大小，追加写为主 | 项目最终目标负载；append 路径、巨文件分块、去重潜力、综合表现（见 [01-zipfs-design.md](./01-zipfs-design.md) §1.1） |
+| **★ `~/.claude/projects` 副本（旗舰真实负载）** | 8.7GB，jsonl/txt/json，**单 838MB jsonl 单流 31x**（FS 级实测仅 5.4/13.7x；冗余主在文件内），双峰大小，追加写为主 | 项目最终目标负载；append 路径、巨文件分块、去重潜力、综合表现（见 [01-scrollz-design.md](./01-scrollz-design.md) §1.1） |
 | 文本/源码（Linux 源码树、JSON dump、日志） | 高可压缩 | 压缩比上限、压缩 CPU |
 | 类家目录混合树 | 混合 | 真实场景综合表现 |
 | 预压缩媒体（jpg/mp4/.zst） | 近乎不可压缩 | 启发式跳过是否生效、无谓开销 |
@@ -175,7 +175,7 @@ flowchart LR
 ## 8. 建议的仓库结构
 
 ```text
-zipfs/
+scrollz/
 ├── docs/
 │   ├── 00-overview.md            # 本文（实验总纲）
 │   └── environment-snapshot.md   # 实测环境
@@ -193,7 +193,7 @@ zipfs/
 
 ### 已定（2026-06-27）
 
-1. **路线 B 形态**：用 **Rust 自研**（无成熟成品，见 §6），以成熟积木 `fuser` + `zstd`/`lz4_flex`（+ 可选 `redb`/`rusqlite`）为地基。两种磁盘布局都做：**布局 V（容器/虚拟盘）** 与 **布局 S（影子树/每文件压缩包）**，详见 [01-zipfs-design.md](./01-zipfs-design.md)。
+1. **路线 B 形态**：用 **Rust 自研**（无成熟成品，见 §6），以成熟积木 `fuser` + `zstd`/`lz4_flex`（+ 可选 `redb`/`rusqlite`）为地基。两种磁盘布局都做：**布局 V（容器/虚拟盘）** 与 **布局 S（影子树/每文件压缩包）**，详见 [01-scrollz-design.md](./01-scrollz-design.md)。
 2. **目标负载**：**读写并重** → SquashFS / DwarFS 等只读方案**排除**出正式对比，仅作参考。
 3. **判据**：压缩比 / 吞吐 / 随机写延迟**三者并重**，不预设高低；结论形态是**场景适配映射表**（见 §4.6），非单一冠军。
 4. **压缩算法**：zstd 多等级 + **lz4（`lz4_flex`）速度/比值对照**，纳入。

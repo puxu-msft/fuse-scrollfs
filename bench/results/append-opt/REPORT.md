@@ -1,7 +1,7 @@
 # append 优化（开放尾块缓冲）—— before/after 微基准报告
 
 > 日期：2026-06-28。优化：未压缩**开放尾块缓冲**（open-tail buffer），落在 Core 写会话（per-inode）。
-> 对应设计 [docs/01-zipfs-design.md](../../../docs/01-zipfs-design.md) §1.1 追加写硬约束、§3 分块内核、§5 Store 接缝。
+> 对应设计 [docs/01-scrollz-design.md](../../../docs/01-scrollz-design.md) §1.1 追加写硬约束、§3 分块内核、§5 Store 接缝。
 
 ## 问题
 

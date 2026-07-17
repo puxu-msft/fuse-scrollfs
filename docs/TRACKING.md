@@ -1,4 +1,4 @@
-# zipfs 进行中工作跟踪 / TRACKING
+# scrollz 进行中工作跟踪 / TRACKING
 
 > **本文回答「正在做什么」**——跨会话的进行中工作（WIP）指针。只放**指向权威源的链接 + 一句现状**，不复制/镜像状态，避免与 [ROADMAP.md](./ROADMAP.md) 双写漂移。
 >
