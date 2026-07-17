@@ -14,14 +14,14 @@ use std::time::Instant;
 use clap::Parser;
 use tempfile::TempDir;
 
-use zipfs_microbench::backend::{Backend, BackendKind, CommitPolicy};
-use zipfs_microbench::blobgen::BlobSizeRange;
-use zipfs_microbench::metrics::{human_bytes, ns_to_ms};
-use zipfs_microbench::redb_backend::RedbBackend;
-use zipfs_microbench::scenario::{
+use scrollz_microbench::backend::{Backend, BackendKind, CommitPolicy};
+use scrollz_microbench::blobgen::BlobSizeRange;
+use scrollz_microbench::metrics::{human_bytes, ns_to_ms};
+use scrollz_microbench::redb_backend::RedbBackend;
+use scrollz_microbench::scenario::{
     build_initial_blocks, scenario_bulk_insert, scenario_random_rmw, RunParams,
 };
-use zipfs_microbench::sqlite_backend::SqliteBackend;
+use scrollz_microbench::sqlite_backend::SqliteBackend;
 
 /// 源块档：64KiB 或 256KiB，对应不同的「压缩后变长区间」。
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +57,7 @@ fn profile_256k() -> ChunkProfile {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "zipfs-microbench",
+    name = "scrollz-microbench",
     about = "redb/sqlite 布局 V 容器：变长压缩 chunk blob 批量插入 + 随机 RMW microbench"
 )]
 struct Cli {

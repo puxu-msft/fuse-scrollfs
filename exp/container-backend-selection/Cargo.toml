@@ -1,5 +1,5 @@
 [package]
-name = "zipfs-microbench"
+name = "scrollz-microbench"
 version = "0.0.0"
 edition = "2021"
 description = "设计闸门 microbench：redb 作为布局 V 容器存变长压缩 chunk blob 并随机更新，性能是否够用？（见 docs/01-zipfs-design.md §6）"
@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [[bin]]
-name = "zipfs-microbench"
+name = "scrollz-microbench"
 path = "src/main.rs"
 
 [dependencies]

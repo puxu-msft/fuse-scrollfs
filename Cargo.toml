@@ -1,12 +1,12 @@
-# zipfs Cargo workspace 根。
+# scrollz Cargo workspace 根。
 #
 # 历史：本项目起源是「btrfs+zstd vs FUSE 透明压缩」横向评测 PoC。FUSE 路线转正为产品后，
 # 原先各自独立的 fuse/ 与 microbench/ 两个 crate 收敛进本 workspace：统一 Cargo.lock、
 # 统一 target/、共享依赖只解析一次、仓库根一键 cargo build / cargo test。
 #
 # 成员：
-#   crates/zipfs                     产品 crate（lib + zipfs 主程序 + mkfixture 离线工具）
-#   crates/zipfs-bench               基准二进制（依赖 zipfs 公有 lib API）
+#   crates/scrollz                     产品 crate（lib + scrollz 主程序 + mkfixture 离线工具）
+#   crates/scrollz-bench               基准二进制（依赖 scrollz 公有 lib API）
 #   exp/container-backend-selection  归档 PoC（2026-06-27 redb-vs-sqlite 容器后端选型）
 #
 # default-members 只含前两者：日常 `cargo build` / `cargo test` 跳过归档 PoC（它拉
@@ -15,13 +15,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/zipfs",
-    "crates/zipfs-bench",
+    "crates/scrollz",
+    "crates/scrollz-bench",
     "exp/container-backend-selection",
 ]
 default-members = [
-    "crates/zipfs",
-    "crates/zipfs-bench",
+    "crates/scrollz",
+    "crates/scrollz-bench",
 ]
 
 # 发布构建优化（perf #3）：compress/decompress 是纯 CPU 热点，lto + 单 codegen-unit 让跨
