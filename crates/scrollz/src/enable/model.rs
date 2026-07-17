@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 
 use crate::core::{DEFAULT_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL};
 
-/// 备份后缀：apply 时 `P` 改名为 `P.zipfs-orig`，restore 时还原（与 cutover.sh 一致）。
-pub const ORIG_SUFFIX: &str = ".zipfs-orig";
-/// 守护 pid 文件后缀：`<mountpoint>.zipfs.pid`（与 cutover.sh / mount.sh 一致）。
-pub const PID_SUFFIX: &str = ".zipfs.pid";
+/// 备份后缀：apply 时 `P` 改名为 `P.scrollz-orig`，restore 时还原（与 cutover.sh 一致）。
+pub const ORIG_SUFFIX: &str = ".scrollz-orig";
+/// 守护 pid 文件后缀：`<mountpoint>.scrollz.pid`（与 cutover.sh / mount.sh 一致）。
+pub const PID_SUFFIX: &str = ".scrollz.pid";
 /// 提交标记 sidecar 文件后缀（评审 C2：committed=1 才算灌入完成、可挂载）。后端无关，
-/// 位于 `back/<name>.zipfs.meta`（与 backing 同级），故 container 的 redb 文件外也有提交点。
-pub const META_SUFFIX: &str = ".zipfs.meta";
+/// 位于 `back/<name>.scrollz.meta`（与 backing 同级），故 container 的 redb 文件外也有提交点。
+pub const META_SUFFIX: &str = ".scrollz.meta";
 /// NEEDS-RECONCILE sentinel 后缀（Task 12）：guard-check 检出 underlay 非空时落
 /// `back_root/<name>.needs-reconcile`，给脚本/人明确信号「自动挂载已被阻止、需人工 reconcile」。
 pub const NEEDS_RECONCILE_SUFFIX: &str = ".needs-reconcile";
@@ -82,7 +82,7 @@ impl Paths {
         }
     }
 
-    /// 提交标记 sidecar = `back/name.zipfs.meta`（**后端无关**的同名兄弟文件，使 container 的
+    /// 提交标记 sidecar = `back/name.scrollz.meta`（**后端无关**的同名兄弟文件，使 container 的
     /// redb 文件外也有可信提交点；记录 backend 供探测时反推 backing 形态）。
     pub fn meta_path(&self, name: &str) -> PathBuf {
         self.back_root().join(format!("{name}{META_SUFFIX}"))
@@ -116,7 +116,7 @@ impl Paths {
             .join(ts)
     }
 
-    /// reconcile 串行锁 = `back_root/<name>.reconcile.lock`。**独立于** backing `.zipfs.lock`：
+    /// reconcile 串行锁 = `back_root/<name>.reconcile.lock`。**独立于** backing `.scrollz.lock`：
     /// 仅串行化并发 reconcile 彼此，不参与挂载互斥（后者靠 underlay-empty 守卫 + reconciling 标记）。
     pub fn reconcile_lock(&self, name: &str) -> PathBuf {
         self.back_root().join(format!("{name}.reconcile.lock"))
@@ -135,7 +135,7 @@ impl Paths {
     ///
     /// guard-check 检出挂载点 underlay 含停用期回落写时落此文件：给脚本/人明确信号「该项目自动挂载
     /// 已被阻止，需 `zipfs enable reconcile <name>` 重合并」。underlay 清空后由下次 guard-check 通过
-    /// 时自愈清除。**独立于** `.reconciling`（那是半改写维护互斥）与 `.zipfs.meta`（提交标记）。
+    /// 时自愈清除。**独立于** `.reconciling`（那是半改写维护互斥）与 `.scrollz.meta`（提交标记）。
     pub fn needs_reconcile_sentinel(&self, name: &str) -> PathBuf {
         self.back_root()
             .join(format!("{name}{NEEDS_RECONCILE_SUFFIX}"))
@@ -219,7 +219,7 @@ pub enum EndpointHealth {
 /// 纯状态分类（评审 C2：以 `backing_committed` 区分「守护死可重挂」与「半灌需人工」）。
 ///
 /// 输入全是探测事实（由 `discovery.rs` 提供）：
-/// - `orig_exists`：`P.zipfs-orig` 备份是否在（= 是否被 apply 过/切换中）。
+/// - `orig_exists`：`P.scrollz-orig` 备份是否在（= 是否被 apply 过/切换中）。
 /// - `mounted`：`P` 是否为活的 zipfs 挂载点（mountinfo 命中 **且** endpoint 健康）。
 /// - `health`：`P` 的 endpoint 健康三态。`mounted` 已蕴含 `Healthy`（探测端 `matches!(health,Healthy) && is_mounted`），
 ///   故 `Stale`/`Hung` 只可能落 `(true,false)` 分支：`Hung → Hung`、`Stale → Broken`。
@@ -432,7 +432,7 @@ mod tests {
         );
         assert_eq!(
             p.orig("proj-x"),
-            Path::new("/home/u/.claude/projects/proj-x.zipfs-orig")
+            Path::new("/home/u/.claude/projects/proj-x.scrollz-orig")
         );
         assert_eq!(
             p.backing("proj-x", Backend::Shadow),
@@ -444,11 +444,11 @@ mod tests {
         );
         assert_eq!(
             p.meta_path("proj-x"),
-            Path::new("/home/u/.claude-zip/back/proj-x.zipfs.meta")
+            Path::new("/home/u/.claude-zip/back/proj-x.scrollz.meta")
         );
         assert_eq!(
             p.pid_file("proj-x"),
-            Path::new("/home/u/.claude/projects/proj-x.zipfs.pid")
+            Path::new("/home/u/.claude/projects/proj-x.scrollz.pid")
         );
         assert_eq!(
             p.needs_reconcile_sentinel("proj-x"),

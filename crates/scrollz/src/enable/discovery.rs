@@ -56,7 +56,7 @@ impl ProjectInfo {
     }
 }
 
-/// 提交标记 sidecar（`back/<name>.zipfs.meta`）的解析结果。`committed` 为 true 才算灌入完成、可挂载
+/// 提交标记 sidecar（`back/<name>.scrollz.meta`）的解析结果。`committed` 为 true 才算灌入完成、可挂载
 /// （评审 C2）。后端无关位置，记录 `backend` 供探测时反推 backing 形态（dir / redb 文件）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Meta {
@@ -157,7 +157,7 @@ impl Meta {
     }
 }
 
-/// 扫描 projects_root 下所有目录（跳过 `*.zipfs-orig` 备份与点文件），探测状态。
+/// 扫描 projects_root 下所有目录（跳过 `*.scrollz-orig` 备份与点文件），探测状态。
 pub fn scan(paths: &Paths) -> io::Result<Vec<ProjectInfo>> {
     let mut out = Vec::new();
     let rd = match fs::read_dir(&paths.projects_root) {
@@ -464,7 +464,7 @@ fn recent_log_write_rec(
 
 // ── sidecar 提交标记（手搓 key=value，无 serde） ──────────────────────────────
 
-/// 写提交标记 sidecar 到 `path`（`back/<name>.zipfs.meta`）。**调用方**负责在 fsync backing
+/// 写提交标记 sidecar 到 `path`（`back/<name>.scrollz.meta`）。**调用方**负责在 fsync backing
 /// 之后再调本函数；本函数自身 fsync sidecar + 其父目录，使「sidecar 存在且 committed=1」成为
 /// 可信提交点（评审 C1/C2）。
 pub fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
@@ -525,7 +525,7 @@ pub fn read_meta(path: &Path) -> io::Result<Option<Meta>> {
     Ok(Some(parse_meta(&content)))
 }
 
-/// 给路径换扩展名后缀（`.zipfs.meta` → `.zipfs.meta.tmp`），保持同目录原子 rename。
+/// 给路径换扩展名后缀（`.scrollz.meta` → `.scrollz.meta.tmp`），保持同目录原子 rename。
 fn with_ext(path: &Path, ext: &str) -> std::path::PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".");
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn parse_meta_round_trip_via_write_read() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("proj.zipfs.meta");
+        let path = dir.path().join("proj.scrollz.meta");
         let meta = Meta {
             backend: Backend::Container,
             chunk_size: 1048576,
@@ -653,11 +653,11 @@ mod tests {
             ..Meta::default()
         };
         meta.dict = Some("/tmp/x\ncommitted=1".to_string());
-        let res = write_meta(&dir.path().join("p.zipfs.meta"), &meta);
+        let res = write_meta(&dir.path().join("p.scrollz.meta"), &meta);
         assert!(res.is_err(), "含换行的 dict 路径须拒绝写入");
         // 干净路径正常写入并读回，committed 保持 false（未被伪造）。
         meta.dict = Some("/tmp/clean-dict".to_string());
-        let p = dir.path().join("q.zipfs.meta");
+        let p = dir.path().join("q.scrollz.meta");
         write_meta(&p, &meta).unwrap();
         let back = read_meta(&p).unwrap().unwrap();
         assert!(!back.committed, "干净写入后 committed 应仍为 false");
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn read_meta_absent_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_meta(&dir.path().join("none.zipfs.meta"))
+        assert!(read_meta(&dir.path().join("none.scrollz.meta"))
             .unwrap()
             .is_none());
     }

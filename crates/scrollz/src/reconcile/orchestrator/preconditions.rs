@@ -8,7 +8,7 @@ use super::*;
 /// 2. backend 必须 `Shadow`（container 无 fall-through 语义，reconcile 不适用）。
 /// 3. underlay 必须含 fall-through 条目（无回落写则无事可做）。
 /// 4. `!force` 时活跃门禁：有活跃写者则拒（除非人工 `--force` 确认）。
-/// 5. 取 `reconcile_lock` flock：串行化并发 reconcile 彼此（与 backing `.zipfs.lock` 是两把锁）。
+/// 5. 取 `reconcile_lock` flock：串行化并发 reconcile 彼此（与 backing `.scrollz.lock` 是两把锁）。
 /// 6. 快照：递归读每个 fall-through 文件（单 fd read+fstat）落 stash 并 fsync（文件 + 目录链），返回持锁 `Preconditions`。
 pub fn check_preconditions(
     paths: &Paths,

@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn compaction_reclaims_frequent_fsync_holes_content_consistent() {
         let dir = tempfile::tempdir().unwrap();
-        // backing 用 tempdir 内子目录，令 `.zipfs.lock` 落 tempdir 内（唯一+随清理），
+        // backing 用 tempdir 内子目录，令 `.scrollz.lock` 落 tempdir 内（唯一+随清理），
         // 避免 backing=tempdir 时 lock 落共享 temp 根被并发测试碰撞（测试隔离缺陷）。
         let backing = dir.path().join("backing");
         std::fs::create_dir(&backing).unwrap();
@@ -254,7 +254,7 @@ mod tests {
         // Bug D 延伸：compact 重写 archive（temp+rename）会把文件 mtime 重置为 now，
         // 与 ingest/seal 同样打乱按时间排序的会话列表。压实后须保留原 archive 文件 mtime。
         let dir = tempfile::tempdir().unwrap();
-        // backing 用 tempdir 内子目录：`.zipfs.lock`（backing 的 sibling）随之落 tempdir 内、
+        // backing 用 tempdir 内子目录：`.scrollz.lock`（backing 的 sibling）随之落 tempdir 内、
         // 随清理且路径唯一。若 backing=tempdir，lock 落共享 temp 根，既残留又与其它测试
         // （tempfile 名复用）碰撞同一 flock → 偶发 WouldBlock（测试隔离缺陷，非生产 bug）。
         let backing = dir.path().join("backing");

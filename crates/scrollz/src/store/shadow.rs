@@ -152,7 +152,7 @@ pub struct ShadowStore {
     backing: PathBuf,
     /// backing 的跨进程排他锁（Bug A）。RAII 持有到 drop：守护退出（含 SIGKILL）时
     /// 内核自动释放，故第二个守护 open 同一 backing 必失败，杜绝双守护并发覆盖。
-    /// 锁文件是 backing 外的 sibling `<backing>.zipfs.lock`，不进 readdir/写路径。
+    /// 锁文件是 backing 外的 sibling `<backing>.scrollz.lock`，不进 readdir/写路径。
     _lock: std::fs::File,
     /// 命名空间锁（阶段 D3）：**仅** create/mkdir/unlink/rmdir/rename/symlink 在方法最开头
     /// 全程持有，把「查存在 → syscall → 改 inodes/sessions/readers 三表」整段串行化为原子。
@@ -1030,18 +1030,18 @@ mod tests {
     #[test]
     fn lock_file_lives_outside_backing() {
         // 锁文件必须放 backing 外 sibling，否则被 readdir 暴露成幽灵文件、
-        // 被 compact/seal/ingest 误当数据（与 .zipfs.meta 同理）。
+        // 被 compact/seal/ingest 误当数据（与 .scrollz.meta 同理）。
         let dir = tempfile::tempdir().unwrap();
         let backing = dir.path().join("proj");
         std::fs::create_dir(&backing).unwrap();
         let _s = ShadowStore::open_with_chunk_size(backing.clone(), 65536).unwrap();
         assert!(
-            !backing.join(".zipfs.lock").exists(),
+            !backing.join(".scrollz.lock").exists(),
             "lock 绝不能在 backing 内（否则被 readdir 暴露）"
         );
         assert!(
-            dir.path().join("proj.zipfs.lock").exists(),
-            "lock 应在 backing 同级 sibling: proj.zipfs.lock"
+            dir.path().join("proj.scrollz.lock").exists(),
+            "lock 应在 backing 同级 sibling: proj.scrollz.lock"
         );
     }
 

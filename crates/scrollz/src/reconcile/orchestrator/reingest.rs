@@ -17,7 +17,7 @@ pub fn reingest_one_file(paths: &Paths, name: &str, rel: &str) -> io::Result<()>
     let orig_file = paths.orig(name).join(rel);
     let backing = paths.backing(name, Backend::Shadow);
     let backing_file = backing.join(rel);
-    // 评审 R-lock：取 backing 排他锁（与 compact/seal/守护同一把 `.zipfs.lock`）保护本次 temp+rename
+    // 评审 R-lock：取 backing 排他锁（与 compact/seal/守护同一把 `.scrollz.lock`）保护本次 temp+rename
     // 覆盖 `backing/<rel>`——否则并发 compact/seal 与 reconcile 交错写同一 archive 致损坏（A3 类）。
     // reconcile 前提是未挂载（守护未持锁），故可取；有界重试兜住释放→重取瞬态。函数内短持、
     // 不跨 rebuild 的 remount（那由 lifecycle::reingest 自管），无自死锁。
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn reingest_one_file_blocked_while_backing_locked() {
-        // 评审 R-lock：reconcile 改写 backing 须与活守护/compact/seal 互斥（同一把 .zipfs.lock）。
+        // 评审 R-lock：reconcile 改写 backing 须与活守护/compact/seal 互斥（同一把 .scrollz.lock）。
         // 持 backing 锁时 reingest_one_file 应 WouldBlock（有界重试耗尽后），杜绝交错写损坏。
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());

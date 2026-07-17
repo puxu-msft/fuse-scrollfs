@@ -165,7 +165,7 @@ fn probe_writable(dir: &Path) -> io::Result<()> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let probe = dir.join(format!(
-        ".zipfs-memory-write-probe.{}.{nanos}",
+        ".scrollz-memory-write-probe.{}.{nanos}",
         std::process::id()
     ));
     File::create(&probe)?;

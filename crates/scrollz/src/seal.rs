@@ -300,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let small_chunk = 64 * 1024;
         let content = redundant_content(50_000);
-        // backing 用 tempdir 内子目录：`.zipfs.lock` 落 tempdir 内（唯一+随清理），避免
+        // backing 用 tempdir 内子目录：`.scrollz.lock` 落 tempdir 内（唯一+随清理），避免
         // backing=tempdir 时 lock 落共享 temp 根被并发测试碰撞（测试隔离缺陷，非生产 bug）。
         let backing = dir.path().join("backing");
         std::fs::create_dir(&backing).unwrap();

@@ -1,7 +1,7 @@
 //! 可逆生命周期：apply（切换）/ restore（还原）/ remount（重挂）/ purge（清 backing）。
 //!
 //! 配方移植自 crash-tested 的 `zipfs-cutover.sh` / `zipfs-rollback.sh`，并强化为
-//! **sidecar 提交标记**：只有 backing 内 `.zipfs.meta` 存在且 `committed=1` 才算灌入完成、可挂载
+//! **sidecar 提交标记**：只有 backing 内 `.scrollz.meta` 存在且 `committed=1` 才算灌入完成、可挂载
 //! （评审 C1/C2）。每个不可逆步骤前后补 fsync（父目录 dirent、backing 树、sidecar），
 //! 使任意时刻崩溃要么可续、要么 fail-closed，绝不把半灌数据当权威挂出。
 
@@ -86,7 +86,7 @@ pub fn apply(
     fs::rename(&mp, &orig)?;
     fsync_parent(&mp);
     // 评审 A1：rename 已发生，此后任何建目录失败都必须回滚 rename，否则项目目录"消失"到
-    // orig（enable list 跳过 *.zipfs-orig 后缀 → 列表里蒸发），用户恐慌驱动二次误操作。
+    // orig（enable list 跳过 *.scrollz-orig 后缀 → 列表里蒸发），用户恐慌驱动二次误操作。
     if let Err(e) = fs::create_dir_all(paths.back_root()).and_then(|_| fs::create_dir(&mp)) {
         let rb = rollback_to_plain(&mp, &orig, &backing, &meta_path);
         return Err(rollback_msg(
@@ -783,9 +783,9 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let mp = tmp.path().join("proj");
-        let orig = tmp.path().join("proj.zipfs-orig");
+        let orig = tmp.path().join("proj.scrollz-orig");
         let backing = tmp.path().join("backdir");
-        let meta = tmp.path().join("p.zipfs.meta");
+        let meta = tmp.path().join("p.scrollz.meta");
         // 源已 mv 到 orig（apply 中段态），backing 是含一个文件的目录。
         fs::create_dir(&orig).unwrap();
         fs::write(orig.join("a.jsonl"), b"data").unwrap();
@@ -980,7 +980,7 @@ mod tests {
     #[test]
     fn apply_rolls_back_rename_when_dir_setup_fails() {
         // 评审 A1：rename(mp→orig) 与 create_dir(mp) 之间失败时，旧码用 `?` 直接传播、
-        // 不回滚 rename → 项目目录"消失"到 .zipfs-orig，enable list 扫不到，用户恐慌。
+        // 不回滚 rename → 项目目录"消失"到 .scrollz-orig，enable list 扫不到，用户恐慌。
         // 注入：在 back_root 路径放一个普通文件，使 create_dir_all(back_root) 必失败。
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
@@ -995,7 +995,7 @@ mod tests {
         let res = apply(&paths, "demo", ApplyOptions::default(), true, &m);
         assert!(res.is_err(), "建目录失败应返回 Err");
 
-        // 关键：必须回滚 rename，源数据回到原挂载点、无遗留 .zipfs-orig 备份。
+        // 关键：必须回滚 rename，源数据回到原挂载点、无遗留 .scrollz-orig 备份。
         assert!(
             paths.mountpoint("demo").join("a.jsonl").exists(),
             "源应回到原挂载点（rename 已回滚），而非消失到 orig"
@@ -1005,7 +1005,7 @@ mod tests {
             content,
             "回滚后内容逐字节一致"
         );
-        assert!(!paths.orig("demo").exists(), "不应残留 .zipfs-orig 备份");
+        assert!(!paths.orig("demo").exists(), "不应残留 .scrollz-orig 备份");
         assert!(!m.is_mounted(&paths.mountpoint("demo")));
     }
 

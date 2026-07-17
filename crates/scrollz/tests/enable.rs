@@ -139,7 +139,7 @@ fn apply_rejects_missing_dict_file() {
     // 未发生切换：源仍在原位、无备份。
     assert!(demo.join("a.jsonl").exists(), "源不应被动过");
     assert!(
-        !tmp.path().join("projects").join("demo.zipfs-orig").exists(),
+        !tmp.path().join("projects").join("demo.scrollz-orig").exists(),
         "不应产生备份（未进入切换）"
     );
 }
