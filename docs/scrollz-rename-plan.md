@@ -1,6 +1,6 @@
 # zipfs → scrollz 改名迁移计划（rev3 · 可转执行）
 
-> 类型:实施计划(how)· 状态:**代码与文档阶段已完成；真实数据迁移待主会话授权执行**(rev1 needs-rework → rev2 闭合 2 Critical → rev3 补 3 Important[I-A/I-B/I-C]+3 Minor;reviewer 复核确认 0 Critical、修完转执行)。
+> 类型:实施计划(how)· 状态:**全部完成**(代码+文档 13 提交 421 测试绿;真实数据迁移 2026-07-18 已执行、可回滚 `~/scrollz-migration-rollback.sh`;neighbors 端到端读校验通过;systemd autostart 已重装)。
 > 决策来源:用户 2026-07-18 定名 `scrollz` + 六项分叉决策(见 §0.2)。
 
 ## 0. 定名、定位与决策台账
