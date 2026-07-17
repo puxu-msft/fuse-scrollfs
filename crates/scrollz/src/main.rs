@@ -230,7 +230,7 @@ fn main() -> std::io::Result<()> {
         Some(Command::Ingest(args)) => run_ingest(args),
         Some(Command::Enable(args)) => {
             // HOME 缺失时不猜测 /root：enable 操作真实用户数据，错树即误操作（fail-closed）。
-            // 需要非默认根时显式用 env CLAUDE_PROJECTS / ZIPFS_HOME 覆盖。
+            // 需要非默认根时显式用 env CLAUDE_PROJECTS / SCROLLZ_HOME 覆盖。
             let home = home_or_err()?;
             scrollz::enable::run(args.action, home)
         }
@@ -246,7 +246,7 @@ fn home_or_err() -> std::io::Result<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "未设置 HOME，拒绝猜测路径；请设 HOME，或用 CLAUDE_PROJECTS / ZIPFS_HOME 显式指定",
+            "未设置 HOME，拒绝猜测路径；请设 HOME，或用 CLAUDE_PROJECTS / SCROLLZ_HOME 显式指定",
         )
     })
 }

@@ -1,7 +1,7 @@
 //! systemd 托管挂载路径集成测试（Bug C）：聚焦 `zipfs mount-managed` 守护入口——
 //! 由 sidecar meta 自拼参数挂载一个**已提交**项目、经挂载点读到原数据、卸载干净、backing 保留。
 //!
-//! 不依赖 systemd（`systemctl --user start` 不会继承本测试进程的 CLAUDE_PROJECTS/ZIPFS_HOME
+//! 不依赖 systemd（`systemctl --user start` 不会继承本测试进程的 CLAUDE_PROJECTS/SCROLLZ_HOME
 //! 环境，无法 hermetic 测）。这里直接以测试 env 拉起 `mount-managed` 子进程，覆盖真正的新代码
 //! 路径：`resolve_managed_spec` → `run_mount` → 真实 FUSE。SystemdMounter 的 systemctl 编排很薄，
 //! 由 C8 手动冒烟覆盖。
@@ -71,7 +71,7 @@ fn run_cli(home: &Path, proj: &Path, zip: &Path, args: &[&str]) -> bool {
         .args(args)
         .env("HOME", home)
         .env("CLAUDE_PROJECTS", proj)
-        .env("ZIPFS_HOME", zip)
+        .env("SCROLLZ_HOME", zip)
         .env("RUST_LOG", "warn")
         .status()
         .map(|s| s.success())
@@ -127,7 +127,7 @@ fn mount_managed_serves_committed_project_and_unmounts_clean() {
         .args(["mount-managed", "--name", name])
         .env("HOME", &home)
         .env("CLAUDE_PROJECTS", &proj)
-        .env("ZIPFS_HOME", &zip)
+        .env("SCROLLZ_HOME", &zip)
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("spawn mount-managed");

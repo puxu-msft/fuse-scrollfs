@@ -34,12 +34,26 @@ pub const ACTIVITY_MTIME_SECS: u64 = 300;
 
 /// 路径布局：projects 根（被管理的 Claude 项目目录）与 scrollz_home（backing 命名空间）。
 ///
-/// 默认 `~/.claude/projects` 与 `~/.claude-zip`，分别可由 env `CLAUDE_PROJECTS` / `ZIPFS_HOME`
-/// 覆盖（测试与隔离烟测靠这两个 env，绝不碰真实 `~/.claude`）。
+/// 默认 `~/.claude/projects` 与 `~/.claude-zip`，分别可由 env `CLAUDE_PROJECTS` / `SCROLLZ_HOME`
+/// 覆盖（测试与隔离烟测靠这两个 env，绝不碰真实 `~/.claude`）。旧 `ZIPFS_HOME` 仅作弃用兼容回落。
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub projects_root: PathBuf,
     pub scrollz_home: PathBuf,
+}
+
+fn resolve_scrollz_home(
+    home: &Path,
+    scrollz_home: Option<std::ffi::OsString>,
+    legacy_zipfs_home: Option<std::ffi::OsString>,
+) -> (PathBuf, bool) {
+    if let Some(path) = scrollz_home {
+        return (PathBuf::from(path), false);
+    }
+    if let Some(path) = legacy_zipfs_home {
+        return (PathBuf::from(path), true);
+    }
+    (home.join(".claude-zip"), false)
 }
 
 impl Paths {
@@ -48,9 +62,16 @@ impl Paths {
         let projects_root = std::env::var_os("CLAUDE_PROJECTS")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".claude").join("projects"));
-        let scrollz_home = std::env::var_os("ZIPFS_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".claude-zip"));
+        let (scrollz_home, used_legacy_env) = resolve_scrollz_home(
+            home,
+            std::env::var_os("SCROLLZ_HOME"),
+            std::env::var_os("ZIPFS_HOME"),
+        );
+        if used_legacy_env {
+            log::warn!(
+                "ZIPFS_HOME 已弃用，请改用 SCROLLZ_HOME；迁移 backing 后请 unset 旧 export，或令 SCROLLZ_HOME 指向 ~/.local/claude-scrollz"
+            );
+        }
         Self {
             projects_root,
             scrollz_home,
@@ -416,12 +437,31 @@ mod tests {
     }
 
     #[test]
+    fn scrollz_home_prefers_new_env_then_legacy_env_then_default() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            resolve_scrollz_home(home, Some("/new".into()), Some("/legacy".into())).0,
+            Path::new("/new")
+        );
+        assert_eq!(
+            resolve_scrollz_home(home, None, Some("/legacy".into())).0,
+            Path::new("/legacy")
+        );
+        assert_eq!(
+            resolve_scrollz_home(home, None, None).0,
+            Path::new("/home/u/.claude-zip")
+        );
+    }
+
+    #[test]
     fn paths_layout_from_explicit_home() {
         // 清掉可能干扰的 env，验证默认布局。
-        // SAFETY: 单线程测试内临时改 env；其他 enable 测试不依赖这两个 env 的缺省。
+        // SAFETY: 单线程测试内临时改 env；其他 enable 测试不依赖这三个 env 的缺省。
         let prev_p = std::env::var_os("CLAUDE_PROJECTS");
+        let prev_s = std::env::var_os("SCROLLZ_HOME");
         let prev_z = std::env::var_os("ZIPFS_HOME");
         std::env::remove_var("CLAUDE_PROJECTS");
+        std::env::remove_var("SCROLLZ_HOME");
         std::env::remove_var("ZIPFS_HOME");
         let p = Paths::resolve(Path::new("/home/u"));
         assert_eq!(p.projects_root, Path::new("/home/u/.claude/projects"));
@@ -456,6 +496,9 @@ mod tests {
         );
         if let Some(v) = prev_p {
             std::env::set_var("CLAUDE_PROJECTS", v);
+        }
+        if let Some(v) = prev_s {
+            std::env::set_var("SCROLLZ_HOME", v);
         }
         if let Some(v) = prev_z {
             std::env::set_var("ZIPFS_HOME", v);

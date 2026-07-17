@@ -131,7 +131,7 @@ pub enum EnableAction {
     /// backing），供换选项重选、重跑 `reconcile`。**须先卸载**（同 reconcile：挂载态读挂载点是 FUSE 视图
     /// 而非 underlay，会误判）。**不触碰外部 memory 目标**——那些文件仅在报告中列出，待你手动 git 回退。
     ReconcileUndo { name: String },
-    /// 查看 / 设置持久化默认选项（ZIPFS_HOME/config，apply 起点）。
+    /// 查看 / 设置持久化默认选项（SCROLLZ_HOME/config，apply 起点）。
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
@@ -405,7 +405,7 @@ struct ApplyOverrides {
 
 /// `apply <name>`：切换并回显结果。
 fn cmd_apply(paths: &Paths, name: &str, ov: ApplyOverrides, force: bool) -> std::io::Result<()> {
-    // 起点 = 持久化默认（ZIPFS_HOME/config），命令行覆盖之。
+    // 起点 = 持久化默认（SCROLLZ_HOME/config），命令行覆盖之。
     let mut opts = config::load_defaults(paths);
     if let Some(b) = ov.backend {
         opts.backend = b;

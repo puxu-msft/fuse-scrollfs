@@ -1,4 +1,4 @@
-//! 持久化默认选项（`ZIPFS_HOME/config`）：apply 的起点，命令行覆盖之。
+//! 持久化默认选项（`SCROLLZ_HOME/config`）：apply 的起点，命令行覆盖之。
 //!
 //! 手搓 key=value（无 serde），键名与 `ApplyOptions` 一一对应。`config show` 打印，
 //! `config set <key> <value>` 校验后写回。让用户不必每次 apply 重复敲 `--level 19 --threads 4`。
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use crate::enable::model::{ApplyOptions, Backend, Paths};
 use crate::enable::ConfigCmd;
 
-/// config 文件路径 = ZIPFS_HOME/config。
+/// config 文件路径 = SCROLLZ_HOME/config。
 fn config_path(paths: &Paths) -> PathBuf {
     paths.scrollz_home.join("config")
 }

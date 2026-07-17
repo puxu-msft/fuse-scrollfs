@@ -20,7 +20,7 @@ fn run_enable(tmp: &std::path::Path, args: &[&str]) -> (String, bool) {
         .arg("enable")
         .args(args)
         .env("CLAUDE_PROJECTS", &projects)
-        .env("ZIPFS_HOME", &zip)
+        .env("SCROLLZ_HOME", &zip)
         .env("HOME", tmp)
         .output()
         .expect("run zipfs enable");
@@ -106,7 +106,7 @@ fn purge_rejects_traversal_name_and_preserves_outside_tree() {
     std::fs::create_dir_all(&sentinel).unwrap();
     std::fs::write(sentinel.join("keep.txt"), b"important").unwrap();
 
-    // backing 默认在 ZIPFS_HOME/back/<name>；用 `../../sentinel` 试图逃逸到哨兵。
+    // backing 默认在 SCROLLZ_HOME/back/<name>；用 `../../sentinel` 试图逃逸到哨兵。
     let (out, ok) = run_enable(tmp.path(), &["purge", "../../sentinel", "--yes"]);
     assert!(!ok, "穿越 name 的 purge 应失败：{out}");
     assert!(out.contains("非法项目名"), "应报非法项目名：{out}");

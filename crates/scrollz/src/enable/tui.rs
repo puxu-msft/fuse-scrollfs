@@ -66,7 +66,7 @@ impl App {
         if !items.is_empty() {
             state.select(Some(0));
         }
-        // 选项起点 = 持久化默认（ZIPFS_HOME/config）。
+        // 选项起点 = 持久化默认（SCROLLZ_HOME/config）。
         let opts = crate::enable::config::load_defaults(&paths);
         Ok(Self {
             paths,
