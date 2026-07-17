@@ -246,119 +246,119 @@ impl Metrics {
         }
         emit(
             out,
-            "zipfs_commit_ok_total",
+            "scrollz_commit_ok_total",
             "counter",
             "container 提交成功次数",
             self.commit_ok.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_commit_failed_total",
+            "scrollz_commit_failed_total",
             "counter",
             "提交失败并合并回 active（避免数据丢失）次数",
             self.commit_failed.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_blocks_flushed_total",
+            "scrollz_blocks_flushed_total",
             "counter",
             "累计落后端的块数",
             self.blocks_flushed.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_flushing_bytes_peak",
+            "scrollz_flushing_bytes_peak",
             "gauge",
             "flushing 缓冲字节峰值",
             self.flushing_bytes_peak.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_fuse_read_ops_total",
+            "scrollz_fuse_read_ops_total",
             "counter",
             "FUSE read 成功次数",
             self.fuse_read_ops.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_fuse_read_bytes_total",
+            "scrollz_fuse_read_bytes_total",
             "counter",
             "FUSE read 累计返回字节数",
             self.fuse_read_bytes.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_fuse_write_ops_total",
+            "scrollz_fuse_write_ops_total",
             "counter",
             "FUSE write 成功次数",
             self.fuse_write_ops.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_fuse_write_bytes_total",
+            "scrollz_fuse_write_bytes_total",
             "counter",
             "FUSE write 累计写入字节数",
             self.fuse_write_bytes.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_fuse_fsync_ops_total",
+            "scrollz_fuse_fsync_ops_total",
             "counter",
             "fsync+flush 同步操作次数",
             self.fuse_fsync_ops.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_fuse_errors_total",
+            "scrollz_fuse_errors_total",
             "counter",
             "read/write/fsync/flush 返回错误次数",
             self.fuse_errors.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_blockcache_hits_total",
+            "scrollz_blockcache_hits_total",
             "counter",
             "block_cache 命中（read_range 内部块免整块解压）次数",
             self.blockcache_hits.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_blockcache_misses_total",
+            "scrollz_blockcache_misses_total",
             "counter",
             "block_cache 未命中（read_range 内部块走 Store + 解压）次数",
             self.blockcache_misses.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_seals_total",
+            "scrollz_seals_total",
             "counter",
             "尾块封块/重压落后端次数",
             self.seals.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_shadow_commits_total",
+            "scrollz_shadow_commits_total",
             "counter",
             "ShadowStore（布局 S）脏会话提交次数",
             self.shadow_commits.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_shadow_reader_hits_total",
+            "scrollz_shadow_reader_hits_total",
             "counter",
             "ShadowStore ArchiveReader 缓存命中（免重解析 footer/index）次数",
             self.shadow_reader_hits.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_shadow_reader_misses_total",
+            "scrollz_shadow_reader_misses_total",
             "counter",
             "ShadowStore ArchiveReader 缓存未命中（打开并解析新 reader）次数",
             self.shadow_reader_misses.load(Ordering::Relaxed),
         );
         emit(
             out,
-            "zipfs_shadow_tail_appends_total",
+            "scrollz_shadow_tail_appends_total",
             "counter",
             "ShadowStore 尾日志增量追加（append_tail）次数",
             self.shadow_tail_appends.load(Ordering::Relaxed),
@@ -366,17 +366,17 @@ impl Metrics {
         // 延迟直方图（Prometheus 惯例：单位秒、名带 _seconds、不带 _total）。
         self.read_latency.write_prometheus(
             out,
-            "zipfs_read_latency_seconds",
+            "scrollz_read_latency_seconds",
             "FUSE read handler 端到端延迟（秒）",
         );
         self.write_latency.write_prometheus(
             out,
-            "zipfs_write_latency_seconds",
+            "scrollz_write_latency_seconds",
             "FUSE write handler 端到端延迟（秒）",
         );
         self.fsync_latency.write_prometheus(
             out,
-            "zipfs_fsync_latency_seconds",
+            "scrollz_fsync_latency_seconds",
             "FUSE fsync/flush handler 端到端延迟（秒）",
         );
     }
@@ -399,25 +399,25 @@ mod tests {
         m.write_prometheus(&mut out);
 
         assert!(
-            out.contains("zipfs_commit_ok_total 1"),
+            out.contains("scrollz_commit_ok_total 1"),
             "提交成功计数应为 1，实际输出：\n{out}"
         );
         assert!(
-            out.contains("zipfs_blocks_flushed_total 3"),
+            out.contains("scrollz_blocks_flushed_total 3"),
             "累计块数应为 3，实际输出：\n{out}"
         );
         assert!(
-            out.contains("zipfs_commit_failed_total 1"),
+            out.contains("scrollz_commit_failed_total 1"),
             "提交失败计数应为 1，实际输出：\n{out}"
         );
         assert!(
-            out.contains("zipfs_flushing_bytes_peak 4096"),
+            out.contains("scrollz_flushing_bytes_peak 4096"),
             "峰值应为 4096（不被更小的 1024 下调），实际输出：\n{out}"
         );
         // Prometheus text 格式：counter/gauge 类型行齐备。
-        assert!(out.contains("# TYPE zipfs_commit_ok_total counter"));
-        assert!(out.contains("# TYPE zipfs_flushing_bytes_peak gauge"));
-        assert!(out.contains("# HELP zipfs_blocks_flushed_total"));
+        assert!(out.contains("# TYPE scrollz_commit_ok_total counter"));
+        assert!(out.contains("# TYPE scrollz_flushing_bytes_peak gauge"));
+        assert!(out.contains("# HELP scrollz_blocks_flushed_total"));
     }
 
     #[test]
@@ -432,36 +432,36 @@ mod tests {
         m.write_prometheus(&mut out);
 
         assert!(
-            out.contains("zipfs_fuse_read_ops_total 1"),
+            out.contains("scrollz_fuse_read_ops_total 1"),
             "read ops 应为 1：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_read_bytes_total 100"),
+            out.contains("scrollz_fuse_read_bytes_total 100"),
             "read bytes 应为 100：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_write_ops_total 1"),
+            out.contains("scrollz_fuse_write_ops_total 1"),
             "write ops 应为 1：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_write_bytes_total 50"),
+            out.contains("scrollz_fuse_write_bytes_total 50"),
             "write bytes 应为 50：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_fsync_ops_total 1"),
+            out.contains("scrollz_fuse_fsync_ops_total 1"),
             "fsync ops 应为 1：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_errors_total 1"),
+            out.contains("scrollz_fuse_errors_total 1"),
             "errors 应为 1：\n{out}"
         );
         // 类型行齐备（均为 counter）。
-        assert!(out.contains("# TYPE zipfs_fuse_read_ops_total counter"));
-        assert!(out.contains("# TYPE zipfs_fuse_read_bytes_total counter"));
-        assert!(out.contains("# TYPE zipfs_fuse_write_ops_total counter"));
-        assert!(out.contains("# TYPE zipfs_fuse_write_bytes_total counter"));
-        assert!(out.contains("# TYPE zipfs_fuse_fsync_ops_total counter"));
-        assert!(out.contains("# TYPE zipfs_fuse_errors_total counter"));
+        assert!(out.contains("# TYPE scrollz_fuse_read_ops_total counter"));
+        assert!(out.contains("# TYPE scrollz_fuse_read_bytes_total counter"));
+        assert!(out.contains("# TYPE scrollz_fuse_write_ops_total counter"));
+        assert!(out.contains("# TYPE scrollz_fuse_write_bytes_total counter"));
+        assert!(out.contains("# TYPE scrollz_fuse_fsync_ops_total counter"));
+        assert!(out.contains("# TYPE scrollz_fuse_errors_total counter"));
     }
 
     #[test]
@@ -474,19 +474,19 @@ mod tests {
         let mut out = String::new();
         m.write_prometheus(&mut out);
         assert!(
-            out.contains("zipfs_fuse_read_ops_total 2"),
+            out.contains("scrollz_fuse_read_ops_total 2"),
             "两次读：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_read_bytes_total 40"),
+            out.contains("scrollz_fuse_read_bytes_total 40"),
             "read bytes 10+30=40：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_write_ops_total 2"),
+            out.contains("scrollz_fuse_write_ops_total 2"),
             "两次写：\n{out}"
         );
         assert!(
-            out.contains("zipfs_fuse_write_bytes_total 12"),
+            out.contains("scrollz_fuse_write_bytes_total 12"),
             "write bytes 5+7=12：\n{out}"
         );
     }
@@ -502,18 +502,18 @@ mod tests {
         m.write_prometheus(&mut out);
 
         assert!(
-            out.contains("zipfs_blockcache_hits_total 2"),
+            out.contains("scrollz_blockcache_hits_total 2"),
             "命中计数应为 2：\n{out}"
         );
         assert!(
-            out.contains("zipfs_blockcache_misses_total 1"),
+            out.contains("scrollz_blockcache_misses_total 1"),
             "未命中计数应为 1：\n{out}"
         );
         // 命中率由 Prometheus 侧 hits/(hits+misses) 算，进程内不算，只暴露两个 counter。
-        assert!(out.contains("# TYPE zipfs_blockcache_hits_total counter"));
-        assert!(out.contains("# TYPE zipfs_blockcache_misses_total counter"));
-        assert!(out.contains("# HELP zipfs_blockcache_hits_total"));
-        assert!(out.contains("# HELP zipfs_blockcache_misses_total"));
+        assert!(out.contains("# TYPE scrollz_blockcache_hits_total counter"));
+        assert!(out.contains("# TYPE scrollz_blockcache_misses_total counter"));
+        assert!(out.contains("# HELP scrollz_blockcache_hits_total"));
+        assert!(out.contains("# HELP scrollz_blockcache_misses_total"));
     }
 
     #[test]
@@ -529,11 +529,11 @@ mod tests {
         m.write_prometheus(&mut out);
 
         assert!(
-            out.contains("zipfs_seals_total 3"),
+            out.contains("scrollz_seals_total 3"),
             "封块计数应为 3，实际输出：\n{out}"
         );
-        assert!(out.contains("# TYPE zipfs_seals_total counter"));
-        assert!(out.contains("# HELP zipfs_seals_total"));
+        assert!(out.contains("# TYPE scrollz_seals_total counter"));
+        assert!(out.contains("# HELP scrollz_seals_total"));
     }
 
     #[test]
@@ -543,9 +543,9 @@ mod tests {
         m.record_commit_ok(5);
         let mut out = String::new();
         m.write_prometheus(&mut out);
-        assert!(out.contains("zipfs_commit_ok_total 2"), "两次成功：\n{out}");
+        assert!(out.contains("scrollz_commit_ok_total 2"), "两次成功：\n{out}");
         assert!(
-            out.contains("zipfs_blocks_flushed_total 7"),
+            out.contains("scrollz_blocks_flushed_total 7"),
             "块数累加 2+5=7：\n{out}"
         );
     }
@@ -571,7 +571,7 @@ mod tests {
         m.write_prometheus(&mut out);
 
         // 逐个累积桶：le 越大，累计计数不减（单调不减）。
-        let name = "zipfs_read_latency_seconds";
+        let name = "scrollz_read_latency_seconds";
         let bucket_les = [
             "0.00005", "0.0001", "0.00025", "0.0005", "0.001", "0.0025", "0.005", "0.01", "0.025",
             "0.05", "0.1", "+Inf",
@@ -638,24 +638,24 @@ mod tests {
 
         // write 直方图观测 2 次。
         assert_eq!(
-            metric_line_value(&out, "zipfs_write_latency_seconds_count "),
+            metric_line_value(&out, "scrollz_write_latency_seconds_count "),
             Some("2"),
             "write count=2：\n{out}"
         );
         // fsync 直方图观测 1 次，独立于 write。
         assert_eq!(
-            metric_line_value(&out, "zipfs_fsync_latency_seconds_count "),
+            metric_line_value(&out, "scrollz_fsync_latency_seconds_count "),
             Some("1"),
             "fsync count=1：\n{out}"
         );
         // read 直方图未观测：count=0，+Inf=0。
         assert_eq!(
-            metric_line_value(&out, "zipfs_read_latency_seconds_count "),
+            metric_line_value(&out, "scrollz_read_latency_seconds_count "),
             Some("0"),
             "read count=0：\n{out}"
         );
         assert_eq!(
-            metric_line_value(&out, "zipfs_read_latency_seconds_bucket{le=\"+Inf\"} "),
+            metric_line_value(&out, "scrollz_read_latency_seconds_bucket{le=\"+Inf\"} "),
             Some("0"),
             "read +Inf=0：\n{out}"
         );
@@ -671,7 +671,7 @@ mod tests {
         let mut out = String::new();
         m.write_prometheus(&mut out);
 
-        let name = "zipfs_read_latency_seconds";
+        let name = "scrollz_read_latency_seconds";
         // le=0.00005 累计 1（50us 落此桶）。
         assert_eq!(
             metric_line_value(&out, &format!("{name}_bucket{{le=\"0.00005\"}} ")),
@@ -704,26 +704,26 @@ mod tests {
         m.write_prometheus(&mut out);
 
         assert!(
-            out.contains("zipfs_shadow_commits_total 2"),
+            out.contains("scrollz_shadow_commits_total 2"),
             "shadow 提交计数应为 2：\n{out}"
         );
         assert!(
-            out.contains("zipfs_shadow_reader_hits_total 3"),
+            out.contains("scrollz_shadow_reader_hits_total 3"),
             "reader 命中应为 3：\n{out}"
         );
         assert!(
-            out.contains("zipfs_shadow_reader_misses_total 1"),
+            out.contains("scrollz_shadow_reader_misses_total 1"),
             "reader 未命中应为 1：\n{out}"
         );
         assert!(
-            out.contains("zipfs_shadow_tail_appends_total 1"),
+            out.contains("scrollz_shadow_tail_appends_total 1"),
             "尾日志追加应为 1：\n{out}"
         );
         // 类型/HELP 行齐备（均为 counter）。
-        assert!(out.contains("# TYPE zipfs_shadow_commits_total counter"));
-        assert!(out.contains("# TYPE zipfs_shadow_reader_hits_total counter"));
-        assert!(out.contains("# TYPE zipfs_shadow_reader_misses_total counter"));
-        assert!(out.contains("# TYPE zipfs_shadow_tail_appends_total counter"));
-        assert!(out.contains("# HELP zipfs_shadow_commits_total"));
+        assert!(out.contains("# TYPE scrollz_shadow_commits_total counter"));
+        assert!(out.contains("# TYPE scrollz_shadow_reader_hits_total counter"));
+        assert!(out.contains("# TYPE scrollz_shadow_reader_misses_total counter"));
+        assert!(out.contains("# TYPE scrollz_shadow_tail_appends_total counter"));
+        assert!(out.contains("# HELP scrollz_shadow_commits_total"));
     }
 }

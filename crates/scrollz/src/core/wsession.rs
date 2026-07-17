@@ -733,7 +733,7 @@ mod tests {
         );
         let mut out = String::new();
         shared.write_prometheus(&mut out);
-        assert!(out.contains("zipfs_seals_total 2"), "封块进 .prom：\n{out}");
+        assert!(out.contains("scrollz_seals_total 2"), "封块进 .prom：\n{out}");
     }
 
     #[test]

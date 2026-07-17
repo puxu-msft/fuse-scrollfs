@@ -823,7 +823,7 @@ fn serve_rw(
                 use std::fmt::Write;
                 let _ = write!(
                     body,
-                    "# HELP zipfs_recompressions_total 块级重压次数\n# TYPE zipfs_recompressions_total counter\nzipfs_recompressions_total {}\n",
+                    "# HELP scrollz_recompressions_total 块级重压次数\n# TYPE scrollz_recompressions_total counter\nscrollz_recompressions_total {}\n",
                     scrollz::core::rmw::block_compress_count()
                 );
             }
@@ -837,9 +837,9 @@ fn serve_rw(
                 };
                 let _ = write!(
                     body,
-                    "# HELP zipfs_logical_bytes 逻辑字节\n# TYPE zipfs_logical_bytes gauge\nzipfs_logical_bytes {logical}\n\
-                     # HELP zipfs_physical_bytes 物理字节\n# TYPE zipfs_physical_bytes gauge\nzipfs_physical_bytes {phys}\n\
-                     # HELP zipfs_compression_ratio 压缩比\n# TYPE zipfs_compression_ratio gauge\nzipfs_compression_ratio {ratio:.4}\n"
+                    "# HELP scrollz_logical_bytes 逻辑字节\n# TYPE scrollz_logical_bytes gauge\nscrollz_logical_bytes {logical}\n\
+                     # HELP scrollz_physical_bytes 物理字节\n# TYPE scrollz_physical_bytes gauge\nscrollz_physical_bytes {phys}\n\
+                     # HELP scrollz_compression_ratio 压缩比\n# TYPE scrollz_compression_ratio gauge\nscrollz_compression_ratio {ratio:.4}\n"
                 );
             }
             let tmp = path.with_extension("prom.tmp");

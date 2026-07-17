@@ -1595,8 +1595,8 @@ mod tests {
         // 首读块 1：块缓存未命中（走 Store + 解压 + 回填）。
         let _ = fs.read_range(ino, b1, 100).unwrap();
         let after_first = read_metrics(&fs);
-        let miss1 = counter(&after_first, "zipfs_blockcache_misses_total");
-        let hit1 = counter(&after_first, "zipfs_blockcache_hits_total");
+        let miss1 = counter(&after_first, "scrollz_blockcache_misses_total");
+        let hit1 = counter(&after_first, "scrollz_blockcache_hits_total");
         assert_eq!(miss1, 1, "首读同一内部块记一次未命中：\n{after_first}");
         assert_eq!(hit1, 0, "首读无命中：\n{after_first}");
 
@@ -1604,12 +1604,12 @@ mod tests {
         let _ = fs.read_range(ino, b1 + 100, 100).unwrap();
         let after_second = read_metrics(&fs);
         assert_eq!(
-            counter(&after_second, "zipfs_blockcache_hits_total"),
+            counter(&after_second, "scrollz_blockcache_hits_total"),
             1,
             "第二遍读同块命中计数上升：\n{after_second}"
         );
         assert_eq!(
-            counter(&after_second, "zipfs_blockcache_misses_total"),
+            counter(&after_second, "scrollz_blockcache_misses_total"),
             1,
             "命中不再增未命中：\n{after_second}"
         );

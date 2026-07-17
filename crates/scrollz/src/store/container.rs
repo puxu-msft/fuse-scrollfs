@@ -1344,25 +1344,25 @@ mod tests {
         let mut out = String::new();
         metrics.write_prometheus(&mut out);
         assert!(
-            out.contains("zipfs_commit_ok_total 1"),
+            out.contains("scrollz_commit_ok_total 1"),
             "应记 1 次成功提交：\n{out}"
         );
         assert!(
-            out.contains("zipfs_blocks_flushed_total 2"),
+            out.contains("scrollz_blocks_flushed_total 2"),
             "应累计 2 块落盘（失败那次不计）：\n{out}"
         );
         assert!(
-            out.contains("zipfs_commit_failed_total 1"),
+            out.contains("scrollz_commit_failed_total 1"),
             "应记 1 次失败提交：\n{out}"
         );
         assert!(
-            out.contains("zipfs_flushing_bytes_peak "),
+            out.contains("scrollz_flushing_bytes_peak "),
             "峰值 gauge 应存在：\n{out}"
         );
         // 峰值应反映曾观测到的最大 flushing 字节（>0，两块编码后字节和）。
         let peak_line = out
             .lines()
-            .find(|l| l.starts_with("zipfs_flushing_bytes_peak "))
+            .find(|l| l.starts_with("scrollz_flushing_bytes_peak "))
             .expect("峰值行存在");
         let peak: u64 = peak_line
             .rsplit(' ')

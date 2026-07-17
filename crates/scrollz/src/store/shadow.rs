@@ -1956,19 +1956,19 @@ mod tests {
         let mut out = String::new();
         metrics.write_prometheus(&mut out);
         assert!(
-            out.contains("zipfs_shadow_commits_total 1"),
+            out.contains("scrollz_shadow_commits_total 1"),
             "一次 fsync 提交应记 1 次 shadow_commit：\n{out}"
         );
         assert!(
-            out.contains("zipfs_shadow_reader_hits_total 1"),
+            out.contains("scrollz_shadow_reader_hits_total 1"),
             "第二次读应命中缓存记 1 次 hit：\n{out}"
         );
         assert!(
-            out.contains("zipfs_shadow_reader_misses_total 1"),
+            out.contains("scrollz_shadow_reader_misses_total 1"),
             "首次读应未命中记 1 次 miss：\n{out}"
         );
         assert!(
-            out.contains("zipfs_shadow_tail_appends_total 1"),
+            out.contains("scrollz_shadow_tail_appends_total 1"),
             "一次 append_tail 应记 1 次 tail_append：\n{out}"
         );
     }
