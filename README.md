@@ -1,5 +1,7 @@
 # scrollz
 
+> *Transparent zstd-chunked compression for Claude Code session transcripts (and any append-only log).* （原名 zipfs,2026-07-18 改名。）
+
 自研 Rust FUSE **透明压缩文件系统**，用于在 WSL/Linux 上把目录以透明压缩方式存储（上层普通 POSIX 读写，底层自动压缩/解压），并**横向评测两种磁盘布局**以决定最终路线。
 
 最终目标负载：承载 `~/.claude/projects` 等 Claude 记录大目录（实测 8.7GB，文本为主，单文件 zstd:3 可达 31x，**追加写为主**）。
