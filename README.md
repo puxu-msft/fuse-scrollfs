@@ -1,4 +1,4 @@
-# zipfs
+# scrollz
 
 自研 Rust FUSE **透明压缩文件系统**，用于在 WSL/Linux 上把目录以透明压缩方式存储（上层普通 POSIX 读写，底层自动压缩/解压），并**横向评测两种磁盘布局**以决定最终路线。
 
@@ -11,13 +11,13 @@
 | **V（容器 / 虚拟盘）** | 整棵树落进一个容器 | redb 全包（64KiB 块 + 批事务） |
 | **S（影子树）** | 每文件一个分块压缩包，目录沿用底层 FS | ext4 上的镜像目录树 + footer 索引 archive |
 
-两者共享同一「分块 + 压缩 + 索引」内核（`crates/zipfs/src/core/`），仅在 `Store` 接缝处不同。
+两者共享同一「分块 + 压缩 + 索引」内核（`crates/scrollz/src/core/`），仅在 `Store` 接缝处不同。
 
 ## 目录结构
 
 ```
-crates/zipfs/        Rust FUSE 实现（产品 crate：lib + zipfs + mkfixture）
-crates/zipfs-bench/  基准二进制（append / ratio / ldm-ratio / discovery）
+crates/scrollz/        Rust FUSE 实现（产品 crate：lib + scrollz + mkfixture）
+crates/scrollz-bench/  基准二进制（append / ratio / ldm-ratio / discovery）
 exp/                 归档 PoC（container-backend-selection：redb 容器后端选型）
 bench/               基准脚本、fio job、结果报告
 docs/                设计与对照文档
@@ -49,27 +49,27 @@ cargo test --release          # 单元 + model-based 差分（两后端）+ 真�
 
 ```bash
 # 布局 S（影子树，读写）
-target/release/zipfs --backend shadow    --backing <底层目录> --mountpoint <挂载点> --chunk-size 65536
+target/release/scrollz --backend shadow    --backing <底层目录> --mountpoint <挂载点> --chunk-size 65536
 # 布局 V（容器，读写）
-target/release/zipfs --backend container --backing <redb文件> --mountpoint <挂载点> --chunk-size 65536
+target/release/scrollz --backend container --backing <redb文件> --mountpoint <挂载点> --chunk-size 65536
 # 容器离线压实（回收 redb MVCC 旧页）
-target/release/zipfs compact --backend container --backing <redb文件>
+target/release/scrollz compact --backend container --backing <redb文件>
 ```
 
-## 启用到 Claude projects（`zipfs enable`，TUI / 子命令）
+## 启用到 Claude projects（`scrollz enable`，TUI / 子命令）
 
 把 `~/.claude/projects/*` 目录**可逆**切换到透明压缩挂载：`mv 备份 → ingest --verify → 挂载`，
-失败回滚、零丢失；backing 内 `.zipfs.meta` 提交标记使半灌可检测、绝不当权威挂出。
+失败回滚、零丢失；backing 内 `.scrollz.meta` 提交标记使半灌可检测、绝不当权威挂出。
 
 ```bash
-target/release/zipfs enable                 # 交互式 TUI（列表/状态/切换/还原/重挂/选项/批量）
-target/release/zipfs enable list            # 状态总览（PLAIN/ZIPFS/STOPPED/BROKEN + NEEDS-RECONCILE + 压缩比）
-target/release/zipfs enable apply  <name>   # 切换（活跃会话默认拦截，需 --force）
-target/release/zipfs enable restore <name>  # 还原（backing 保留，可 `enable purge` 清理）
-target/release/zipfs enable remount --all   # 守护崩溃/重启后重挂所有 STOPPED
-target/release/zipfs enable reconcile      -- <name>   # 停用期回落写重合并（详见 docs/09；须先卸载；逐条确认，高置信回车即采纳）
-target/release/zipfs enable reconcile-undo -- <name>   # 回退最近一次 reconcile 供重选（docs/09 §10）
-target/release/zipfs enable autostart install   # systemd user 登录自挂载（WSL 用 `autostart print`）
+target/release/scrollz enable                 # 交互式 TUI（列表/状态/切换/还原/重挂/选项/批量）
+target/release/scrollz enable list            # 状态总览（PLAIN/SCROLLZ/STOPPED/BROKEN + NEEDS-RECONCILE + 压缩比）
+target/release/scrollz enable apply  <name>   # 切换（活跃会话默认拦截，需 --force）
+target/release/scrollz enable restore <name>  # 还原（backing 保留，可 `enable purge` 清理）
+target/release/scrollz enable remount --all   # 守护崩溃/重启后重挂所有 STOPPED
+target/release/scrollz enable reconcile      -- <name>   # 停用期回落写重合并（详见 docs/09；须先卸载；逐条确认，高置信回车即采纳）
+target/release/scrollz enable reconcile-undo -- <name>   # 回退最近一次 reconcile 供重选（docs/09 §10）
+target/release/scrollz enable autostart install   # systemd user 登录自挂载（WSL 用 `autostart print`）
 ```
 
 > 项目名前导 `-`（path-encoded）在子命令里须用 `--` 分隔，如 `enable reconcile -- -home-xp-src-foo`。停用期若 Claude 直接写进裸挂载点（回落写），`enable list` 标 `NEEDS-RECONCILE`、remount 被守卫拒；先 `enable reconcile` 无损并回 backing（详见 [docs/09-session-reconcile.md](docs/09-session-reconcile.md)）。
@@ -77,18 +77,18 @@ target/release/zipfs enable autostart install   # systemd user 登录自挂载�
 apply 选项（全部持久化到 backing sidecar，remount 原样复用；TUI 内 `o` 调 backend/chunk/level/threads/writeback）：
 
 ```bash
-zipfs enable apply <name> --backend shadow|container \
+scrollz enable apply <name> --backend shadow|container \
   --chunk 1048576 --level 19 --dict shared.dict --threads 4 --writeback \
   --max-write 4194304 --no-tail-buffer --allow-other --auto-unmount --metrics-file z.prom
 ```
 
 - **两种后端可选**：`shadow`（默认；真实目录树，支持 symlink，append 友好）/ `container`（redb 单文件，便于搬运；不支持 symlink）。
-- **持久化默认**：`zipfs enable config set level 19` / `config show` —— 免去每次重复敲选项。
-- **维护**：`zipfs enable compact <name>`（回收空间，两后端）、`zipfs enable seal <name>`（仅 shadow，冷文件大块重压）—— 自动卸载→操作→重挂。大文件（会话 jsonl）为主的库可加 `--seal-chunk` 提块到 >8MiB（如 `67108864`=64MiB），自动启用 zstd 长程匹配（LDM）逼近整流上界（实测大 transcript +8~16%，见 [bench/results/ldm-ratio/REPORT.md](bench/results/ldm-ratio/REPORT.md)）；默认 8MiB 不开 LDM，代价是冷读单块解压内存随块增大。
+- **持久化默认**：`scrollz enable config set level 19` / `config show` —— 免去每次重复敲选项。
+- **维护**：`scrollz enable compact <name>`（回收空间，两后端）、`scrollz enable seal <name>`（仅 shadow，冷文件大块重压）—— 自动卸载→操作→重挂。大文件（会话 jsonl）为主的库可加 `--seal-chunk` 提块到 >8MiB（如 `67108864`=64MiB），自动启用 zstd 长程匹配（LDM）逼近整流上界（实测大 transcript +8~16%，见 [bench/results/ldm-ratio/REPORT.md](bench/results/ldm-ratio/REPORT.md)）；默认 8MiB 不开 LDM，代价是冷读单块解压内存随块增大。
 - 透明支持 Claude 的 `memory` 外部软链（shadow：ingest 照原样重建、运行时经 readlink 服务）；真正特殊文件（FIFO/socket/设备）会被拒绝并回滚，避免静默丢失。
 
-> 路径可经 env `CLAUDE_PROJECTS` / `ZIPFS_HOME` 覆盖（默认 `~/.claude/projects`、`~/.local/claude-scrollz`）。
-> 取代了早期 `bench/scripts/zipfs-{cutover,rollback,mount}.sh`（保留作手动/参考）。
+> 路径可经 env `CLAUDE_PROJECTS` / `SCROLLZ_HOME` 覆盖（默认 `~/.claude/projects`、`~/.local/claude-scrollz`）。旧 `ZIPFS_HOME` 仅作弃用兼容回落；迁移后请 unset，或改设 `SCROLLZ_HOME=~/.local/claude-scrollz`。
+> 取代了早期 `bench/scripts/scrollz-{cutover,rollback,mount}.sh`（保留作手动/参考）。
 
 
 ## 基准

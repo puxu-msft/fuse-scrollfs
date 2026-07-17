@@ -155,7 +155,7 @@ impl Paths {
     /// NEEDS-RECONCILE sentinel = `back_root/<name>.needs-reconcile`（Task 12）。
     ///
     /// guard-check 检出挂载点 underlay 含停用期回落写时落此文件：给脚本/人明确信号「该项目自动挂载
-    /// 已被阻止，需 `zipfs enable reconcile <name>` 重合并」。underlay 清空后由下次 guard-check 通过
+    /// 已被阻止，需 `scrollz enable reconcile <name>` 重合并」。underlay 清空后由下次 guard-check 通过
     /// 时自愈清除。**独立于** `.reconciling`（那是半改写维护互斥）与 `.scrollz.meta`（提交标记）。
     pub fn needs_reconcile_sentinel(&self, name: &str) -> PathBuf {
         self.back_root()
@@ -199,7 +199,7 @@ pub fn validate_name(name: &str) -> std::io::Result<()> {
 /// 项目当前状态（`classify` 的输出，TUI 状态色块与 list 表的依据）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectStatus {
-    /// 未被 zipfs 管理（普通目录）。
+    /// 未被 scrollz 管理（普通目录）。
     Plain,
     /// 正常透明压缩挂载中。
     Active,
@@ -217,7 +217,7 @@ impl ProjectStatus {
     pub fn label(self) -> &'static str {
         match self {
             ProjectStatus::Plain => "PLAIN",
-            ProjectStatus::Active => "ZIPFS",
+            ProjectStatus::Active => "SCROLLZ",
             ProjectStatus::Stopped => "STOPPED",
             ProjectStatus::Broken => "BROKEN",
             ProjectStatus::Hung => "HUNG",
@@ -241,7 +241,7 @@ pub enum EndpointHealth {
 ///
 /// 输入全是探测事实（由 `discovery.rs` 提供）：
 /// - `orig_exists`：`P.scrollz-orig` 备份是否在（= 是否被 apply 过/切换中）。
-/// - `mounted`：`P` 是否为活的 zipfs 挂载点（mountinfo 命中 **且** endpoint 健康）。
+/// - `mounted`：`P` 是否为活的 scrollz 挂载点（mountinfo 命中 **且** endpoint 健康）。
 /// - `health`：`P` 的 endpoint 健康三态。`mounted` 已蕴含 `Healthy`（探测端 `matches!(health,Healthy) && is_mounted`），
 ///   故 `Stale`/`Hung` 只可能落 `(true,false)` 分支：`Hung → Hung`、`Stale → Broken`。
 /// - `backing_committed`：backing 内 sidecar 存在且 `committed=1`。
@@ -297,7 +297,7 @@ impl Backend {
 }
 
 /// apply 选项：后端布局 + 压缩/挂载参数。全量持久化到 backing sidecar，remount 原样复用，
-/// 与底层 `zipfs --backend ... ` 一一对应。
+/// 与底层 `scrollz --backend ... ` 一一对应。
 #[derive(Debug, Clone)]
 pub struct ApplyOptions {
     /// 后端布局（shadow/container）。
@@ -306,7 +306,7 @@ pub struct ApplyOptions {
     pub chunk_size: u32,
     /// zstd 等级（1/3/9/19；大块叠高等级提比值）。
     pub level: i32,
-    /// 共享 zstd 字典文件路径（`zipfs train-dict` 产出）；None 不启用。
+    /// 共享 zstd 字典文件路径（`scrollz train-dict` 产出）；None 不启用。
     pub dict: Option<PathBuf>,
     /// FUSE 工作线程数（0=默认 = CPU 数，下限 4）。
     pub threads: usize,

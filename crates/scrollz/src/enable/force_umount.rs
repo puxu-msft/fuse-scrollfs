@@ -221,7 +221,7 @@ mod tests {
     fn run_fusermount_notfound_when_binary_absent() {
         // 用一个不存在的挂载点 + 极短超时；真实 fusermount 会快速失败（非 hang）。
         // 断言不 panic 且返回可判定的 outcome（Failed / NotFound）。
-        let mp = Path::new("/nonexistent/zipfs/mp");
+        let mp = Path::new("/nonexistent/scrollz/mp");
         let out = run_fusermount(&[OsStr::new("-u"), mp.as_os_str()], Duration::from_secs(2));
         assert!(matches!(out, CmdOutcome::Failed | CmdOutcome::NotFound));
     }
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn umount_reports_not_mounted_as_success() {
         // 未挂载的路径：was_mounted=false、unmounted=true、不 abort。
-        let mp = Path::new("/definitely/not/mounted/zipfs");
+        let mp = Path::new("/definitely/not/mounted/scrollz");
         let r = umount(mp, UmountLevel::Auto).unwrap();
         assert!(!r.was_mounted);
         assert!(r.unmounted);

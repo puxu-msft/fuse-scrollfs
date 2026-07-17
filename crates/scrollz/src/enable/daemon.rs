@@ -48,18 +48,18 @@ pub trait Mounter {
     /// （wedge 也能摘除，且不改写 backing 故 lazy/abort 无损）。`name` 供 systemd 实现
     /// `systemctl stop` 用，`RealMounter`/`FakeMounter` 忽略（直接卸 mountpoint）。
     fn unmount(&self, name: &str, mountpoint: &Path, level: UmountLevel) -> std::io::Result<()>;
-    /// 是否为活的 zipfs 挂载点。
+    /// 是否为活的 scrollz 挂载点。
     fn is_mounted(&self, mountpoint: &Path) -> bool;
 
     /// 注册项目自启（apply 成功后调用）。default no-op：`RealMounter`/`FakeMounter` 无 systemd
-    /// 自启概念。`SystemdMounter` 覆盖为 `systemctl --user enable zipfs@<esc>`，使 apply 的项目
+    /// 自启概念。`SystemdMounter` 覆盖为 `systemctl --user enable scrollz@<esc>`，使 apply 的项目
     /// 重启后自动重挂。best-effort：失败不应回滚已成功的挂载（调用方忽略错误）。
     fn enable_autostart(&self, _name: &str) -> std::io::Result<()> {
         Ok(())
     }
 
     /// 注销项目自启（restore/purge 时调用）。default no-op；`SystemdMounter` 覆盖为
-    /// `systemctl --user disable zipfs@<esc>`。
+    /// `systemctl --user disable scrollz@<esc>`。
     fn disable_autostart(&self, _name: &str) -> std::io::Result<()> {
         Ok(())
     }

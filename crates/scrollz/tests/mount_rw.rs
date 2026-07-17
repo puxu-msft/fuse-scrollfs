@@ -1,4 +1,4 @@
-//! 读写挂载集成测试（§12 P2/P3）：真实挂载 zipfs，经挂载点做 read/write/append/truncate
+//! 读写挂载集成测试（§12 P2/P3）：真实挂载 scrollz，经挂载点做 read/write/append/truncate
 //! round-trip，**两后端各跑一遍**（shadow / container）。无法挂载（无 /dev/fuse 或无
 //! fusermount）优雅跳过不 panic。结束必卸载。
 
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-fn zipfs_bin() -> PathBuf {
+fn scrollz_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_scrollz"))
 }
 
@@ -71,12 +71,12 @@ fn kill_child(mut child: Child) {
     let _ = child.wait();
 }
 
-/// 挂某后端，跑 `body`，结束必卸载。`backing` 是给 zipfs 的 --backing 参数。
+/// 挂某后端，跑 `body`，结束必卸载。`backing` 是给 scrollz 的 --backing 参数。
 fn with_mount<F: FnOnce(&Path)>(backend: &str, backing: &Path, body: F) -> bool {
     let mountdir = tempfile::tempdir().unwrap();
     let mountpoint = mountdir.path().to_path_buf();
 
-    let child = match Command::new(zipfs_bin())
+    let child = match Command::new(scrollz_bin())
         .arg("--backend")
         .arg(backend)
         .arg("--backing")
@@ -90,7 +90,7 @@ fn with_mount<F: FnOnce(&Path)>(backend: &str, backing: &Path, body: F) -> bool 
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[SKIP] 无法启动 zipfs 二进制：{e}");
+            eprintln!("[SKIP] 无法启动 scrollz 二进制：{e}");
             return false;
         }
     };
@@ -117,9 +117,9 @@ fn with_mount<F: FnOnce(&Path)>(backend: &str, backing: &Path, body: F) -> bool 
 fn rw_assertions(mountpoint: &Path) {
     // 1) create + write + read round-trip。
     let f1 = mountpoint.join("hello.txt");
-    fs::write(&f1, b"zipfs read-write P2\n").expect("写新文件");
+    fs::write(&f1, b"scrollz read-write P2\n").expect("写新文件");
     let got = fs::read(&f1).expect("读回");
-    assert_eq!(got, b"zipfs read-write P2\n", "顺序写 round-trip");
+    assert_eq!(got, b"scrollz read-write P2\n", "顺序写 round-trip");
 
     // 2) 跨多块的大文件 + append + 跨块随机读。
     let big_path = mountpoint.join("big.dat");
@@ -196,7 +196,7 @@ fn rw_assertions(mountpoint: &Path) {
     assert!(!mountpoint.join("hello.txt").exists());
     assert_eq!(
         fs::read(mountpoint.join("renamed.txt")).unwrap(),
-        b"zipfs read-write P2\n"
+        b"scrollz read-write P2\n"
     );
     fs::remove_file(mountpoint.join("renamed.txt")).expect("unlink");
     assert!(!mountpoint.join("renamed.txt").exists());

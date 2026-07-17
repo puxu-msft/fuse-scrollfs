@@ -1,10 +1,10 @@
 //! P0 集成测试：透传 round-trip。
 //!
-//! 若环境允许挂载（/dev/fuse 存在且 fusermount3 可用），把 zipfs 挂到临时目录，
+//! 若环境允许挂载（/dev/fuse 存在且 fusermount3 可用），把 scrollz 挂到临时目录，
 //! 做 create/write/read/readdir/mkdir/unlink round-trip 校验后卸载。
 //! 若挂载失败（权限/环境），优雅跳过并打印原因，不 panic 让整个 test 套失败。
 //!
-//! 见 docs/01-scrollz-design.md §12 P0。测试通过「启动已编译的 zipfs 二进制」来挂载，
+//! 见 docs/01-scrollz-design.md §12 P0。测试通过「启动已编译的 scrollz 二进制」来挂载，
 //! 贴近真实使用路径，也避免引入 lib target。
 
 use std::fs;
@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-/// 取已编译的 zipfs 二进制路径（cargo 通过 CARGO_BIN_EXE_<name> 暴露）。
-fn zipfs_bin() -> PathBuf {
+/// 取已编译的 scrollz 二进制路径（cargo 通过 CARGO_BIN_EXE_<name> 暴露）。
+fn scrollz_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_scrollz"))
 }
 
@@ -108,8 +108,8 @@ fn passthrough_round_trip_or_skip() {
     };
     let mountpoint = mountdir.path().to_path_buf();
 
-    // 启动 zipfs（前台，AutoUnmount 默认开）。
-    let child = match Command::new(zipfs_bin())
+    // 启动 scrollz（前台，AutoUnmount 默认开）。
+    let child = match Command::new(scrollz_bin())
         .arg("--backing")
         .arg(backing.path())
         .arg("--mountpoint")
@@ -119,7 +119,7 @@ fn passthrough_round_trip_or_skip() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[SKIP] 无法启动 zipfs 二进制：{e}");
+            eprintln!("[SKIP] 无法启动 scrollz 二进制：{e}");
             return;
         }
     };
@@ -150,7 +150,7 @@ fn passthrough_round_trip_or_skip() {
 fn round_trip_assertions(mountpoint: &Path, backing: &Path) {
     // 1) create + write
     let file_path = mountpoint.join("hello.txt");
-    let payload = b"zipfs passthrough P0\n";
+    let payload = b"scrollz passthrough P0\n";
     {
         let mut f = fs::OpenOptions::new()
             .create(true)

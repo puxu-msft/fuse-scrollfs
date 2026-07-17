@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> PathBuf {
-    // cargo 在 target/<profile>/zipfs 产出主二进制；测试时用 CARGO_BIN_EXE_scrollz。
+    // cargo 在 target/<profile>/scrollz 产出主二进制；测试时用 CARGO_BIN_EXE_scrollz。
     PathBuf::from(env!("CARGO_BIN_EXE_scrollz"))
 }
 
@@ -23,7 +23,7 @@ fn run_enable(tmp: &std::path::Path, args: &[&str]) -> (String, bool) {
         .env("SCROLLZ_HOME", &zip)
         .env("HOME", tmp)
         .output()
-        .expect("run zipfs enable");
+        .expect("run scrollz enable");
     (
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
         out.status.success(),

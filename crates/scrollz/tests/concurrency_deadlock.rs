@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 // ---- 环境探测 / 挂载脚手架（与 mount_rw.rs 同款，集成测试间不共享辅助，故各自带一份）----
 
-fn zipfs_bin() -> PathBuf {
+fn scrollz_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_scrollz"))
 }
 
@@ -145,7 +145,7 @@ impl ShadowMount {
         let backing = tempfile::tempdir().ok()?;
         let mountdir = tempfile::tempdir().ok()?;
         let mountpoint = mountdir.path().to_path_buf();
-        let child = Command::new(zipfs_bin())
+        let child = Command::new(scrollz_bin())
             .arg("--backend")
             .arg("shadow")
             .arg("--backing")

@@ -1,6 +1,6 @@
 //! 可逆生命周期：apply（切换）/ restore（还原）/ remount（重挂）/ purge（清 backing）。
 //!
-//! 配方移植自 crash-tested 的 `zipfs-cutover.sh` / `zipfs-rollback.sh`，并强化为
+//! 配方移植自 crash-tested 的 `scrollz-cutover.sh` / `scrollz-rollback.sh`，并强化为
 //! **sidecar 提交标记**：只有 backing 内 `.scrollz.meta` 存在且 `committed=1` 才算灌入完成、可挂载
 //! （评审 C1/C2）。每个不可逆步骤前后补 fsync（父目录 dirent、backing 树、sidecar），
 //! 使任意时刻崩溃要么可续、要么 fail-closed，绝不把半灌数据当权威挂出。
@@ -188,7 +188,7 @@ pub fn apply(
         )));
     }
 
-    // 挂载成功 → 注册自启（systemd：enable zipfs@<esc>，重启后自动重挂）。best-effort：失败
+    // 挂载成功 → 注册自启（systemd：enable scrollz@<esc>，重启后自动重挂）。best-effort：失败
     // 不回滚已成功的挂载（RealMounter 下是 no-op），但要 warn——否则 systemd 下注册失败会让
     // 项目重启后不自动重挂，用户无从知晓。
     if let Err(e) = mounter.enable_autostart(name) {
@@ -231,7 +231,7 @@ pub fn restore(paths: &Paths, name: &str, mounter: &dyn Mounter) -> io::Result<(
             let _ = discovery::write_meta(&paths.meta_path(name), &m);
         }
     }
-    // 注销自启（systemd：disable zipfs@<esc>）。best-effort（RealMounter 下 no-op），warn 可观测。
+    // 注销自启（systemd：disable scrollz@<esc>）。best-effort（RealMounter 下 no-op），warn 可观测。
     if let Err(e) = mounter.disable_autostart(name) {
         log::warn!(
             "{name} 已还原，但 systemd 自启注销失败：{e}（可手动 `systemctl --user disable`）"

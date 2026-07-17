@@ -1,9 +1,9 @@
-# zipfs（crates/zipfs）—— 路线 B（用户态 FUSE）Rust 实现
+# scrollz（crates/scrollz）—— 路线 B（用户态 FUSE）Rust 实现
 
 > 实验背景见 [`../../docs/00-overview.md`](../../docs/00-overview.md)，磁盘布局与分阶段设计见 [`../../docs/01-scrollz-design.md`](../../docs/01-scrollz-design.md)。
 > **进度与缺陷的单一信息源**是 [`../../docs/ROADMAP.md`](../../docs/ROADMAP.md)（T0–T4 优先级）与 [`../../docs/06-defect-audit.md`](../../docs/06-defect-audit.md)（两轮审查台账）。本 README 只描述「这个 crate 现在是什么、怎么用」，不重复路线图的优先级排序。
 
-本 crate 是 zipfs「方案四 / 路线 B」的 Rust 实现。设计文档 §12 的分阶段骨架 **P0–P4 已全部落地**（P0 透传基线 + P1 只读/顺序读 + P2 顺序写/截断 + P3 随机写 RMW + P4 元数据 POSIX 语义），代码内 **无 `todo!()` 占位**；当前投入已转向 ROADMAP 的 **T1 可靠性 / T2 性能 / T3 空间 / T4 生产化**。
+本 crate 是 scrollz「方案四 / 路线 B」的 Rust 实现。设计文档 §12 的分阶段骨架 **P0–P4 已全部落地**（P0 透传基线 + P1 只读/顺序读 + P2 顺序写/截断 + P3 随机写 RMW + P4 元数据 POSIX 语义），代码内 **无 `todo!()` 占位**；当前投入已转向 ROADMAP 的 **T1 可靠性 / T2 性能 / T3 空间 / T4 生产化**。
 
 ## 阶段完成度（设计文档 §12 P0–P5）
 
@@ -56,7 +56,7 @@
 - `src/archive/`：布局 S 的每文件 archive 格式——双 superblock 原子提交、per-block CRC、append-only 尾日志、head 缓存区。按职责拆为 `format`（crc32/整数编解码）、`superblock`、`journal`、`reader`、`writer`、`updater` 子模块。
 - `src/blockio.rs`：`BlockIo` 接缝 + `FaultIo` 确定性崩溃模拟器（`fault-injection` feature，见测试）。
 - 离线工具：`compact`（回收 MVCC / append-only 空洞）、`seal`（冷文件大块高等级重编码）、`ingest`（迁移灌入 + `--verify`）、`fixture`（测试预置数据）。
-- `src/enable/`：Claude projects 透明压缩启用器（可逆切换 / systemd 自挂载 / TUI），取代旧 `bench/scripts/zipfs-*.sh`。
+- `src/enable/`：Claude projects 透明压缩启用器（可逆切换 / systemd 自挂载 / TUI），取代旧 `bench/scripts/scrollz-*.sh`。
 - `src/reconcile/`：停用期回落写重合并。`orchestrator/` 按流水线阶段拆为 `preconditions`/`io`/`delete_gate`/`reingest`/`plan`/`quarantine`/`routes`/`apply`/`manifest`/`prune`/`driver`（`reconcile` 主入口）/`undo`（`reconcile_undo` 入口）等子模块。
 
 ## 构建与测试
@@ -64,7 +64,7 @@
 环境前提：Linux / WSL，`/dev/fuse` 存在，`fusermount3`（或 `fusermount`）在 `PATH` 中。
 
 ```bash
-cd crates/zipfs
+cd crates/scrollz
 cargo build                              # 编译
 cargo test                               # 229 个测试（202 单元 + 27 集成）
 cargo test --features fault-injection    # 额外 8 个故障注入测试（共 237）
@@ -82,7 +82,7 @@ cargo clippy --all-targets
 
 ## 命令总览
 
-无子命令 = 挂载（向后兼容原 `zipfs --backend ... --backing ...` 用法）。
+无子命令 = 挂载（向后兼容原 `scrollz --backend ... --backing ...` 用法）。
 
 | 子命令 | 用途 |
 |---|---|
@@ -92,7 +92,7 @@ cargo clippy --all-targets
 | `ingest` | 迁移灌入：源目录流式转布局 S，`--verify` 逐字节校验 |
 | `train-dict` | 从语料训练共享 zstd 字典（T3 研究项，opt-in `--dict`） |
 | `enable` | Claude projects 透明压缩启用器（TUI 或 `list/apply/restore/remount/status/purge/autostart`） |
-| `mount-managed` / `umount-managed` | systemd 模板 `zipfs@<inst>.service` 内部调用 |
+| `mount-managed` / `umount-managed` | systemd 模板 `scrollz@<inst>.service` 内部调用 |
 
 挂载常用参数：`--chunk-size`（默认 **1MiB**，实测裁决退役 64KiB）、`--level`（zstd 等级，默认 3）、`--threads`、`--block-cache-bytes`（解压块缓存，默认 **128MiB**，压力感知）、`--writeback`、`--max-write`、`--pid-file`、`--metrics-file`（Prometheus textfile）、`--dict`、`--auto-unmount`、`--allow-other`。
 
@@ -100,20 +100,20 @@ cargo clippy --all-targets
 
 ```bash
 # 准备底层对象与挂载点（shadow：backing 是目录树）
-mkdir -p /tmp/zipfs-backing /tmp/zipfs-mnt
+mkdir -p /tmp/scrollz-backing /tmp/scrollz-mnt
 
 # 前台运行布局 S（Ctrl-C 退出）
 RUST_LOG=info cargo run -- \
-  --backend shadow --backing /tmp/zipfs-backing --mountpoint /tmp/zipfs-mnt
+  --backend shadow --backing /tmp/scrollz-backing --mountpoint /tmp/scrollz-mnt
 
 # 另开终端验证读写 round-trip（数据以压缩 archive 落在 backing）
-echo hello > /tmp/zipfs-mnt/a.txt
-cat /tmp/zipfs-mnt/a.txt          # 应看到 hello（解压后）
-ls -l /tmp/zipfs-backing          # 应看到 a.txt 的 archive（非明文）
-df -h /tmp/zipfs-mnt              # statfs 折算压缩比
+echo hello > /tmp/scrollz-mnt/a.txt
+cat /tmp/scrollz-mnt/a.txt          # 应看到 hello（解压后）
+ls -l /tmp/scrollz-backing          # 应看到 a.txt 的 archive（非明文）
+df -h /tmp/scrollz-mnt              # statfs 折算压缩比
 
 # 卸载
-fusermount3 -u /tmp/zipfs-mnt
+fusermount3 -u /tmp/scrollz-mnt
 ```
 
 把 `--backend shadow` 换成 `passthrough`（数据明文落 backing，B0 基线）或 `container`（`--backing` 改为 redb 容器文件路径）即可切后端。
@@ -138,10 +138,10 @@ fusermount3 -u /tmp/zipfs-mnt
 
 ## 长期运行 / 自启（生产化，ROADMAP T4）
 
-守护是前台阻塞 `mount2`；长期运行推荐 `zipfs enable`（取代旧脚本）：
+守护是前台阻塞 `mount2`；长期运行推荐 `scrollz enable`（取代旧脚本）：
 
-- **一键启用**：`zipfs enable`（TUI）或 `apply`/`restore`/`remount`/`status`——可逆切换 Claude projects 透明压缩，半灌（未提交 sidecar）可检测、活跃会话默认拦截、失败回滚到 Plain。
-- **systemd 自启 + 崩溃重挂**：`enable autostart` 装 per-project 模板 `zipfs@<inst>.service`（`Restart=on-failure`）到 `~/.config/systemd/user/`。
+- **一键启用**：`scrollz enable`（TUI）或 `apply`/`restore`/`remount`/`status`——可逆切换 Claude projects 透明压缩，半灌（未提交 sidecar）可检测、活跃会话默认拦截、失败回滚到 Plain。
+- **systemd 自启 + 崩溃重挂**：`enable autostart` 装 per-project 模板 `scrollz@<inst>.service`（`Restart=on-failure`）到 `~/.config/systemd/user/`。
 - **多线程**：`--threads N`（默认 = CPU 数，下限 4）降写尾 p99；per-inode RwLock 保并发安全。
 - **WSL 无 systemd**：`/etc/wsl.conf` 加 `[boot] command = ...` 自挂载。
 - **可观测性**：`statfs` 显压缩比（`df`）+ `--metrics-file` 写 Prometheus textfile + sd-notify 健康。

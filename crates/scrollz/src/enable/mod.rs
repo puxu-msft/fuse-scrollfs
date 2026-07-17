@@ -1,10 +1,10 @@
-//! `zipfs enable`：把 Claude projects 目录可逆切换到透明压缩挂载的启用器。
+//! `scrollz enable`：把 Claude projects 目录可逆切换到透明压缩挂载的启用器。
 //!
 //! - 无子动作 → 交互式 ratatui TUI（`tui.rs`）。
 //! - 子动作 `list/apply/restore/remount/status/purge/autostart` → 可脚本化（便于测试/批处理/自挂载）。
 //!
 //! 设计见 docs 计划与 ROADMAP T4「切换工具」。可逆配方移植自 crash-tested 的
-//! `bench/scripts/zipfs-{cutover,rollback,mount}.sh`，并以 sidecar 提交标记强化半灌可检测性。
+//! `bench/scripts/scrollz-{cutover,rollback,mount}.sh`，并以 sidecar 提交标记强化半灌可检测性。
 
 pub mod autostart;
 pub mod config;
@@ -29,10 +29,10 @@ use crate::reconcile::orchestrator::{
 };
 pub use model::{ApplyOptions, Backend, Paths, ProjectStatus};
 
-/// `zipfs enable` 的子动作。`None`（不给）→ 启动 TUI。
+/// `scrollz enable` 的子动作。`None`（不给）→ 启动 TUI。
 #[derive(Subcommand, Debug, Clone)]
 pub enum EnableAction {
-    /// 列出所有 Claude projects 的 zipfs 状态（PLAIN/ZIPFS/STOPPED/BROKEN）。
+    /// 列出所有 Claude projects 的 scrollz 状态（PLAIN/SCROLLZ/STOPPED/BROKEN）。
     List,
     /// 把某项目可逆切换到透明压缩挂载（mv 备份 → ingest --verify → 挂载）。
     Apply {
@@ -47,7 +47,7 @@ pub enum EnableAction {
         /// zstd 等级（1/3/9/19），默认 3。
         #[arg(long)]
         level: Option<i32>,
-        /// 共享 zstd 字典文件（`zipfs train-dict` 产出）；持久化、remount 复用。
+        /// 共享 zstd 字典文件（`scrollz train-dict` 产出）；持久化、remount 复用。
         #[arg(long)]
         dict: Option<PathBuf>,
         /// FUSE 工作线程数（0=默认 = CPU 数，下限 4）。
@@ -169,7 +169,7 @@ pub enum ConfigCmd {
 /// 自挂载子动作。
 #[derive(Subcommand, Debug, Clone)]
 pub enum AutostartCmd {
-    /// 安装并启用 systemd user 单元（每个 ZIPFS 项目一个实例）。
+    /// 安装并启用 systemd user 单元（每个 SCROLLZ 项目一个实例）。
     Install {
         #[arg(long, default_value_t = false)]
         all: bool,
@@ -776,19 +776,19 @@ pub fn underlay_guard(paths: &Paths, name: &str) -> std::io::Result<GuardOutcome
     let sentinel = paths.needs_reconcile_sentinel(name);
     if let Err(e) = write_needs_reconcile_sentinel(&sentinel, name) {
         eprintln!(
-            "[zipfs] 警告：写 NEEDS-RECONCILE sentinel 失败 {}：{e}（仍阻止自动挂载）",
+            "[scrollz] 警告：写 NEEDS-RECONCILE sentinel 失败 {}：{e}（仍阻止自动挂载）",
             sentinel.display()
         );
     }
     if reconciling {
         eprintln!(
-            "[zipfs] {name}: 正在 reconcile/undo（半改写窗口），已阻止自动挂载（防挂到半改写 backing）。\
+            "[scrollz] {name}: 正在 reconcile/undo（半改写窗口），已阻止自动挂载（防挂到半改写 backing）。\
              待其完成后重试。"
         );
     } else {
         eprintln!(
-            "[zipfs] {name}: 挂载点 underlay 含停用期回落写，已阻止自动挂载（避免静默盖住）。\
-             需人工 `zipfs enable reconcile {name}` 重合并后方可自动挂载。"
+            "[scrollz] {name}: 挂载点 underlay 含停用期回落写，已阻止自动挂载（避免静默盖住）。\
+             需人工 `scrollz enable reconcile {name}` 重合并后方可自动挂载。"
         );
     }
     Ok(GuardOutcome::NeedsReconcile)
@@ -803,7 +803,7 @@ fn write_needs_reconcile_sentinel(sentinel: &std::path::Path, name: &str) -> std
         sentinel,
         format!(
             "{name}: 挂载点 underlay 含停用期回落写，自动挂载已被 guard-check 阻止。\n\
-             请 `zipfs enable reconcile {name}` 重合并；清空后自动挂载会自愈。\n"
+             请 `scrollz enable reconcile {name}` 重合并；清空后自动挂载会自愈。\n"
         ),
     )
 }

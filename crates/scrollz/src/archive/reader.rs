@@ -43,7 +43,7 @@ impl ArchiveReader {
         let mut header = [0u8; HEADER_LEN as usize];
         read_exact_at(&file, &mut header, 0)?;
         if header[..8] != MAGIC {
-            return Err(corrupt("magic 不匹配，非 zipfs archive"));
+            return Err(corrupt("magic 不匹配，非 scrollz archive"));
         }
         let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
         if version != VERSION {

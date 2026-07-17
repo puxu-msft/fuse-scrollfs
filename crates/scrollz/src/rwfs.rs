@@ -34,8 +34,8 @@ use crate::store::{Attr, Store};
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// 读写 zipfs 前端。持一个 `Store` + codec 参数 + per-inode 状态表（含写锁与开放尾块）。
-pub struct ZipfsRw {
+/// 读写 scrollz 前端。持一个 `Store` + codec 参数 + per-inode 状态表（含写锁与开放尾块）。
+pub struct ScrollzRw {
     store: Arc<dyn Store>,
     params: CodecParams,
     default_chunk_size: u32,
@@ -67,14 +67,14 @@ pub struct ZipfsRw {
     metrics: Arc<Metrics>,
 }
 
-impl ZipfsRw {
+impl ScrollzRw {
     /// 取后端引用（main 后台 metrics 线程读 compression_stats 写 .prom）。
     pub fn store_handle(&self) -> Arc<dyn Store> {
         Arc::clone(&self.store)
     }
 }
 
-impl ZipfsRw {
+impl ScrollzRw {
     pub fn new(store: Arc<dyn Store>, algo: Algo, level: i32, default_chunk_size: u32) -> Self {
         Self::with_tail_buffer(store, algo, level, default_chunk_size, true, None)
     }
@@ -424,7 +424,7 @@ fn resolve_time_or_now(t: TimeOrNow) -> SystemTime {
     }
 }
 
-impl Filesystem for ZipfsRw {
+impl Filesystem for ScrollzRw {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
         // 协商更大 max_write，减大行 append 的内核拆分（fuser 默认 128KiB→ 可到 16MiB）。
         if self.max_write > 0 {
@@ -1008,8 +1008,8 @@ mod tests {
 
     const ROOT: u64 = 1;
 
-    /// 建 shadow ZipfsRw + 一个 200KiB 文件（128KiB 块 → 块0 满封建 head 缓存），返回 (fs, 内容, ino)。
-    fn fs_with_head_cache() -> (ZipfsRw, Vec<u8>, u64) {
+    /// 建 shadow ScrollzRw + 一个 200KiB 文件（128KiB 块 → 块0 满封建 head 缓存），返回 (fs, 内容, ino)。
+    fn fs_with_head_cache() -> (ScrollzRw, Vec<u8>, u64) {
         let dir = tempfile::tempdir().unwrap();
         let cs = 128 * 1024u32;
         let backing = dir.path().join("backing");
@@ -1029,7 +1029,7 @@ mod tests {
         };
         let ino = store.create(ROOT, "f.bin", attr).unwrap();
         let data: Vec<u8> = (0..200 * 1024).map(|i| b"abcde \n"[i % 7]).collect();
-        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs);
+        let fs = ScrollzRw::new(store.clone(), Algo::Zstd, 3, cs);
         rmw::write_at(store.as_ref(), ino, 0, &data, &fs.params).unwrap();
         store.fsync(ino).unwrap();
         std::mem::forget(dir); // 测试期保留 backing
@@ -1079,7 +1079,7 @@ mod tests {
             chunk_size: cs,
         };
         let ino = store.create(ROOT, "f.bin", attr).unwrap();
-        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs);
+        let fs = ScrollzRw::new(store.clone(), Algo::Zstd, 3, cs);
         // 写恰好一个满块（cs 字节）并封块，使后续 append 落在 cs 边界的新开放尾块（生产真实
         // append 路径：尾日志记录对应 idx==chunk_count 的新尾块）。
         let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
@@ -1142,7 +1142,7 @@ mod tests {
         let ino = inner.create(ROOT, "f.bin", attr).unwrap();
         // flush 注入失败的装饰器（seal/append_tail 仍转发到 inner → seal 成功、flush 报错）。
         let store = Arc::new(FlushFailStore::new(inner));
-        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs);
+        let fs = ScrollzRw::new(store.clone(), Algo::Zstd, 3, cs);
 
         // 写满一个块并封块，使后续 append 落在新开放尾块（同 forget_evicts 测试的真实 append 路径）。
         let base: Vec<u8> = (0..cs as usize).map(|i| b"abcde \n"[i % 7]).collect();
@@ -1216,7 +1216,7 @@ mod tests {
             chunk_size: cs,
         };
         let ino = mem.create(ROOT, "f.bin", attr).unwrap();
-        let fs = Arc::new(ZipfsRw::new(mem, Algo::Zstd, 3, cs));
+        let fs = Arc::new(ScrollzRw::new(mem, Algo::Zstd, 3, cs));
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
@@ -1483,7 +1483,7 @@ mod tests {
         cs: u32,
         nbytes: usize,
         cap: usize,
-    ) -> (ZipfsRw, Arc<CountingStore>, Vec<u8>, u64) {
+    ) -> (ScrollzRw, Arc<CountingStore>, Vec<u8>, u64) {
         let mem: Arc<dyn Store> = Arc::new(MemStore::new(cs));
         let ino = {
             // 经 MemStore 便捷入口在根下建匿名文件。
@@ -1502,7 +1502,7 @@ mod tests {
             mem.create(ROOT, "f.bin", attr).unwrap()
         };
         let store = Arc::new(CountingStore::new(mem));
-        let fs = ZipfsRw::new(store.clone(), Algo::Zstd, 3, cs).with_block_cache(cap);
+        let fs = ScrollzRw::new(store.clone(), Algo::Zstd, 3, cs).with_block_cache(cap);
         let data: Vec<u8> = (0..nbytes).map(|i| b"abcde \n"[i % 7]).collect();
         rmw::write_at(store.as_ref(), ino, 0, &data, &fs.params).unwrap();
         store.fsync(ino).unwrap();
@@ -1581,7 +1581,7 @@ mod tests {
         let (fs, _store, _data, ino) = fs_counting(cs, 4 * cs as usize + 100, 1 << 20);
         let b1 = cs as u64; // 内部块 1 起点。
 
-        fn read_metrics(fs: &ZipfsRw) -> String {
+        fn read_metrics(fs: &ScrollzRw) -> String {
             let mut out = String::new();
             fs.metrics.write_prometheus(&mut out);
             out

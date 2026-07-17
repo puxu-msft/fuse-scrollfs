@@ -54,7 +54,7 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     level: i32,
 
-    /// 共享字典文件（`zipfs train-dict` 产出）。给定则走字典压缩路径。
+    /// 共享字典文件（`scrollz train-dict` 产出）。给定则走字典压缩路径。
     #[arg(long)]
     dict: Option<PathBuf>,
 
@@ -90,7 +90,7 @@ impl ScratchDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zipfs-ratio-bench-{tag}-{nanos}"));
+        let path = std::env::temp_dir().join(format!("scrollz-ratio-bench-{tag}-{nanos}"));
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })
     }
@@ -193,7 +193,7 @@ fn main() -> std::io::Result<()> {
             (Arc::new(s), scratch.path().to_path_buf())
         }
         BackendSel::Container => {
-            let backing = scratch.path().join("zipfs.redb");
+            let backing = scratch.path().join("scrollz.redb");
             let s = ContainerStore::open_with_chunk_size(&backing, cli.chunk_size)?;
             (Arc::new(s), backing)
         }

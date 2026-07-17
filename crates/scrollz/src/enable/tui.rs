@@ -150,7 +150,7 @@ fn describe(p: &Pending) -> String {
         Pending::Restore { name } => format!("还原 {name}"),
         Pending::Remount { name } => format!("重挂 {name}"),
         Pending::ApplyAll => "切换所有空闲 PLAIN".into(),
-        Pending::RestoreAll => "还原所有 ZIPFS".into(),
+        Pending::RestoreAll => "还原所有 SCROLLZ".into(),
     }
 }
 
@@ -272,7 +272,7 @@ fn handle_list_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('E') => {
             app.mode = Mode::Confirm {
                 pending: Pending::RestoreAll,
-                prompt: "还原所有 ZIPFS/STOPPED 项目？(y/n)".into(),
+                prompt: "还原所有 SCROLLZ/STOPPED 项目？(y/n)".into(),
             }
         }
         _ => {}
@@ -457,7 +457,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" zipfs · Claude projects "),
+                .title(" scrollz · Claude projects "),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = app.state;

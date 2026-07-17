@@ -1,7 +1,7 @@
 //! discovery-bench：会话发现读 micro-bench（docs/02-layered-chunking.md §6.1，第 0 步门控）。
 //!
 //! 量化「head 缓存」对发现读的真实收益，**零格式改动**——用现有 v1 archive + 离线对照。
-//! harness 发现会话时对每个 .jsonl 读首/尾 64KB（`tan` line 30799），经 zipfs(BS) 即：
+//! harness 发现会话时对每个 .jsonl 读首/尾 64KB（`tan` line 30799），经 scrollz(BS) 即：
 //! `ArchiveReader::open`（解析 footer+index+CRC+越界校验）+ 读块 0(1MiB) 解压取首 64KB。
 //! head 缓存方案把第二项换成「解压一段独立 64KB zstd 流」。本 bench 把三段成本**分离**：
 //!   (1) open 解析    —— head 缓存救不了的固定开销（审查 H2，必须独立测）
@@ -68,7 +68,7 @@ impl ScratchDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zipfs-discovery-bench-{nanos}"));
+        let path = std::env::temp_dir().join(format!("scrollz-discovery-bench-{nanos}"));
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })
     }

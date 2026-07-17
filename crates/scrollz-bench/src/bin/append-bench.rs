@@ -218,7 +218,7 @@ impl ScratchDir {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zipfs-append-bench-{tag}-{nanos}"));
+        let path = std::env::temp_dir().join(format!("scrollz-append-bench-{tag}-{nanos}"));
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })
     }

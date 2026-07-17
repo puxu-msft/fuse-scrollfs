@@ -34,7 +34,7 @@ pub fn underlay_has_fallthrough(mp: &Path) -> io::Result<bool> {
 pub fn ensure_underlay_empty(mp: &Path) -> io::Result<()> {
     if underlay_has_fallthrough(mp)? {
         return Err(io::Error::other(format!(
-            "{} 挂载点 underlay 含停用期回落写，拒绝挂载（防静默盖住）；先 `zipfs enable reconcile` 重合并",
+            "{} 挂载点 underlay 含停用期回落写，拒绝挂载（防静默盖住）；先 `scrollz enable reconcile` 重合并",
             mp.display()
         )));
     }

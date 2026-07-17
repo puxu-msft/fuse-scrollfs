@@ -593,9 +593,9 @@ mod tests {
 
     #[test]
     fn parse_mountinfo_exact_match_and_fstype() {
-        // 真实 fuse 挂载行（zipfs）。
+        // 真实 fuse 挂载行（scrollz）。
         let line =
-            "123 45 0:50 / /home/u/.claude/projects/foo rw,nosuid - fuse.zipfs-shadow zipfs rw";
+            "123 45 0:50 / /home/u/.claude/projects/foo rw,nosuid - fuse.scrollz-shadow scrollz rw";
         let (mp, is_fuse) = parse_mountinfo_line(line).unwrap();
         assert_eq!(mp, "/home/u/.claude/projects/foo");
         assert!(is_fuse);
@@ -895,7 +895,7 @@ mod tests {
     fn parse_connection_id_takes_minor_from_fuse_line() {
         let target = std::path::Path::new("/mnt/x");
         let mi =
-            "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.zipfs-shadow zipfs rw,user_id=1000\n";
+            "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.scrollz-shadow scrollz rw,user_id=1000\n";
         assert_eq!(parse_connection_id(mi, target), Some(44));
     }
 
@@ -909,15 +909,15 @@ mod tests {
     #[test]
     fn parse_connection_id_overmount_takes_last() {
         let target = std::path::Path::new("/mnt/x");
-        let mi = "36 35 0:44 / /mnt/x rw - fuse.zipfs-shadow z rw\n\
-                  37 35 0:55 / /mnt/x rw - fuse.zipfs-shadow z rw\n";
+        let mi = "36 35 0:44 / /mnt/x rw - fuse.scrollz-shadow z rw\n\
+                  37 35 0:55 / /mnt/x rw - fuse.scrollz-shadow z rw\n";
         assert_eq!(parse_connection_id(mi, target), Some(55));
     }
 
     #[test]
     fn parse_connection_id_handles_octal_escaped_path() {
         let target = std::path::Path::new("/mnt/a b"); // 含空格
-        let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse zipfs rw\n";
+        let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse scrollz rw\n";
         assert_eq!(parse_connection_id(mi, target), Some(44));
     }
 

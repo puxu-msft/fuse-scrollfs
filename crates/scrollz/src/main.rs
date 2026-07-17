@@ -19,7 +19,7 @@ use scrollz::core::blockcache::DEFAULT_CACHE_BYTES;
 use scrollz::core::codec::{train_dict, Algo, SharedDict};
 use scrollz::core::{DEFAULT_CHUNK_SIZE, DEFAULT_ZSTD_LEVEL};
 use scrollz::passthrough::PassthroughFs;
-use scrollz::rwfs::ZipfsRw;
+use scrollz::rwfs::ScrollzRw;
 use scrollz::store::container::ContainerStore;
 use scrollz::store::shadow::ShadowStore;
 use scrollz::store::Store;
@@ -747,7 +747,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 ShadowStore::open_with_chunk_size(backing, args.chunk_size)?
                     .with_metrics(metrics.clone()),
             );
-            let fs = ZipfsRw::with_tail_buffer(
+            let fs = ScrollzRw::with_tail_buffer(
                 store,
                 Algo::Zstd,
                 args.level,
@@ -766,7 +766,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
                 ContainerStore::open_with_chunk_size(&backing, args.chunk_size)?
                     .with_metrics(metrics.clone()),
             );
-            let fs = ZipfsRw::with_tail_buffer(
+            let fs = ScrollzRw::with_tail_buffer(
                 store,
                 Algo::Zstd,
                 args.level,
@@ -790,7 +790,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
 /// 后台挂载读写 fs + 注入内核失效通知器（fsync 后失效只读 mmap 缓存）后阻塞，等价 mount2 前台。
 /// 挂载就绪后向 systemd 发 READY，并起看门狗周期心跳（无 systemd / 未配 WATCHDOG 时静默降级）。
 fn serve_rw(
-    fs: ZipfsRw,
+    fs: ScrollzRw,
     mountpoint: &std::path::Path,
     cfg: &fuser::Config,
     metrics_file: Option<PathBuf>,

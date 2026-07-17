@@ -1,4 +1,4 @@
-//! 分档卸载集成：真起 zipfs shadow 挂载，验证各档摘除（clean/lazy/auto）与 wedge 恢复
+//! 分档卸载集成：真起 scrollz shadow 挂载，验证各档摘除（clean/lazy/auto）与 wedge 恢复
 //! （SIGKILL daemon 后经 abort/auto 兜底）。见 docs/07-hangfree-umount.md。
 //!
 //! 无法挂载（无 /dev/fuse 或无 fusermount）优雅 SKIP，不 panic（对齐 tests/mount_rw.rs）。
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use scrollz::enable::discovery::is_mounted;
 use scrollz::enable::force_umount::{umount, UmountLevel};
 
-fn zipfs_bin() -> PathBuf {
+fn scrollz_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_scrollz"))
 }
 
@@ -95,7 +95,7 @@ fn mount_shadow() -> MountGuard {
     let mountdir = tempfile::tempdir().expect("mount tempdir");
     let mountpoint = mountdir.path().to_path_buf();
 
-    let child = Command::new(zipfs_bin())
+    let child = Command::new(scrollz_bin())
         .arg("--backend")
         .arg("shadow")
         .arg("--backing")
@@ -106,7 +106,7 @@ fn mount_shadow() -> MountGuard {
         .arg("65536") // MIN_CHUNK_SIZE=64KiB（core::mod 强制下限）；卸载测试与块大小无关，取最小合法值即可。
         .env("RUST_LOG", "warn")
         .spawn()
-        .expect("spawn zipfs mount");
+        .expect("spawn scrollz mount");
 
     let guard = MountGuard {
         child: Some(child),

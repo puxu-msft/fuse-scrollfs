@@ -9,7 +9,7 @@
 //!   故单进程内即可测出冲突（无需起第二个进程）。
 //! - **内核自动释放**：进程退出（含被 SIGKILL）时内核释放锁，正好解决「僵尸守护被 kill
 //!   后锁不残留」——不会留下死锁文件挡住后续合法 open。
-//! - 仅约束走 open 路径的 zipfs 守护互相（足够);非 zipfs 进程不受 advisory 锁约束（可接受）。
+//! - 仅约束走 open 路径的 scrollz 守护互相（足够);非 scrollz 进程不受 advisory 锁约束（可接受）。
 
 use std::fs::{File, OpenOptions};
 use std::io;

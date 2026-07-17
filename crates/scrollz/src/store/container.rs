@@ -316,7 +316,7 @@ impl ContainerStore {
     /// （首轮实测 0.54x，物理比逻辑还大）。`Database::compact` 重排页面、释放尾部空间，
     /// 把文件收缩到接近真实占用（设计 §6.1 推算 64KiB 块 compact 后约 1.34x 膨胀）。
     ///
-    /// 须在**无任何活跃读/写事务**时调用（独占 `&mut self`），故仅作为离线 `zipfs compact`
+    /// 须在**无任何活跃读/写事务**时调用（独占 `&mut self`），故仅作为离线 `scrollz compact`
     /// 子命令入口，不在挂载运行期触发。返回 `Ok(true)` 表示确实压实了数据。
     pub fn compact(&mut self) -> io::Result<bool> {
         self.db.compact().map_err(|e| db_err("compact", e))
@@ -1132,7 +1132,7 @@ mod tests {
     #[test]
     fn setattr_mtime_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("c.zipfs");
+        let path = dir.path().join("c.scrollz");
         let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(1_750_740_420, 0);
         let ino = {
             let store = ContainerStore::open(&path).unwrap();

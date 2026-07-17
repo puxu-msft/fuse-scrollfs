@@ -1,4 +1,4 @@
-//! systemd 托管挂载路径集成测试（Bug C）：聚焦 `zipfs mount-managed` 守护入口——
+//! systemd 托管挂载路径集成测试（Bug C）：聚焦 `scrollz mount-managed` 守护入口——
 //! 由 sidecar meta 自拼参数挂载一个**已提交**项目、经挂载点读到原数据、卸载干净、backing 保留。
 //!
 //! 不依赖 systemd（`systemctl --user start` 不会继承本测试进程的 CLAUDE_PROJECTS/SCROLLZ_HOME
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-fn zipfs_bin() -> PathBuf {
+fn scrollz_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_scrollz"))
 }
 
@@ -65,9 +65,9 @@ fn fusermount_u(mp: &Path) {
     }
 }
 
-/// 以隔离 env 跑一条 `zipfs <args…>` 到结束，返回是否成功。
+/// 以隔离 env 跑一条 `scrollz <args…>` 到结束，返回是否成功。
 fn run_cli(home: &Path, proj: &Path, zip: &Path, args: &[&str]) -> bool {
-    Command::new(zipfs_bin())
+    Command::new(scrollz_bin())
         .args(args)
         .env("HOME", home)
         .env("CLAUDE_PROJECTS", proj)
@@ -123,7 +123,7 @@ fn mount_managed_serves_committed_project_and_unmounts_clean() {
 
     // 3) mount-managed 守护：由 sidecar meta 自拼参数重挂（真正的新代码路径）。
     //    escape("demo") == "demo"，故 --name demo。
-    let mut child: Child = Command::new(zipfs_bin())
+    let mut child: Child = Command::new(scrollz_bin())
         .args(["mount-managed", "--name", name])
         .env("HOME", &home)
         .env("CLAUDE_PROJECTS", &proj)
