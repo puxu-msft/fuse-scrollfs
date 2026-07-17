@@ -2,8 +2,8 @@
 # teardown.sh — 安全卸载 btrfs loop 挂载，并可选删除镜像文件。
 #
 # 用法:
-#   MNT=/mnt/zipfs-btrfs                     bash bench/scripts/teardown.sh        # 仅卸载
-#   MNT=/mnt/zipfs-btrfs IMG=/path/btrfs.img DELETE_IMG=1 bash .../teardown.sh     # 卸载并删 image
+#   MNT=/mnt/scrollz-btrfs                     bash bench/scripts/teardown.sh        # 仅卸载
+#   MNT=/mnt/scrollz-btrfs IMG=/path/btrfs.img DELETE_IMG=1 bash .../teardown.sh     # 卸载并删 image
 #
 # 参数:
 #   MNT          挂载点（必填）

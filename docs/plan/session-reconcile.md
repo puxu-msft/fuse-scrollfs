@@ -1032,7 +1032,7 @@ Expected: 373e2835/de756008 = LogOnly→UnionIntoBase(High)；925fc3a1 = Suspect
 - [ ] **Step 4: 字节/超集校验**
 ```bash
 # orig 中 373e2835 应重新含完整正文 + 新标题；925fc3a1 隔离副本保原 UUID 名
-ls ~/.claude-zip/reconcile-quarantine/-home-xp-src-neighbors/*/
+ls ~/.local/claude-scrollz/reconcile-quarantine/-home-xp-src-neighbors/*/
 python3 -c "import json,sys; [json.loads(l) for l in open(sys.argv[1])]" ~/.claude/projects/-home-xp-src-neighbors.scrollz-orig/373e2835-c5a4-4822-a8b9-23d9d3cbd667.jsonl
 ```
 Expected: 隔离目录含 `925fc3a1-….jsonl`（原名）；orig 各文件合法 jsonl。

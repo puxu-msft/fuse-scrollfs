@@ -90,7 +90,7 @@
 2. 逐条目分类 + 出建议单 → 逐条确认（策略 B）。
 3. 对确认条目：
    - `*.jsonl` 两侧都在 → session_merge → `Merged`：**先**把合并明文原子写入 orig（`<file>.tmp`→fsync→rename→fsync_dir），**再**原子重灌进 backing（`<file>.reconcile-tmp`→fsync→rename 覆盖→fsync_dir）。
-   - `疑 reuse` 且用户选 keep-separate → base 不动；incoming 副本**保留原 UUID 文件名**隔离到 `~/.claude-zip/reconcile-quarantine/<name>/<ts>/<uuid>.jsonl`（**移出 projects 树**，Claude 不会在活动视图撞见、语义完整、用户可手动恢复）。
+   - `疑 reuse` 且用户选 keep-separate → base 不动；incoming 副本**保留原 UUID 文件名**隔离到 `~/.local/claude-scrollz/reconcile-quarantine/<name>/<ts>/<uuid>.jsonl`（**移出 projects 树**，Claude 不会在活动视图撞见、语义完整、用户可手动恢复）。
    - `*.jsonl` underlay 独有 → new → 并入 orig + 灌入。
    - sidecar 目录 `<uuid>/`（subagents，**也是 jsonl transcript**）→ **走同一 session_merge**，同名一律并集/keep-both，**绝不按 mtime 删较旧者**。
    - 遮蔽 backing **symlink** 的条目（memory）→ **透传恢复**（§6）。

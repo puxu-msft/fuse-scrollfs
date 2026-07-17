@@ -14,14 +14,14 @@ IN="${1:?用法: ratio-matrix.sh <语料目录> [max_bytes]}"
 CAP="${2:-134217728}"   # 默认 128MiB 控时
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RB="$REPO_DIR/target/release/zipfs"
+RB="$REPO_DIR/target/release/scrollz"
 BIN="$REPO_DIR/target/release/ratio-bench"
 
-[ -x "$BIN" ] || { echo "先构建：( cargo build --release -p zipfs-bench --bin ratio-bench )"; exit 1; }
-[ -x "$RB" ]  || { echo "先构建：( cargo build --release -p zipfs --bin zipfs )"; exit 1; }
+[ -x "$BIN" ] || { echo "先构建：( cargo build --release -p scrollz-bench --bin ratio-bench )"; exit 1; }
+[ -x "$RB" ]  || { echo "先构建：( cargo build --release -p scrollz --bin scrollz )"; exit 1; }
 [ -d "$IN" ]  || { echo "语料目录不存在：$IN"; exit 1; }
 
-DICT="$(mktemp -t zipfs-matrix-dict.XXXXXX)"
+DICT="$(mktemp -t scrollz-matrix-dict.XXXXXX)"
 trap 'rm -f "$DICT"' EXIT
 
 echo "# 训练 512K 字典（64KiB 切块，对齐块粒度）"

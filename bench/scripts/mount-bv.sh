@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# mount-bv.sh — 用 zipfs 布局 V（container，redb 全包容器）读写挂载。
+# mount-bv.sh — 用 scrollz 布局 V（container，redb 全包容器）读写挂载。
 #
 # BV = FUSE + zstd 分块，redb 容器（单文件 ACID B-tree 当变长 blob 分配器），读写。
 # 见 docs/00-overview.md §4.1、docs/01-scrollz-design.md §6.1。
-# 用法：zipfs --backend container --backing <redb 容器文件> --mountpoint <mnt> --chunk-size 65536。
+# 用法：scrollz --backend container --backing <redb 容器文件> --mountpoint <mnt> --chunk-size 65536。
 #
 # 关键差异（与 BS）：container 的 --backing 是【redb 容器文件路径】（不存在则创建），
 # 不是目录。挂载点照常是目录。
 #
 # 用法:
 #   bash bench/scripts/mount-bv.sh                 # 默认容器/挂载点，后台挂载，64KiB 块
-#   BACKING=/path/on/ext4/zipfs.redb MNT=/path/mnt bash .../mount-bv.sh
+#   BACKING=/path/on/ext4/scrollz.redb MNT=/path/mnt bash .../mount-bv.sh
 #   FOREGROUND=1 bash .../mount-bv.sh              # 前台运行（Ctrl-C 卸载，便于调试）
 #
 # 参数（环境变量）:
-#   BACKING     redb 容器文件路径（必须在 ext4 上）   默认 bench/.bv-backing/zipfs.redb
+#   BACKING     redb 容器文件路径（必须在 ext4 上）   默认 bench/.bv-backing/scrollz.redb
 #   MNT         BV 挂载点                              默认 bench/.mnt/bv
-#   BIN         zipfs 二进制路径                       默认 target/release/zipfs
+#   BIN         scrollz 二进制路径                       默认 target/release/scrollz
 #   CHUNK_SIZE  逻辑块大小（字节）                     默认 65536（64KiB，§6.1 裁决）
 #   FOREGROUND  置 1 则前台阻塞运行；否则后台启动并写 PID 文件
 #
@@ -32,9 +32,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
 
-BACKING="${BACKING:-$BENCH_DIR/.bv-backing/zipfs.redb}"
+BACKING="${BACKING:-$BENCH_DIR/.bv-backing/scrollz.redb}"
 MNT="${MNT:-$BENCH_DIR/.mnt/bv}"
-BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/scrollz}"
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
 FOREGROUND="${FOREGROUND:-0}"
 PIDFILE="$BENCH_DIR/.mnt/bv.pid"
@@ -46,10 +46,10 @@ die()  { printf '[mount-bv] ERROR: %s\n' "$*" >&2; exit 1; }
 # ── 二进制存在性 ───────────────────────────────────────────────
 if [ ! -x "$BIN" ]; then
   cat >&2 <<EOF
-[mount-bv] ERROR: 未找到 zipfs 二进制: $BIN
-  请先构建 zipfs（crates/zipfs）:
-      ( cd "$REPO_DIR" && cargo build --release -p zipfs )
-  产物应为 target/release/zipfs。构建后重跑本脚本。
+[mount-bv] ERROR: 未找到 scrollz 二进制: $BIN
+  请先构建 scrollz（crates/scrollz）:
+      ( cd "$REPO_DIR" && cargo build --release -p scrollz )
+  产物应为 target/release/scrollz。构建后重跑本脚本。
 EOF
   exit 1
 fi
@@ -62,7 +62,7 @@ command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1 
 # ── 容器父目录（应在 ext4 上）──────────────────────────────────
 BACKING_DIR="$(dirname "$BACKING")"
 mkdir -p "$BACKING_DIR" || die "无法创建容器父目录: $BACKING_DIR"
-log "backing(redb 容器文件): $BACKING（不存在则由 zipfs 创建）"
+log "backing(redb 容器文件): $BACKING（不存在则由 scrollz 创建）"
 
 # ── 挂载点幂等 ─────────────────────────────────────────────────
 mkdir -p "$MNT" || die "无法创建挂载点: $MNT"

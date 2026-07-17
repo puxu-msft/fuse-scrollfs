@@ -34,7 +34,7 @@ pub const ACTIVITY_MTIME_SECS: u64 = 300;
 
 /// 路径布局：projects 根（被管理的 Claude 项目目录）与 scrollz_home（backing 命名空间）。
 ///
-/// 默认 `~/.claude/projects` 与 `~/.claude-zip`，分别可由 env `CLAUDE_PROJECTS` / `SCROLLZ_HOME`
+/// 默认 `~/.claude/projects` 与 `~/.local/claude-scrollz`，分别可由 env `CLAUDE_PROJECTS` / `SCROLLZ_HOME`
 /// 覆盖（测试与隔离烟测靠这两个 env，绝不碰真实 `~/.claude`）。旧 `ZIPFS_HOME` 仅作弃用兼容回落。
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -53,7 +53,7 @@ fn resolve_scrollz_home(
     if let Some(path) = legacy_zipfs_home {
         return (PathBuf::from(path), true);
     }
-    (home.join(".claude-zip"), false)
+    (home.join(".local").join("claude-scrollz"), false)
 }
 
 impl Paths {
@@ -449,7 +449,7 @@ mod tests {
         );
         assert_eq!(
             resolve_scrollz_home(home, None, None).0,
-            Path::new("/home/u/.claude-zip")
+            Path::new("/home/u/.local/claude-scrollz")
         );
     }
 
@@ -465,7 +465,7 @@ mod tests {
         std::env::remove_var("ZIPFS_HOME");
         let p = Paths::resolve(Path::new("/home/u"));
         assert_eq!(p.projects_root, Path::new("/home/u/.claude/projects"));
-        assert_eq!(p.scrollz_home, Path::new("/home/u/.claude-zip"));
+        assert_eq!(p.scrollz_home, Path::new("/home/u/.local/claude-scrollz"));
         assert_eq!(
             p.mountpoint("proj-x"),
             Path::new("/home/u/.claude/projects/proj-x")
@@ -476,15 +476,15 @@ mod tests {
         );
         assert_eq!(
             p.backing("proj-x", Backend::Shadow),
-            Path::new("/home/u/.claude-zip/back/proj-x")
+            Path::new("/home/u/.local/claude-scrollz/back/proj-x")
         );
         assert_eq!(
             p.backing("proj-x", Backend::Container),
-            Path::new("/home/u/.claude-zip/back/proj-x.redb")
+            Path::new("/home/u/.local/claude-scrollz/back/proj-x.redb")
         );
         assert_eq!(
             p.meta_path("proj-x"),
-            Path::new("/home/u/.claude-zip/back/proj-x.scrollz.meta")
+            Path::new("/home/u/.local/claude-scrollz/back/proj-x.scrollz.meta")
         );
         assert_eq!(
             p.pid_file("proj-x"),
@@ -492,7 +492,7 @@ mod tests {
         );
         assert_eq!(
             p.needs_reconcile_sentinel("proj-x"),
-            Path::new("/home/u/.claude-zip/back/proj-x.needs-reconcile")
+            Path::new("/home/u/.local/claude-scrollz/back/proj-x.needs-reconcile")
         );
         if let Some(v) = prev_p {
             std::env::set_var("CLAUDE_PROJECTS", v);

@@ -17,14 +17,14 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_DIR="$(cd "$BENCH_DIR/.." && pwd)"
-BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/scrollz}"
 
 LINES="${1:-100000}"          # 写够多让 kill 大概率落在写中途
 KILL_AFTER="${2:-1.5}"        # 守护起来后多少秒 kill -9
 CHUNK_SIZE="${CHUNK_SIZE:-1048576}"
 
 # 自建唯一临时工作区（drop 时只删自己建的目录，路径已知非空、非通配）。
-WORK="$(mktemp -d -t zipfs-crash-XXXXXX)"
+WORK="$(mktemp -d -t scrollz-crash-XXXXXX)"
 BACKING="$WORK/backing"
 MNT="$WORK/mnt"
 MNT2="$WORK/mnt2"          # 重挂用全新挂载点，避开 kill -9 残留的 stale endpoint（测试假象）
@@ -39,11 +39,11 @@ cleanup() {
   [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
   for m in "$MNT" "$MNT2"; do fusermount3 -u "$m" 2>/dev/null || fusermount -u "$m" 2>/dev/null || true; done
   # 只删本脚本在 mktemp 下建的唯一目录。
-  case "$WORK" in /tmp/zipfs-crash-*|"$TMPDIR"zipfs-crash-*) rm -rf "$WORK" 2>/dev/null ;; esac
+  case "$WORK" in /tmp/scrollz-crash-*|"$TMPDIR"scrollz-crash-*) rm -rf "$WORK" 2>/dev/null ;; esac
 }
 trap cleanup EXIT
 
-[ -x "$BIN" ] || fail "未找到 zipfs 二进制：$BIN（先 cargo build --release -p zipfs）"
+[ -x "$BIN" ] || fail "未找到 scrollz 二进制：$BIN（先 cargo build --release -p scrollz）"
 [ -c /dev/fuse ] || { log "SKIP：/dev/fuse 不存在，FUSE 不可用"; exit 0; }
 
 # 确定性行内容：seq + 可压缩 payload，便于逐行核对字节完好。

@@ -88,7 +88,7 @@ fn mount_managed_serves_committed_project_and_unmounts_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let proj = home.join(".claude/projects");
-    let zip = home.join(".claude-zip");
+    let zip = home.join(".local/claude-scrollz");
     fs::create_dir_all(&proj).unwrap();
 
     // 源项目：proj/demo/a.txt。

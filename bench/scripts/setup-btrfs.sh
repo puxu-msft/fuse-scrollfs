@@ -8,16 +8,16 @@
 #   目标负载是 ~/.claude/projects 这类 append-only 可压缩 jsonl。btrfs 默认的
 #   `compress=zstd` 用采样启发式，会误判跳过大量本可压缩的数据——实测对 676M 子集
 #   漏压 212M、整体仅 2.44x。`compress-force` 强制压每个 extent，对此场景才是最佳，
-#   也才与 zipfs「逐块强制压缩」apples-to-apples（用 FORCE=0 可退回默认启发式对照）。
+#   也才与 scrollz「逐块强制压缩」apples-to-apples（用 FORCE=0 可退回默认启发式对照）。
 #
 # 用法（环境变量参数化）:
-#   IMG=/path/to/btrfs.img SIZE=20G MNT=/mnt/zipfs-btrfs ZSTD_LEVEL=3 \
+#   IMG=/path/to/btrfs.img SIZE=20G MNT=/mnt/scrollz-btrfs ZSTD_LEVEL=3 \
 #     sudo -E bash bench/scripts/setup-btrfs.sh
 #
 # 参数（均可用环境变量覆盖，含默认值）:
 #   IMG         镜像文件路径        默认 ./bench/results/btrfs.img（相对调用处）
 #   SIZE        镜像逻辑容量        默认 20G（truncate 稀疏，不立即占满物理空间）
-#   MNT         挂载点              默认 /mnt/zipfs-btrfs
+#   MNT         挂载点              默认 /mnt/scrollz-btrfs
 #   ZSTD_LEVEL  zstd 压缩等级       默认 3（btrfs 支持 1..15）
 #
 # 安全约束:
@@ -29,7 +29,7 @@ set -euo pipefail
 
 IMG="${IMG:-./bench/results/btrfs.img}"
 SIZE="${SIZE:-20G}"
-MNT="${MNT:-/mnt/zipfs-btrfs}"
+MNT="${MNT:-/mnt/scrollz-btrfs}"
 ZSTD_LEVEL="${ZSTD_LEVEL:-3}"
 FORCE="${FORCE:-1}"   # 1=compress-force（默认，本负载最佳）；0=compress（btrfs 默认启发式，仅作对照）
 

@@ -87,7 +87,7 @@ zipfs enable apply <name> --backend shadow|container \
 - **维护**：`zipfs enable compact <name>`（回收空间，两后端）、`zipfs enable seal <name>`（仅 shadow，冷文件大块重压）—— 自动卸载→操作→重挂。大文件（会话 jsonl）为主的库可加 `--seal-chunk` 提块到 >8MiB（如 `67108864`=64MiB），自动启用 zstd 长程匹配（LDM）逼近整流上界（实测大 transcript +8~16%，见 [bench/results/ldm-ratio/REPORT.md](bench/results/ldm-ratio/REPORT.md)）；默认 8MiB 不开 LDM，代价是冷读单块解压内存随块增大。
 - 透明支持 Claude 的 `memory` 外部软链（shadow：ingest 照原样重建、运行时经 readlink 服务）；真正特殊文件（FIFO/socket/设备）会被拒绝并回滚，避免静默丢失。
 
-> 路径可经 env `CLAUDE_PROJECTS` / `ZIPFS_HOME` 覆盖（默认 `~/.claude/projects`、`~/.claude-zip`）。
+> 路径可经 env `CLAUDE_PROJECTS` / `ZIPFS_HOME` 覆盖（默认 `~/.claude/projects`、`~/.local/claude-scrollz`）。
 > 取代了早期 `bench/scripts/zipfs-{cutover,rollback,mount}.sh`（保留作手动/参考）。
 
 

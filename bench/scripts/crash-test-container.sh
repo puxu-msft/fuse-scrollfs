@@ -15,7 +15,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/scrollz}"
 LINES="${1:-40000}"
 KILL_AFTER="${2:-1.5}"
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
@@ -23,7 +23,7 @@ CHUNK_SIZE="${CHUNK_SIZE:-65536}"
 log()  { printf '[crash-ctr] %s\n' "$*"; }
 skip() { printf '[crash-ctr] SKIP：%s\n' "$*"; exit 0; }
 
-WORK="$(mktemp -d -t zipfs-crashctr-XXXXXX)"
+WORK="$(mktemp -d -t scrollz-crashctr-XXXXXX)"
 CONTAINER="$WORK/container.redb"   # container 后端 backing = 单个 redb 容器文件
 MNT="$WORK/mnt"; MNT2="$WORK/mnt2"
 PROGRESS="$WORK/acked.log"
@@ -34,13 +34,13 @@ cleanup() {
   [ -n "$DAEMON_PID" ] && kill -9 "$DAEMON_PID" 2>/dev/null
   for m in "$MNT" "$MNT2"; do fusermount3 -u "$m" 2>/dev/null || fusermount -u "$m" 2>/dev/null || true; done
   case "$WORK" in
-    /tmp/zipfs-crashctr-*|"${TMPDIR:-/tmp/}"zipfs-crashctr-*) rm -rf "$WORK" 2>/dev/null ;;
+    /tmp/scrollz-crashctr-*|"${TMPDIR:-/tmp/}"scrollz-crashctr-*) rm -rf "$WORK" 2>/dev/null ;;
   esac
 }
 trap cleanup EXIT
 fail() { printf '[crash-ctr] FAIL：%s\n' "$*" >&2; exit 1; }
 
-[ -x "$BIN" ] || skip "未找到 zipfs 二进制：$BIN（先 cargo build --release -p zipfs）"
+[ -x "$BIN" ] || skip "未找到 scrollz 二进制：$BIN（先 cargo build --release -p scrollz）"
 [ -c /dev/fuse ] || skip "/dev/fuse 不存在，FUSE 不可用"
 
 mount_ctr() {

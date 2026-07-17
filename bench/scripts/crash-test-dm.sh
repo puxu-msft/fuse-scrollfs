@@ -17,7 +17,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/scrollz}"
 LINES="${1:-20000}"
 CHUNK_SIZE="${CHUNK_SIZE:-1048576}"
 
@@ -31,17 +31,17 @@ for t in dmsetup losetup mkfs.ext4 mountpoint fusermount3; do
   command -v "$t" >/dev/null 2>&1 || skip "缺工具：$t"
 done
 dmsetup targets 2>/dev/null | grep -qiw flakey || skip "内核无 dm-flakey target"
-[ -x "$BIN" ] || skip "未找到 zipfs 二进制：$BIN（先 cargo build --release -p zipfs）"
+[ -x "$BIN" ] || skip "未找到 scrollz 二进制：$BIN（先 cargo build --release -p scrollz）"
 
 # 唯一命名，避免与系统现有 dm/loop 冲突；cleanup 只认这些名字。
-UNIQ="zipfsdm$$"
+UNIQ="scrollzdm$$"
 DM_NAME="$UNIQ"
 DM_DEV="/dev/mapper/$DM_NAME"
-WORK="$(mktemp -d -t zipfs-crashdm-XXXXXX)"
+WORK="$(mktemp -d -t scrollz-crashdm-XXXXXX)"
 IMG="$WORK/backing.img"
 FSMNT="$WORK/fs"          # ext4 挂载点（dm 设备上）
-MNT="$WORK/mnt"           # zipfs 首次挂载点
-MNT2="$WORK/mnt2"         # zipfs 重挂点
+MNT="$WORK/mnt"           # scrollz 首次挂载点
+MNT2="$WORK/mnt2"         # scrollz 重挂点
 PROGRESS="$WORK/acked.log"
 LOOP=""
 DAEMON_PID=""
@@ -54,7 +54,7 @@ cleanup() {
   [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
   # 只删 mktemp 建的唯一目录（case 守卫，绝不通配）。
   case "$WORK" in
-    /tmp/zipfs-crashdm-*|"${TMPDIR:-/tmp/}"zipfs-crashdm-*) rm -rf "$WORK" 2>/dev/null ;;
+    /tmp/scrollz-crashdm-*|"${TMPDIR:-/tmp/}"scrollz-crashdm-*) rm -rf "$WORK" 2>/dev/null ;;
   esac
 }
 trap cleanup EXIT
@@ -77,7 +77,7 @@ mkfs.ext4 -q -F "$DM_DEV" || fail "mkfs.ext4 失败"
 mount "$DM_DEV" "$FSMNT" || fail "挂载 ext4 失败"
 BACKING="$FSMNT/backing"; mkdir -p "$BACKING"
 
-mount_zipfs() {
+mount_scrollz() {
   "$BIN" --backend shadow --backing "$BACKING" --mountpoint "$1" --chunk-size "$CHUNK_SIZE" \
     >"$WORK/daemon.log" 2>&1 &
   DAEMON_PID=$!
@@ -90,7 +90,7 @@ mount_zipfs() {
 }
 
 log "真实块设备就绪：loop=$LOOP dm=$DM_DEV（chunk=$CHUNK_SIZE）"
-mount_zipfs "$MNT" || fail "首次挂载 zipfs 失败"
+mount_scrollz "$MNT" || fail "首次挂载 scrollz 失败"
 
 # 写者：逐行 append+fsync，每行 fsync 成功记 acked。drop_writes 切换前的 acked 行为真 durable。
 python3 - "$MNT/session.jsonl" "$PROGRESS" "$LINES" <<'PY' &
@@ -124,12 +124,12 @@ wait "$WRITER_PID" 2>/dev/null
 DAEMON_PID=""
 fusermount3 -u "$MNT" 2>/dev/null || true
 
-# 重挂前把设备切回 up（停止丢写），重挂 ext4 + zipfs 验证。
+# 重挂前把设备切回 up（停止丢写），重挂 ext4 + scrollz 验证。
 flakey_up || fail "切回 flakey up 失败"
 umount "$FSMNT" 2>/dev/null
 mount "$DM_DEV" "$FSMNT" || fail "重挂 ext4 失败"
 
-mount_zipfs "$MNT2" || fail "重挂 zipfs 失败——崩溃后 archive 不可打开（违反 fail-closed）"
+mount_scrollz "$MNT2" || fail "重挂 scrollz 失败——崩溃后 archive 不可打开（违反 fail-closed）"
 
 # 校验：恢复内容是 0..S-1 连续前缀、每行字节完好，且 S-1 >= ACKED_BEFORE（drop 前 acked 行存活）。
 python3 - "$MNT2/session.jsonl" "$ACKED_BEFORE" <<'PY' || fail "恢复校验失败（见上）"

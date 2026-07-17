@@ -2,7 +2,7 @@
 # crash-test-dm-logwrites.sh — Tier 2 真实块层 barrier 排序门（dm-log-writes 回放，root 门控，docs/05 §5）。
 #
 # dm-log-writes 把每个 write/flush/fua 记到独立 log 设备；`replay-log` 可把数据盘**回放到任一 flush
-# 边界（mark）**，逐个 mount + 跑 zipfs 恢复校验，从而证明**真实内核 fs 真的兑现 barrier 排序**
+# 边界（mark）**，逐个 mount + 跑 scrollz 恢复校验，从而证明**真实内核 fs 真的兑现 barrier 排序**
 # （barrier 1 → SB 写 → barrier 2），以及目录项 / rename durability——这是 Tier 1（只验自家逻辑）和
 # dm-flakey（粗粒度丢写）都覆盖不到的最高保真层。收窄到 3 个招牌场景（docs/05 §5），**不做 xfstests 全量**：
 #   (a) append+fsync 序列：回放到每个 fsync 边界，恢复内容必是连续前缀；
@@ -18,7 +18,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="${BIN:-$REPO_DIR/target/release/zipfs}"
+BIN="${BIN:-$REPO_DIR/target/release/scrollz}"
 CHUNK_SIZE="${CHUNK_SIZE:-65536}"
 
 log()  { printf '[dm-logw] %s\n' "$*"; }
@@ -31,12 +31,12 @@ for t in dmsetup losetup mkfs.ext4 mountpoint fusermount3 replay-log; do
   command -v "$t" >/dev/null 2>&1 || skip "缺工具：$t（replay-log 属 xfstests src/log-writes）"
 done
 dmsetup targets 2>/dev/null | grep -qiw log-writes || skip "内核无 dm-log-writes target"
-[ -x "$BIN" ] || skip "未找到 zipfs 二进制：$BIN"
+[ -x "$BIN" ] || skip "未找到 scrollz 二进制：$BIN"
 
-UNIQ="zipfslogw$$"
+UNIQ="scrollzlogw$$"
 DM_NAME="$UNIQ"
 DM_DEV="/dev/mapper/$DM_NAME"
-WORK="$(mktemp -d -t zipfs-logw-XXXXXX)"
+WORK="$(mktemp -d -t scrollz-logw-XXXXXX)"
 DATA_IMG="$WORK/data.img"; LOG_IMG="$WORK/log.img"
 FSMNT="$WORK/fs"; MNT="$WORK/mnt"
 DATA_LOOP=""; LOG_LOOP=""; DAEMON_PID=""
@@ -49,7 +49,7 @@ cleanup() {
   [ -n "$DATA_LOOP" ] && losetup -d "$DATA_LOOP" 2>/dev/null
   [ -n "$LOG_LOOP" ] && losetup -d "$LOG_LOOP" 2>/dev/null
   case "$WORK" in
-    /tmp/zipfs-logw-*|"${TMPDIR:-/tmp/}"zipfs-logw-*) rm -rf "$WORK" 2>/dev/null ;;
+    /tmp/scrollz-logw-*|"${TMPDIR:-/tmp/}"scrollz-logw-*) rm -rf "$WORK" 2>/dev/null ;;
   esac
 }
 trap cleanup EXIT
@@ -69,7 +69,7 @@ BACKING="$FSMNT/backing"; mkdir -p "$BACKING"
 
 mark() { dmsetup message "$DM_NAME" 0 mark "$1"; }
 
-mount_zipfs() {
+mount_scrollz() {
   "$BIN" --backend shadow --backing "$BACKING" --mountpoint "$1" --chunk-size "$CHUNK_SIZE" \
     >"$WORK/daemon.log" 2>&1 &
   DAEMON_PID=$!
@@ -80,11 +80,11 @@ mount_zipfs() {
   done
   return 1
 }
-umount_zipfs() { [ -n "$DAEMON_PID" ] && { fusermount3 -u "$MNT" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""; }; }
+umount_scrollz() { [ -n "$DAEMON_PID" ] && { fusermount3 -u "$MNT" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null; DAEMON_PID=""; }; }
 
 # ===== 跑工作负载（写经 dm-log-writes 全程记录），在 3 个招牌边界打 mark =====
 log "跑工作负载，打 mark（append-a / rename-b / create-c）…"
-mount_zipfs "$MNT" || fail "挂 zipfs 失败"
+mount_scrollz "$MNT" || fail "挂 scrollz 失败"
 
 # (a) append+fsync 10 行；末行 fsync 后 mark。
 python3 - "$MNT/log.jsonl" 10 <<'PY' || fail "append 工作负载失败"
@@ -118,20 +118,20 @@ dfd = os.open(root, os.O_RDONLY|os.O_DIRECTORY); os.fsync(dfd); os.close(dfd)
 PY
 mark create-c
 
-umount_zipfs
+umount_scrollz
 umount "$FSMNT" 2>/dev/null
 dmsetup remove "$DM_NAME" 2>/dev/null   # 撤掉 log-writes 层，后续直接对 DATA_LOOP 回放/挂载
 
-# ===== 逐 mark 回放 → 直接挂 DATA_LOOP 的 ext4 → 跑 zipfs 校验 =====
+# ===== 逐 mark 回放 → 直接挂 DATA_LOOP 的 ext4 → 跑 scrollz 校验 =====
 replay_and_check() {
   local target_mark="$1" checker="$2"
   log "回放至 mark=$target_mark …"
   replay-log --log "$LOG_LOOP" --replay "$DATA_LOOP" --end-mark "$target_mark" \
     >"$WORK/replay-$target_mark.log" 2>&1 || fail "replay-log 至 $target_mark 失败（见 $WORK/replay-$target_mark.log）"
   mount "$DATA_LOOP" "$FSMNT" || fail "回放后挂 ext4 失败（fs 不一致？）"
-  mount_zipfs "$MNT" || { umount "$FSMNT" 2>/dev/null; fail "回放后挂 zipfs 失败（违反 fail-closed）"; }
+  mount_scrollz "$MNT" || { umount "$FSMNT" 2>/dev/null; fail "回放后挂 scrollz 失败（违反 fail-closed）"; }
   "$checker"; local rc=$?
-  umount_zipfs
+  umount_scrollz
   umount "$FSMNT" 2>/dev/null
   [ "$rc" -eq 0 ] || fail "mark=$target_mark 校验失败"
 }

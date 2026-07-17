@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# probe-env.sh — 重新探测 zipfs 基准所需的运行环境。
+# probe-env.sh — 重新探测 scrollz 基准所需的运行环境。
 # 幂等、只读：不加载模块、不改系统、不写文件。只打印一份简洁报告。
 # 用法: bash bench/scripts/probe-env.sh
 #
@@ -24,7 +24,7 @@ hdr()  { printf '\n%s== %s ==%s\n' "$C_DIM" "$*" "$C_RST"; }
 
 has() { command -v "$1" >/dev/null 2>&1; }
 
-printf '%s\n' "zipfs 环境探测报告 / probe-env"
+printf '%s\n' "scrollz 环境探测报告 / probe-env"
 printf '采集时间: %s\n' "$(date -Iseconds 2>/dev/null || date)"
 printf 'hostname: %s\n' "$(hostname 2>/dev/null || echo '?')"
 

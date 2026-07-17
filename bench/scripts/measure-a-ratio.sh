@@ -10,7 +10,7 @@
 #   DATASET=~/.claude/projects bash bench/scripts/measure-a-ratio.sh   # 测完整目标负载（8.7G，慢、写盘多）
 #
 # 参数（环境变量）：
-#   MNT      btrfs 挂载点      默认 /mnt/zipfs-btrfs
+#   MNT      btrfs 挂载点      默认 /mnt/scrollz-btrfs
 #   DATASET  要测的数据源(只读) 默认 bench/datasets/claude-projects
 #
 # 行为：把 DATASET 复制进 btrfs 的一个探针子目录 → sync → sudo compsize → 算比值 → 删探针。
@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-MNT="${MNT:-/mnt/zipfs-btrfs}"
+MNT="${MNT:-/mnt/scrollz-btrfs}"
 DATASET="${DATASET:-bench/datasets/claude-projects}"
 PROBE="$MNT/.ratio-probe"   # 专属探针目录，避免碰其它数据
 

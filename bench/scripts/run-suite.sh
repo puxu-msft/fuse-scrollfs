@@ -3,7 +3,7 @@
 #
 # 条件映射通过 CONDITIONS 环境变量传入，格式: "名称=挂载点" 以空格或换行分隔。
 # 例:
-#   CONDITIONS="C0=/mnt/zipfs-c0 A=/mnt/zipfs-btrfs B0=bench/.mnt/b0 B2=/mnt/zipfs-b2" \
+#   CONDITIONS="C0=/mnt/scrollz-c0 A=/mnt/scrollz-btrfs B0=bench/.mnt/b0 B2=/mnt/scrollz-b2" \
 #     bash bench/scripts/run-suite.sh
 #
 # B0 挂载点由 mount-b0.sh 准备（FUSE 透传二进制），卸载用 umount-b0.sh。
@@ -40,7 +40,7 @@ ROUNDS="${ROUNDS:-1}"
 # 默认条件映射（占位；真实运行请通过 CONDITIONS 覆盖）。
 # B0 指向 mount-b0.sh 的默认挂载点（bench/.mnt/b0）；未挂载则按现有逻辑优雅跳过。
 # B0 的卸载走 umount-b0.sh（FUSE 透传，非 btrfs，不用 teardown.sh）。
-DEFAULT_CONDITIONS="C0=$BENCH_DIR/.mnt/c0 A=/mnt/zipfs-btrfs B0=$BENCH_DIR/.mnt/b0 B2=/mnt/zipfs-b2"
+DEFAULT_CONDITIONS="C0=$BENCH_DIR/.mnt/c0 A=/mnt/scrollz-btrfs B0=$BENCH_DIR/.mnt/b0 B2=/mnt/scrollz-b2"
 CONDITIONS="${CONDITIONS:-$DEFAULT_CONDITIONS}"
 
 log()  { printf '[run-suite] %s\n' "$*"; }
