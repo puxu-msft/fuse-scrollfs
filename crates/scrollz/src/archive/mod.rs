@@ -48,7 +48,8 @@ pub use superblock::{parse_superblock, pick_active, serialize_superblock, SuperB
 pub use updater::ArchiveUpdater;
 pub use writer::ArchiveWriter;
 
-/// 文件头魔数，标识 zipfs 布局 S 的 archive。取 "ZIPFSAR1" 的字节。
+/// 文件头魔数，标识布局 S 的 archive。历史值取 "ZIPFSAR1" 的字节。
+// COMPAT-FROZEN: 改字节=存量归档不可读,禁止改。品牌无关。
 pub const MAGIC: [u8; 8] = *b"ZIPFSAR\x01";
 
 /// 当前格式版本。v2 = 崩溃安全双 superblock 提交协议（docs/04）。无历史 archive，不背兼容。

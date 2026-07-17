@@ -9,6 +9,7 @@ use super::format::{crc32, get_u32, get_u64, put_u32, put_u64};
 use super::{HeadCache, SB_LEN};
 
 /// superblock 魔数（"ZSB2" 小端），区分未初始化/损坏槽。
+// COMPAT-FROZEN: 改字节=存量归档不可读,禁止改。品牌无关。
 pub const SB_MAGIC: u32 = u32::from_le_bytes(*b"ZSB2");
 /// sb_crc 在槽内的偏移：覆盖 `[0, SB_CRC_OFFSET)` 的全部字段 + 零填充。
 const SB_CRC_OFFSET: usize = SB_LEN as usize - 4;
