@@ -1,7 +1,7 @@
 //! 后端接缝：把「布局 V 容器」抽象成一个最小 KV 接口，让 redb 与 rusqlite
 //! 共用同一套场景 harness，公平对照。
 //!
-//! 这不是 zipfs 的 `Store` trait（那个还管命名空间/元数据），而是只覆盖
+//! 这不是 scrollz 的 `Store` trait（那个还管命名空间/元数据），而是只覆盖
 //! microbench 关心的部分：变长 blob 的批量写、随机读改写、提交策略、空间度量。
 
 use std::path::Path;

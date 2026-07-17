@@ -17,7 +17,7 @@
 
 | 条目 | 现状与位置 | 关联 |
 |---|---|---|
-| 压缩前端 unlink-while-open | `ZipfsRw::open` 恒返回 `fh=0`，无句柄表/open count/orphan；unlink 后立即删数据，已 open fd 无法继续访问。lookup-count/延迟回收仅在 passthrough 简化 inode 表中部分存在。`rwfs.rs:517-531,681-696` | POSIX 语义缺口；append-only transcript 主路径不高频 |
+| 压缩前端 unlink-while-open | `ScrollzRw::open` 恒返回 `fh=0`，无句柄表/open count/orphan；unlink 后立即删数据，已 open fd 无法继续访问。lookup-count/延迟回收仅在 passthrough 简化 inode 表中部分存在。`rwfs.rs:517-531,681-696` | POSIX 语义缺口；append-only transcript 主路径不高频 |
 | reconcile `--rebuild` W2 自启窗口 | 清 `.reconciling` marker 后到重建/重挂完成之间，外部 systemd 理论可挂到重建中 backing。orig 仍权威、单文件替换原子，风险是短暂暴露混合代/双挂载。`reconcile/orchestrator/driver.rs:174-179` 已标 W2 | 需区分「reconcile 内部可信重挂」与外部自启，使 marker 覆盖整个 rebuild |
 | 自动 compact 策略 | Shadow 在线 RMW/index/head cache/journal 均只追加，旧版本仅靠 compact 回收；当前无自动触发 | 长期运行需定期 compact |
 | hang-free stat 遗留 D 状态线程 | 首次 endpoint stat 超时可能遗留一个 D 状态线程；熔断只限制重复泄漏频率，非根除 | [07-hangfree-umount.md](./07-hangfree-umount.md) |

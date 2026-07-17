@@ -1,4 +1,4 @@
-//! zipfs microbench library：模块导出，供 main 与测试共用。
+//! scrollz microbench library：模块导出，供 main 与测试共用。
 
 pub mod backend;
 pub mod blobgen;

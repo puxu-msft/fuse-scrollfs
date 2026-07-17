@@ -1,4 +1,4 @@
-//! zipfs microbench 驱动。
+//! scrollz microbench 驱动。
 //!
 //! 设计闸门问题：「redb 作为布局 V 容器、存变长压缩 chunk blob 并做随机更新，
 //! 性能是否够用，还是需要自写数据区」（见 docs/01-scrollz-design.md §6/§6.1）。
@@ -293,7 +293,7 @@ fn main() {
         }
     };
 
-    println!("zipfs microbench — 布局 V 容器后端闸门测试");
+    println!("scrollz microbench — 布局 V 容器后端闸门测试");
     println!(
         "后端={} | 种子=0x{:016X} | 临时目录(tempfile，跑完自动清理)",
         cli.backend, cli.seed

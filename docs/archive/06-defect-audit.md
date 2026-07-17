@@ -35,7 +35,7 @@
 | 编号 | 位置 | 缺陷 | 提交 |
 |---|---|---|---|
 | C1 | `ingest.rs::verify_file{,_in_store}` | 不校验源 EOF / 总长 → archive 短于源时尾部字节漏检、静默通过，使"逐字节校验"形同虚设。补 EOF + `total==size` 断言 | `0a78cc7` |
-| D1 | `rwfs.rs` | `ZipfsRw` 无 `forget` → `locks`/`tails` 映射随只追加不删除会话无界增长。实现 forget：先 seal+flush（保数据）再丢缓冲 + evict 锁 | `8a6d91a` |
+| D1 | `rwfs.rs` | `ScrollzRw` 无 `forget` → `locks`/`tails` 映射随只追加不删除会话无界增长。实现 forget：先 seal+flush（保数据）再丢缓冲 + evict 锁 | `8a6d91a` |
 | D3 | `store/container.rs::rmdir` | `rmdir`=`unlink` 不查空目录 → 子项 dirent/inode 成孤儿（无法 lookup 又永占空间）。补 ENOTEMPTY | `b11d940` |
 | E1 | `store/{shadow,container}.rs` + `store/mod.rs` | Store API 不校验 name → `ingest_dir_into_store` 绕内核喂 `..`/`/` 可逃逸 backing / 污染键空间。新 `store::validate_name`，guard create/mkdir/symlink/rename | `5621c67` |
 
