@@ -1,4 +1,4 @@
-//! systemd user 服务托管（Bug C）：per-project 模板实例 `zipfs@<name>.service`。
+//! systemd user 服务托管（Bug C）：per-project 模板实例 `scrollz@<name>.service`。
 //!
 //! 根因：裸 spawn + `setsid` 产生无人监管的孤儿守护，父退出后 reparent 到 init、无人重启、
 //! 无单实例保证（叠加 Bug A flock 才不会互相覆盖）。改用 systemd user 模板托管：单实例、
@@ -107,13 +107,13 @@ pub fn resolve_managed_spec(
     ))
 }
 
-/// 构造 `systemctl --user <verb> zipfs@<esc>.service` 的 argv（不含 `systemctl` 本身），
+/// 构造 `systemctl --user <verb> scrollz@<esc>.service` 的 argv（不含 `systemctl` 本身），
 /// 实例名经 `systemd_escape`。纯函数，便于单测命令构造正确性（仿 daemon 的 mount_argv 模式）。
 pub fn systemctl_args(verb: &str, name: &str) -> Vec<String> {
     vec![
         "--user".to_string(),
         verb.to_string(),
-        format!("zipfs@{}.service", systemd_escape(name)),
+        format!("scrollz@{}.service", systemd_escape(name)),
     ]
 }
 
@@ -136,7 +136,7 @@ fn run_systemctl(args: &[String]) -> std::io::Result<()> {
     }
 }
 
-/// systemd user 托管挂载器：per-project 模板实例 `zipfs@<esc>.service`（单实例 + 自动重启 +
+/// systemd user 托管挂载器：per-project 模板实例 `scrollz@<esc>.service`（单实例 + 自动重启 +
 /// 监管）。`spawn`/`unmount` 走 `systemctl --user start/stop`；`is_mounted` 查 /proc 地面真值
 /// （非 unit active 状态，避免 unit 报 active 但挂载实际已 stale）。
 pub struct SystemdMounter;
@@ -213,7 +213,7 @@ impl crate::enable::daemon::Mounter for SystemdMounter {
 
 /// 选哪个 mounter 的纯决策（真值表可单测）：三个探测都通过才用 systemd，否则降级 Real。
 /// 降级不劣化——RealMounter 叠加 Bug A flock 仍杜绝双守护覆盖，只是少了崩溃自愈/监管。
-/// `template_installed` 必查：SystemdMounter.spawn 走 `systemctl start zipfs@<esc>`，模板单元
+/// `template_installed` 必查：SystemdMounter.spawn 走 `systemctl start scrollz@<esc>`，模板单元
 /// 不在则 start 报 "Unit not found"——故 systemd 路径是 opt-in（先 `enable autostart install`）。
 fn pick_systemd(has_systemd_run_dir: bool, user_bus_ok: bool, template_installed: bool) -> bool {
     has_systemd_run_dir && user_bus_ok && template_installed
@@ -236,12 +236,12 @@ fn user_bus_reachable() -> bool {
         .unwrap_or(false)
 }
 
-/// 模板单元 `~/.config/systemd/user/zipfs@.service` 是否已安装（`enable autostart install` 装）。
+/// 模板单元 `~/.config/systemd/user/scrollz@.service` 是否已安装（`enable autostart install` 装）。
 fn template_installed() -> bool {
     std::env::var_os("HOME")
         .map(|home| {
             std::path::Path::new(&home)
-                .join(".config/systemd/user/zipfs@.service")
+                .join(".config/systemd/user/scrollz@.service")
                 .is_file()
         })
         .unwrap_or(false)
@@ -309,12 +309,12 @@ mod tests {
             vec![
                 "--user",
                 "start",
-                "zipfs@\\x2dhome\\x2dxp\\x2dsrc\\x2dneighbors.service",
+                "scrollz@\\x2dhome\\x2dxp\\x2dsrc\\x2dneighbors.service",
             ]
         );
         assert_eq!(
             systemctl_args("stop", "plain"),
-            vec!["--user", "stop", "zipfs@plain.service"]
+            vec!["--user", "stop", "scrollz@plain.service"]
         );
     }
 

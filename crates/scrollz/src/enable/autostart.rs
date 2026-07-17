@@ -1,10 +1,10 @@
 //! 自挂载接线：开机/登录后自动重挂所有已切换项目。
 //!
 //! 两条路径（与 docs/01 §T1 一致）：
-//! - **systemd user**：装 **per-project 模板** `zipfs@.service`（`Type=notify`、`Restart=on-failure`、
-//!   `WatchdogSec`），对每个已提交项目 `systemctl --user enable zipfs@<esc>.service`。单实例 +
-//!   崩溃自动重启 + 监管，根治裸 spawn 孤儿守护（Bug C）。装时迁移掉旧聚合单元
-//!   `zipfs-projects.service`。
+//! - **systemd user**：装 **per-project 模板** `scrollz@.service`（`Type=notify`、`Restart=on-failure`、
+//!   `WatchdogSec`），对每个已提交项目 `systemctl --user enable scrollz@<esc>.service`。单实例 +
+//!   崩溃自动重启 + 监管，根治裸 spawn 孤儿守护（Bug C）。装时迁移掉原名 zipfs 的旧模板、
+//!   实例链接与遗留独立/聚合单元。
 //! - **WSL 无 systemd**：打印 `/etc/wsl.conf` 的 `[boot] command` 片段供用户粘贴（root 文件，**只打印不自动改**）。
 
 use std::io::{self, Write};
@@ -29,7 +29,7 @@ pub fn run(home: &Path, cmd: AutostartCmd) -> io::Result<()> {
     }
 }
 
-/// per-project 模板单元 `zipfs@.service` 正文。`%i` = systemd 实例字符串（escaped），
+/// per-project 模板单元 `scrollz@.service` 正文。`%i` = systemd 实例字符串（escaped），
 /// `mount-managed`/`umount-managed`/`guard-check` 在 Rust 侧 unescape 回原名。`Type=notify` 依赖守护
 /// 的 sd_notify READY（main.rs serve 路径）；`WatchdogSec` 启用心跳监管；`Restart=on-failure`
 /// 崩溃自愈。
@@ -47,10 +47,10 @@ fn template_unit_body(exe: &Path) -> String {
     let exe = exe.display();
     let guard_exit = crate::enable::model::GUARD_CHECK_NEEDS_RECONCILE_EXIT;
     format!(
-        "# zipfs per-project 托管模板（生成自 `zipfs enable autostart install`）。\n\
-         # 实例名 = systemd-escaped 的 Claude 项目目录名；用 `systemctl --user enable zipfs@<esc>` 接管。\n\
+        "# scrollz per-project 托管模板（生成自 `scrollz enable autostart install`）。\n\
+         # 实例名 = systemd-escaped 的 Claude 项目目录名；用 `systemctl --user enable scrollz@<esc>` 接管。\n\
          [Unit]\n\
-         Description=zipfs transparent-compression mount for Claude project %i\n\
+         Description=scrollz transparent-compression mount for Claude project %i\n\
          After=default.target\n\n\
          [Service]\n\
          Type=notify\n\
@@ -71,7 +71,7 @@ fn install_systemd(home: &Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = home.join(".config").join("systemd").join("user");
     std::fs::create_dir_all(&dir)?;
-    let unit_path = dir.join("zipfs@.service");
+    let unit_path = dir.join("scrollz@.service");
     std::fs::write(&unit_path, template_unit_body(&exe))?;
     println!("已写入模板单元 {}", unit_path.display());
 
@@ -80,8 +80,8 @@ fn install_systemd(home: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    // 迁移：disable 旧聚合单元 zipfs-projects.service（被 per-project 模板取代）。
-    migrate_off_aggregate_unit(&dir);
+    // 迁移：停用并移除旧品牌模板、实例链接与遗留独立/聚合单元。
+    migrate_legacy_units(&dir);
 
     run_quiet("systemctl", &["--user", "daemon-reload"]);
 
@@ -89,12 +89,12 @@ fn install_systemd(home: &Path) -> io::Result<()> {
     let paths = Paths::resolve(home);
     let committed = committed_project_names(&paths);
     if committed.is_empty() {
-        println!("当前无已提交项目；apply 后会自动 enable 对应 zipfs@<name>.service。");
-        println!("（也可手动：systemctl --user enable --now zipfs@<esc>.service）");
+        println!("当前无已提交项目；apply 后会自动 enable 对应 scrollz@<name>.service。");
+        println!("（也可手动：systemctl --user enable --now scrollz@<esc>.service）");
         return Ok(());
     }
     for name in &committed {
-        let unit = format!("zipfs@{}.service", systemd_escape(name));
+        let unit = format!("scrollz@{}.service", systemd_escape(name));
         match Command::new("systemctl")
             .args(["--user", "enable", &unit])
             .status()
@@ -104,27 +104,73 @@ fn install_systemd(home: &Path) -> io::Result<()> {
         }
     }
     println!(
-        "立即生效：systemctl --user start zipfs@<esc>.service（或重新登录）。共 {} 个项目。",
+        "立即生效：systemctl --user start scrollz@<esc>.service（或重新登录）。共 {} 个项目。",
         committed.len()
     );
     Ok(())
 }
 
-/// 迁移掉旧聚合单元 `zipfs-projects.service`：best-effort `disable --now` 并删其单元文件。
-/// 旧单元只是自挂载编排（非数据），安全移除（no-unconscious：不碰任何 backing/项目数据）。
-fn migrate_off_aggregate_unit(user_unit_dir: &Path) {
-    let legacy = user_unit_dir.join("zipfs-projects.service");
-    if legacy.exists() || which("systemctl") {
+/// 找出旧品牌的 user unit 文件与 wants 实例链接，供安装时 best-effort 自改名迁移。
+fn legacy_unit_paths(user_unit_dir: &Path) -> Vec<std::path::PathBuf> {
+    fn visit(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                println!("（提示）扫描旧 systemd 单元失败 {}：{e}", dir.display());
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    println!("（提示）读取旧 systemd 单元目录项失败：{e}");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "zipfs@.service"
+                || name == "zipfs-projects.service"
+                || (name.starts_with("zipfs-") && name.ends_with(".service"))
+                || (name.starts_with("zipfs@") && name.ends_with(".service"))
+            {
+                out.push(path);
+            } else if path.is_dir() {
+                visit(&path, out);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    visit(user_unit_dir, &mut paths);
+    paths
+}
+
+/// 迁移掉旧品牌单元：best-effort 停用旧模板实例/聚合或独立单元，再删模板与 wants 链接。
+/// 仅改 user unit 控制文件，不碰 backing/项目数据；每个失败均输出提示而非静默吞掉。
+fn migrate_legacy_units(user_unit_dir: &Path) {
+    let paths = legacy_unit_paths(user_unit_dir);
+    let mut units: Vec<String> = paths
+        .iter()
+        .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .filter(|name| name.ends_with(".service") && name != "zipfs@.service")
+        .collect();
+    units.sort();
+    units.dedup();
+    for unit in units {
         run_quiet(
             "systemctl",
-            &["--user", "disable", "--now", "zipfs-projects.service"],
+            &["--user", "disable", "--now", unit.as_str()],
         );
     }
-    if legacy.exists() {
-        if let Err(e) = std::fs::remove_file(&legacy) {
-            println!("（提示）旧单元 {} 删除失败：{e}", legacy.display());
-        } else {
-            println!("已移除旧聚合单元 {}", legacy.display());
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("已移除旧品牌单元 {}", path.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => println!("（提示）旧品牌单元 {} 删除失败：{e}", path.display()),
         }
     }
 }
@@ -145,7 +191,7 @@ fn committed_project_names(paths: &Paths) -> Vec<String> {
 fn print_systemd_manual(unit_path: &Path) {
     println!("未检测到 systemctl。手动：");
     println!("  systemctl --user daemon-reload");
-    println!("  对每个项目：systemctl --user enable --now zipfs@<systemd-escaped-name>.service");
+    println!("  对每个项目：systemctl --user enable --now scrollz@<systemd-escaped-name>.service");
     println!("（模板单元已在 {}）", unit_path.display());
 }
 
@@ -153,7 +199,7 @@ fn print_systemd_manual(unit_path: &Path) {
 fn print_wsl_snippet() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "/path/to/zipfs".into());
+        .unwrap_or_else(|_| "/path/to/scrollz".into());
     println!("# 把以下片段加入 /etc/wsl.conf（需 root；WSL 无 systemd 时用）：");
     println!("[boot]");
     println!("command = {exe} enable remount --all");
@@ -173,12 +219,23 @@ fn which(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn run_quiet(bin: &str, args: &[&str]) {
-    let _ = Command::new(bin)
+fn run_quiet(bin: &str, args: &[&str]) -> bool {
+    match Command::new(bin)
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            println!("（提示）命令失败：{bin} {}（{status}）", args.join(" "));
+            false
+        }
+        Err(e) => {
+            println!("（提示）命令无法执行：{bin} {}：{e}", args.join(" "));
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,9 +244,9 @@ mod tests {
 
     #[test]
     fn template_unit_body_has_managed_execstart_and_supervision() {
-        let body = template_unit_body(Path::new("/usr/bin/zipfs"));
-        assert!(body.contains("ExecStart=/usr/bin/zipfs mount-managed --name %i"));
-        assert!(body.contains("ExecStop=/usr/bin/zipfs umount-managed --name %i --level auto"));
+        let body = template_unit_body(Path::new("/opt/scrollz/bin/scrollz"));
+        assert!(body.contains("ExecStart=/opt/scrollz/bin/scrollz mount-managed --name %i"));
+        assert!(body.contains("ExecStop=/opt/scrollz/bin/scrollz umount-managed --name %i --level auto"));
         assert!(body.contains("Type=notify"));
         assert!(body.contains("Restart=on-failure"));
         assert!(body.contains("WatchdogSec=30"));
@@ -197,13 +254,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_unit_names_cover_template_instance_links_and_standalone_units() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in [
+            "zipfs@.service",
+            "default.target.wants/zipfs@demo.service",
+            "zipfs-neighbors.service",
+            "zipfs-projects.service",
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"legacy").unwrap();
+        }
+        let mut got = legacy_unit_paths(dir.path());
+        got.sort();
+        let mut expected = vec![
+            dir.path().join("default.target.wants/zipfs@demo.service"),
+            dir.path().join("zipfs-neighbors.service"),
+            dir.path().join("zipfs-projects.service"),
+            dir.path().join("zipfs@.service"),
+        ];
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
     fn template_unit_body_has_guard_check_execcondition_and_restart_prevent() {
         // Task 12：ExecCondition 守卫 + RestartPreventExitStatus 防 crash-loop。ExecCondition（非
         // ExecStartPre）是关键——控制进程 1–254 退出使 unit skipped 不重启，而 RestartPreventExitStatus
         // 只对主进程有效，故 ExecStartPre 无法防风暴（systemd.service(5)）。
-        let body = template_unit_body(Path::new("/usr/bin/zipfs"));
+        let body = template_unit_body(Path::new("/opt/scrollz/bin/scrollz"));
         assert!(
-            body.contains("ExecCondition=/usr/bin/zipfs enable guard-check --name %i"),
+            body.contains("ExecCondition=/opt/scrollz/bin/scrollz enable guard-check --name %i"),
             "应含 ExecCondition guard-check（而非 ExecStartPre）"
         );
         assert!(
