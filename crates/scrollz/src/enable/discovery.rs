@@ -1,0 +1,940 @@
+//! enable 的探测层（IO）：扫描 projects、判挂载、判活跃、读写 backing 提交标记 sidecar。
+//!
+//! 纯解析逻辑（mountinfo 行匹配、sidecar 解析）抽成无 IO 函数以便单测；真正读 `/proc`、`stat`
+//! 挂载点的部分靠集成/手测覆盖。
+
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+use crate::enable::model::{
+    classify, Activity, ApplyOptions, Backend, EndpointHealth, Paths, ProjectStatus,
+    ACTIVITY_MTIME_SECS,
+};
+
+use super::hang_free::{with_timeout, with_timeout_memo, PROBE_TIMEOUT};
+
+/// 遍历挂载点子树（活跃判定）的超时上限。子树某个 read_dir/metadata 撞上 hung FUSE 时兜底。
+const WALK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 单个项目的探测快照（list/TUI 一行）。
+#[derive(Debug, Clone)]
+pub struct ProjectInfo {
+    pub name: String,
+    pub status: ProjectStatus,
+    pub meta: Option<Meta>,
+    /// reconcile 进行中标记（`back_root/<name>.reconciling`）存在（评审 I-4）。独立于 `status`：
+    /// 标记存在示意 orig 正被 reconcile 半改写，list 展示（Task 11）与生命周期让路据此判定。
+    pub reconciling: bool,
+    /// 需重合并：`status == Stopped` 且 underlay 含停用期回落写（fall-through 条目）。示意有 Claude
+    /// 直接写进挂载点 underlay 的 jsonl 等，remount 前须先 `enable reconcile` 合并（否则守卫拒挂）。
+    /// 仅在 Stopped（未挂载，mp 即真实 underlay）时探测；探测出错保守取 false，不阻断 list。
+    pub needs_reconcile: bool,
+}
+
+impl ProjectInfo {
+    /// 已记录的后端（无 meta 时回退 shadow）。
+    pub fn backend(&self) -> Backend {
+        self.meta
+            .as_ref()
+            .map(|m| m.backend)
+            .unwrap_or(Backend::Shadow)
+    }
+
+    /// STATUS 列显示串：基础状态标签叠加 reconcile 标记。`reconciling`（正在处理中）优先级高于
+    /// `needs_reconcile`（待处理）。抽成纯函数便于单测（list/status 渲染共用，杜绝两处漂移）。
+    pub fn status_display(&self) -> String {
+        let base = self.status.label();
+        if self.reconciling {
+            format!("{base} RECONCILING")
+        } else if self.needs_reconcile {
+            format!("{base} NEEDS-RECONCILE")
+        } else {
+            base.to_string()
+        }
+    }
+}
+
+/// 提交标记 sidecar（`back/<name>.zipfs.meta`）的解析结果。`committed` 为 true 才算灌入完成、可挂载
+/// （评审 C2）。后端无关位置，记录 `backend` 供探测时反推 backing 形态（dir / redb 文件）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Meta {
+    pub backend: Backend,
+    pub chunk_size: u32,
+    pub level: i32,
+    pub bytes_src: u64,
+    pub bytes_archive: u64,
+    pub applied_at: u64,
+    pub committed: bool,
+    /// 持久化的挂载选项（remount 复用，与 ApplyOptions 一一对应）。
+    pub dict: Option<String>,
+    pub threads: usize,
+    pub writeback: bool,
+    pub max_write: u32,
+    pub no_tail_buffer: bool,
+    pub allow_other: bool,
+    pub auto_unmount: bool,
+    pub metrics_file: Option<String>,
+}
+
+impl Default for Meta {
+    fn default() -> Self {
+        Self {
+            backend: Backend::Shadow,
+            chunk_size: 0,
+            level: 0,
+            bytes_src: 0,
+            bytes_archive: 0,
+            applied_at: 0,
+            committed: false,
+            dict: None,
+            threads: 0,
+            writeback: false,
+            max_write: 0,
+            no_tail_buffer: false,
+            allow_other: false,
+            auto_unmount: false,
+            metrics_file: None,
+        }
+    }
+}
+
+impl Meta {
+    /// 压缩比（逻辑/物理）。
+    pub fn ratio(&self) -> f64 {
+        if self.bytes_archive == 0 {
+            0.0
+        } else {
+            self.bytes_src as f64 / self.bytes_archive as f64
+        }
+    }
+
+    /// apply 后的提交选项（remount 原样复用全部挂载参数）。
+    pub fn options(&self) -> ApplyOptions {
+        ApplyOptions {
+            backend: self.backend,
+            chunk_size: self.chunk_size,
+            level: self.level,
+            dict: self.dict.as_ref().map(std::path::PathBuf::from),
+            threads: self.threads,
+            writeback: self.writeback,
+            max_write: self.max_write,
+            no_tail_buffer: self.no_tail_buffer,
+            allow_other: self.allow_other,
+            auto_unmount: self.auto_unmount,
+            metrics_file: self.metrics_file.as_ref().map(std::path::PathBuf::from),
+        }
+    }
+
+    /// 由 apply 选项 + 灌入统计构造提交标记（committed=true）。
+    pub fn from_apply(
+        opts: &ApplyOptions,
+        bytes_src: u64,
+        bytes_archive: u64,
+        applied_at: u64,
+    ) -> Self {
+        Self {
+            backend: opts.backend,
+            chunk_size: opts.chunk_size,
+            level: opts.level,
+            bytes_src,
+            bytes_archive,
+            applied_at,
+            committed: true,
+            dict: opts.dict.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            threads: opts.threads,
+            writeback: opts.writeback,
+            max_write: opts.max_write,
+            no_tail_buffer: opts.no_tail_buffer,
+            allow_other: opts.allow_other,
+            auto_unmount: opts.auto_unmount,
+            metrics_file: opts
+                .metrics_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
+}
+
+/// 扫描 projects_root 下所有目录（跳过 `*.zipfs-orig` 备份与点文件），探测状态。
+pub fn scan(paths: &Paths) -> io::Result<Vec<ProjectInfo>> {
+    let mut out = Vec::new();
+    let rd = match fs::read_dir(&paths.projects_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e),
+    };
+    for dent in rd {
+        let dent = dent?;
+        let name = match dent.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue, // 非 UTF-8 名跳过（Claude 项目名是 ASCII path-encoded）。
+        };
+        if name.ends_with(super::model::ORIG_SUFFIX) || name.starts_with('.') {
+            continue;
+        }
+        if !dent.file_type()?.is_dir() {
+            continue;
+        }
+        out.push(probe(paths, &name));
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// 探测单个项目状态。meta（后端无关 sidecar）先读 → 反推 backend → 派生 backing。
+pub fn probe(paths: &Paths, name: &str) -> ProjectInfo {
+    let mp = paths.mountpoint(name);
+    let orig_exists = paths.orig(name).exists();
+    // 编排（阶段 D）：先读 mountinfo（`is_mounted` 永不阻塞）；仅确为 fuse 挂载点才对 endpoint 做
+    // 超时探测（可能 hung，需起线程）；非挂载的普通目录同步 stat，省去无谓起线程。
+    let is_mnt = is_mounted(&mp);
+    let health = if is_mnt {
+        endpoint_health(&mp)
+    } else {
+        health_from_stat(fs::symlink_metadata(&mp))
+    };
+    let mounted = matches!(health, EndpointHealth::Healthy) && is_mnt;
+    let meta = read_meta(&paths.meta_path(name)).ok().flatten();
+    let committed = meta.as_ref().map(|m| m.committed).unwrap_or(false);
+    let status = classify(orig_exists, mounted, health, committed);
+    let reconciling = paths.reconciling_marker(name).exists();
+    // 仅 Stopped（未挂载，mp 即真实 underlay）才探测 fall-through；否则读 mp 是 FUSE 视图会误判，
+    // 且避免对活跃/卡死挂载做多余 read_dir。探测出错保守取 false（不阻断 list），并 warn。
+    let needs_reconcile = status == ProjectStatus::Stopped
+        && match crate::reconcile::guard::underlay_has_fallthrough(&mp) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("探测 {name} underlay 回落写失败（保守视为无需重合并）：{e}");
+                false
+            }
+        };
+    ProjectInfo {
+        name: name.to_string(),
+        status,
+        meta,
+        reconciling,
+        needs_reconcile,
+    }
+}
+
+/// 挂载点 endpoint 健康三态。经 `with_timeout_memo` 熔断：近期已判卡死的挂载直接判 `Hung`，不重复
+/// 起线程（键用原始挂载路径，与消费点一致；仅此一处 memo，`canonicalized_target`/活跃扫描保持裸
+/// `with_timeout`）。`ENOTCONN → Stale`（daemon 死僵尸）；超时/熔断命中 `→ Hung`（daemon 无响应）；
+/// 其余（可 stat 或非 ENOTCONN 错误）`→ Healthy`（原语义：非 ENOTCONN 不算坏）。
+pub fn endpoint_health(path: &Path) -> EndpointHealth {
+    let p = path.to_path_buf();
+    match with_timeout_memo(path, PROBE_TIMEOUT, move || fs::symlink_metadata(&p)) {
+        Some(res) => health_from_stat(res),
+        None => EndpointHealth::Hung, // 超时/熔断命中 → daemon 无响应
+    }
+}
+
+/// `stat` 结果 → 健康态映射：`ENOTCONN`=stale（僵尸 endpoint）；其余（成功或非 ENOTCONN 错误）=Healthy。
+/// `endpoint_health`（异步超时探测）与 `probe` 非挂载分支（同步 stat）共用，杜绝两处映射漂移。
+fn health_from_stat(res: io::Result<fs::Metadata>) -> EndpointHealth {
+    match res {
+        Ok(_) => EndpointHealth::Healthy,
+        Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => EndpointHealth::Stale,
+        Err(_) => EndpointHealth::Healthy,
+    }
+}
+
+/// 挂载点是否健康（可 stat）的薄封装。只关心「健康与否」的消费点（readiness poll、remount 守卫、
+/// abort 守卫）沿用此 bool——stale 或 hung 都算不健康（`false`），与升级为三态前语义一致、零改动。
+pub fn endpoint_ok(path: &Path) -> bool {
+    matches!(endpoint_health(path), EndpointHealth::Healthy)
+}
+
+/// `path` 是否为活的 fuse 挂载点：解析 `/proc/self/mountinfo`，精确匹配挂载点且 fstype=fuse。
+pub fn is_mounted(path: &Path) -> bool {
+    let target = canonicalized_target(path);
+    let Ok(content) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    // 同一挂载点可能多行（overmount），取最后一条为准。
+    let mut mounted = false;
+    for line in content.lines() {
+        if let Some((mp, is_fuse)) = parse_mountinfo_line(line) {
+            if Path::new(&mp) == target {
+                mounted = is_fuse;
+            }
+        }
+    }
+    mounted
+}
+
+/// 规范化挂载点用于与 mountinfo（内核规范路径）精确比对。**不对叶子 canonicalize**
+/// （hung FUSE 下 stat 叶子会 D 睡眠永阻塞）；仅规范化父目录再拼回末段，父目录也 wedge 的
+/// 极端情形由超时兜底回退未规范化原路径（宁可偶发漏判也不 hang）。
+fn canonicalized_target(path: &Path) -> std::path::PathBuf {
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let parent = parent.to_path_buf();
+        if let Some(Ok(cp)) = with_timeout(PROBE_TIMEOUT, move || fs::canonicalize(&parent)) {
+            return cp.join(name);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// 解析一行 mountinfo，返回（反转义后的挂载点, fstype 是否 fuse 系）。格式：
+/// `id pid major:minor root mountpoint opts... - fstype source superopts`。
+fn parse_mountinfo_line(line: &str) -> Option<(String, bool)> {
+    let fields: Vec<&str> = line.split(' ').collect();
+    if fields.len() < 7 {
+        return None;
+    }
+    let mountpoint = unescape_octal(fields[4]);
+    // 找 ` - ` 分隔符后的 fstype。
+    let sep = fields.iter().position(|&f| f == "-")?;
+    let fstype = fields.get(sep + 1)?;
+    let is_fuse = fstype.starts_with("fuse");
+    Some((mountpoint, is_fuse))
+}
+
+/// 从 mountinfo 文本取 `target` 对应 fuse 挂载的连接号（`major:minor` 的 minor，即
+/// `/sys/fs/fuse/connections/<minor>`）。overmount 取末条；非 fuse / 无匹配 → None。
+/// 纯函数（无 IO）以便单测。
+pub(crate) fn parse_connection_id(mountinfo: &str, target: &Path) -> Option<u64> {
+    let mut found = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let Some(sep) = fields.iter().position(|&f| f == "-") else {
+            continue;
+        };
+        let Some(fstype) = fields.get(sep + 1) else {
+            continue;
+        };
+        if !fstype.starts_with("fuse") {
+            continue;
+        }
+        if Path::new(&unescape_octal(fields[4])) != target {
+            continue;
+        }
+        // 字段 2 = `major:minor`；fuse 的 minor 即连接号。
+        if let Some((_, minor)) = fields[2].split_once(':') {
+            if let Ok(id) = minor.parse::<u64>() {
+                found = Some(id); // 不 break：overmount 取末条。
+            }
+        }
+    }
+    found
+}
+
+/// 读 `/proc/self/mountinfo` 取挂载点的 fuse 连接号。不 stat 挂载点叶子。
+pub fn mount_connection_id(path: &Path) -> Option<u64> {
+    let target = canonicalized_target(path);
+    let content = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    parse_connection_id(&content, &target)
+}
+
+/// 反转义 mountinfo 的八进制转义（空格 \040、tab \011、换行 \012、反斜杠 \134）。
+fn unescape_octal(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // 需要完整 4 字节 `\ooo`（含末尾恰好以转义结尾的挂载点）。
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            let oct = &s[i + 1..i + 4];
+            if let Ok(v) = u8::from_str_radix(oct, 8) {
+                out.push(v);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 活跃判定：扫 `/proc/*/fd` 与 `/cwd` 命中 `P` 子树（catch 任何活跃写者，含当前会话的 claude），
+/// 再辅以 `*.jsonl`/`*.log` 近期 mtime。任一命中即 `Active`（带原因）。
+pub fn detect_activity(path: &Path) -> Activity {
+    // 不对挂载点自身 canonicalize（hung 会卡死）；经父目录规范化拼回末段，与 mountinfo 对齐。
+    let target = canonicalized_target(path);
+    if let Some(reason) = scan_proc_for_holders(&target) {
+        return Activity::Active(reason);
+    }
+    if let Some(reason) = recent_log_write(&target) {
+        return Activity::Active(reason);
+    }
+    Activity::Idle
+}
+
+/// 扫 `/proc/[pid]/fd/*` 与 `/proc/[pid]/cwd`，若有进程在 `target` 子树持 fd 或以其为 cwd 则返回原因。
+fn scan_proc_for_holders(target: &Path) -> Option<String> {
+    let rd = fs::read_dir("/proc").ok()?;
+    let mut eacces_skipped = 0u32; // 评审 C3：他人 uid 进程 fd 目录不可读，计数使"拦截盲区"可观测
+    for dent in rd.flatten() {
+        let pid_name = dent.file_name();
+        let pid_str = pid_name.to_string_lossy();
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let base = dent.path();
+        // cwd
+        if let Ok(cwd) = fs::read_link(base.join("cwd")) {
+            if cwd.starts_with(target) {
+                return Some(format!("pid {pid_str} 以此为 cwd"));
+            }
+        }
+        // 打开的 fd（他人进程目录 EACCES → 跳过，但计数）。
+        match fs::read_dir(base.join("fd")) {
+            Ok(fds) => {
+                for fd in fds.flatten() {
+                    if let Ok(p) = fs::read_link(fd.path()) {
+                        if p.starts_with(target) {
+                            let comm = fs::read_to_string(base.join("comm"))
+                                .map(|s| s.trim().to_string())
+                                .unwrap_or_default();
+                            return Some(format!("pid {pid_str} ({comm}) 持有打开 fd"));
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => eacces_skipped += 1,
+            Err(_) => {} // 进程已退出等 → 忽略
+        }
+    }
+    // 未发现持有者，但若有进程无法探测，活跃检测可能不完整——告警，避免"无活跃"被误读为可靠。
+    if eacces_skipped > 0 {
+        log::warn!(
+            "活跃检测：{eacces_skipped} 个他人 uid 进程的 fd 不可探测（若 claude 以不同用户运行，\
+             fd 持有探测会漏判，仅余 mtime 窗口兜底）"
+        );
+    }
+    None
+}
+
+/// `target` 下任一 `*.jsonl`/`*.log` 的 mtime 在活跃窗口内 → 返回原因。
+fn recent_log_write(target: &Path) -> Option<String> {
+    let now = SystemTime::now();
+    let window = Duration::from_secs(ACTIVITY_MTIME_SECS);
+    let t = target.to_path_buf();
+    // 遍历挂载点子树可能撞上 hung FUSE 的 read_dir/metadata → 超时保护（超时=无法判定近期写入→None）。
+    with_timeout(WALK_TIMEOUT, move || {
+        recent_log_write_rec(&t, now, window, 0)
+    })
+    .flatten()
+}
+
+fn recent_log_write_rec(
+    dir: &Path,
+    now: SystemTime,
+    window: Duration,
+    depth: u32,
+) -> Option<String> {
+    if depth > 8 {
+        return None; // 防极深树。
+    }
+    let rd = fs::read_dir(dir).ok()?;
+    for dent in rd.flatten() {
+        let path = dent.path();
+        // 单个 entry 取类型失败：跳过此条，继续扫同级其余文件（绝不放弃整层 → 防活跃误判）。
+        let Ok(ft) = dent.file_type() else { continue };
+        if ft.is_dir() {
+            if let Some(r) = recent_log_write_rec(&path, now, window, depth + 1) {
+                return Some(r);
+            }
+        } else if ft.is_file() {
+            let is_log = path
+                .extension()
+                .map(|e| e == "jsonl" || e == "log")
+                .unwrap_or(false);
+            if !is_log {
+                continue;
+            }
+            if let Ok(md) = dent.metadata() {
+                if let Ok(mt) = md.modified() {
+                    if now.duration_since(mt).map(|d| d < window).unwrap_or(true) {
+                        return Some(format!("{} 近期写入", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// ── sidecar 提交标记（手搓 key=value，无 serde） ──────────────────────────────
+
+/// 写提交标记 sidecar 到 `path`（`back/<name>.zipfs.meta`）。**调用方**负责在 fsync backing
+/// 之后再调本函数；本函数自身 fsync sidecar + 其父目录，使「sidecar 存在且 committed=1」成为
+/// 可信提交点（评审 C1/C2）。
+pub fn write_meta(path: &Path, meta: &Meta) -> io::Result<()> {
+    // 评审 M4：sidecar 是数据安全信任根（committed 是挂载闸门）。自由文本值 dict/metrics_file
+    // 是路径，Unix 路径可含换行——含 `\n` 的路径会注入伪造行（如 `\ncommitted=1`），parse 末键
+    // 胜出即可把半灌 backing 伪造成权威挂出。写入端 fail-closed 拒绝含控制字符的值。
+    let dict = sidecar_value(meta.dict.as_deref().unwrap_or(""))?;
+    let metrics_file = sidecar_value(meta.metrics_file.as_deref().unwrap_or(""))?;
+    let tmp = with_ext(path, "tmp");
+    let body = format!(
+        "backend={}\nchunk_size={}\nlevel={}\nbytes_src={}\nbytes_archive={}\napplied_at={}\ncommitted={}\ndict={}\nthreads={}\nwriteback={}\nmax_write={}\nno_tail_buffer={}\nallow_other={}\nauto_unmount={}\nmetrics_file={}\n",
+        meta.backend.flag(),
+        meta.chunk_size,
+        meta.level,
+        meta.bytes_src,
+        meta.bytes_archive,
+        meta.applied_at,
+        if meta.committed { 1 } else { 0 },
+        dict,
+        meta.threads,
+        if meta.writeback { 1 } else { 0 },
+        meta.max_write,
+        if meta.no_tail_buffer { 1 } else { 0 },
+        if meta.allow_other { 1 } else { 0 },
+        if meta.auto_unmount { 1 } else { 0 },
+        metrics_file,
+    );
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    // fsync 父目录使 rename 持久（dirent durability）。
+    crate::core::fsync_dir_of(path);
+    Ok(())
+}
+
+/// 校验一个 sidecar key=value 的 value 不含会破坏 key=value 解析 / 伪造键的控制字符
+/// （`\n`/`\r`）。含则 fail-closed 报错（评审 M4）。返回原值便于内联使用。
+fn sidecar_value(v: &str) -> io::Result<&str> {
+    if v.contains('\n') || v.contains('\r') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("sidecar 值含换行/回车，拒绝写入（防伪造提交标记）：{v:?}"),
+        ));
+    }
+    Ok(v)
+}
+
+/// 读提交标记 sidecar。不存在 → Ok(None)。解析未知键忽略，缺失键取默认（parse-don't-validate）。
+pub fn read_meta(path: &Path) -> io::Result<Option<Meta>> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some(parse_meta(&content)))
+}
+
+/// 给路径换扩展名后缀（`.zipfs.meta` → `.zipfs.meta.tmp`），保持同目录原子 rename。
+fn with_ext(path: &Path, ext: &str) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".");
+    s.push(ext);
+    std::path::PathBuf::from(s)
+}
+
+/// 纯解析：key=value 行 → Meta（单测覆盖）。
+fn parse_meta(content: &str) -> Meta {
+    let mut m = Meta::default();
+    let opt = |v: &str| {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.to_string())
+        }
+    };
+    for line in content.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "backend" => m.backend = Backend::parse(v).unwrap_or(Backend::Shadow),
+            "chunk_size" => m.chunk_size = v.parse().unwrap_or(0),
+            "level" => m.level = v.parse().unwrap_or(0),
+            "bytes_src" => m.bytes_src = v.parse().unwrap_or(0),
+            "bytes_archive" => m.bytes_archive = v.parse().unwrap_or(0),
+            "applied_at" => m.applied_at = v.parse().unwrap_or(0),
+            "committed" => m.committed = v == "1",
+            "dict" => m.dict = opt(v),
+            "threads" => m.threads = v.parse().unwrap_or(0),
+            "writeback" => m.writeback = v == "1",
+            "max_write" => m.max_write = v.parse().unwrap_or(0),
+            "no_tail_buffer" => m.no_tail_buffer = v == "1",
+            "allow_other" => m.allow_other = v == "1",
+            "auto_unmount" => m.auto_unmount = v == "1",
+            "metrics_file" => m.metrics_file = opt(v),
+            _ => {}
+        }
+    }
+    m
+}
+
+/// 当前 unix 时间戳（秒），失败回 0。
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn unescape_octal_handles_space_and_backslash() {
+        assert_eq!(unescape_octal("/mnt/a"), "/mnt/a");
+        assert_eq!(unescape_octal("/mnt/a\\040b"), "/mnt/a b"); // \040 = space
+        assert_eq!(unescape_octal("/x\\134y"), "/x\\y"); // \134 = backslash
+        assert_eq!(unescape_octal("/x\\040"), "/x "); // 末尾恰好转义（M2 边界）
+    }
+
+    #[test]
+    fn parse_mountinfo_exact_match_and_fstype() {
+        // 真实 fuse 挂载行（zipfs）。
+        let line =
+            "123 45 0:50 / /home/u/.claude/projects/foo rw,nosuid - fuse.zipfs-shadow zipfs rw";
+        let (mp, is_fuse) = parse_mountinfo_line(line).unwrap();
+        assert_eq!(mp, "/home/u/.claude/projects/foo");
+        assert!(is_fuse);
+        // 非 fuse（ext4）。
+        let ext = "1 2 0:1 / /data rw - ext4 /dev/sda1 rw";
+        assert!(!parse_mountinfo_line(ext).unwrap().1);
+    }
+
+    #[test]
+    fn parse_meta_round_trip_via_write_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.zipfs.meta");
+        let meta = Meta {
+            backend: Backend::Container,
+            chunk_size: 1048576,
+            level: 3,
+            bytes_src: 1000,
+            bytes_archive: 100,
+            applied_at: 42,
+            committed: true,
+            dict: Some("/x/shared.dict".to_string()),
+            threads: 8,
+            writeback: true,
+            max_write: 4194304,
+            no_tail_buffer: true,
+            allow_other: true,
+            auto_unmount: true,
+            metrics_file: Some("/m/z.prom".to_string()),
+        };
+        write_meta(&path, &meta).unwrap();
+        let got = read_meta(&path).unwrap().unwrap();
+        assert_eq!(got, meta);
+        assert!((got.ratio() - 10.0).abs() < 1e-9);
+        // options() 透传全部选项（含 backend）。
+        let o = got.options();
+        assert_eq!(o.backend, Backend::Container);
+        assert_eq!(o.threads, 8);
+        assert!(o.writeback && o.no_tail_buffer && o.allow_other && o.auto_unmount);
+        assert_eq!(
+            o.dict.as_deref(),
+            Some(std::path::Path::new("/x/shared.dict"))
+        );
+        assert_eq!(
+            o.metrics_file.as_deref(),
+            Some(std::path::Path::new("/m/z.prom"))
+        );
+    }
+
+    #[test]
+    fn write_meta_rejects_newline_injection_in_paths() {
+        // 评审 M4：含换行的路径会注入伪造行（如 `\ncommitted=1`）篡改提交闸门。须 fail-closed。
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = Meta {
+            committed: false,
+            ..Meta::default()
+        };
+        meta.dict = Some("/tmp/x\ncommitted=1".to_string());
+        let res = write_meta(&dir.path().join("p.zipfs.meta"), &meta);
+        assert!(res.is_err(), "含换行的 dict 路径须拒绝写入");
+        // 干净路径正常写入并读回，committed 保持 false（未被伪造）。
+        meta.dict = Some("/tmp/clean-dict".to_string());
+        let p = dir.path().join("q.zipfs.meta");
+        write_meta(&p, &meta).unwrap();
+        let back = read_meta(&p).unwrap().unwrap();
+        assert!(!back.committed, "干净写入后 committed 应仍为 false");
+        assert_eq!(back.dict.as_deref(), Some("/tmp/clean-dict"));
+    }
+
+    #[test]
+    fn read_meta_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_meta(&dir.path().join("none.zipfs.meta"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn probe_reports_reconciling_when_marker_present() {
+        // 评审 I-4：probe 填充 reconciling 字段（back_root/<name>.reconciling 存在即真）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            scrollz_home: tmp.path().join("zip"),
+        };
+        fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        // 无标记 → false。
+        assert!(!probe(&paths, "demo").reconciling);
+        // 落标记 → probe 报 reconciling=true（status 仍由 classify 独立决定）。
+        fs::create_dir_all(paths.back_root()).unwrap();
+        fs::write(paths.reconciling_marker("demo"), b"").unwrap();
+        assert!(probe(&paths, "demo").reconciling);
+    }
+
+    /// 构造一个 STOPPED 项目（orig 备份存在、未挂载、mp 可 stat、backing committed=1）的隔离 Paths。
+    /// 返回 (tempdir 守卫, paths)；调用方按需往 mp（underlay）里写 fall-through 文件。
+    fn stopped_project(name: &str) -> (tempfile::TempDir, Paths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            scrollz_home: tmp.path().join("zip"),
+        };
+        fs::create_dir_all(paths.mountpoint(name)).unwrap(); // underlay（未挂载即真实目录）
+        fs::create_dir_all(paths.orig(name)).unwrap(); // orig 备份存在 → 已 apply 过
+        fs::create_dir_all(paths.back_root()).unwrap();
+        let meta = Meta {
+            committed: true,
+            ..Meta::default()
+        };
+        write_meta(&paths.meta_path(name), &meta).unwrap(); // committed=1 → Stopped 而非 Broken
+        (tmp, paths)
+    }
+
+    #[test]
+    fn probe_needs_reconcile_when_stopped_and_underlay_has_fallthrough() {
+        // Task 11：STOPPED 且 underlay 含停用期回落写 → needs_reconcile=true。
+        let (_g, paths) = stopped_project("demo");
+        fs::write(paths.mountpoint("demo").join("s.jsonl"), b"{}\n").unwrap();
+        let info = probe(&paths, "demo");
+        assert_eq!(info.status, ProjectStatus::Stopped, "前置：应为 Stopped");
+        assert!(
+            info.needs_reconcile,
+            "STOPPED + 非空 underlay 应标 needs_reconcile"
+        );
+    }
+
+    #[test]
+    fn probe_no_needs_reconcile_when_underlay_empty_or_only_harmless() {
+        // 空 underlay（或仅无害隐藏项）→ false，即便 Stopped。
+        let (_g, paths) = stopped_project("demo");
+        assert_eq!(probe(&paths, "demo").status, ProjectStatus::Stopped);
+        assert!(
+            !probe(&paths, "demo").needs_reconcile,
+            "空 underlay 不应标记"
+        );
+        // 仅无害隐藏项（.fuse_hidden）也放行。
+        fs::write(paths.mountpoint("demo").join(".fuse_hidden0001"), b"").unwrap();
+        assert!(
+            !probe(&paths, "demo").needs_reconcile,
+            "仅无害隐藏项不应标记"
+        );
+    }
+
+    #[test]
+    fn probe_no_needs_reconcile_when_not_stopped() {
+        // 非 Stopped（如 Plain：无 orig 备份）即便 underlay 非空也不标（仅 Stopped 才探测）。
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            projects_root: tmp.path().join("projects"),
+            scrollz_home: tmp.path().join("zip"),
+        };
+        fs::create_dir_all(paths.mountpoint("demo")).unwrap();
+        fs::write(paths.mountpoint("demo").join("s.jsonl"), b"{}\n").unwrap();
+        let info = probe(&paths, "demo");
+        assert_eq!(info.status, ProjectStatus::Plain, "无 orig → Plain");
+        assert!(!info.needs_reconcile, "非 Stopped 不探测 underlay，不标记");
+    }
+
+    #[test]
+    fn status_display_combines_markers_with_reconciling_priority() {
+        // 纯函数：RECONCILING 优先级高于 NEEDS-RECONCILE；二者与基础状态标签组合。
+        let base = ProjectInfo {
+            name: "demo".into(),
+            status: ProjectStatus::Stopped,
+            meta: None,
+            reconciling: false,
+            needs_reconcile: false,
+        };
+        assert_eq!(base.status_display(), "STOPPED");
+        let needs = ProjectInfo {
+            needs_reconcile: true,
+            ..base.clone()
+        };
+        assert_eq!(needs.status_display(), "STOPPED NEEDS-RECONCILE");
+        let reconciling = ProjectInfo {
+            reconciling: true,
+            needs_reconcile: true, // 同时置位时 RECONCILING 胜出
+            ..base.clone()
+        };
+        assert_eq!(reconciling.status_display(), "STOPPED RECONCILING");
+    }
+
+    #[test]
+    fn canonicalized_target_resolves_symlinked_parent_for_stale_endpoint() {
+        // 评审 A4/C2：挂载点 endpoint 自身不可 stat（stale 或 hung）时，仍应经父目录解析出规范路径，
+        // 而非回退未规范化原路径（会与 mountinfo 失配漏判已挂载）。
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // link/ep 不存在（模拟 stale endpoint）：不 stat 末段，经父（link→real）解析即可。
+        let stale = link.join("ep");
+        let got = canonicalized_target(&stale);
+        let want = fs::canonicalize(&real).unwrap().join("ep");
+        assert_eq!(got, want, "应经规范化父目录拼回末段，而非回退原路径");
+    }
+
+    #[test]
+    fn canonicalized_target_does_not_stat_leaf_segment() {
+        // 末段是坏 symlink（指向不存在目标）：整路径 canonicalize 会失败，但本函数只规范化父目录，
+        // 故仍返回 canonicalize(父)/末段，且不因坏 symlink 报错。
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let leaf = parent.join("mnt");
+        std::os::unix::fs::symlink("/no/such/target/anywhere", &leaf).unwrap();
+        let got = canonicalized_target(&leaf);
+        let want = std::fs::canonicalize(&parent).unwrap().join("mnt");
+        assert_eq!(
+            got, want,
+            "应仅规范化父目录、原样拼回末段，不解析/stat 末段"
+        );
+    }
+
+    #[test]
+    fn parse_meta_tolerates_legacy_sidecar_without_new_fields() {
+        // 升级路径：apply 增挂载选项前写的旧 sidecar 没有 dict/threads/writeback/max_write 行。
+        // 解析须容忍缺失（留 Default），新字段不得污染旧值，committed 仍可信。
+        let legacy = "chunk_size=1048576\nlevel=3\nbytes_src=1000\nbytes_archive=100\napplied_at=42\ncommitted=1\n";
+        let m = parse_meta(legacy);
+        assert_eq!(m.chunk_size, 1048576);
+        assert_eq!(m.level, 3);
+        assert!(m.committed, "committed 仍应可信");
+        // 新字段回落默认（remount 据此用默认挂载参数，与升级前行为一致）。
+        assert_eq!(m.dict, None);
+        assert_eq!(m.threads, 0);
+        assert!(!m.writeback);
+        assert_eq!(m.max_write, 0);
+    }
+
+    #[test]
+    fn uncommitted_meta_parses_committed_false() {
+        let m = parse_meta("chunk_size=65536\nlevel=3\ncommitted=0\n");
+        assert!(!m.committed);
+        assert_eq!(m.chunk_size, 65536);
+    }
+
+    #[test]
+    fn endpoint_ok_true_for_normal_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(endpoint_ok(dir.path()));
+    }
+
+    #[test]
+    fn endpoint_health_healthy_for_normal_dir() {
+        // 正常目录可 stat → Healthy；薄封装 endpoint_ok 与之一致。
+        // Stale(ENOTCONN)/Hung(超时) 分支需真 wedge/僵尸挂载，靠集成/手测覆盖。
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(endpoint_health(dir.path()), EndpointHealth::Healthy);
+        assert!(endpoint_ok(dir.path()));
+    }
+
+    #[test]
+    fn health_from_stat_maps_enotconn_to_stale() {
+        // 纯映射单测（阶段 D 抽出，供 endpoint_health 异步 + probe 同步分支共用）：
+        // ENOTCONN → Stale（僵尸），其余错误/成功 → Healthy（非 ENOTCONN 不算坏）。
+        assert_eq!(
+            health_from_stat(Err(io::Error::from_raw_os_error(libc::ENOTCONN))),
+            EndpointHealth::Stale
+        );
+        assert_eq!(
+            health_from_stat(Err(io::Error::from_raw_os_error(libc::EACCES))),
+            EndpointHealth::Healthy
+        );
+        let md = fs::symlink_metadata(".").unwrap();
+        assert_eq!(health_from_stat(Ok(md)), EndpointHealth::Healthy);
+    }
+
+    #[test]
+    fn detect_activity_idle_for_quiet_nonlog_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("note.txt"), b"hi").unwrap(); // 非 jsonl/log，不触发 mtime 分支
+        assert_eq!(detect_activity(dir.path()), Activity::Idle);
+    }
+
+    #[test]
+    fn detect_activity_active_when_fd_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.txt"); // 用非 log 文件，确保命中的是 fd 分支而非 mtime
+        fs::write(&f, b"hi").unwrap();
+        let mut handle = fs::File::open(&f).unwrap();
+        let act = detect_activity(dir.path());
+        assert!(act.is_active(), "本进程持有 fd 应判活跃：{act:?}");
+        // 触碰 handle 防止被提前 drop/优化。
+        let mut buf = [0u8; 1];
+        let _ = handle.read(&mut buf);
+    }
+
+    #[test]
+    fn detect_activity_active_when_recent_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("s.jsonl"), b"{}\n").unwrap(); // 新建 → mtime=now → 活跃
+        assert!(detect_activity(dir.path()).is_active());
+    }
+
+    #[test]
+    fn parse_connection_id_takes_minor_from_fuse_line() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi =
+            "36 35 0:44 / /mnt/x rw,nosuid shared:1 - fuse.zipfs-shadow zipfs rw,user_id=1000\n";
+        assert_eq!(parse_connection_id(mi, target), Some(44));
+    }
+
+    #[test]
+    fn parse_connection_id_none_for_non_fuse() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi = "36 35 0:44 / /mnt/x rw - ext4 /dev/sda1 rw\n";
+        assert_eq!(parse_connection_id(mi, target), None);
+    }
+
+    #[test]
+    fn parse_connection_id_overmount_takes_last() {
+        let target = std::path::Path::new("/mnt/x");
+        let mi = "36 35 0:44 / /mnt/x rw - fuse.zipfs-shadow z rw\n\
+                  37 35 0:55 / /mnt/x rw - fuse.zipfs-shadow z rw\n";
+        assert_eq!(parse_connection_id(mi, target), Some(55));
+    }
+
+    #[test]
+    fn parse_connection_id_handles_octal_escaped_path() {
+        let target = std::path::Path::new("/mnt/a b"); // 含空格
+        let mi = "36 35 0:44 / /mnt/a\\040b rw - fuse zipfs rw\n";
+        assert_eq!(parse_connection_id(mi, target), Some(44));
+    }
+
+    #[test]
+    fn recent_log_write_scans_all_siblings_and_subdirs() {
+        // 回归：单个 entry 出错不得放弃同级其余文件；近期 .jsonl 即便排在其它条目之后、
+        // 或嵌在子目录里，也必须被扫到（活跃误判 → 零丢失漏洞）。
+        let dir = tempfile::tempdir().unwrap();
+        // 先放若干非 log 文件与一个子目录，最后才是近期 .jsonl。
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        fs::write(dir.path().join("b.bin"), b"x").unwrap();
+        let sub = dir.path().join("nested");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("recent.jsonl"), b"{}\n").unwrap(); // 子目录里的近期日志
+        assert!(
+            detect_activity(dir.path()).is_active(),
+            "子目录中的近期 .jsonl 应判活跃"
+        );
+    }
+}
