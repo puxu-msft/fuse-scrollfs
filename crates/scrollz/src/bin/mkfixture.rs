@@ -2,7 +2,7 @@
 //!
 //! 只读路径的「鸡生蛋」工具：没有在线写路径却要有可读数据，故离线生成。
 //! 用法：`mkfixture --src <源目录> --dst <BACKING 输出目录> [--chunk-size N] [--level L]`。
-//! 之后可 `zipfs --backend shadow --backing <dst> --mountpoint <mnt>` 只读挂载验证。
+//! 之后可 `scrollz --backend shadow --backing <dst> --mountpoint <mnt>` 只读挂载验证。
 
 use std::path::PathBuf;
 use std::process::ExitCode;

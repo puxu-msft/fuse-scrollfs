@@ -1,4 +1,4 @@
-//! zipfs 入口：P0 透传挂载 + P2/P3 布局 S / 布局 V 读写挂载。
+//! scrollz 入口：P0 透传挂载 + P2/P3 布局 S / 布局 V 读写挂载。
 //!
 //! 解析 `--backend {passthrough|shadow|container}` / `--backing` / `--mountpoint` / `--chunk-size`，
 //! 初始化 logger，挂载。
@@ -6,7 +6,7 @@
 //! - shadow（布局 S）：每文件分块压缩包，**读写**（append 只脏尾块 + footer 原子更新，§7）。
 //! - container（布局 V）：redb 全包容器，**读写**（写批处理一事务，§6.1）。
 //!
-//! 见 docs/01-zipfs-design.md §11（模块布局）、§12 P2/P3。
+//! 见 docs/01-scrollz-design.md §11（模块布局）、§12 P2/P3。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,15 +35,15 @@ enum Backend {
     Container,
 }
 
-/// zipfs：fuser 透传（P0）/ 布局 S / 布局 V 读写 + 离线 compact。
+/// scrollz：fuser 透传（P0）/ 布局 S / 布局 V 读写 + 离线 compact。
 #[derive(Parser, Debug)]
 #[command(
     name = "scrollz",
     version,
-    about = "zipfs：P0 透传 / 布局 S / 布局 V，把 FUSE 操作映射到底层目录、archive 树或 redb 容器"
+    about = "scrollz：P0 透传 / 布局 S / 布局 V，把 FUSE 操作映射到底层目录、archive 树或 redb 容器"
 )]
 struct Cli {
-    /// 子命令。缺省（不给子命令）= 挂载（向后兼容原有 `zipfs --backend ... --backing ...` 用法）。
+    /// 子命令。缺省（不给子命令）= 挂载（向后兼容原有 `scrollz --backend ... --backing ...` 用法）。
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -57,45 +57,45 @@ struct Cli {
 enum Command {
     /// 离线压实：container 回收 redb MVCC 未引用页；shadow 回收 append-only 空洞（temp+rename）。
     ///
-    /// 用法：`zipfs compact --backend {container|shadow} --backing <文件或目录>`。须**未挂载**。
+    /// 用法：`scrollz compact --backend {container|shadow} --backing <文件或目录>`。须**未挂载**。
     Compact(CompactArgs),
 
     /// 从语料目录训练共享 zstd 字典（T3 研究项），产出字典文件供 `--dict` 挂载使用。
     ///
-    /// 用法：`zipfs train-dict --input <语料目录> --output <字典文件> [--max-dict 524288] [--chunk-size 65536]`。
+    /// 用法：`scrollz train-dict --input <语料目录> --output <字典文件> [--max-dict 524288] [--chunk-size 65536]`。
     /// 把语料文件按 `--chunk-size` 切块作训练样本（对齐块独立压缩的粒度），训练上限 `--max-dict`。
     TrainDict(TrainDictArgs),
 
     /// 冷文件封存：把 shadow archive 树里的文件用更大块 + 高等级离线重编码（algo-compare 结论 #4）。
     ///
-    /// 用法：`zipfs seal --backing <shadow 目录> [--seal-chunk 8388608] [--level 19]`。
+    /// 用法：`scrollz seal --backing <shadow 目录> [--seal-chunk 8388608] [--level 19]`。
     /// 须在 backing **未挂载**时跑（每文件临时文件 + 原子 rename）。活跃块 1MiB 换冷归档大块，
     /// 把比值从 ~16x 推向 ~25–30x。读路径无需改（按每文件 footer chunk_size 解块）。
     Seal(SealArgs),
 
     /// 迁移灌入：把源目录流式转成布局 S archive 树（可选逐字节校验）。
     ///
-    /// 用法：`zipfs ingest --src <目录> --backing <dst 树> [--verify] [--chunk-size --level]`。
+    /// 用法：`scrollz ingest --src <目录> --backing <dst 树> [--verify] [--chunk-size --level]`。
     /// 源只读、流式（单文件内存 ~chunk），适合大 jsonl；`--verify` 灌后逐字节比对。
     Ingest(IngestArgs),
 
     /// Claude projects 透明压缩启用器：可逆切换/还原/重挂 + 状态总览 + 自挂载（TUI / 子动作）。
     ///
-    /// 用法：`zipfs enable`（TUI）或 `zipfs enable list|apply|restore|remount|status|purge|autostart`。
+    /// 用法：`scrollz enable`（TUI）或 `scrollz enable list|apply|restore|remount|status|purge|autostart`。
     Enable(EnableArgs),
 
-    /// systemd 托管挂载（内部子命令，由 `zipfs@<inst>.service` 的 ExecStart 调用）。
+    /// systemd 托管挂载（内部子命令，由 `scrollz@<inst>.service` 的 ExecStart 调用）。
     ///
     /// `--name` 取 systemd **实例字符串**（escaped，模板里的 `%i`）；Rust 侧 unescape 回原名，
     /// 读 sidecar meta 自拼挂载参数后复用 `run_mount`。半灌（未提交）拒绝挂载。
     MountManaged(MountManagedArgs),
 
-    /// systemd 托管卸载（内部子命令，供 `zipfs@<inst>.service` 的 ExecStop 调用）。
+    /// systemd 托管卸载（内部子命令，供 `scrollz@<inst>.service` 的 ExecStop 调用）。
     UmountManaged(MountManagedArgs),
 
     /// 按档位卸载某项目挂载（hang-free）：clean/lazy/abort/auto。见 docs/07。
     ///
-    /// 用法：`zipfs umount --name <项目名> [--level clean|lazy|abort|auto]`。
+    /// 用法：`scrollz umount --name <项目名> [--level clean|lazy|abort|auto]`。
     Umount(UmountArgs),
 }
 
@@ -154,7 +154,7 @@ struct MountArgs {
     #[arg(long, default_value_t = DEFAULT_ZSTD_LEVEL)]
     level: i32,
 
-    /// 共享 zstd 字典文件路径（`zipfs train-dict` 产出）。给定则所有块走字典压缩/解压：
+    /// 共享 zstd 字典文件路径（`scrollz train-dict` 产出）。给定则所有块走字典压缩/解压：
     /// 在保持小块（append/RMW 友好、免 redb 膨胀）的同时把 boilerplate 长程冗余补回（T3 研究项）。
     /// **注意**：解压每块都需同一字典——字典文件须与挂载共存、不可丢失（首版由用户保管，未入容器）。
     #[arg(long)]
@@ -261,7 +261,7 @@ fn run_mount_managed(args: MountManagedArgs) -> std::io::Result<()> {
             format!("{e}（systemd 实例 %i={:?} → 解码名 {name:?}）", args.name),
         )
     })?;
-    // 评审 C1 + Task 12 + C-plan1：systemd 开机自启（`ExecStart=zipfs mount-managed --name %i`）由 systemd
+    // 评审 C1 + Task 12 + C-plan1：systemd 开机自启（`ExecStart=scrollz mount-managed --name %i`）由 systemd
     // 直接拉起本进程，**不经** `SystemdMounter::spawn`，故守卫必须在此真正挂载前兜底。underlay 含非白名单
     // fall-through **或** reconcile/undo 半改写窗口（`reconciling` marker 在，undo 尤甚：先改 backing、后还原
     // underlay，underlay 空也不可挂）→ 落 NEEDS-RECONCILE sentinel + 明确 stderr + 以独特码 75 退出
@@ -317,7 +317,7 @@ fn run_umount(args: UmountArgs) -> std::io::Result<()> {
     let mp = paths.mountpoint(name);
     // C1：本命令不 systemctl stop；托管实例（Restart=on-failure）直卸可能与自动重挂竞态。
     eprintln!(
-        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop zipfs@{}.service`；\
+        "提示：若 {name} 由 systemd 托管，请优先 `systemctl --user stop scrollz@{}.service`；\
          本命令仅作强制兜底。",
         scrollz::enable::systemd::systemd_escape(name)
     );
@@ -671,19 +671,19 @@ fn run_compact(args: CompactArgs) -> std::io::Result<()> {
 /// 挂载路径（无子命令）：校验必填挂载参数后按 backend 挂载。
 fn run_mount(args: MountArgs) -> std::io::Result<()> {
     // backend 缺省回退 passthrough（保持原 `default_value_t = Backend::Passthrough` 行为，
-    // 向后兼容 `zipfs --backing ... --mountpoint ...` 不带 --backend 的 P0 透传用法）。
+    // 向后兼容 `scrollz --backing ... --mountpoint ...` 不带 --backend 的 P0 透传用法）。
     let backend = args.backend.unwrap_or(Backend::Passthrough);
     scrollz::core::validate_chunk_size(args.chunk_size)?;
     let backing = args.backing.ok_or_else(|| missing("--backing"))?;
     let mountpoint = args.mountpoint.ok_or_else(|| missing("--mountpoint"))?;
 
     let mut options = vec![
-        MountOption::FSName("zipfs".to_string()),
+        MountOption::FSName("scrollz".to_string()),
         MountOption::Subtype(
             match backend {
-                Backend::Passthrough => "zipfs-passthrough",
-                Backend::Shadow => "zipfs-shadow",
-                Backend::Container => "zipfs-container",
+                Backend::Passthrough => "scrollz-passthrough",
+                Backend::Shadow => "scrollz-shadow",
+                Backend::Container => "scrollz-container",
             }
             .to_string(),
         ),
@@ -714,7 +714,7 @@ fn run_mount(args: MountArgs) -> std::io::Result<()> {
     cfg.clone_fd = threads > 1;
 
     info!(
-        "挂载 zipfs：backend={:?} backing={} -> mountpoint={} chunk_size={} level={} tail_buffer={} threads={}",
+        "挂载 scrollz：backend={:?} backing={} -> mountpoint={} chunk_size={} level={} tail_buffer={} threads={}",
         backend,
         backing.display(),
         mountpoint.display(),
@@ -847,7 +847,7 @@ fn serve_rw(
                 .and_then(|_| std::fs::rename(&tmp, &path))
                 .is_err()
             {
-                eprintln!("[zipfs] 写 metrics 文件失败：{}", path.display());
+                eprintln!("[scrollz] 写 metrics 文件失败：{}", path.display());
             }
             std::thread::sleep(std::time::Duration::from_secs(15));
         });
@@ -869,7 +869,7 @@ fn systemd_watchdog_usec() -> Option<u64> {
 fn missing(flag: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        format!("挂载缺少必填参数 {flag}（或用子命令，如 `zipfs compact ...`）"),
+        format!("挂载缺少必填参数 {flag}（或用子命令，如 `scrollz compact ...`）"),
     )
 }
 
@@ -898,7 +898,7 @@ mod cli_tests {
     #[test]
     fn parses_umount_with_default_level() {
         // 面向用户：RAW project 名（以 - 开头，来自 projects 目录名）；默认档 auto。
-        let cli = Cli::parse_from(["zipfs", "umount", "--name", "-home-xp-src-foo"]);
+        let cli = Cli::parse_from(["scrollz", "umount", "--name", "-home-xp-src-foo"]);
         match cli.command {
             Some(Command::Umount(a)) => {
                 assert_eq!(a.name, "-home-xp-src-foo");
@@ -912,7 +912,7 @@ mod cli_tests {
     fn parses_umount_managed_with_level() {
         // systemd ExecStop：escaped %i（无前导 -）+ 显式档。
         let cli = Cli::parse_from([
-            "zipfs",
+            "scrollz",
             "umount-managed",
             "--name",
             "\\x2dhome\\x2dxp",
@@ -933,7 +933,7 @@ mod cli_tests {
         // hide 只隐藏 help，仍可解析。%i 实例串以 `-` 开头（path-encoded 项目名），故 name arg
         // 须 `allow_hyphen_values`，否则 systemd `--name -home-...` 被 clap 当 flag 拒绝 → unit skip。
         let cli = Cli::parse_from([
-            "zipfs",
+            "scrollz",
             "enable",
             "guard-check",
             "--name",
@@ -954,7 +954,7 @@ mod cli_tests {
     fn parses_enable_guard_check_escaped_name() {
         // 兼容 escaped 形态实例串（含反斜杠 `\x2d`）：clap 同样接受。
         let cli = Cli::parse_from([
-            "zipfs",
+            "scrollz",
             "enable",
             "guard-check",
             "--name",
@@ -976,7 +976,7 @@ mod cli_tests {
         // §10.5：`enable reconcile-undo <name>` 回退最近一次 reconcile（无 flag，仅项目名）。
         // 项目名以 `-` 开头（path-encoded），与 Reconcile 等兄弟同为 positional，故经 `--` 传入。
         let cli = Cli::parse_from([
-            "zipfs",
+            "scrollz",
             "enable",
             "reconcile-undo",
             "--",
