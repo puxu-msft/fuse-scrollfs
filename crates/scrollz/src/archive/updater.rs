@@ -160,6 +160,24 @@ impl<W: BlockIo> ArchiveUpdater<W> {
     /// 追加一条尾日志记录（未封尾块的原始字节增量，docs/04 §8.4）。**不压缩、不动 index**——
     /// fsync 路径调用，成本 O(delta)。首条记录确立 journal 区起点。commit 时写入 SB 的尾日志指针。
     pub fn append_journal(&mut self, raw_delta: &[u8]) -> io::Result<()> {
+        // 恢复后连续性守卫（防 ghost record 复活）：若已有已提交 journal 区，但物理 EOF 与其末端
+        // 不连续（write_cursor != journal_offset + journal_len），说明存在崩溃遗留的未提交 journal
+        // 后缀（ghost）。直接在 EOF 追加会使新记录落在 ghost 之后，而 commit_journal 写的 SB 引用
+        // 从 journal_offset 起的连续前缀 [journal_offset, +journal_len+新记录] 会把 ghost 纳入、
+        // 挤掉新记录 → 静默错误数据。故先把已提交 journal 原始字节（保 record 边界与 CRC）复制到
+        // 当前 EOF，建立新的连续区间，再追加；ghost 留作物理空洞由 compact 回收。append-only + 双 SB
+        // 提交协议保证复制中途崩溃仍回退旧槽（旧 journal_offset 处字节完整），幂等可重试。
+        if let Some(joff) = self.journal_offset {
+            let committed_end = joff + self.journal_len;
+            if self.write_cursor != committed_end {
+                let mut committed = vec![0u8; self.journal_len as usize];
+                read_exact_at(&self.io, &mut committed, joff)?;
+                let new_start = self.write_cursor;
+                self.io.write_at(new_start, &committed)?;
+                self.write_cursor += committed.len() as u64;
+                self.journal_offset = Some(new_start); // journal_len 不变（复制同样已提交字节）
+            }
+        }
         let rec = serialize_journal_record(raw_delta);
         if self.journal_offset.is_none() {
             self.journal_offset = Some(self.write_cursor);
@@ -442,6 +460,119 @@ mod tests {
         assert_eq!(r.chunk_count(), 1);
         assert_eq!(r.footer().uncompressed_size, 8);
         assert_eq!(r.read_block(0).unwrap().unwrap().0, b"AAAAAAAA");
+    }
+
+    #[test]
+    fn ghost_repro_uncommitted_journal_record_revived_after_restart() {
+        // 独立 root-cause：复现 reviewer 报告的 ghost record Critical，走真实文件 open->append->commit 路径。
+        // 崩溃前 append 一条未提交 record（GHOST），重启后 append 等长新 record（FRESH）并提交。
+        // 若有 bug：新 SB 引用 [A][GHOST]（等长 -> CRC 全合法），read_tail 返回 AAAAGGGG 而非 AAAAFFFF。
+        let (_d, path) = build_archive_file(64, &[(b"BLOCK000".to_vec(), false, 8)]);
+
+        // 1) 提交尾日志记录 A。
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        up.append_journal(b"AAAA").unwrap();
+        up.commit_journal().unwrap();
+        drop(up);
+        assert_eq!(
+            ArchiveReader::open(&path).unwrap().read_tail().unwrap().unwrap(),
+            b"AAAA"
+        );
+
+        // 2) append 未提交的 GHOST（与后续 FRESH 等长），模拟 commit_journal 前崩溃。
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        up.append_journal(b"GGGG").unwrap();
+        drop(up); // 不 commit_journal：GHOST 物理落盘但不被任何 SB 引用
+        assert_eq!(
+            ArchiveReader::open(&path).unwrap().read_tail().unwrap().unwrap(),
+            b"AAAA",
+            "未提交 GHOST 不应被读到"
+        );
+
+        // 3) 重启后 append FRESH 并提交。
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        up.append_journal(b"FFFF").unwrap();
+        up.commit_journal().unwrap();
+        drop(up);
+
+        // 4) 读回尾日志：应为已提交的 A+FRESH。
+        let tail = ArchiveReader::open(&path).unwrap().read_tail().unwrap().unwrap();
+        assert_eq!(
+            tail, b"AAAAFFFF",
+            "尾日志应为 A+FRESH；若为 AAAAGGGG 则 ghost record 复活（Critical 确认存在）"
+        );
+    }
+
+    /// 辅助：append 一条记录并提交（模拟一次 fsync）。
+    fn journal_commit(path: &std::path::Path, delta: &[u8]) {
+        let mut up = ArchiveUpdater::open(path).unwrap();
+        up.append_journal(delta).unwrap();
+        up.commit_journal().unwrap();
+    }
+    /// 辅助：append 一条记录但不提交（模拟 commit 前崩溃），留下未提交物理后缀。
+    fn journal_append_no_commit(path: &std::path::Path, delta: &[u8]) {
+        let mut up = ArchiveUpdater::open(path).unwrap();
+        up.append_journal(delta).unwrap();
+        // drop 不 commit
+    }
+    fn read_tail_bytes(path: &std::path::Path) -> Vec<u8> {
+        ArchiveReader::open(path).unwrap().read_tail().unwrap().unwrap()
+    }
+
+    #[test]
+    fn ghost_longer_than_fresh_no_stale_prefix() {
+        // ghost 比新记录长：不得引用 stale 前缀，也不得因范围截在 ghost 中而误 fail-closed。
+        let (_d, path) = build_archive_file(64, &[(b"BLOCK000".to_vec(), false, 8)]);
+        journal_commit(&path, b"AAAA");
+        journal_append_no_commit(&path, b"GGGGGGGG"); // 8 字节 ghost
+        journal_commit(&path, b"FF"); // 2 字节新记录
+        assert_eq!(read_tail_bytes(&path), b"AAAAFF");
+    }
+
+    #[test]
+    fn ghost_shorter_than_fresh_no_corruption() {
+        let (_d, path) = build_archive_file(64, &[(b"BLOCK000".to_vec(), false, 8)]);
+        journal_commit(&path, b"AAAA");
+        journal_append_no_commit(&path, b"GG"); // 2 字节 ghost
+        journal_commit(&path, b"FFFFFFFF"); // 8 字节新记录
+        assert_eq!(read_tail_bytes(&path), b"AAAAFFFFFFFF");
+    }
+
+    #[test]
+    fn torn_ghost_header_then_continue() {
+        // 未提交的是半截 record（只写了部分头/payload），重启继续 append 仍正确。
+        let (_d, path) = build_archive_file(64, &[(b"BLOCK000".to_vec(), false, 8)]);
+        journal_commit(&path, b"AAAA");
+        // 直接在 EOF 手写 3 个裸字节，模拟半截 record（不成完整 header）。
+        {
+            let r = ArchiveReader::open(&path).unwrap();
+            drop(r);
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            use std::os::unix::fs::FileExt;
+            let eof = std::fs::metadata(&path).unwrap().len();
+            f.write_all_at(b"\x01\x02\x03", eof).unwrap();
+            f.sync_all().unwrap();
+        }
+        journal_commit(&path, b"FFFF");
+        assert_eq!(read_tail_bytes(&path), b"AAAAFFFF");
+    }
+
+    #[test]
+    fn multiple_appends_after_recovery_relocate_once_then_contiguous() {
+        // 恢复后连续多次 append：首次触发重定位，之后连续，最终尾日志完整。
+        let (_d, path) = build_archive_file(64, &[(b"BLOCK000".to_vec(), false, 8)]);
+        journal_commit(&path, b"AAAA");
+        journal_append_no_commit(&path, b"GGGG"); // ghost
+        // 一个会话里连续 append 两条再提交。
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        up.append_journal(b"BB").unwrap(); // 触发重定位
+        up.append_journal(b"CC").unwrap(); // 应连续，不再重定位
+        up.commit_journal().unwrap();
+        drop(up);
+        assert_eq!(read_tail_bytes(&path), b"AAAABBCC");
+        // 再次重开继续写，仍正确。
+        journal_commit(&path, b"DD");
+        assert_eq!(read_tail_bytes(&path), b"AAAABBCCDD");
     }
 
     #[test]
