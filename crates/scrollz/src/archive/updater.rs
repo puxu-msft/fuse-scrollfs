@@ -575,6 +575,87 @@ mod tests {
         assert_eq!(read_tail_bytes(&path), b"AAAABBCCDD");
     }
 
+    /// 用内存 RecordingIo 造出「已提交 A + 未提交 ghost」盘面字节（供重定位路径的写计数/崩溃枚举测试）。
+    fn bytes_committed_a_then_ghost() -> Vec<u8> {
+        let base = build_archive(64, &[(b"BLOCK000".to_vec(), false, 8)]);
+        let io = RecordingIo::new(base);
+        let probe = io.clone();
+        let mut up = ArchiveUpdater::from_io(io).unwrap();
+        up.append_journal(b"AAAA").unwrap();
+        up.commit_journal().unwrap(); // 提交 A（进 durable/初始盘面）
+        drop(up);
+        let io2 = RecordingIo::new(probe.image());
+        let probe2 = io2.clone();
+        let mut up2 = ArchiveUpdater::from_io(io2).unwrap();
+        up2.append_journal(b"GGGG").unwrap(); // ghost：物理写，不 commit
+        drop(up2);
+        probe2.image()
+    }
+
+    #[test]
+    fn relocate_happens_only_once_per_recovery() {
+        // Minor 1：证明恢复后首次 append 只重定位一次（复制已提交 journal + 写新记录 = 2 次数据区写），
+        // 第二次 append 只写新记录 1 次、不再重定位——用 RecordingIo 数写次数，堵「每次 append 都复制」的低效实现。
+        let spy = RecordingIo::new(bytes_committed_a_then_ghost());
+        let probe = spy.clone();
+        let mut up = ArchiveUpdater::from_io(spy).unwrap();
+        up.append_journal(b"BB").unwrap();
+        let after_first = probe.writes().len();
+        up.append_journal(b"CC").unwrap();
+        let after_second = probe.writes().len();
+        up.commit_journal().unwrap();
+        drop(up);
+        assert_eq!(
+            after_first, 2,
+            "首次 append 应重定位：复制已提交 journal(1) + 写新记录(1) = 2 次数据区写"
+        );
+        assert_eq!(
+            after_second - after_first,
+            1,
+            "第二次 append 应只写新记录 1 次，不再重定位"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.archive");
+        std::fs::write(&p, probe.image()).unwrap();
+        assert_eq!(read_tail_bytes(&p), b"AAAABBCC");
+    }
+
+    #[test]
+    fn crash_during_relocation_copy_is_idempotent() {
+        // Minor 2：重定位的复制/新写在提交前崩溃，枚举 durable + 脏写任意子集
+        // （neither/copy-only/fresh-only/both），每个崩溃镜像都应仍读到已提交 A（绝不 ghost、不丢 A），
+        // 且重开追加 + 提交后得 AAAAFFFF——把「复制途中崩溃可幂等重试」钉成常驻回归。
+        use crate::blockio::FaultIo;
+        let fio = FaultIo::from_bytes(bytes_committed_a_then_ghost());
+        let probe = fio.clone();
+        let mut up = ArchiveUpdater::from_io(fio).unwrap();
+        up.append_journal(b"FFFF").unwrap(); // 复制 A + 写 FFFF，均为脏写（未 commit_journal → 未 sync）
+        drop(up);
+        let n = probe.dirty_count();
+        assert!(n >= 1, "重定位应产生脏写（复制 + 新记录）");
+        for mask in 0u64..(1u64 << n) {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("a.archive");
+            std::fs::write(&p, probe.crash_with_mask(mask)).unwrap();
+            // 新 commit 未落（无 SB 写、无 sync）→ 活跃 SB 仍指向已提交 A。
+            assert_eq!(
+                read_tail_bytes(&p),
+                b"AAAA",
+                "mask={mask}: 复制/新写未提交，崩溃后必须读到已提交 A（非 ghost、不丢 A）"
+            );
+            // 重试：重开追加 + 提交，最终正确。
+            let mut up2 = ArchiveUpdater::open(&p).unwrap();
+            up2.append_journal(b"FFFF").unwrap();
+            up2.commit_journal().unwrap();
+            drop(up2);
+            assert_eq!(
+                read_tail_bytes(&p),
+                b"AAAAFFFF",
+                "mask={mask}: 重试后应得 AAAAFFFF"
+            );
+        }
+    }
+
     #[test]
     fn updater_after_commit_crc_stays_consistent_reopenable() {
         let (_d, path) = build_archive_file(8, &[(b"AAAAAAAA".to_vec(), false, 8)]);
