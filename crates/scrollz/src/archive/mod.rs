@@ -42,7 +42,9 @@ mod updater;
 mod writer;
 
 pub use format::crc32;
-pub use journal::{replay_journal, serialize_journal_record, JOURNAL_REC_HEADER_LEN};
+pub use journal::{
+    replay_journal, serialize_journal_record, JournalReplay, JOURNAL_REC_HEADER_LEN,
+};
 pub use reader::ArchiveReader;
 pub use superblock::{parse_superblock, pick_active, serialize_superblock, SuperBlock, SB_MAGIC};
 pub use updater::ArchiveUpdater;

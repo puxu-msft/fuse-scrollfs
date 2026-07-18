@@ -20,7 +20,7 @@
 |---|---|---|---|
 | **D-seal-drops-journal**（高） | `seal_file` 只遍历 `0..chunk_count()`，不读尾日志；未满尾块若只存在于 journal，seal 后丢失尾部、`uncompressed_size` 被算小。对照 `compact_file` 已 `read_tail()` 折叠末块。`seal.rs:133-160` vs `compact.rs:95-110` | 与 compact 对齐：seal 流式读完普通块后把 `read_tail()` 明文加入重切缓冲；加「含 journal 的 archive 经 seal 后逐字节不变」回归测试 | ✅ 已修复（含幂等缺口：目标块已达但仍有尾日志 raw 时不再跳过、`max(cur,seal)` 防降级；2 回归测试） |
 | **D-shadow-lost-session**（高） | `commit_session` 先 `sessions.remove(&ino)` 再 open updater/写块/barrier；任一步失败则已移除的 `WriteSession` 不放回，已返回应用的 RMW 写在内存层消失、无法重试。`shadow.rs:352-425` | 已升级为 active/flushing 双缓冲 + 全局 archive commit lock：IO 期间三层读可见，未确认提交失败按操作序合并且 active 新写/截断优先，已确认后 sync 错误只清 flushing；head cache 用 Keep/Set/Clear 显式操作；FaultIo 验证 barrier1 旧盘与 sync#3 新 durable 版本 | ✅ 已修复（含第二轮并发/字段组合审查整改） |
-| **D-journal-corrupt-no-fallback**（中高） | Reader 级联校验只验 journal 物理范围，不验每条 record 可重放；`replay_journal` 遇错只返回最近完整前缀、不报损坏，较新 SB 即使指向 CRC 坏 journal 仍被选中 → 读到截短尾块被补零成错误数据。`reader.rs:151-227`、`journal.rs:22-45` | 让 journal replay 返回「完整消费字节数/错误位置」，纳入 `load_active` 槽可用性校验 | ☐ 待做 |
+| **D-journal-corrupt-no-fallback**（中高） | Reader 级联校验只验 journal 物理范围，不验每条 record 可重放；`replay_journal` 遇错只返回最近完整前缀、不报损坏，较新 SB 即使指向 CRC 坏 journal 仍被选中 → 读到截短尾块被补零成错误数据。`reader.rs:151-227`、`journal.rs:22-45` | `replay_journal` 返回明文与干净消费字节数；`load_active` 只接受 `consumed == tail_journal_len` 的槽，坏新槽回落旧槽、两槽皆坏 fail-closed，且只校验 SB 引用范围以免误拒范围外 torn tail | ✅ 已修复（真实字节翻转、双槽损坏、范围外半写回归测试） |
 
 ## 开放决策门（待触发，详情在 ROADMAP / ADR）
 

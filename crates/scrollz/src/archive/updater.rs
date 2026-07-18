@@ -81,7 +81,7 @@ impl<W: BlockIo> ArchiveUpdater<W> {
         {
             return Err(corrupt("非 v2 archive"));
         }
-        let (sb, active_off, index) = load_active(&io, total_len)?;
+        let (sb, active_off, index, _tail_journal) = load_active(&io, total_len)?;
         let footer = footer_from_sb(&sb);
         // 载入既有 head 缓存字节（越界 → None，可丢弃派生数据 M2）。
         let head_cache = sb.head_cache.and_then(|hc| {

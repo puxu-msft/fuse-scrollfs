@@ -21,8 +21,8 @@ pub struct ArchiveReader {
     file: File,
     footer: Footer,
     index: Vec<ChunkEntry>,
-    /// 未封尾块的尾日志区 `(offset, len)`（无则 None）。`read_tail` 重放它（docs/04 §8.4）。
-    tail_journal: Option<(u64, u64)>,
+    /// open 时已校验并重放的未封尾块原始字节（无则 None）。`read_tail` 复用它（docs/04 §8.4）。
+    tail_journal: Option<Vec<u8>>,
 }
 
 impl ArchiveReader {
@@ -49,12 +49,7 @@ impl ArchiveReader {
         if version != VERSION {
             return Err(corrupt(&format!("不支持的 archive 版本：{version}")));
         }
-        let (sb, _active_off, index) = load_active(&file, total_len)?;
-        let tail_journal = if sb.tail_journal_len > 0 {
-            Some((sb.tail_journal_offset, sb.tail_journal_len))
-        } else {
-            None
-        };
+        let (sb, _active_off, index, tail_journal) = load_active(&file, total_len)?;
         Ok(Self {
             file,
             footer: footer_from_sb(&sb),
@@ -63,15 +58,10 @@ impl ArchiveReader {
         })
     }
 
-    /// 重放尾日志，返回未封尾块的**原始字节**（无未封尾则 None）。区间已在 `load_active` 校验 bounds，
-    /// 故可信。上层把它当作「块 chunk_count」的 verbatim 尾块（docs/04 §8.4）。
+    /// 返回 open 时已校验并重放的未封尾块**原始字节**（无未封尾则 None）。上层把它当作「块
+    /// chunk_count」的 verbatim 尾块（docs/04 §8.4）。
     pub fn read_tail(&self) -> io::Result<Option<Vec<u8>>> {
-        let Some((off, len)) = self.tail_journal else {
-            return Ok(None);
-        };
-        let mut buf = vec![0u8; len as usize];
-        read_exact_at(&self.file, &mut buf, off)?;
-        Ok(Some(replay_journal(&buf)))
+        Ok(self.tail_journal.clone())
     }
 
     /// footer 视图（含 uncompressed_size / chunk_size，供 getattr 复用）。
@@ -129,6 +119,9 @@ impl ArchiveReader {
 
 // ---- v2 superblock / 数据区读取 helper（崩溃安全提交协议，docs/04 §12）----
 
+type LoadedIndex = (Vec<ChunkEntry>, Option<Vec<u8>>);
+type ActiveArchive = (SuperBlock, u64, Vec<ChunkEntry>, Option<Vec<u8>>);
+
 /// 从活跃 superblock 派生 `Footer` 视图（兼容旧调用面）。
 pub(crate) fn footer_from_sb(sb: &SuperBlock) -> Footer {
     Footer {
@@ -149,11 +142,9 @@ fn read_sb_slot(io: &impl BlockIo, off: u64) -> io::Result<Option<SuperBlock>> {
 }
 
 /// 级联校验并加载活跃 superblock：读两槽 → 候选按 seq 降序 → 逐个验证 index（bounds + index_crc +
-/// 块 bounds）→ 取首个通过者，返回 `(活跃 SB, 活跃槽偏移, index)`；两槽皆不可用 → corrupt（M4）。
-pub(crate) fn load_active(
-    io: &impl BlockIo,
-    total_len: u64,
-) -> io::Result<(SuperBlock, u64, Vec<ChunkEntry>)> {
+/// 块 bounds）与已提交 journal 完整性 → 取首个通过者，返回 `(活跃 SB, 活跃槽偏移, index,
+/// 已重放尾日志)`；两槽皆不可用 → corrupt（M4）。
+pub(crate) fn load_active(io: &impl BlockIo, total_len: u64) -> io::Result<ActiveArchive> {
     let mut cands: Vec<(SuperBlock, u64)> = Vec::with_capacity(2);
     if let Some(sb) = read_sb_slot(io, SB_A_OFFSET)? {
         cands.push((sb, SB_A_OFFSET));
@@ -163,8 +154,8 @@ pub(crate) fn load_active(
     }
     cands.sort_by_key(|c| std::cmp::Reverse(c.0.seq)); // seq 降序
     for (sb, off) in cands {
-        if let Some(index) = validate_and_load_index(io, &sb, total_len)? {
-            return Ok((sb, off, index));
+        if let Some((index, tail_journal)) = validate_and_load_index(io, &sb, total_len)? {
+            return Ok((sb, off, index, tail_journal));
         }
     }
     Err(corrupt(
@@ -172,13 +163,14 @@ pub(crate) fn load_active(
     ))
 }
 
-/// 校验并加载某 superblock 的 index 区；任一校验失败 → Ok(None)（让 load_active 回落另一槽）。
-/// io 错误 → Err。校验：chunk_size!=0、index 区 bounds、index_crc、每块在数据区内。
+/// 校验并加载某 superblock 的 index 与尾日志区；任一校验失败 → Ok(None)（让 load_active 回落另一
+/// 槽）。io 错误 → Err。校验：chunk_size!=0、index 区 bounds、index_crc、每块在数据区内、已提交
+/// journal 区 bounds 且每条记录完整通过 CRC 校验。
 fn validate_and_load_index(
     io: &impl BlockIo,
     sb: &SuperBlock,
     total_len: u64,
-) -> io::Result<Option<Vec<ChunkEntry>>> {
+) -> io::Result<Option<LoadedIndex>> {
     if sb.chunk_size == 0 {
         return Ok(None);
     }
@@ -214,8 +206,9 @@ fn validate_and_load_index(
             return Ok(None);
         }
     }
-    // 尾日志区 bounds（docs/04 §8.4）：在 [DATA_START, total_len] 内，使 read_tail 可信。
-    if sb.tail_journal_len > 0 {
+    // 已提交尾日志区必须既在物理 bounds 内，又能恰好重放完整个 SB 引用范围。commit_journal 先
+    // fsync journal 再写 SB，因此引用范围内的消费不足是真损坏；SB 范围外的 torn tail 不参与校验。
+    let tail_journal = if sb.tail_journal_len > 0 {
         let jend = match sb.tail_journal_offset.checked_add(sb.tail_journal_len) {
             Some(v) => v,
             None => return Ok(None),
@@ -223,8 +216,18 @@ fn validate_and_load_index(
         if sb.tail_journal_offset < DATA_START || jend > total_len {
             return Ok(None);
         }
-    }
-    Ok(Some(index))
+        let journal_len = sb.tail_journal_len as usize;
+        let mut journal = vec![0u8; journal_len];
+        read_exact_at(io, &mut journal, sb.tail_journal_offset)?;
+        let replay = replay_journal(&journal);
+        if replay.consumed != journal.len() {
+            return Ok(None);
+        }
+        Some(replay.plain)
+    } else {
+        None
+    };
+    Ok(Some((index, tail_journal)))
 }
 
 /// 读 head 缓存压缩字节，越界/溢出 → None（可丢弃派生数据，M2）。`footer` 提供 index_offset 上界。
@@ -277,7 +280,9 @@ pub(crate) fn serialize_index(index: &[ChunkEntry]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::archive::testutil::{active_sb, build_archive, patch_both_sb};
-    use crate::archive::ArchiveWriter;
+    use crate::archive::{
+        serialize_journal_record, ArchiveUpdater, ArchiveWriter, JOURNAL_REC_HEADER_LEN,
+    };
     use std::io::{Cursor, Write};
 
     /// 把内存缓冲写到临时文件，open 成 ArchiveReader。
@@ -379,6 +384,105 @@ mod tests {
             Ok(_) => panic!("预期 open 失败，却成功了"),
             Err(e) => e,
         }
+    }
+
+    /// 构造一个含一个已封块和两个已提交 journal 版本的 archive，并返回旧、新槽及盘面字节。
+    fn build_two_journal_versions() -> (tempfile::TempDir, Vec<u8>, SuperBlock, SuperBlock) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.archive");
+        {
+            let mut w = ArchiveWriter::create(&path, 64).unwrap();
+            w.append_block(b"sealed-block", true, 12).unwrap();
+            w.finish().unwrap().sync_all().unwrap();
+        }
+        let mut up = ArchiveUpdater::open(&path).unwrap();
+        up.commit().unwrap();
+        up.append_journal(b"old-consistent-").unwrap();
+        up.set_size(27);
+        up.commit_journal().unwrap();
+        up.append_journal(b"new-version").unwrap();
+        up.set_size(38);
+        up.commit_journal().unwrap();
+        drop(up);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let a = parse_superblock(&bytes[SB_A_OFFSET as usize..]).unwrap();
+        let b = parse_superblock(&bytes[SB_B_OFFSET as usize..]).unwrap();
+        let (old, new) = if a.seq < b.seq { (a, b) } else { (b, a) };
+        assert_eq!(new.seq, old.seq + 1);
+        assert!(old.tail_journal_len < new.tail_journal_len);
+        (dir, bytes, old, new)
+    }
+
+    /// 翻转指定槽 journal 最后一条记录的首个 payload 字节，保持物理 bounds 与 SB CRC 不变。
+    fn corrupt_last_committed_journal_record(bytes: &mut [u8], sb: &SuperBlock) {
+        let journal_start = sb.tail_journal_offset as usize;
+        let journal_end = journal_start + sb.tail_journal_len as usize;
+        let mut p = journal_start;
+        let mut last_payload = None;
+        while p < journal_end {
+            let rec_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            let data_start = p + JOURNAL_REC_HEADER_LEN;
+            let data_end = data_start + rec_len;
+            assert!(data_end <= journal_end, "测试 fixture 的 journal 必须完整");
+            last_payload = Some(data_start);
+            p = data_end;
+        }
+        assert_eq!(p, journal_end);
+        bytes[last_payload.unwrap()] ^= 0x80;
+    }
+
+    #[test]
+    fn newer_corrupt_journal_falls_back_to_older_consistent_slot() {
+        let (_dir, mut bytes, old, new) = build_two_journal_versions();
+        corrupt_last_committed_journal_record(&mut bytes, &new);
+
+        let reader = reader_from_bytes(&bytes);
+        assert_eq!(
+            reader.footer().uncompressed_size,
+            old.uncompressed_size,
+            "必须回落旧槽，不能保留新槽逻辑大小后把损坏点之后补零"
+        );
+        assert_ne!(reader.footer().uncompressed_size, new.uncompressed_size);
+        assert_eq!(reader.read_block(0).unwrap().unwrap().0, b"sealed-block");
+        assert_eq!(
+            reader.read_tail().unwrap().as_deref(),
+            Some(b"old-consistent-".as_ref()),
+            "回落后应读到旧槽完整一致版本"
+        );
+    }
+
+    #[test]
+    fn both_slots_with_corrupt_journals_fail_closed() {
+        let (_dir, mut bytes, old, new) = build_two_journal_versions();
+        corrupt_last_committed_journal_record(&mut bytes, &old);
+        corrupt_last_committed_journal_record(&mut bytes, &new);
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&bytes).unwrap();
+        tmp.flush().unwrap();
+        let err = expect_open_err(tmp.path());
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn torn_record_after_committed_journal_range_is_ignored() {
+        let (_dir, mut bytes, _old, new) = build_two_journal_versions();
+        let committed_len = bytes.len();
+        let torn = serialize_journal_record(b"not-committed");
+        bytes.extend_from_slice(&torn[..JOURNAL_REC_HEADER_LEN + 3]);
+
+        let reader = reader_from_bytes(&bytes);
+        assert_eq!(reader.footer().uncompressed_size, new.uncompressed_size);
+        assert_eq!(
+            reader.read_tail().unwrap().as_deref(),
+            Some(b"old-consistent-new-version".as_ref())
+        );
+        assert_eq!(
+            new.tail_journal_offset + new.tail_journal_len,
+            committed_len as u64,
+            "半写记录必须位于已提交 tail_journal_len 之外"
+        );
     }
 
     #[test]
