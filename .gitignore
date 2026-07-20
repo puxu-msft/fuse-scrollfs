@@ -1,0 +1,26 @@
+# zipfs 仓库根 .gitignore（仓库根仍名 zipfs;子目录另有更细规则：crates/、exp/、bench/）
+
+# Rust 构建产物（各 crate 另有 /target，这里兜底）
+target/
+**/target/
+*.rs.bk
+
+# fio / 基准散落的 scratch 数据文件（如 <jobname>.0.0），不应进库
+# 历史上根目录出现过 cal.0.0（fio 默认输出），统一拦在此
+*.0.0
+*.fio.tmp
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 临时 / 日志
+*.log
+/tmp-*
