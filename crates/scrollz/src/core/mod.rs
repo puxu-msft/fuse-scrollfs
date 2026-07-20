@@ -1,0 +1,198 @@
+//! Core 压缩内核占位（P1+ 填充）。
+//!
+//! 设计见 docs/01-scrollz-design.md §3「共享内核」与 §11「模块布局」。
+//! 分块数学 / RMW / codec / inode 属性都在此层，两种磁盘布局（V 容器、S 影子树）共享。
+//! P0 透传阶段不使用本层，仅保留可编译的签名骨架，避免 P1 起步时重新设计接缝。
+//!
+//! P0 阶段大部分尚未 wire-in，故 allow(dead_code)；P1 起逐步去除。
+#![allow(dead_code)]
+
+pub mod blockcache;
+pub mod chunk;
+pub mod codec;
+pub mod inode;
+pub mod metrics;
+pub mod rmw;
+pub mod wsession;
+
+/// 默认逻辑块大小（**1MiB**）。
+///
+/// 实测裁决（`bench/results/dict-chunk-ratio/` + `bench/results/20260628-algo-compare/`）：
+/// 64KiB 是错的——boilerplate 复现间距 p90≈154KiB，64KiB 只逮到 p50 以下，砍掉绝大部分长程冗余
+/// （真实路径 Shadow 仅 5.43x、Container 病态 1.89x）。**1MiB 是实时随机访问块的甜点**
+/// （Shadow zstd-3=13.7x / zstd-19=15.9x；Container 8.8x），更高比值上 2–4MiB。块越大压缩越好、
+/// 写调用越少（写更快）；append 负载下尾块缓冲让 append 成本与块大小无关，故可纯按比值选。
+/// 代价：随机中间写 RMW 需读改写整块（本负载罕见）、`max_write`(128KiB) 拆分（尾缓冲已缓解）。
+/// 仍可 `--chunk-size` 覆盖。原 64KiB 默认（§6.1「不默认 256KiB」）按真实数据退役。
+pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// chunk_size 上限（64 MiB）。块缓冲是 `vec![0u8; chunk_size]`（ingest/RMW/seal 各处），
+/// 用户给的 `--chunk-size` 接近 u32::MAX 会一次性分配数 GB → OOM/DoS。封存最大 8MiB，
+/// 64 MiB 上限远高于任何合理用途，把病态值挡在 CLI 边界（评审：CLI 无 chunk-size 上限）。
+pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
+
+/// chunk_size 下限（64 KiB）。低于此则压缩被击穿——实测裁决（见 [`DEFAULT_CHUNK_SIZE`]）：
+/// boilerplate 复现间距 p90≈154KiB，64KiB 只逮 p50、真实仅 5.43x；4KiB 之类更是灾难
+/// （远低于任何长程冗余间距，压缩比崩、解压块缓存因块 < 内核读粒度而无从命中、块/索引开销爆炸）。
+/// 64KiB 是「仍算文件系统而非退化」的地板（亦 enable TUI 最小预设），**非**推荐值——推荐 1MiB 默认。
+pub const MIN_CHUNK_SIZE: u32 = 64 * 1024;
+
+/// 校验用户给定的 chunk_size：`0` 表"用默认"（调用方自行处理），非 0 则须落在
+/// `[MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]`。过大块缓冲会 OOM；过小则压缩被击穿（见 [`MIN_CHUNK_SIZE`]）。
+pub fn validate_chunk_size(chunk_size: u32) -> std::io::Result<()> {
+    if chunk_size > MAX_CHUNK_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("chunk_size {chunk_size} 超上限 {MAX_CHUNK_SIZE}（64MiB）——过大块缓冲会 OOM"),
+        ));
+    }
+    if chunk_size != 0 && chunk_size < MIN_CHUNK_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "chunk_size {chunk_size} 过小（< {MIN_CHUNK_SIZE}=64KiB）——低于此压缩被击穿、\
+                 解压块缓存失效、块/索引开销爆炸；本项目为会话日志压缩而生，推荐用默认 1MiB"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 默认 zstd 压缩等级（3）。`--level` 可覆盖。
+///
+/// 保持 3 而非 19：活跃写负载下 19 的 CPU 代价 25–100x，比值仅 +13~16%（1MiB/L3=13.7x→L19=15.9x），
+/// 写延迟优先。要更高比值用 `--level 19` 或冷封存（zstd-19 --long，35x，见 algo-compare 结论 #4）。
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
+/// 由 unix 时间戳（秒 + 纳秒）构造 `SystemTime`，负秒按 epoch 处理（罕见）。
+/// 读路径共享：passthrough / shadow attr_from_meta / container 行解码都用它把底层
+/// `meta.mtime()` 等转 FUSE 时间，避免各处重复实现（文件日期不再退化为 1970）。
+///
+/// 用 `checked_add` 防溢出 panic：container `decode` 把**持久化的任意 8 字节**喂进来，
+/// 损坏/极端 secs 不应让 `decode`（返 io::Result）变进程崩溃——溢出回退 epoch。
+pub fn system_time_from(secs: i64, nsec: i64) -> std::time::SystemTime {
+    use std::time::{Duration, SystemTime};
+    if secs < 0 {
+        return SystemTime::UNIX_EPOCH;
+    }
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(
+            secs as u64,
+            nsec.clamp(0, 999_999_999) as u32,
+        ))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// 读取文件的 `(atime, mtime)`，供重写 archive（seal/compact）前捕获、rename 后还原。
+/// 读不到（文件不存在等）返回 `None`，调用方据此跳过还原而不阻断主流程。
+/// 用 `symlink_metadata` 不跟随符号链接，与 [`set_file_times`] 的 NOFOLLOW 语义对齐。
+pub fn read_file_times(
+    path: &std::path::Path,
+) -> Option<(std::time::SystemTime, std::time::SystemTime)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.accessed().ok()?, meta.modified().ok()?))
+}
+
+/// 把 atime/mtime 落到底层文件（`utimensat`，不跟随符号链接，对齐 symlink_metadata 语义）。
+/// epoch 之前的时间 clamp 到 0。ctime 不可由用户态直接设定，故不处理。
+///
+/// 写路径共享：shadow setattr 写回、ingest/seal/compact 重写 archive 后保留源 mtime
+/// （避免挂载点文件时间退化为注入/重写时刻，打乱按时间排序的会话列表）。
+pub fn set_file_times(
+    abs: &std::path::Path,
+    atime: std::time::SystemTime,
+    mtime: std::time::SystemTime,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    fn to_timespec(t: std::time::SystemTime) -> libc::timespec {
+        let (secs, nsec) = match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as libc::time_t, d.subsec_nanos() as i64),
+            Err(_) => (0, 0),
+        };
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: nsec as _,
+        }
+    }
+    let times = [to_timespec(atime), to_timespec(mtime)];
+    let c_path = std::ffi::CString::new(abs.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "路径含 NUL"))?;
+    // SAFETY: c_path 是有效的 NUL 结尾 C 字符串；times 指向本栈上长度为 2 的合法数组。
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// fsync `path` 的父目录，持久化对 `path` 的 create/rename 产生的 dirent。
+///
+/// 崩溃一致性共享点：仅 `fsync(file)` 不保证目录项 durable——崩溃后文件内容在盘、dentry 未落
+/// → 文件整体消失。shadow `create` 新建 archive、seal/compact 的 temp+rename 都必须补这一步
+/// （评审 A1/A2）。失败按 best-effort 处理但**记 warn**（不静默吞错误），因为此时主对象已落盘、
+/// 仅持久化时机受影响，硬失败反而会让 create 误报。
+pub fn fsync_dir_of(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        match std::fs::File::open(parent) {
+            Ok(d) => {
+                if let Err(e) = d.sync_all() {
+                    log::warn!("fsync 父目录 {} 失败：{e}", parent.display());
+                }
+            }
+            Err(e) => log::warn!("打开父目录 {} 以 fsync 失败：{e}", parent.display()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::system_time_from;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn validate_chunk_size_rejects_oversize() {
+        assert!(super::validate_chunk_size(0).is_ok(), "0=用默认，放行");
+        assert!(
+            super::validate_chunk_size(super::MIN_CHUNK_SIZE).is_ok(),
+            "64KiB 地板放行"
+        );
+        assert!(super::validate_chunk_size(super::DEFAULT_CHUNK_SIZE as u32).is_ok());
+        assert!(super::validate_chunk_size(super::MAX_CHUNK_SIZE).is_ok());
+        assert!(
+            super::validate_chunk_size(super::MAX_CHUNK_SIZE + 1).is_err(),
+            "超 64MiB 上限须拒绝（防 OOM）"
+        );
+        assert!(super::validate_chunk_size(u32::MAX).is_err());
+        // 过小须拒绝：4KiB / 8KiB / 63KiB 击穿压缩，不符合会话日志压缩负载（本次修复）。
+        assert!(
+            super::validate_chunk_size(4096).is_err(),
+            "4KiB 须拒绝——压缩被击穿"
+        );
+        assert!(super::validate_chunk_size(8192).is_err(), "8KiB 须拒绝");
+        assert!(
+            super::validate_chunk_size(super::MIN_CHUNK_SIZE - 1).is_err(),
+            "低于 64KiB 地板须拒绝"
+        );
+    }
+
+    #[test]
+    fn system_time_from_maps_valid_and_clamps_extremes() {
+        assert_eq!(
+            system_time_from(100, 500),
+            SystemTime::UNIX_EPOCH + Duration::new(100, 500)
+        );
+        // 负秒 → epoch。
+        assert_eq!(system_time_from(-5, 0), SystemTime::UNIX_EPOCH);
+        // 极端大秒（损坏的容器字节）不得 panic——平台溢出时回退 epoch，否则返某有效时间。
+        let _ = system_time_from(i64::MAX, 0);
+        // 越界 nsec 被 clamp，不 panic（Duration::new 对 >1e9 纳秒会 panic，故须 clamp）。
+        let _ = system_time_from(0, i64::MAX);
+    }
+}

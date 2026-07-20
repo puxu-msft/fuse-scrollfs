@@ -1,0 +1,86 @@
+[package]
+name = "scrollz"
+version = "0.0.0"
+edition = "2021"
+description = "scrollz：自研 Rust FUSE 透明压缩文件系统（P0 透传骨架）"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# P1 起引入 lib：archive 格式 / core / store / 两个 FUSE 前端 / fixture 逻辑都放进 lib，
+# 供 scrollz 主二进制、mkfixture 工具与集成测试共享，避免跨 bin 复制（见 §11）。
+[lib]
+name = "scrollz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scrollz"
+path = "src/main.rs"
+
+# 离线 fixture 工具（§12 P1）：把源目录递归转成布局 S 的 BACKING archive 树。
+# 只读路径「鸡生蛋」：没有写路径却要有可读数据，故独立 bin 离线生成。
+[[bin]]
+name = "mkfixture"
+path = "src/bin/mkfixture.rs"
+
+# 注：append-bench / ratio-bench / ldm-ratio / discovery-bench 四个基准 bin 已迁出到
+# 独立的 `scrollz-bench` crate（crates/scrollz-bench/），依赖本 crate 的公有 lib API，
+# 使产品 crate 的 [[bin]] 只留 scrollz 主程序与 mkfixture 离线工具。
+
+# 故障注入测试门控（docs/05 §6）：`FaultIo` 确定性崩溃模拟器经 `#[cfg(any(test, feature =
+# "fault-injection"))]` 门控。`#[cfg(test)]` 对 tests/ 独立 crate 不可见，集成测试唯一途径是
+# 此 feature；故 Tier 1 集成测试统一带 `--features fault-injection` 运行。
+[features]
+fault-injection = []
+
+[dependencies]
+# default-features = false 关闭 libfuse 链接：本机未装 libfuse3-dev（无 fuse3.pc），
+# 改用 fusermount3 二进制挂载，避免 build 依赖 pkg-config 找不到 fuse3 而失败。
+# 见 docs/01-scrollz-design.md §6.1 积木选型与本机 environment 约束。
+fuser = { version = "0.17", default-features = false }
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+# P1：每块独立 zstd 压缩（布局 S archive 用），见 §3。lz4 留作后续对照（codec::Algo::Lz4）。
+zstd = "0.13"
+# P2/P3：布局 V 容器后端。redb 全包（表 inodes/dirents/blocks），复用其 ACID B-tree
+# 作变长 blob 分配器 + 事务，见 §6.1。写批处理一次 write 多块合并一事务（microbench 8-18x）。
+redb = "4"
+crc32fast = "1.5.0"
+# systemd Type=notify 守护：挂载就绪后发 READY、周期 WATCHDOG（无 systemd 时静默降级）。
+sd-notify = "0.4"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+# per-inode 分片并发表（D4-b）：locks 表从 Mutex<HashMap> 改 DashMap，锁包住 InodeState 数据，
+# entry/remove_if 在同 key 同 shard 锁内串行 → 与旧 std 版「单活锁」不变量等价，且降全表锁争用。
+dashmap = "6"
+# 热路径锁去毒化（C-6）：std 锁单线程持锁 panic 会毒化锁 → 整挂载级联拒服务（DoS）。
+# parking_lot 锁无毒化语义（panic 后正常释放，其他 fuser worker 可继续），lock()/read()/write()
+# 直接返回 guard。仅替换多线程 FUSE 数据/存储热路径的 std 锁，atomic/Arc/OnceLock 保持 std。
+parking_lot = "0.12"
+# 会话重合并（reconcile）解析 Claude jsonl 记录为 serde_json::Value；serde 1.x 已作 redb 传递依赖存在。
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# 集成测试断言 errno（如 hardlink → ENOTSUP）；tests/ 是独立 crate，不继承主依赖。
+libc = "0.2"
+
+# 并发模型检验器（D6）：用 loom 自己的原语穷举线程交错，证明双缓冲提交与锁表引用计数
+# 两个算法的并发骨架正确。仅在 `RUSTFLAGS="--cfg loom"` 下编译（cfg(loom) 门控），
+# 平时 cargo test / 发布构建均不拉取、不编译，零运行期成本。loom 无法插桩
+# parking_lot/DashMap/redb，故 tests/loom_*.rs 用 loom 原语忠实复刻被验证算法骨架，
+# 验证的是算法；生产实现的端到端正确由 D1/D4-b 的确定性回归测试覆盖。
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# 让 rustc 认识 `--cfg loom`（D6 loom 测试用），消除 unexpected_cfgs 警告。
+# 平时不传该 cfg，仅 `RUSTFLAGS="--cfg loom"` 时生效；不影响发布构建。
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# 注：发布构建优化 profile（lto="thin" + codegen-units=1）已上提到 workspace 根 Cargo.toml
+# 的 [profile.release]——workspace 下 profile 只在根生效，member crate 的 [profile.*] 会被忽略。
+# **不设 panic="abort"**：守护进程中单个 FUSE worker panic 不应 abort 整个挂载，保留 unwind。
+
+# P2/P3 引入 redb；lz4_flex / rusqlite 仍留待后续（codec lz4 对照 / 空间敏感备选）。
