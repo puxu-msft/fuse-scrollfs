@@ -1,0 +1,22 @@
+[package]
+name = "scrollz-microbench"
+version = "0.0.0"
+edition = "2021"
+description = "设计闸门 microbench：redb 作为布局 V 容器存变长压缩 chunk blob 并随机更新，性能是否够用？（见 docs/01-scrollz-design.md §6）"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "scrollz-microbench"
+path = "src/main.rs"
+
+[dependencies]
+redb = "4.1.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+clap = { version = "4.6.1", features = ["derive"] }
+tempfile = "3.27.0"
+hdrhistogram = "7.5.4"
+
+# 注：原 [profile.release]（opt-level=3 + lto="thin"）已上提到 workspace 根 Cargo.toml。
+# workspace 下 profile 只在根生效，member crate 的 [profile.*] 会被忽略。opt-level=3 本就是
+# release 默认；lto 交由根 profile 统一。

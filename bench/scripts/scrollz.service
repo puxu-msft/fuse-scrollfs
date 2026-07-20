@@ -1,0 +1,22 @@
+# scrollz systemd user unit — 长期运行 + 崩溃自重挂（生产化，ROADMAP T1）。
+# 安装：cp 到 ~/.config/systemd/user/scrollz.service，改下面 ExecStart 路径，再
+#   systemctl --user daemon-reload && systemctl --user enable --now scrollz
+# WSL（无 systemd 时）改用 /etc/wsl.conf：
+#   [boot]
+#   command = /home/USER/src/scrollz/bench/scripts/scrollz-mount.sh /data/back /mnt/scrollz
+[Unit]
+Description=scrollz transparent-compression FUSE mount (layout S)
+After=local-fs.target
+
+[Service]
+# Type=notify：scrollz 前台运行，挂载就绪后 sd_notify(READY)，崩溃 WatchdogSec 内无心跳即重启。
+Type=notify
+ExecStartPre=/bin/mkdir -p %h/.local/claude-scrollz/back %h/.local/claude-scrollz/mnt
+ExecStart=%h/src/zipfs/target/release/scrollz --backend shadow --backing %h/.local/claude-scrollz/back --mountpoint %h/.local/claude-scrollz/mnt --pid-file %h/.local/claude-scrollz/scrollz.pid
+ExecStop=/usr/bin/fusermount3 -u %h/.local/claude-scrollz/mnt
+WatchdogSec=30
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

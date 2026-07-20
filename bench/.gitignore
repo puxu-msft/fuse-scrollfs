@@ -1,0 +1,28 @@
+# bench 产物忽略规则
+# 原则：原始基准输出（fio JSON/stderr、镜像、运行时 backing）体积大或不可复现，不入库；
+# 但所有 curated 报告（*.md / summary.csv / compression-ratio.txt）必须入库。
+#
+# 注意：用「忽略文件类型」而非「忽略目录」——git 无法在被忽略的目录内反选文件，
+# 旧写法 `results/*/` 会把 CONSOLIDATED.md 等报告一并吞掉。
+
+# fio 原始输出（体积大，仅忽略这两类；报告 .md/.csv/.txt 默认入库）
+results/**/*.json
+results/**/*.stderr
+
+# loop image（btrfs.img 等，体积大）
+*.img
+*.img.*
+
+# fio 工作数据
+fio-work/
+*.fio.tmp
+.run-suite-write-test.*
+
+# 旗舰真实数据集副本（~/.claude/projects 只读副本 = 隐私 + 体积，绝不入库）
+datasets/claude-projects/
+
+# 运行时 backing 与挂载点（FUSE 后端 / btrfs 挂载点等）
+.b0-backing/
+.bs-backing/
+.bv-backing/
+.mnt/
