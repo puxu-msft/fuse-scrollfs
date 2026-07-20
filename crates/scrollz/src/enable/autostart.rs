@@ -1,0 +1,304 @@
+//! 自挂载接线：开机/登录后自动重挂所有已切换项目。
+//!
+//! 两条路径（与 docs/01 §T1 一致）：
+//! - **systemd user**：装 **per-project 模板** `scrollz@.service`（`Type=notify`、`Restart=on-failure`、
+//!   `WatchdogSec`），对每个已提交项目 `systemctl --user enable scrollz@<esc>.service`。单实例 +
+//!   崩溃自动重启 + 监管，根治裸 spawn 孤儿守护（Bug C）。装时迁移掉原名 zipfs 的旧模板、
+//!   实例链接与遗留独立/聚合单元。
+//! - **WSL 无 systemd**：打印 `/etc/wsl.conf` 的 `[boot] command` 片段供用户粘贴（root 文件，**只打印不自动改**）。
+
+use std::io::{self, Write};
+use std::path::Path;
+use std::process::Command;
+
+use crate::enable::model::Paths;
+use crate::enable::systemd::systemd_escape;
+use crate::enable::{discovery, AutostartCmd};
+
+/// 自挂载子动作入口。
+pub fn run(home: &Path, cmd: AutostartCmd) -> io::Result<()> {
+    match cmd {
+        AutostartCmd::Install { all } => {
+            let _ = all; // 模板对每个已提交项目逐一 enable，天然覆盖所有项目。
+            install_systemd(home)
+        }
+        AutostartCmd::Print => {
+            print_wsl_snippet();
+            Ok(())
+        }
+    }
+}
+
+/// per-project 模板单元 `scrollz@.service` 正文。`%i` = systemd 实例字符串（escaped），
+/// `mount-managed`/`umount-managed`/`guard-check` 在 Rust 侧 unescape 回原名。`Type=notify` 依赖守护
+/// 的 sd_notify READY（main.rs serve 路径）；`WatchdogSec` 启用心跳监管；`Restart=on-failure`
+/// 崩溃自愈。
+///
+/// **防 crash-loop 双层守卫（Task 12）**，把「underlay 含停用期回落写」这一需人工的稳定态既 fail-closed
+/// 又不 crash-loop：
+/// - `ExecCondition=... enable guard-check`：在 ExecStart 前显式守卫。underlay 非空时以独特码 75 退出；
+///   `ExecCondition` 控制进程以 1–254 退出使 unit **skipped（非 failed）**，故 `Restart=on-failure` **不触发**
+///   （这是正确的 systemd 原语——`RestartPreventExitStatus` 只作用于**主进程**，对 `ExecStartPre`/`ExecCondition`
+///   控制进程无效，见 systemd.service(5)，故不能用 `ExecStartPre` 承担此职）。
+/// - `RestartPreventExitStatus={guard_exit}`：兜底 **ExecStart 主进程**（`run_mount_managed`）自身的 underlay
+///   守卫——覆盖 `ExecCondition` 通过后到真正挂载之间 underlay 又生回落写的 TOCTOU 窗口；主进程以 75 退出时
+///   本项拦住 Restart（对主进程有效）。两层都指向同一独特码，正确防风暴。
+fn template_unit_body(exe: &Path) -> String {
+    let exe = exe.display();
+    let guard_exit = crate::enable::model::GUARD_CHECK_NEEDS_RECONCILE_EXIT;
+    format!(
+        "# scrollz per-project 托管模板（生成自 `scrollz enable autostart install`）。\n\
+         # 实例名 = systemd-escaped 的 Claude 项目目录名；用 `systemctl --user enable scrollz@<esc>` 接管。\n\
+         [Unit]\n\
+         Description=scrollz transparent-compression mount for Claude project %i\n\
+         After=default.target\n\n\
+         [Service]\n\
+         Type=notify\n\
+         ExecCondition={exe} enable guard-check --name %i\n\
+         ExecStart={exe} mount-managed --name %i\n\
+         ExecStop={exe} umount-managed --name %i --level auto\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         RestartPreventExitStatus={guard_exit}\n\
+         WatchdogSec=30\n\n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
+/// 写 per-project 模板单元并对每个已提交项目 `enable`。无 systemctl → 打印手动指引。
+fn install_systemd(home: &Path) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = home.join(".config").join("systemd").join("user");
+    std::fs::create_dir_all(&dir)?;
+    let unit_path = dir.join("scrollz@.service");
+    std::fs::write(&unit_path, template_unit_body(&exe))?;
+    println!("已写入模板单元 {}", unit_path.display());
+
+    if !which("systemctl") {
+        print_systemd_manual(&unit_path);
+        return Ok(());
+    }
+
+    // 迁移：停用并移除旧品牌模板、实例链接与遗留独立/聚合单元。
+    migrate_legacy_units(&dir);
+
+    run_quiet("systemctl", &["--user", "daemon-reload"]);
+
+    // 对每个已提交（committed）项目 enable 模板实例（崩溃自愈 + 登录自起）。
+    let paths = Paths::resolve(home);
+    let committed = committed_project_names(&paths);
+    if committed.is_empty() {
+        println!("当前无已提交项目；apply 后会自动 enable 对应 scrollz@<name>.service。");
+        println!("（也可手动：systemctl --user enable --now scrollz@<esc>.service）");
+        return Ok(());
+    }
+    for name in &committed {
+        let unit = format!("scrollz@{}.service", systemd_escape(name));
+        match Command::new("systemctl")
+            .args(["--user", "enable", &unit])
+            .status()
+        {
+            Ok(s) if s.success() => println!("已 enable {unit}（{name}）"),
+            _ => println!("enable {unit} 失败，请手动：systemctl --user enable --now {unit}"),
+        }
+    }
+    println!(
+        "立即生效：systemctl --user start scrollz@<esc>.service（或重新登录）。共 {} 个项目。",
+        committed.len()
+    );
+    Ok(())
+}
+
+/// 找出旧品牌的 user unit 文件与 wants 实例链接，供安装时 best-effort 自改名迁移。
+fn legacy_unit_paths(user_unit_dir: &Path) -> Vec<std::path::PathBuf> {
+    fn visit(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                println!("（提示）扫描旧 systemd 单元失败 {}：{e}", dir.display());
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    println!("（提示）读取旧 systemd 单元目录项失败：{e}");
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "zipfs@.service"
+                || name == "zipfs-projects.service"
+                || (name.starts_with("zipfs-") && name.ends_with(".service"))
+                || (name.starts_with("zipfs@") && name.ends_with(".service"))
+            {
+                out.push(path);
+            } else if path.is_dir() {
+                visit(&path, out);
+            }
+        }
+    }
+
+    let mut paths = Vec::new();
+    visit(user_unit_dir, &mut paths);
+    paths
+}
+
+/// 迁移掉旧品牌单元：best-effort 停用旧模板实例/聚合或独立单元，再删模板与 wants 链接。
+/// 仅改 user unit 控制文件，不碰 backing/项目数据；每个失败均输出提示而非静默吞掉。
+fn migrate_legacy_units(user_unit_dir: &Path) {
+    let paths = legacy_unit_paths(user_unit_dir);
+    let mut units: Vec<String> = paths
+        .iter()
+        .filter_map(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+        .filter(|name| name.ends_with(".service") && name != "zipfs@.service")
+        .collect();
+    units.sort();
+    units.dedup();
+    for unit in units {
+        run_quiet(
+            "systemctl",
+            &["--user", "disable", "--now", unit.as_str()],
+        );
+    }
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("已移除旧品牌单元 {}", path.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => println!("（提示）旧品牌单元 {} 删除失败：{e}", path.display()),
+        }
+    }
+}
+
+/// 扫描已提交（committed）项目名（apply 完成、可被 systemd 托管的）。
+fn committed_project_names(paths: &Paths) -> Vec<String> {
+    discovery::scan(paths)
+        .map(|infos| {
+            infos
+                .into_iter()
+                .filter(|i| i.meta.as_ref().map(|m| m.committed).unwrap_or(false))
+                .map(|i| i.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn print_systemd_manual(unit_path: &Path) {
+    println!("未检测到 systemctl。手动：");
+    println!("  systemctl --user daemon-reload");
+    println!("  对每个项目：systemctl --user enable --now scrollz@<systemd-escaped-name>.service");
+    println!("（模板单元已在 {}）", unit_path.display());
+}
+
+/// 打印 WSL `/etc/wsl.conf` 片段（不自动改 root 文件）。
+fn print_wsl_snippet() {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/path/to/scrollz".into());
+    println!("# 把以下片段加入 /etc/wsl.conf（需 root；WSL 无 systemd 时用）：");
+    println!("[boot]");
+    println!("command = {exe} enable remount --all");
+    println!();
+    println!("# 然后在 Windows 侧 `wsl --shutdown` 重启发行版生效。");
+    let _ = io::stdout().flush();
+}
+
+/// PATH 中是否有某可执行（轻量 which）。
+fn which(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn run_quiet(bin: &str, args: &[&str]) -> bool {
+    match Command::new(bin)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            println!("（提示）命令失败：{bin} {}（{status}）", args.join(" "));
+            false
+        }
+        Err(e) => {
+            println!("（提示）命令无法执行：{bin} {}：{e}", args.join(" "));
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_unit_body_has_managed_execstart_and_supervision() {
+        let body = template_unit_body(Path::new("/opt/scrollz/bin/scrollz"));
+        assert!(body.contains("ExecStart=/opt/scrollz/bin/scrollz mount-managed --name %i"));
+        assert!(body.contains("ExecStop=/opt/scrollz/bin/scrollz umount-managed --name %i --level auto"));
+        assert!(body.contains("Type=notify"));
+        assert!(body.contains("Restart=on-failure"));
+        assert!(body.contains("WatchdogSec=30"));
+        assert!(body.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn legacy_unit_names_cover_template_instance_links_and_standalone_units() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in [
+            "zipfs@.service",
+            "default.target.wants/zipfs@demo.service",
+            "zipfs-neighbors.service",
+            "zipfs-projects.service",
+        ] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"legacy").unwrap();
+        }
+        let mut got = legacy_unit_paths(dir.path());
+        got.sort();
+        let mut expected = vec![
+            dir.path().join("default.target.wants/zipfs@demo.service"),
+            dir.path().join("zipfs-neighbors.service"),
+            dir.path().join("zipfs-projects.service"),
+            dir.path().join("zipfs@.service"),
+        ];
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn template_unit_body_has_guard_check_execcondition_and_restart_prevent() {
+        // Task 12：ExecCondition 守卫 + RestartPreventExitStatus 防 crash-loop。ExecCondition（非
+        // ExecStartPre）是关键——控制进程 1–254 退出使 unit skipped 不重启，而 RestartPreventExitStatus
+        // 只对主进程有效，故 ExecStartPre 无法防风暴（systemd.service(5)）。
+        let body = template_unit_body(Path::new("/opt/scrollz/bin/scrollz"));
+        assert!(
+            body.contains("ExecCondition=/opt/scrollz/bin/scrollz enable guard-check --name %i"),
+            "应含 ExecCondition guard-check（而非 ExecStartPre）"
+        );
+        assert!(
+            !body.contains("ExecStartPre="),
+            "不应用 ExecStartPre（RestartPreventExitStatus 对控制进程无效，会 crash-loop）"
+        );
+        assert!(
+            body.contains("RestartPreventExitStatus=75"),
+            "应含 RestartPreventExitStatus=75 拦住主进程 ExecStart 守卫的退出码"
+        );
+        // ExecCondition 必须排在 ExecStart 之前（systemd 按书写顺序执行前置钩子）。
+        let cond = body.find("ExecCondition=").expect("有 ExecCondition");
+        let start = body.find("ExecStart=").expect("有 ExecStart");
+        assert!(cond < start, "ExecCondition 应排在 ExecStart 之前");
+    }
+}
