@@ -1,9 +1,7 @@
 # scrollz 自主改进 harness / Spec
 
-> 状态：**草案 v4，待用户复核**。v1（9c5e1ab）/ v2（6831bda）/ v3（94048c3）经 gpt-souls:reviewer 三轮对抗评审；本版按第三轮的 Stage 1 四项开工阻塞点与 Stage 2 协议断点逐条处置。处置台账见 §十五。
+> 状态：**v5，Stage 1 已判 ready，待用户复核**。v1（9c5e1ab）/ v2（6831bda）/ v3（94048c3）/ v4（d0cda3a）经 gpt-souls:reviewer 四轮对抗评审；第四轮判 Stage 1 四项阻塞点闭合三项，余下的 §5.0 有序派生函数缺口已在本版按其指定修法补齐。处置台账见 §十五。
 > 撰写日期 2026-07-29。本文回答「做什么、为什么」；「怎么做」由后续 [plan.md](./plan.md) 承载。
->
-> 第三轮判定 Stage 1「暂不可开工」，卡四项：①结束点越界到分支/worktree ②缺发布生命周期 ③commit/push main/label/收据未纳入 outbox 与崩溃矩阵 ④`--settings` 是伪协议。本版四项均已收敛（§零、§5.0、§6.1、§9.1、§14）。
 
 ## 零、交付分期（用户 2026-07-29 裁定）
 
@@ -93,22 +91,33 @@ Stage 1 先上线的理由不变：协议复杂度低一个量级，却能立刻
 
 label 是索引不是真值。每轮**先派生状态再路由**。
 
-### 5.0 Stage 1 发布生命周期（评审 R3-02）
+### 5.0 Stage 1 发布生命周期（评审 R3-02 / R4）
 
-分期新增了「Issue 与提案卡联合发布」这一状态机，六维（§5.1）表达不了它——「只有 Issue」「本地已 commit 未 push」「已 push 但无收据」「全部完成」在六维里坍缩成同一个 tuple，Stage 1 的中断因此无法恢复。故 Stage 1 单列：
+分期新增了「Issue 与提案卡联合发布」这一状态机，六维（§5.1）表达不了它——「只有 Issue」「本地已 commit 未 push」「已 push 但无收据」「全部完成」在六维里坍缩成同一个 tuple，Stage 1 的中断因此无法恢复。故 Stage 1 单列。
 
-| 状态 | 判定依据（全部为远端事实） |
-|---|---|
-| `candidate-selected` | outbox 有 `prepared` 的 operation，远端无对应 Issue |
-| `issue-created` | 存在含 `HARNESS-OP:<operation_id>` 的 Issue |
-| `labels-set` | 该 Issue 的 label 集合符合预期 |
-| `proposal-committed-local` | 专用 clone 本地有含 trailer `HARNESS-OP:<operation_id>` 的 commit，远端 main 尚无 |
-| `proposal-published` | **远端 main** 含该 operation 的 commit 或同一 proposal blob |
-| `publication-receipt-complete` | Issue 上存在对应 marker 的发布收据评论 |
-| `closed-by-user` | Issue 被用户关闭 |
-| `inconsistent` | 上述无法唯一判定 |
+判定依据为 **outbox + 本地专用 clone + 远端 GitHub/Git 事实**三者；**完成态必须以远端事实确认**。
 
-关键点：`proposal-published` 必须查**远端** `docs/proposals/<issue>-<slug>.md` 的存在与 operation 绑定，而不是只看本地 commit。
+必须写成**有序派生函数**而非条件表——发布完成后 `issue-created` / `labels-set` / `proposal-published` / `publication-receipt-complete` 会同时为真，无序求值会误落 `inconsistent`：
+
+```
+按优先级求值，命中即停：
+
+0. Issue 已被用户关闭                                    → closed-by-user
+1. 发布收据存在，且其 operation_id、proposal path、
+   远端 main 的 blob/commit 三者全部一致                 → publication-receipt-complete
+2. 远端 main 已含绑定同一 operation_id 的提案卡          → proposal-published
+3. 专用 clone 有绑定同一 operation_id 的本地 proposal
+   commit，且远端 main 尚无                              → proposal-committed-local
+4. Issue 的 label 集合与预期全集一致                     → labels-set
+5. 存在绑定 operation_id 的 Issue                        → issue-created
+6. outbox 有 prepared 的 operation，远端无对应 Issue      → candidate-selected
+7. 其余组合，或任何绑定冲突                              → inconsistent
+```
+
+两处精度要求：
+
+- **`proposal-published` 必须查远端** `docs/proposals/<issue>-<slug>.md` 的存在与 operation 绑定，不能只看本地 commit。
+- **`publication-receipt-complete` 不能只验收据 marker 存在**，必须同时校验收据绑定的 `operation_id`、proposal path 与已观察到的远端 main commit/blob 一致；否则一条过早写入或陈旧的收据会把「尚未发布」误判为完成。
 
 ### 5.1 正交事实维度（Stage 2）
 
@@ -378,7 +387,7 @@ Stage 1 没有「实际开发选择」，按开发选择计算的软配额在此
 
 ### 14.1 状态派生函数
 
-- **Stage 1**：穷举 §5.0 发布生命周期的可达状态与远端事实组合，断言中断后能唯一恢复（尤其区分「只有 Issue」「本地已 commit 未 push」「已 push 未写收据」「已完成」）。
+- **Stage 1**：穷举 §5.0 的**底层布尔事实**（而非直接穷举八个已命名状态）的全组合，断言该有序函数对每个组合恰好产生一个结果；重点覆盖「只有 Issue」「本地已 commit 未 push」「已 push 未写收据」「收据存在但绑定不一致」「已完成」的可区分性。
 - **Stage 2**：property-based test 穷举 §5.1 六维度全组合，断言每组合恰好命中一条判定、无重叠无遗漏，非规范组合唯一落到 `needs-human-reconciliation`。
 
 ### 14.2 崩溃点矩阵（从 §六 的 operation registry **自动生成**，非手写）
