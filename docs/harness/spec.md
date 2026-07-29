@@ -1,7 +1,7 @@
 # scrollz 自主改进 harness / Spec
 
-> 状态：**v5，Stage 1 已判 ready，待用户复核**。v1（9c5e1ab）/ v2（6831bda）/ v3（94048c3）/ v4（d0cda3a）经 gpt-souls:reviewer 四轮对抗评审；第四轮判 Stage 1 四项阻塞点闭合三项，余下的 §5.0 有序派生函数缺口已在本版按其指定修法补齐。处置台账见 §十五。
-> 撰写日期 2026-07-29。本文回答「做什么、为什么」；「怎么做」由后续 [plan.md](./plan.md) 承载。
+> 状态：**v6，Stage 1 已判 ready，待用户复核**。v1（9c5e1ab）/ v2（6831bda）/ v3（94048c3）/ v4（d0cda3a）/ v5（36f1a8b）经 gpt-souls:reviewer 四轮对抗评审；v6 按用户 2026-07-30 的仓库内布局偏好与 Web UI 规划调整配置。处置台账见 §十五。
+> 撰写日期 2026-07-29，末次修订 2026-07-30。本文回答「做什么、为什么」；「怎么做」由后续 [plan.md](./plan.md) 承载。
 
 ## 零、交付分期（用户 2026-07-29 裁定）
 
@@ -45,6 +45,9 @@ Stage 1 先上线的理由不变：协议复杂度低一个量级，却能立刻
 | GitHub 写身份 | **专用 fine-grained PAT**（属 `puxu-msft`，仅本仓库 Contents/Issues/Pull requests: write + Metadata: read），存仓库外，systemd 注入 `GH_TOKEN` | 现 `gh` 账号 `puxu_microsoft` 对本仓库仅 READ（已实测），跑不通状态机 |
 | 生产数据隔离 | **不做 OS 级隔离**（用户裁定「无需隔离」） | 改以 §九 确定性纵深防线替代；OS 隔离降为 optional，见 §十五 |
 | 交付方式 | **分两阶段**（§零） | |
+| 目录布局 | **仓库内**：`.claude/{agents,rules,scripts,skills,workflows}`、`.worktree/<task>`、`docs/`（用户 2026-07-30 偏好） | 取代早期的「仓库外专用 clone」方案，隔离目标不变（§四） |
+| 运行时状态 | **SQLite**（`.claude/state/harness.db`），控制器用 **Python 3** | 由 Web UI 规划倒推（§十六、§十七） |
+| Web UI | **Stage 3，后续另开 spec**；现在只保证不堵路 | 用户 2026-07-30 提出 |
 
 ## 三、实测环境事实（影响设计，非假设）
 
@@ -64,28 +67,35 @@ Stage 1 先上线的理由不变：协议复杂度低一个量级，却能立刻
 
 | 层 | 实体 | 可信度 | 职责 |
 |---|---|---|---|
-| **控制面** | 可信控制器（`scripts/harness/`，非模型） | 可信 | 单例锁、启动预检、预算预留、GitHub 查询与状态派生、模式路由、凭据持有、Issue/分支/worktree 生命周期、diff 白名单与红线 gate、commit/push/开 PR、label 迁移、outbox 事务、熔断与记账 |
+| **控制面** | 可信控制器（`.claude/scripts/harness/`，非模型） | 可信 | 单例锁、启动预检、预算预留、GitHub 查询与状态派生、模式路由、凭据持有、Issue/分支/worktree 生命周期、diff 白名单与红线 gate、commit/push/开 PR、label 迁移、outbox 事务、熔断与记账 |
 | **编排面** | `.claude/workflows/scrollz-*.js` | 半可信（顺序确定，内容不可信） | 固定 agent 调用顺序与 barrier，收集结构化结果 |
 | **执行面** | agent（finder / judge / implementer / reviewer） | **不可信** | 只产出结构化主张与工作区改动；**不持凭据、不 push、不改 label、不开 PR** |
 
 **铁律：任何状态迁移只能由控制器在重新查证事实之后执行。**
 
-组件位置：
+组件位置（**用户偏好的仓库内布局**）：
 
 | 组件 | 位置 |
 |---|---|
 | 定时器与单例闸 | `~/.config/systemd/user/scrollz-harness.{timer,service}`（固定 PATH，绝对路径） |
-| 可信控制器 | `scripts/harness/`（随仓库版本化） |
+| 可信控制器 | `.claude/scripts/harness/`（随仓库版本化） |
 | 轮次入口 skill | `.claude/skills/scrollz-round/SKILL.md` |
 | Workflow 脚本 | `.claude/workflows/scrollz-{propose,implement,review}.js` |
+| harness 专用 agent 定义 | `.claude/agents/`（finder-* / judge-* / implementer / reviewer） |
+| harness 专用规则 | `.claude/rules/`（注入 agent 的不可信输入纪律、红线纪律等） |
+| harness 会话 settings | `.claude/harness-settings.json` |
 | 红线清单 | `docs/harness/redlines.yaml` |
-| 专用 settings | `.claude/harness-settings.json`（只给 harness 会话用） |
-| 测试 launcher | 控制器持有、**仓库外**、agent 不可修改 |
-| harness 工作区 | 专用 clone `~/src/scrollz-harness/`（不复用用户开发目录） |
-| 开发 worktree | `~/src/scrollz-harness-wt/<issue>-<slug>`（Stage 2） |
-| outbox / ledger | `~/.local/state/scrollz-harness/`（durable，见 §六） |
+| 运行时状态（outbox / ledger） | `.claude/state/harness.db`（SQLite，**gitignore**） |
+| 发布工作区 | `.worktree/_publish`（detached at `origin/main`） |
+| 开发 worktree | `.worktree/<issue>-<slug>`（Stage 2，**gitignore**） |
+| 测试 launcher | 控制器持有、**仓库外**、agent 不可修改（Stage 2） |
+| PAT | `~/.config/scrollz-harness/env`（仓库外，`chmod 600`） |
 
-**关于专用 clone**：用户开发目录 `/home/xp/src/zipfs` 随时有未提交改动与并行会话（现场已实测存在）。harness 在那里 pull/commit/清 worktree 会误带他人变更或删掉别人的对象。专用 clone 提交的仍是同一 `main`、推同一远端——「在主树留文档」的语义不变，只是换了物理工作区。
+`.gitignore` 需追加：`.worktree/`、`.claude/state/`。
+
+**发布工作区为何是 detached**：git 不允许两个 worktree 同时检出同一分支，而用户主工作区已占用 `main`。故 `.worktree/_publish` 停在 detached `origin/main`，提交后以 `git push origin HEAD:main` 发布。这既满足仓库内布局偏好，又拿到独立 index——**不会碰主工作区的未提交改动**（评审 C-05 的目标不变，实现手段由「专用 clone」改为「detached worktree」）。控制器每轮开始前 `git fetch` 并把 `_publish` 重置到最新 `origin/main`。
+
+**运行时状态存 SQLite** 而非纯日志文件：一方面满足 §六 durable intent 的原子更新与崩溃恢复要求，另一方面为未来的 Web UI（§十七）提供可直接只读查询的数据源，避免届时再补一层导出。
 
 ## 五、状态：事实派生函数
 
@@ -95,7 +105,7 @@ label 是索引不是真值。每轮**先派生状态再路由**。
 
 分期新增了「Issue 与提案卡联合发布」这一状态机，六维（§5.1）表达不了它——「只有 Issue」「本地已 commit 未 push」「已 push 但无收据」「全部完成」在六维里坍缩成同一个 tuple，Stage 1 的中断因此无法恢复。故 Stage 1 单列。
 
-判定依据为 **outbox + 本地专用 clone + 远端 GitHub/Git 事实**三者；**完成态必须以远端事实确认**。
+判定依据为 **outbox + 本地发布工作区 + 远端 GitHub/Git 事实**三者；**完成态必须以远端事实确认**。
 
 必须写成**有序派生函数**而非条件表——发布完成后 `issue-created` / `labels-set` / `proposal-published` / `publication-receipt-complete` 会同时为真，无序求值会误落 `inconsistent`：
 
@@ -106,7 +116,7 @@ label 是索引不是真值。每轮**先派生状态再路由**。
 1. 发布收据存在，且其 operation_id、proposal path、
    远端 main 的 blob/commit 三者全部一致                 → publication-receipt-complete
 2. 远端 main 已含绑定同一 operation_id 的提案卡          → proposal-published
-3. 专用 clone 有绑定同一 operation_id 的本地 proposal
+3. `.worktree/_publish` 有绑定同一 operation_id 的本地 proposal
    commit，且远端 main 尚无                              → proposal-committed-local
 4. Issue 的 label 集合与预期全集一致                     → labels-set
 5. 存在绑定 operation_id 的 Issue                        → issue-created
@@ -195,7 +205,7 @@ GitHub labels API **没有通用 compare-and-set**，replace-all 在读后写之
 
 ### Phase A · 控制器：预检 → 预算预留 → 派生 → 路由
 
-**启动硬预检**（任一失败 fail closed，不起模型、不烧钱）：`GH_TOKEN` 对本仓库 `viewerPermission >= WRITE`；`git ls-remote` 可达；专用 clone 干净；无 `harness:paused` 哨兵；`claude`/`cargo` 绝对路径可执行；outbox 无未决且无法判定的 operation。
+**启动硬预检**（任一失败 fail closed，不起模型、不烧钱）：`GH_TOKEN` 对本仓库 `viewerPermission >= WRITE`；`git ls-remote` 可达；`.worktree/_publish` 干净且已重置到最新 `origin/main`；无 `harness:paused` 哨兵；`claude`/`cargo` 绝对路径可执行；outbox 无未决且无法判定的 operation。
 
 **预算预留**（评审 R2-07）：调用 `claude` **之前**原子预留本轮最大预算并落盘，事后按实际成本结算；结果未知时按最坏上限计费直到对账成功。熔断计数同样在尝试开始前落盘。否则「崩溃 → 重启 → 再花一次」可无限越过日预算。
 
@@ -261,7 +271,7 @@ remaining_grant = round_reserved - settled_cost - outstanding_worst_case
 
 ## 八、收尾模式
 
-1. 专用 clone `git pull`（merge，不 rebase）。
+1. `.worktree/_publish` fetch 后重置到最新 `origin/main`（merge 语义，不 rebase）。
 2. 更新 [ROADMAP.md](../ROADMAP.md) / [CHANGELOG.md](../CHANGELOG.md) / [TRACKING.md](../TRACKING.md)。
 3. 提案卡移入 `docs/proposals/archive/`。
 4. **校验 owner marker 后**删远端分支与 worktree；marker 不符则跳过并告警。
@@ -417,7 +427,7 @@ Stage 1 没有「实际开发选择」，按开发选择计算的软配额在此
 | R1 C-02 headless 权限 | 采纳并在 R2-04 后加强（§9.1） | Stage 1 |
 | R1 C-03 OS 隔离 | **降档保留**：用户裁定不做；改以 §9.2 确定性防线替代。触发重议的条件——出现一次真实生产数据事故或误触 | — |
 | R1 C-04 可信控制器 | 采纳（§四、§七） | Stage 1 |
-| R1 C-05 专用 clone | 采纳（§四） | Stage 1 |
+| R1 C-05 不污染用户工作区 | 采纳（§四）；实现手段按用户布局偏好由「专用 clone」改为 `.worktree/_publish` detached worktree | Stage 1 |
 | R1 I-06 双层超时 | 采纳（§十一.1） | Stage 1 |
 | R1 I-07 事实对账 | 采纳并按 R2-02 重做为派生函数（§五） | Stage 2（Stage 1 只需退化版） |
 | R1 I-08 收尾饥饿与基线漂移 | 采纳（§5.2 第 4 条、§七模式 1） | Stage 2 |
@@ -461,5 +471,21 @@ Stage 1 没有「实际开发选择」，按开发选择计算的软配额在此
 
 - `claude -p` 后台等待的真实上限与退出码形态——Round 0 实测。
 - 具体数值：每轮 token/美元预算、重试次数、熔断阈值 N、队列上限、skip 数阈值、lane 配额窗口 N——先给保守硬上限，实测后只调优不新建。
-- 控制器实现语言：shell 脚本 vs 小型 Rust bin（后者可复用 workspace 与类型化 GitHub 客户端）——由 plan 定。
-- outbox 存储：SQLite WAL vs append-only journal + fsync + checksum——需求是 durable intent + 原子更新 + 崩溃恢复，技术选型由 plan 定。
+
+**已从开放项转为裁定**（因 §十七 Web UI 与仓库内布局偏好）：
+
+- **outbox / ledger 存储 = SQLite**（WAL）。它同时满足 durable intent 的原子更新与崩溃恢复，以及 Web UI 的只读查询；落 `.claude/state/harness.db`，gitignore。
+- **控制器实现语言 = Python 3**（标准库 `sqlite3`，GitHub 访问经 `gh`）。理由：无构建步骤、状态机与 SQL 直写、未来 Web UI 可复用同一进程与数据层；相对 Rust bin 少一层编译与 workspace 耦合，相对 shell 多了可测试性与结构化数据处理能力。此裁定可在 plan 阶段以实测理由推翻。
+
+## 十七、未来阶段：Web UI（Stage 3，用户 2026-07-30 提出）
+
+用户希望后续配套 Web UI。本 spec 不展开其设计，但**现在就要保证不把路堵死**，故已产生两条前置约束（见 §十六）：状态存 SQLite、控制器用 Python。
+
+预期形态与边界：
+
+- **只读优先**：仪表盘展示轮次流水（round_id / mode / 耗时 / 成本 / turns / 结果）、提案队列与 lane 分布、状态派生结果、outbox 未决 operation、预算与熔断状态、质量指标趋势。数据源就是 `.claude/state/harness.db` + GitHub 事实缓存，不新增真值源。
+- **写操作一律回流 GitHub**：即使将来加「暂停」「否决提案」「立即起一轮」等按钮，其效果也必须落成 GitHub 上的对象（`harness:paused` 哨兵 Issue、关闭 Issue、label 变更）或控制器的 outbox operation，**不得**在 Web 层另建一份状态。理由与 §四 铁律一致——真值只能有一处，且用户在网页与手机上的手动干预必须与 Web UI 看到的是同一份事实。
+- **不暴露凭据**：PAT 只在控制器进程环境，Web 层不读取、不转发。
+- **本地绑定**：默认只监听 loopback；如需远程访问由用户自行决定方式，不在 harness 内置认证。
+
+触发条件：Stage 1 稳定运行、积累了足够轮次数据之后再启动设计（届时另开 spec）。
