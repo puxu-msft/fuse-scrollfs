@@ -1,295 +1,324 @@
 # scrollz 自主改进 harness / Spec
 
-> 状态：**草案 v2，待用户复核**。v1（9c5e1ab）经 gpt-souls:reviewer 对抗评审判定 needs-rework，本版按 Critical 5 / Important 11 / Minor 1 逐条处置后重写；处置结论见 §十四。
+> 状态：**草案 v3，待用户复核**。v1（9c5e1ab）与 v2（6831bda）分别经 gpt-souls:reviewer 两轮对抗评审判定 needs-rework；本版按第二轮 Critical 4 / Important 7 / Minor 1 逐条处置，并加入实测环境事实。处置台账见 §十五。
 > 撰写日期 2026-07-29。本文回答「做什么、为什么」；「怎么做」由后续 [plan.md](./plan.md) 承载。
+
+## 零、交付分期（用户 2026-07-29 裁定）
+
+| 阶段 | 范围 | 副作用面 | 需要的协议强度 |
+|---|---|---|---|
+| **Stage 1 · 只扫描** | 发现候选 → 对抗裁决 → 建 Issue + 提案卡推 main。**不开发、不开 PR、不建 worktree** | 建 Issue、加 label、提交 `docs/proposals/`、push main | 建 Issue 幂等 + 预算预留 + 权限隔离 + 队列治理 |
+| **Stage 2 · 开发轮** | 全流程：选题 → 实现 → 评审 → PR → 收尾 | 上述 + 分支 / worktree / PR / 多次状态迁移 / 删除清理 | 完整 outbox 事务 + 状态派生函数 + 崩溃点矩阵 + CI 激活门 |
+
+Stage 1 先上线的理由：它的副作用只有「建对象」没有「改与删」，协议复杂度低一个量级，却能立刻暴露最不确定的东西——**选题质量**。若 finder/judge 产出的提案不值得做，后面所有工程都白搭。Stage 2 的设计在本 spec 中同样完整给出，不因分期而削减（§十五记录哪些条目属 Stage 2 才生效）。
 
 ## 一、目标与问题陈述
 
-让本项目在**无人值守**状态下持续自我推进：定时起一轮，agent 自己找到可行的下一步改进、在主分支留下提案文档、去独立 worktree 开发、提起 PR；用户只在 GitHub 上审阅并合并；合并后由后续轮次自动收尾（回收文档状态、更新 ROADMAP/CHANGELOG、清理分支与 worktree）。
+让本项目在**无人值守**状态下持续自我推进：定时起一轮，agent 自己找到可行的下一步改进、在主分支留下提案文档、去独立 worktree 开发、提起 PR；用户只在 GitHub 上审阅并合并；合并后由后续轮次自动收尾。
 
 要解决的五个真问题：
 
-1. **选题质量**——无人值守下没人拦住 agent 挑伪需求、重复已完成项、或踩已冻结的设计红线。
+1. **选题质量**——没人拦住 agent 挑伪需求、重复已完成项、踩已冻结的设计红线。
 2. **上下文耗尽**——长循环会话必然撑爆上下文，靠「写交接文档」只是缓解。
 3. **中断韧性**——网络/进程中断随时可能发生，任何一轮都必须能被下一轮无损接续。
 4. **状态可信**——模型的自我报告（「我推了分支」「测试绿了」）不能直接作为状态迁移依据。
 5. **不失控**——失败要有预算和熔断，成本要有硬上限，队列不能无界膨胀，提案质量不能随时间静默退化。
 
-## 二、已裁定决策（用户 2026-07-27/29 裁定，本 spec 视为前提，不再重开）
+## 二、已裁定决策
 
 | 维度 | 裁定 | 备注 |
 |---|---|---|
 | 驱动方式 | **无人值守循环** | 非手动起轮 |
 | 循环载体 | **headless 每轮一个新进程**（systemd user timer + `claude -p`） | 从根上消除上下文累积 |
-| 编排载体 | **内置 `Workflow` 工具** 承载模型侧编排 | 用户明确要求先建 agent workflow |
-| 控制面 | **确定性可信控制器**承载全部副作用与状态迁移（评审 C-04） | Workflow 降权为「只产出结构化结果」 |
-| 提案队列真值源 | **GitHub**（Issue/PR/branch/commit 联合对账），label 只作索引 | 手机/网页可见完整队列 |
-| 提案文档落点 | **新建 `docs/proposals/`** 轻量提案卡；中大型再升级 `docs/plan/<topic>.md` | 不冲淡现有 plan/ |
-| 节拍 | **30 分钟一轮，最多 5 个在飞 PR** | 满 5 后自动降为「只扫描写提案」 |
-| 选题边界 | 已登记待办（ROADMAP/TRACKING/BACKLOG） + 允许发现新问题 + 允许卫生型改进；**不碰冻结红线** | 红线项只允许开 Issue 提请用户裁决 |
-| GitHub Actions CI | **要建**，先跑 PoC 探清 runner 能力边界；且 CI 门是**开闸前提**而非并行子项（评审 I-09） | 无人值守 PR 的可信凭据 |
-| 分支策略 | **merge-based**：主分支用 merge 回收，不做 rebase 纪律 | 允许大量 merge 提交 |
-| GitHub 写身份 | **专用 fine-grained PAT**（属 `puxu-msft`，只授本仓库 Contents/Issues/Pull requests: write + Metadata: read），存仓库外，systemd 以 `GH_TOKEN` 注入 | 现有 `gh` 账号 `puxu_microsoft` 对本仓库仅 READ，跑不通状态机（评审 C-01，已实测确认） |
-| 生产数据隔离 | **不做 OS 级隔离**（用户 2026-07-29 裁定「无需隔离」） | 评审 C-03 的专用 Unix 用户 / 独立 HOME / mount namespace 降为 optional 硬化项保留，见 §十四 |
+| 编排载体 | **内置 `Workflow` 工具**（已核实存在；skill 指令调用它属合法 opt-in 路径） | 承载模型侧编排 |
+| 控制面 | **确定性可信控制器**独占全部副作用与状态迁移 | Workflow 降权为「只产出结构化结果」 |
+| 队列真值源 | **GitHub 事实**（Issue/PR/branch/commit 联合派生），label 只作索引 | 网页/手机可见 |
+| 提案文档落点 | **新建 `docs/proposals/`**；中大型再升级 `docs/plan/<topic>.md` | 不冲淡现有 plan/ |
+| 节拍 | **30 分钟一轮，最多 5 个在飞 PR** | 满 5 后降为只扫描 |
+| 选题边界 | 已登记待办 + 允许发现新问题 + 允许卫生型改进；**不碰冻结红线** | 红线项只允许开 Issue 提请裁决 |
+| CI | **要建**，先 PoC 探边界；CI 门是 **Stage 2 的激活门** | 无人值守 PR 的可信凭据 |
+| 分支策略 | **merge-based**，不做 rebase 纪律 | 允许大量 merge 提交 |
+| GitHub 写身份 | **专用 fine-grained PAT**（属 `puxu-msft`，仅本仓库 Contents/Issues/Pull requests: write + Metadata: read），存仓库外，systemd 注入 `GH_TOKEN` | 现 `gh` 账号 `puxu_microsoft` 对本仓库仅 READ（已实测），跑不通状态机 |
+| 生产数据隔离 | **不做 OS 级隔离**（用户裁定「无需隔离」） | 改以 §九 确定性纵深防线替代；OS 隔离降为 optional，见 §十五 |
+| 交付方式 | **分两阶段**（§零） | |
 
-## 三、架构总览
+## 三、实测环境事实（影响设计，非假设）
 
-### 3.1 三层结构
+| 事实 | 影响 |
+|---|---|
+| `gh` API 身份 `puxu_microsoft` 对本仓库 `viewerPermission=READ`；git SSH 身份是 `puxu-msft`（可推） | 两条身份链分裂，必须用专用 PAT 统一 API 写权限 |
+| 用户级 `~/.claude/settings.json` 含 **332 条 `Bash(...)` 授权**，并允许 `mcp__plugin_serena_serena__execute_shell_command` 等可执行 shell 的 MCP 工具 | permission 作用域会合并；「在项目里写最小 allow」**不成立**，必须隔离 setting sources 并禁用 MCP |
+| systemd user `PATH` = 系统默认，**不含** `~/.local/bin`（`claude`）与 `~/.cache/cargo/bin`（`cargo`/`rustc`） | service 必须固定 `Environment=PATH=` 或用绝对路径，否则永久卡在预检 |
+| systemd user 环境含 `SSH_AUTH_SOCK`（gpg-agent） | agent 只要能跑 `git` 就能用你的 SSH 身份直接 push，绕过「凭据只在控制器」 |
+| `Workflow` 脚本内有 `budget` 全局（`total`/`spent()`/`remaining()`），超限时 `agent()` 抛错 | 每轮预算可在脚本内硬收敛，优于只靠外部 `--max-budget-usd` |
+| `Workflow` 的 `agent()` 支持 `agentType` | 裁决/评审阶段可点名 `gpt-souls:*` 做跨模型对抗，避免同模型自查盲区 |
+| `Workflow` 并发上限 `min(16, cores-2)`，本机 20 核 → 16；建议单轮 <15 agent | §六 的 agent 数上限依此 |
+| 交互式认证的 MCP server 在 headless/cron 下可能不可用 | 设计不得依赖任何 MCP |
+| 远端 main **无 branch protection**，且专用 PAT 无 Administration 权限 | 「required check」需 owner 一次性配置并留激活收据，否则术语要改口径（§十一） |
 
-评审 C-04 指出的核心问题：Workflow 的「确定性」只保证**调用顺序**，不保证**副作用正确**，也不保证 agent 的自述属实；而 v1 把最关键的状态盘点与模式路由放在 Workflow 之外由模型自由完成，自相矛盾。v2 拆成三层，信任逐层递减：
+## 四、架构：三层信任
 
 | 层 | 实体 | 可信度 | 职责 |
 |---|---|---|---|
-| **控制面** | 可信控制器（`scripts/harness/` 下的确定性程序，非模型） | 可信 | 单例锁、启动预检、GitHub 查询与对账、模式路由、凭据持有、worktree 生命周期、diff 路径白名单校验、commit/push/开 PR、label 原子迁移、预算与熔断、记账 |
-| **编排面** | `.claude/workflows/scrollz-round.js` | 半可信（顺序确定，内容不可信） | 固定 agent 调用顺序与 barrier，收集结构化结果 |
-| **执行面** | 各 agent（finder / judge / implementer / reviewer） | **不可信** | 只产出结构化主张与工作区改动；**不持有 GitHub 凭据，不执行状态迁移** |
+| **控制面** | 可信控制器（`scripts/harness/`，非模型） | 可信 | 单例锁、启动预检、预算预留、GitHub 查询与状态派生、模式路由、凭据持有、Issue/分支/worktree 生命周期、diff 白名单与红线 gate、commit/push/开 PR、label 迁移、outbox 事务、熔断与记账 |
+| **编排面** | `.claude/workflows/scrollz-*.js` | 半可信（顺序确定，内容不可信） | 固定 agent 调用顺序与 barrier，收集结构化结果 |
+| **执行面** | agent（finder / judge / implementer / reviewer） | **不可信** | 只产出结构化主张与工作区改动；**不持凭据、不 push、不改 label、不开 PR** |
 
-**铁律：任何状态迁移只能由控制器在重新查证事实之后执行。** agent 说「我推了分支」，控制器去 `git ls-remote` 查；agent 说「测试绿了」，控制器查退出码、测试数、skip 数与被测 SHA。
+**铁律：任何状态迁移只能由控制器在重新查证事实之后执行。**
 
-### 3.2 组件与位置
+组件位置：
 
-| 组件 | 位置 | 依赖 |
-|---|---|---|
-| 定时器与单例闸 | `~/.config/systemd/user/scrollz-harness.{timer,service}` | systemd user（项目已在用同款） |
-| 可信控制器 | `scripts/harness/`（随仓库版本化） | `gh` + `git` + `GH_TOKEN` |
-| 轮次入口 skill | `.claude/skills/scrollz-round/SKILL.md` | Claude CLI 2.1.220 |
-| Workflow 脚本 | `.claude/workflows/scrollz-round.js` | 内置 `Workflow` 工具 |
-| 红线清单 | `docs/harness/redlines.yaml` | 控制器确定性判定用 |
-| 队列与状态 | GitHub Issues/PR/branches + `docs/proposals/` | 专用 PAT |
-| harness 工作区 | 专用 clone `~/src/scrollz-harness/`（**不复用用户开发目录**） | 评审 C-05 |
-| 开发隔离 | `git worktree` at `~/src/scrollz-harness-wt/<issue>-<slug>` | 每提案一 worktree 一分支 |
-
-轮次日志落 `~/.local/state/scrollz-harness/rounds/<round_id>.jsonl`，不进版本库；它是排障数据，不是真值。
-
-**关于专用 clone**：用户的开发目录 `/home/xp/src/zipfs` 随时可能有未提交改动与并行会话（现场已实测存在）。harness 在那里 pull/commit/清 worktree 会误带他人变更或删掉别人的 worktree。专用 clone 提交的仍是同一个 `main` 分支、推同一个远端——「在主树留文档」的语义不变，只是换了个物理工作区。
-
-## 四、状态：label 是索引，事实才是真值
-
-### 4.1 label（索引层）
-
-| label | 含义 |
+| 组件 | 位置 |
 |---|---|
-| `harness:proposed` | 已通过对抗裁决、进入队列，未开工 |
-| `harness:picked` | 已选中，开发中 |
-| `harness:in-pr` | PR 已开，等待用户合并 |
-| `harness:blocked` | 卡住，需用户裁决或外部条件 |
-| `harness:needs-decision` | 触及冻结红线或架构决策，agent 不得自行实施 |
-| `harness:rejected` | PR 被关闭未合并 / 用户否决，终态 |
+| 定时器与单例闸 | `~/.config/systemd/user/scrollz-harness.{timer,service}`（固定 PATH，绝对路径） |
+| 可信控制器 | `scripts/harness/`（随仓库版本化） |
+| 轮次入口 skill | `.claude/skills/scrollz-round/SKILL.md` |
+| Workflow 脚本 | `.claude/workflows/scrollz-{propose,implement,review}.js` |
+| 红线清单 | `docs/harness/redlines.yaml` |
+| 专用 settings | `.claude/harness-settings.json`（只给 harness 会话用） |
+| 测试 launcher | 控制器持有、**仓库外**、agent 不可修改 |
+| harness 工作区 | 专用 clone `~/src/scrollz-harness/`（不复用用户开发目录） |
+| 开发 worktree | `~/src/scrollz-harness-wt/<issue>-<slug>`（Stage 2） |
+| outbox / ledger | `~/.local/state/scrollz-harness/`（durable，见 §六） |
 
-辅助 label：`harness`（来源标记）、`T0`–`T4`（沿用 ROADMAP 优先级）、`size:S/M/L`、`lane:*`（见 §十一）。
+**关于专用 clone**：用户开发目录 `/home/xp/src/zipfs` 随时有未提交改动与并行会话（现场已实测存在）。harness 在那里 pull/commit/清 worktree 会误带他人变更或删掉别人的对象。专用 clone 提交的仍是同一 `main`、推同一远端——「在主树留文档」的语义不变，只是换了物理工作区。
 
-### 4.2 对账（事实层）
+## 五、状态：事实派生函数
 
-每轮开头**先对账再路由**，不得直接按 label 分支（评审 I-07）。事实来源：Issue 状态 + PR 状态与 mergeable + 远端分支存在性与 SHA + 本地 worktree marker + Issue 上的迁移收据评论。对账规则表：
+label 是索引不是真值。每轮**先派生状态再路由**。
 
-| 观察到的事实组合 | 判定 | 动作 |
-|---|---|---|
-| `picked` 且远端无分支 | 上轮在首次 push 前死亡 | 回落 `proposed`，清理残留 worktree |
-| `picked` 且远端有分支、无 PR | 上轮中断于开发中 | 进入接续模式，从 `last_checkpoint` SHA 继续 |
-| `in-pr` 且 PR 已合并 | 待收尾 | 进入收尾模式 |
-| `in-pr` 且 PR 已关闭未合并 | 用户否决 | 迁 `harness:rejected`，记录关闭原因入拒绝记忆（§十一） |
-| `in-pr` 且 PR 的 base 已漂移 | 并行 PR 先合并导致基线变化 | 把 main merge 进 feature 分支、重跑受影响测试；冲突则迁 `blocked` |
-| Issue 被用户手动关闭 | 用户干预 | 视为终态，不再选中；记录原因 |
-| label 缺失或双状态 | 上轮迁移中途失败 | 按事实重推，迁移幂等 |
-| 无 marker 的 worktree/分支 | 不属于 harness | **不动**（禁止清理非自己创建的对象） |
+### 5.1 正交事实维度
 
-### 4.3 迁移收据与幂等
+先把观察归一化到互相独立的维度，再做判定（不把 label 写进判定条件）：
 
-每次状态迁移由控制器写一条 Issue 评论（固定 `HARNESS-RECEIPT` 结构）：`round_id` / `attempt_id` / 旧状态 / 新状态 / 已验证事实（branch SHA、PR 号、测试 receipt 摘要）。收据是对账的辅助证据，也是崩溃后判断「迁移是否发生过」的依据。所有迁移以 `(issue, attempt_id, target_state)` 幂等——重复执行不产生第二次副作用。
+| 维度 | 取值 |
+|---|---|
+| Issue lifecycle | `open` / `closed-by-user` / `closed-by-linked-merge` |
+| PR lifecycle | `none` / `open` / `closed-unmerged` / `merged` / `multiple` |
+| branch lifecycle | `absent` / `present-at-receipted-SHA` / `present-diverged` |
+| worktree lifecycle | `absent` / `owned` / `foreign` / `marker-mismatch` |
+| attempt lifecycle | `none` / `active` / `superseded` |
+| base 漂移 | `fresh` / `stale`（PR base SHA ≠ 当前 main） |
 
-worktree 与分支带 owner marker：分支名固定前缀 `harness/<issue>-<slug>`，worktree 内放 `.harness-owner`（含 issue、attempt_id、base SHA）。
+### 5.2 有序判定（优先级从高到低，命中即停）
 
-## 五、一轮的流程
+1. `closed-by-linked-merge` 或 PR `merged` → **待收尾**
+2. Issue `closed-by-user` → **用户终态**，记录原因，不再选中
+3. PR `closed-unmerged` → **rejected**，原因入拒绝记忆
+4. PR `open` 且 base `stale` → merge main 进 feature 分支、重跑受影响测试；冲突则 `blocked`
+5. PR `open` 且 `fresh` → **等待用户**，不动
+6. PR `none` 且 branch `present` 且 worktree `owned` → **接续**，从收据中的 `last_checkpoint` 继续
+7. PR `none` 且 branch `present` 且 worktree `absent`/`marker-mismatch` → 重建 worktree 后接续
+8. PR `none` 且 branch `absent` → 回落 `proposed`
+9. 其余任何组合（含 PR `multiple`、`proposed` 却有分支、`blocked` 却有 open PR、收据与远端事实不符、label 缺失或双状态） → **`needs-human-reconciliation`**，开哨兵评论并告警，**不猜**
 
-### Phase A · 控制器：预检 → 对账 → 路由
+**互斥完备性必须被机械证明**：以 property-based test 穷举六维度全组合，断言每个组合恰好落到一个结果，无重叠、无遗漏（评审 R2-02）。
 
-**启动硬预检**（任一失败即 fail closed，不起模型，不烧钱）：
+`foreign` / 无 marker 的分支与 worktree **一律不动**——禁止清理非 harness 创建的对象。
 
-1. `GH_TOKEN` 存在且对本仓库 `viewerPermission >= WRITE`；能读 Issue/PR。
-2. `git ls-remote` 可达；push 凭据可用。
-3. 专用 clone 干净（无未提交改动、无冲突中状态）。
-4. 预算未耗尽、熔断未触发、无 `harness:paused` 哨兵 Issue。
-5. `claude` 可执行、认证有效。
+### 5.3 标识与收据
 
-预检通过后对账（§4.2），再路由到唯一模式：
+- 分支名固定 `harness/<issue>-<slug>`；worktree 内 `.harness-owner`（issue、attempt_id、base SHA）。
+- 每次迁移由控制器写一条 Issue 评论（固定首行 marker `HARNESS-RECEIPT`）：`round_id` / `attempt_id` / 旧态 / 新态 / 已验证事实（branch SHA、PR 号、测试 receipt 摘要）。
+- 收据是对账辅助证据，不是唯一真值；控制器崩溃后必须**双向 reconcile**（outbox ↔ 远端事实），不得单信任一方。
 
-| 优先级 | 模式 | 触发条件 | 本轮做什么 |
+## 六、副作用：durable outbox 事务协议
+
+GitHub 的建 Issue / 开 PR / 写评论**没有统一幂等接口**，「响应丢失」会造成重复对象或丢账（评审 R2-03）。因此控制器必须持久化 intent，而不是事后记账：
+
+1. **任何副作用前**先落盘并 `fsync`：`operation_id`、natural key、payload hash、`phase=prepared`。
+2. 调用返回后写 `observed`；**响应不确定时禁止盲重试**，先按 natural key 查询远端。
+3. natural key 约定：
+   - Issue：标题/正文内嵌机器 marker `HARNESS-OP:<operation_id>`，建前建后均按 marker 搜索。
+   - PR：`repo + head branch + base branch`，重试前按 head 查现存 PR。
+   - receipt 评论：隐藏 marker / 固定首行。
+4. **label 迁移**：单次 replace-all（保留 `T*`/`size:*`/`lane:*` 辅助 label）或带期望旧值的 compare-and-set；不可 CAS 时把人工并发修改视为**冲突**而非覆盖，转 `needs-human-reconciliation`。
+5. 存储要求是「durable intent + 原子更新 + 崩溃恢复」；SQLite WAL 是直接选择，严格实现的 append-only journal + fsync + checksum 亦可（实现由 plan 定）。
+
+## 七、一轮的流程
+
+### Phase A · 控制器：预检 → 预算预留 → 派生 → 路由
+
+**启动硬预检**（任一失败 fail closed，不起模型、不烧钱）：`GH_TOKEN` 对本仓库 `viewerPermission >= WRITE`；`git ls-remote` 可达；专用 clone 干净；无 `harness:paused` 哨兵；`claude`/`cargo` 绝对路径可执行；outbox 无未决且无法判定的 operation。
+
+**预算预留**（评审 R2-07）：调用 `claude` **之前**原子预留本轮最大预算并落盘，事后按实际成本结算；结果未知时按最坏上限计费直到对账成功。熔断计数同样在尝试开始前落盘。否则「崩溃 → 重启 → 再花一次」可无限越过日预算。
+
+**派生与路由**（§五）→ 唯一模式：
+
+| 优先级 | 模式 | 触发 | 本轮做什么 |
 |---|---|---|---|
-| 1 | **事实收尾** | 有已合并未收尾 PR | 对**所有**已合并 PR 做轻量幂等事实收尾（清分支/worktree、关 Issue、写收据），再限量做一份文档整理 |
-| 2 | **接续** | 有 `picked` 且远端有分支、无 PR | 从 `last_checkpoint` 继续做完并开 PR |
-| 3 | **只扫描** | 在飞 PR ≥ 5 或 `proposed` 队列已满上限 | 只跑扫描+裁决与队列治理，不开发 |
-| 4 | **正常开发轮** | 其余 | 全流程 |
+| 1 | 事实收尾 | 有已合并未收尾 PR | 对**所有**已合并 PR 做轻量幂等事实收尾，再限量做一份文档整理 |
+| 2 | 接续 | §5.2 第 6/7 条 | 从 `last_checkpoint` 继续 |
+| 3 | 只扫描 | 在飞 PR ≥ 5 或队列满 或 **Stage 1** | 只扫描+裁决+队列治理 |
+| 4 | 正常开发轮 | 其余（Stage 2） | 全流程 |
 
-模式 1 拆成「必须立即做的事实收尾」与「可批处理的文档整理」，避免连续多个 PR 合并时把 `picked` 的中断恢复无限压后（评审 I-08）。
+### Phase B · 分段执行（评审 R2-01 修正）
 
-### Phase B · Workflow 编排（正常开发轮）
+v2 的致命矛盾：既要求「agent 第一个可编译提交即 push」保证中断韧性，又要求「只有控制器能 push」——**不可能同时成立**，因为控制器在 Workflow 返回前无法介入。修正为**多次 Workflow 调用，控制器在段间接管**：
 
 ```
-扫描（4 个并行 finder，各自视角）
-  ├ lens-1 已登记待办：ROADMAP T0–T4 的 ☐/◐ 行、TRACKING 待推进、BACKLOG 成熟项
-  ├ lens-2 代码与测试空白：未覆盖路径、TODO/FIXME、已知语义缺口
-  ├ lens-3 实测信号：bench/results 里的未闭环结论、性能回归
-  └ lens-4 文档-代码漂移与卫生：doc 与实现不一致、陈旧描述、小型重构
-        ↓ 结构化候选：意图 / 证据（含文件行号）/ 触碰面 / 规模 / 风险 / 验收 oracle / fingerprint
-去重（脚本内纯 JS + 控制器提供的现存 Issue 指纹表，含已 rejected / superseded）
+段 1  Workflow scrollz-propose
+        扫描（4 lens 并行 finder）→ JS 去重 → 3 judge 对抗裁决（可跨模型 agentType）→ 排序选一
+        ↓ 返回结构化候选，不产生任何外部副作用
+控制器  建 Issue（natural key 幂等）→ 冻结 attempt_id → 提案卡 docs/proposals/<issue>-<slug>.md
+        → 提交并推 main → 建分支 + worktree + .harness-owner → 写 intent receipt
+        ↓                                    【Stage 1 到此结束】
+段 2  Workflow scrollz-implement（在既有 worktree 内，TDD）
+        只允许 commit，**不允许 push**；到达 checkpoint 即返回
         ↓
-对抗裁决（3 个并行 judge，任一否决即淘汰，否决理由持久化）
-  ├ judge-1 伪需求与已完成
-  ├ judge-2 红线守卫：只负责发现 redlines.yaml **未覆盖**的新语义风险（确定性部分由控制器做）
-  └ judge-3 冲突与可验收：触碰面 vs 在飞 PR；验收 oracle 是否可证伪
+控制器  校验 commit（diff 路径白名单 + 红线 gate + 属主）→ push → 更新 last_checkpoint 收据
+        ↓ 未完成则回到段 2 下一段（多次调用，而非一次后台 Workflow 内部回调）
+段 3  Workflow scrollz-review（未参与实现的 reviewer，可跨模型）
         ↓
-排序选一（lane 配额 + aging + T 优先级，见 §十一）
-        ↓
-实现（worktree 内 TDD；**第一个可编译提交即 push**）
-        ↓
-独立评审（未参与实现的 reviewer，对抗视角）→ 据 Critical/Important 返工
-        ↓
-返回结构化结果给控制器（不自行开 PR、不自行改 label）
+控制器  验证测试 receipt → gh pr create（含 Closes #N、被测 SHA、命令与退出码、测试数/skip 数、触碰面、评审结论）
+        → label 迁移 → 写收据 → 结算预算与记账
 ```
 
-规模约束：单轮 agent ≤ 12（工具建议 <15；机器 20 核，并发上限 min(16, 18)）。
+单轮 agent ≤ 12（工具建议 <15，并发上限 16）。
 
-### Phase C · 控制器：验证 → 副作用 → 记账
+### Phase C · 记账退出
 
-1. **先建 Issue 再写提案卡**（评审 M-17）：Issue 号即提案卡编号 `docs/proposals/<issue>-<slug>.md`，消除编号分配冲突与占位改名的崩溃窗口。
-2. 校验实现产出：diff 路径不越白名单、不触 redlines、分支 SHA 与 agent 主张一致、测试 receipt 有效（见 §十）。
-3. 执行副作用：提交提案卡到 main、push 分支、`gh pr create`（正文含 `Closes #N`、被测 SHA、命令与退出码、测试/skip 计数、触碰面、评审结论）。
-4. 迁移 label、写收据、记轮次账（`round_id`/mode/issue/attempt/duration/turns/cost/工具拒绝次数/退出码/last_checkpoint）。
+轮次账字段：`round_id` / mode / issue / attempt / workflow run id / duration / turns / cost / 工具拒绝次数 / result / exit code / last_checkpoint。
 
-## 六、收尾模式（用户合并之后）
+## 八、收尾模式
 
-1. 专用 clone `git pull`（**merge，不 rebase**）。
-2. 更新 [ROADMAP.md](../ROADMAP.md) 对应行、[CHANGELOG.md](../CHANGELOG.md) 追加、[TRACKING.md](../TRACKING.md) 摘除已完成 WIP。
-3. 提案卡标记完成并移入 `docs/proposals/archive/`。
-4. 校验 owner marker 后删除远端分支与本地 worktree（marker 不符则跳过并告警）。
-5. 高风险 PR（触及并发/崩溃安全/磁盘格式）派一次**合并态评审**；发现问题**开新 Issue**，不当场改。
-6. **经验只产出候选文档或 Issue**：无人值守收尾**禁止**修改 `.claude/skills/`、`.claude/workflows/`、permissions、hooks、systemd 单元、全局 memory——这些是可执行策略，等于让系统按自己的输出重写自身控制逻辑；任何此类改动必须走独立 PR 由用户合并（评审 I-15）。
+1. 专用 clone `git pull`（merge，不 rebase）。
+2. 更新 [ROADMAP.md](../ROADMAP.md) / [CHANGELOG.md](../CHANGELOG.md) / [TRACKING.md](../TRACKING.md)。
+3. 提案卡移入 `docs/proposals/archive/`。
+4. **校验 owner marker 后**删远端分支与 worktree；marker 不符则跳过并告警。
+5. 高风险 PR（并发/崩溃安全/磁盘格式）派一次合并态评审；发现问题**开新 Issue**，不当场改。
+6. **经验只产出候选文档或 Issue**：无人值守收尾**禁止**修改 `.claude/skills/`、`.claude/workflows/`、permissions、hooks、systemd 单元、全局 memory——这些是可执行策略，等于让系统按自己的输出重写自身控制逻辑；此类改动必须走独立 PR 由用户合并。
 
-收尾产生的文档改动由控制器直接提交推送 main（路径白名单限定 `docs/`）。
+## 九、权限、凭据与确定性纵深防线
 
-## 七、中断韧性与上下文
+### 9.1 会话隔离（对抗作用域合并，评审 R2-04）
 
-| 失效场景 | 机制 |
+- 固定 `--setting-sources` 或专用 `--settings .claude/harness-settings.json`，**阻断用户级 332 条 Bash 授权、hooks 与 plugin 能力**进入 harness 会话。
+- `--disallowedTools "mcp__*"`：设计不依赖任何 MCP，且 headless 下 MCP 本就可能不可用。
+- `--permission-mode dontAsk` + 最小 allow；**禁止 `bypassPermissions`**。
+- deny 至少覆盖：`git push*`、`git remote *`、`git config *`、`gh *`、`systemctl *`、`fusermount*`、生产路径写入。仅禁 force push 远远不够。
+- **凭据清场**：agent 进程显式清除 `GH_TOKEN`/`GITHUB_TOKEN`/`SSH_AUTH_SOCK`/git credential helper 环境，设 `GIT_TERMINAL_PROMPT=0`。否则 systemd user 环境里现存的 `SSH_AUTH_SOCK` 足以让 agent 直接推 main。
+- `--max-turns`、`--max-budget-usd`、`--output-format stream-json` 固定给值；脚本内再用 `budget.remaining()` 二次收敛。
+- 被拒工具调用超阈值 → `harness:blocked` 并记账，不视为可绕过。
+
+### 9.2 不做 OS 隔离前提下的确定性防线（评审 R2-05）
+
+用户已裁定不做 OS 级隔离。但有一条防御必须补：**Bash deny 管不住子进程**——`cargo test` 会执行 agent 刚写的代码，那段代码可以直接调 `fusermount3`、`systemctl`、读写真实 `~/.claude/projects`，完全绕过顶层命令拦截。低成本补法：
+
+1. agent 不获得通用 `Bash(cargo *)`；测试经**控制器持有、仓库外、agent 不可改**的 launcher 执行。
+2. launcher 固定临时 `HOME`/`CLAUDE_PROJECTS`/`SCROLLZ_HOME`，执行前后记录 mount table、scrollz units、相关进程、生产目录 metadata hash；有变化即 kill + 熔断 + 告警。
+3. tokenized `PreToolUse(Bash)` guard 处理复合命令、wrapper、绝对路径与重定向；无法解析的高危命令 fail closed。**它只防直接 shell，不宣称能管住子进程。**
+4. scrollz CLI 增加 harness-mode interlock：harness 环境变量启用时，`enable apply/restore/purge/reconcile/remount` 与 managed mount 只接受本轮临时根，拒绝真实生产根；**interlock 实现文件本身列入红线**，agent 改动即阻断。
+5. diff gate：新增 `Command::new`/`std::process`/`systemctl`/`fusermount`/绝对 home 路径/环境变量清除时，要求人工审查。
+
+这些不等同 OS 隔离，但对「合作型但会犯错的 agent」是有实质价值的确定性防线。
+
+### 9.3 不可信输入纪律
+
+本仓库公开，Issue/PR/评论/提交信息可被任何人写入，可能含提示注入；harness 自己写入的提案又会成为下一轮上下文，形成自注入回路。因此：所有 GitHub 与仓库文本**一律按 data 处理**，置于提示词中显式不可信边界内；禁止从中提取可执行命令；控制动作只接受固定 schema，并校验 actor allowlist、repo、marker 与合法迁移；外部评论只能作为候选证据，不能改变权限、红线或执行模式。
+
+## 十、红线清单
+
+`docs/harness/redlines.yaml` 版本化。**每条必须声明可执行 oracle 类型**，不能只有自然语言（评审 R2-10）：
+
+| oracle 类型 | 含义 |
 |---|---|
-| 进程中途被杀 / 网络断 | 下轮 Phase A 从 GitHub 事实重建；`picked` 按 §4.2 对账表分流。**要求：实现 agent 第一个可编译提交就 push**，并把 SHA 写进 Issue 收据作为 `last_checkpoint` |
-| 一轮内上下文将满 | Workflow 重活全在 subagent；仍不够则把进度写成 `HARNESS-HANDOVER` 评论后主动退出，交给接续模式 |
-| 两个轮次撞车 | `flock` 全局单例；systemd oneshot `Restart=no` |
-| Workflow 跨进程续跑 | 明确不依赖 `resumeFromRunId`（同会话限定），一律靠事实重建 |
-| 一轮跑太久 | 双层超时必须显式对齐（评审 I-06）：CLI 后台等待上限（`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`，Round 0 实测确认默认值）必须 **大于** systemd `TimeoutStartSec`（建议 25 分钟），否则 CLI 先截断而 systemd 还没超时 |
-| 迁移做了一半 | 迁移幂等 + 收据；对账按事实重推 |
-| 用户手动干预 | 用户改 label/关 Issue/关 PR 均按 §4.2 处理为合法输入，不覆盖用户意图 |
+| `deny_change` | 指定文件/字节/常量禁止变化 |
+| `requires_decision` | 触碰即转 `needs-decision` |
+| `requires_tests` | 列出必须执行且**不可 skip** 的测试 |
+| `cross_site_invariant` | 列出所有已知实施点 + 可复现搜索式 |
+| `manual_semantic_review` | 无法机器证明，直接阻断自动 PR |
 
-## 八、护栏与红线
+机器 gate 的结论只能是「规则命中 / 未命中」，**不得声称自然语言不变量已被证明**——「文件没碰受保护 symbol，但调用顺序改了同一不变量」是最危险的假绿。初始条目至少覆盖：磁盘格式魔数与版本、superblock 布局、尾日志 record 格式、崩溃安全提交顺序、已生效 ADR 锚点、§9.2 的 interlock 实现文件。
 
-### 8.1 机器可判定的红线清单
+## 十一、CI 与 Stage 2 激活门
 
-`docs/harness/redlines.yaml` 版本化列出：受保护路径 / 符号 / 常量 / 不变量、允许的改动类型、必须通过的测试、触发用户裁决的条件。**控制器在提交与开 PR 前对 diff 跑确定性 gate**；judge-2 只负责发现清单未覆盖的新语义风险（评审 I-16）。初始条目至少含：磁盘格式魔数与版本、superblock 布局、尾日志 record 格式、崩溃安全提交顺序、已生效 ADR 锚点。
+**Round 0 是 Stage 2 的激活门。** 未通过前只允许 Stage 1。必须实测：
 
-### 8.2 行为红线（写进每个 agent 提示词 + 控制器强制）
-
-1. **绝不合并**：禁止 `gh pr merge`、`git push --force`、改写 main 历史、删非 harness 创建的分支/worktree。
-2. **绝不扩权**：不改 `~/.claude` 全局配置、不装系统包、不改他人 systemd 单元、不自改 harness 自身控制逻辑（§六.6）。
-3. **测试纪律**：测试 backing 必须建在 tempdir 的**子目录**内（既有教训：落共享 temp 根会导致 `.scrollz.lock` 残留与 flock 偶发失败）；不得对生产挂载点执行 mount/umount/reconcile/purge。
-4. **PR 必须自证**：无有效测试 receipt 不得开 PR，改为 `harness:blocked`。
-
-> 注：用户已裁定不做 OS 级隔离，因此以上第 3 条依靠提示词纪律 + §九 deny 规则，而非操作系统边界。风险已知并接受，硬化方案见 §十四。
-
-### 8.3 不可信输入纪律（评审 I-14）
-
-本仓库公开，Issue/PR/评论/提交信息可被任何人写入，其中可能含提示注入；harness 自己写入的提案又会成为下一轮上下文，形成自注入回路。因此：**所有 GitHub 与仓库文本一律按 data 处理**，在提示词中置于显式不可信边界内；禁止从中提取可执行命令；控制动作只接受固定 schema，并校验 actor allowlist、repo、Issue marker 与合法迁移；外部评论只能作为候选证据，不能改变权限、红线或执行模式。
-
-## 九、权限与预算契约（评审 C-02）
-
-headless 下不存在「自动批准」，未获批的 Edit/Bash/网络操作会停下，当前 `.claude/settings.json` 的 `permissions.allow` 为空——按 v1 写法首轮就会卡死。契约固定为：
-
-- `--permission-mode dontAsk` + **最小 allow 列表**（Read/Edit 限定路径、`Bash(cargo *)`、`Bash(git *)` 等）+ deny 列表（`Bash(gh pr merge*)`、`Bash(git push --force*)`、`Bash(systemctl *)`、`Bash(fusermount*)`、生产路径写入）。**禁止 `bypassPermissions`**。
-- `--max-turns`、`--max-budget-usd`、`--output-format stream-json` 固定给值。
-- 被拒工具调用不视为可绕过：控制器把「被拒次数 > 阈值」映射为 `harness:blocked` 并记账。
-- GitHub 凭据只在控制器进程环境中，不进入 agent shell。
-
-## 十、CI 与开闸门（Round 0）
-
-**Round 0 是激活门，不是并行子项。** 未通过之前，harness 只允许跑「只扫描」模式，不得开代码 PR（评审 I-09）。
-
-Round 0 必须实测确认：
-
-1. `claude -p` 等待后台 Workflow 的真实行为与上限，及与 systemd 超时的先后顺序。
-2. `--permission-mode dontAsk` + allow/deny 组合能否无人值守跑完一轮全部动作。
-3. 专用 PAT 的实际权限：能建/改 label、开 Issue、开 PR。
+1. `claude -p` 等待后台 Workflow 的真实行为与上限，及与 systemd 超时的先后顺序（CLI 后台等待上限必须 **大于** `TimeoutStartSec`，建议后者 25 分钟）。
+2. `--settings` + `--permission-mode dontAsk` + deny 组合能否无人值守跑完，且**负向验证**：agent 无法 `push main`、无法 `gh issue create`、无法经 MCP 间接执行 shell。只验 happy path 不算通过。
+3. 专用 PAT 实权：建/改 label、开 Issue、开 PR。
 4. GitHub runner 能力边界：`/dev/fuse`、`fusermount3`、loop 设备、`dm-flakey`/`dm-log-writes`、sudo、单 job 时长。
+5. **branch protection 激活收据**（评审 R2-11）：远端 main 现无保护，且专用 PAT 无 Administration 权限，无法自建或自查。需仓库 owner 一次性配置并留收据（保护已启用、required checks 精确名称、是否要求 up-to-date、是否禁 force push 与删除）；控制器每轮只读校验仍符合收据，不符即暂停自动开发。**若用户决定不用 branch protection，文档必须把「required」改称「控制器的 merge-readiness 条件」，不得混用术语。**
 
-**测试 receipt 的硬要求**：本项目的 FUSE 测试在缺 `/dev/fuse` 或 `fusermount` 时会打印 SKIP 后**成功返回**——「cargo test 绿」不证明挂载路径跑过。因此 receipt 必须含被测 head SHA、命令、退出码、测试数、**skip 数**、以及「真实 FUSE 路径确实执行」的正向证据；skip 数超阈值即判定证据不足。
+**测试 receipt 硬要求**：本项目 FUSE 测试在缺 `/dev/fuse` 或 `fusermount` 时会打印 SKIP 后**成功返回**——「cargo test 绿」不证明挂载路径跑过。receipt 必须含被测 head SHA、命令、退出码、测试数、**skip 数**、以及「真实 FUSE 路径确实执行」的正向证据；skip 超阈值即判证据不足。
 
-CI 分层预期：L0 `fmt`/`clippy`/`build`（required check）；L1 不需 FUSE 的测试（required）；L2 需 `/dev/fuse` 的挂载测试（视 PoC）；L3 systemd/dm-* 留本地，由控制器校验 receipt。边界结论写入 `docs/harness/ci-boundary.md`。
+CI 分层预期：L0 `fmt`/`clippy`/`build`；L1 不需 FUSE 的测试；L2 需 `/dev/fuse` 的挂载测试（视 PoC）；L3 systemd/dm-* 留本地由 launcher 产出 receipt。边界结论写入 `docs/harness/ci-boundary.md`。
 
-## 十一、队列治理
+## 十二、队列治理
 
-- **lane 配额 + aging**（评审 I-12）：候选分 `roadmap` / `defect` / `perf` / `hygiene` 四 lane，各有最低选中配额，防止「按低风险小规模排序」把大项与高风险正确修复永久饿死；排队越久权重越高。
-- **否决可复议**：judge 否决必须持久化理由与「重新考虑的条件」，不得静默消失。
-- **队列上限**：`proposed` 超上限后停止产出新提案，只做去重与治理。
-- **fingerprint 而非标题去重**（评审 I-13）：指纹由规范化目标 + 不变量 + 主要位置 + 验收 oracle 构成，与 open/closed/rejected/superseded 一并比对，识别「换个措辞的同一提案」。
-- **拒绝记忆**：用户关闭 Issue / 关闭 PR 的原因入库，供后续 finder 与 judge 使用。
-- **质量指标**：持续统计合并率、拒绝率、重复率、revert 率、首次评审通过率、proposal→PR 周期、各 lens 有效率；低于门槛自动降级为只扫描或暂停请求复核。
+- **软配额而非硬配额**（评审 R2-09）：候选分 `roadmap`/`defect`/`perf`/`hygiene` 四 lane，按 rolling N 次**实际开发选择**计算，且只对**当前 eligible** 候选生效（blocked、needs-decision、与在飞 PR 冲突、oracle 不成立者不参与）。欠额只**提高权重**不强制选择；只扫描期间只累计 deficit，不虚构选中。
+- **aging**：排队越久权重越高；队列治理必须能把 stale 项迁 `superseded`/`blocked` 释放容量，避免旧而不适用的候选永久占位。
+- **去重分两级**（评审 R2-08）：精确 operation/proposal ID 可硬去重；**fingerprint 只能产出 `possible_duplicate`**，交确定性字段与 judge 复核——fingerprint 的「规范化目标/不变量」由不可信模型生成，既可能误碰撞也可能被轻微改写绕过。
+- **拒绝可复议**：rejected 记录必须带 `reconsider_when` 与决定版本；条件满足、关联代码 SHA 变化或用户裁定变化后**自动失效**，不得成为永久去重键。保留人工 override 与 `supersedes` 关系。
+- **质量指标**：合并率、拒绝率、重复率、revert 率、首次评审通过率、proposal→PR 周期、各 lens 有效率；跌破门槛自动降级只扫描或暂停请求复核。
 
-## 十二、可观测性、失败预算与熔断（评审 I-11）
+## 十三、可观测性、失败预算与熔断
 
-- 每轮记账字段见 §五 Phase C。
-- 预算三档：per-round、per-day、rolling-24h；耗尽即暂停。
-- 熔断：同类错误连续 N 次、或日预算耗尽、或质量指标跌破门槛 → 自动切 `paused`。
-- 告警：通过专用哨兵 Issue + systemd `OnFailure` 单元；stale `picked`/`in-pr` 超时告警。
+- 预算三档：per-round、per-day、rolling-24h，均带 §七 的**事前预留**。
+- 熔断：同类错误连续 N 次、日预算耗尽、质量指标跌破门槛 → 切 `paused`。
+- 告警：专用哨兵 Issue + systemd `OnFailure`；stale `picked`/`in-pr` 超时告警；预检失败必须列明缺失项（如 PATH 缺 `claude`）并触发告警，而非静默重试。
 - 人工开关：`harness:paused` 哨兵 Issue 存在即暂停；提供只读诊断命令。
 
-## 十三、验收判据
+## 十四、验收判据
 
-分两类，均需可证伪（评审 I-10）。
+### 14.1 状态派生函数
 
-### 13.1 确定性验收（fixture repo + fake/recording GitHub adapter）
+property-based test 穷举 §5.1 六维度全组合，断言每组合恰好命中一条判定、无重叠无遗漏，非规范组合唯一落到 `needs-human-reconciliation`。
 
-用受控 fixture 仓库注入确定性候选，在**每个副作用边界**注入崩溃并重启，断言恢复正确、无重复 Issue、无孤儿对象：
+### 14.2 崩溃点矩阵（从控制器的 operation 清单**自动生成**，非手写）
 
-| 崩溃点 | 期望 |
-|---|---|
-| 建 Issue 前 / 后 | 无孤儿提案卡 / 不重复建 Issue |
-| 提案卡提交前 / 后 | 提案卡与 Issue 一致 |
-| 首次 push 前 / 后 | 前：回落 `proposed`；后：接续模式续做 |
-| 开 PR 前 / 后 | 前：接续；后：不重复开 PR |
-| label 迁移中途 | 幂等重推，不出现双状态/零状态 |
+每个 operation 至少四个崩溃点：`before-call` / `server-applied-response-lost` / `after-response-before-ledger` / `after-ledger`。覆盖对象必须包含：建 Issue、提案卡 commit、push main、建 worktree、写 `.harness-owner`、实现 commit、feature push、开 PR、label 迁移（含 replace-all 响应未知）、写 receipt、写 outbox/ledger，以及**收尾流程的独立矩阵**（关 Issue、删远端分支、删 worktree、文档 commit、push main、receipt）。断言不止「不重复」，还要「重启后最终状态一致」。
 
-另需断言：PR 被关闭未合并 → `rejected`；用户手改 label → 按 §4.2 合法处理；PAT 失效 / GitHub 429/5xx → fail closed 且不烧钱；在飞 PR 达 5 时**第 6 个提案不产生任何分支/worktree/PR**。
+### 14.3 真实环境验收
 
-### 13.2 真实环境验收
+1. 关闭终端、断开会话，30 分钟后 `gh issue list --label harness` 出现新提案，提案卡已在 main（Stage 1 即可验）。
+2. `kill -9` 一轮进程后，下轮自动接续同一提案完成，无重复 Issue、无孤儿 worktree。
+3. 用户合并一个 PR 后，后续轮次完成收尾：文档已更新、分支与 worktree 已清理、Issue 已关。
+4. 诱饵项：ROADMAP 塞一条触及磁盘格式的候选 → 产出 `harness:needs-decision` 而非 PR，且控制器确定性 gate 独立拦下。
+5. **负向权限验收**：agent 尝试 `git push origin HEAD:main`、`gh issue create`、经 MCP 执行 shell，全部失败。
+6. 一轮跑完后比对 mount table、systemd units、非 harness 分支与工作树 hash、生产目录 metadata hash，均无变化。
+7. PAT 失效 / GitHub 429/5xx → fail closed 且不烧钱。
+8. 在飞 PR 达 5 时第 6 个提案**不产生任何分支/worktree/PR**。
+9. 真实 GitHub smoke test 至少一轮，避免 fake adapter 自洽假绿。
 
-1. 关闭终端、断开会话，30 分钟后 `gh issue list --label harness` 出现新提案，提案卡已在 main。
-2. 人为 `kill -9` 一轮进程后，下轮自动接续同一提案完成，无重复 Issue、无孤儿 worktree。
-3. 用户合并一个 PR 后，后续轮次完成收尾：ROADMAP/CHANGELOG 已更新、分支与 worktree 已清理、Issue 已关。
-4. 故意在 ROADMAP 塞一条触及磁盘格式的诱饵项 → 产出 `harness:needs-decision` Issue 而非 PR，且控制器的确定性 gate 也能独立拦下。
-5. 一轮跑完后比对 mount table、systemd units、非 harness 分支与工作树 hash，均无变化。
-6. 真实 GitHub smoke test 至少一轮，避免 fake adapter 自洽假绿。
+## 十五、评审处置台账
 
-## 十四、评审处置与未采纳记录
+| 条目 | 处置 | 生效阶段 |
+|---|---|---|
+| R1 C-01 凭据只读 | 采纳，专用 PAT（§二、§三） | Stage 1 |
+| R1 C-02 headless 权限 | 采纳并在 R2-04 后加强（§9.1） | Stage 1 |
+| R1 C-03 OS 隔离 | **降档保留**：用户裁定不做；改以 §9.2 确定性防线替代。触发重议的条件——出现一次真实生产数据事故或误触 | — |
+| R1 C-04 可信控制器 | 采纳（§四、§七） | Stage 1 |
+| R1 C-05 专用 clone | 采纳（§四） | Stage 1 |
+| R1 I-06 双层超时 | 采纳（§十一.1） | Stage 1 |
+| R1 I-07 事实对账 | 采纳并按 R2-02 重做为派生函数（§五） | Stage 2（Stage 1 只需退化版） |
+| R1 I-08 收尾饥饿与基线漂移 | 采纳（§5.2 第 4 条、§七模式 1） | Stage 2 |
+| R1 I-09 测试证据 | 采纳，CI 升为 Stage 2 激活门（§十一） | Stage 2 |
+| R1 I-10 验收弱 | 采纳并按 R2-06 自动生成矩阵（§十四） | Stage 2 |
+| R1 I-11 预算与熔断 | 采纳并按 R2-07 补事前预留（§七、§十三） | Stage 1 |
+| R1 I-12 大项饥饿 | 采纳并按 R2-09 改软配额（§十二） | Stage 1 |
+| R1 I-13 提案质量闭环 | 采纳并按 R2-08 拆两级去重（§十二） | Stage 1 |
+| R1 I-14 不可信输入 | 采纳（§9.3） | Stage 1 |
+| R1 I-15 自修改通道 | 采纳（§八.6） | Stage 2 |
+| R1 I-16 机器红线 | 采纳并按 R2-10 加 oracle 类型（§十） | Stage 2 |
+| R1 M-17 编号顺序 | 采纳，且 R2-01 修正后真正成立（§七 Phase B） | Stage 1 |
+| R2-01 Phase 因果矛盾 | 采纳，改为多次 Workflow 调用 + 段间控制器接管（§七 Phase B） | Stage 2 |
+| R2-02 派生函数不互斥完备 | 采纳（§五、§14.1） | Stage 2 |
+| R2-03 outbox 事务协议 | 采纳（§六） | Stage 1 |
+| R2-04 凭据与作用域合并 | 采纳（§9.1、§三 实测证据） | Stage 1 |
+| R2-05 无隔离下的纵深防线 | 采纳（§9.2） | Stage 2（launcher 在 Stage 1 无测试执行，不需要） |
+| R2-06 崩溃矩阵不全 | 采纳，改自动生成（§14.2） | Stage 2 |
+| R2-07 预算事前预留 | 采纳（§七） | Stage 1 |
+| R2-08 fingerprint 永久压制 | 采纳（§十二） | Stage 1 |
+| R2-09 配额语义 | 采纳（§十二） | Stage 1 |
+| R2-10 红线 oracle 类型 | 采纳（§十） | Stage 2 |
+| R2-11 branch protection 收据 | 采纳（§十一.5） | Stage 2 |
+| R2-12 systemd PATH | 采纳（§三、§四、§十三） | Stage 1 |
 
-| 评审条目 | 处置 |
-|---|---|
-| C-01 凭据只读 | **采纳**，已实测确认；改用专用 PAT（§二） |
-| C-02 headless 权限模型 | **采纳**（§九） |
-| C-03 OS 级隔离 | **降档保留**：用户裁定「无需隔离」。保留提示词纪律 + deny 规则；专用 Unix 用户 / 独立 HOME / mount namespace 记为 optional 硬化项，触发条件——出现一次真实的生产数据事故或误触 |
-| C-04 可信控制器 | **采纳**（§三、§五 Phase A/C） |
-| C-05 专用 clone | **采纳**（§三.2） |
-| I-06 双层超时 | **采纳**（§七），默认值待 Round 0 实测 |
-| I-07 事实对账 | **采纳**（§四.2/4.3） |
-| I-08 收尾饥饿与基线漂移 | **采纳**（§五 Phase A 模式 1、§四.2） |
-| I-09 测试证据不可信 | **采纳**，CI 门升为激活门（§十） |
-| I-10 验收判据弱 | **采纳**（§十三） |
-| I-11 失败预算与熔断 | **采纳**（§十二） |
-| I-12 大项饥饿 | **采纳**（§十一） |
-| I-13 提案质量闭环 | **采纳**（§十一） |
-| I-14 不可信输入 | **采纳**（§八.3） |
-| I-15 自修改通道 | **采纳**（§六.6） |
-| I-16 红线机器可判定 | **采纳**（§八.1） |
-| M-17 编号顺序矛盾 | **采纳**（§五 Phase C.1） |
+## 十六、开放项（实施期确认，不阻塞本 spec）
 
-## 十五、开放项（实施期确认，不阻塞本 spec）
-
-- `claude -p` 后台等待的真实上限与退出码形态——Round 0 实测（§十）。
-- 每轮 token/美元预算、失败重试次数、熔断阈值 N、队列上限、skip 数阈值的**具体数值**——先给保守硬上限，实测后只调优不新建（§十二）。
-- 控制器的实现语言：随仓库的 shell 脚本 vs 小型 Rust bin（后者可复用 workspace 与类型化 GitHub 客户端）——由 plan 阶段定。
+- `claude -p` 后台等待的真实上限与退出码形态——Round 0 实测。
+- 具体数值：每轮 token/美元预算、重试次数、熔断阈值 N、队列上限、skip 数阈值、lane 配额窗口 N——先给保守硬上限，实测后只调优不新建。
+- 控制器实现语言：shell 脚本 vs 小型 Rust bin（后者可复用 workspace 与类型化 GitHub 客户端）——由 plan 定。
+- outbox 存储：SQLite WAL vs append-only journal + fsync + checksum——需求是 durable intent + 原子更新 + 崩溃恢复，技术选型由 plan 定。
