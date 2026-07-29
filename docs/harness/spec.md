@@ -1,16 +1,22 @@
 # scrollz 自主改进 harness / Spec
 
-> 状态：**草案 v3，待用户复核**。v1（9c5e1ab）与 v2（6831bda）分别经 gpt-souls:reviewer 两轮对抗评审判定 needs-rework；本版按第二轮 Critical 4 / Important 7 / Minor 1 逐条处置，并加入实测环境事实。处置台账见 §十五。
+> 状态：**草案 v4，待用户复核**。v1（9c5e1ab）/ v2（6831bda）/ v3（94048c3）经 gpt-souls:reviewer 三轮对抗评审；本版按第三轮的 Stage 1 四项开工阻塞点与 Stage 2 协议断点逐条处置。处置台账见 §十五。
 > 撰写日期 2026-07-29。本文回答「做什么、为什么」；「怎么做」由后续 [plan.md](./plan.md) 承载。
+>
+> 第三轮判定 Stage 1「暂不可开工」，卡四项：①结束点越界到分支/worktree ②缺发布生命周期 ③commit/push main/label/收据未纳入 outbox 与崩溃矩阵 ④`--settings` 是伪协议。本版四项均已收敛（§零、§5.0、§6.1、§9.1、§14）。
 
 ## 零、交付分期（用户 2026-07-29 裁定）
 
 | 阶段 | 范围 | 副作用面 | 需要的协议强度 |
 |---|---|---|---|
-| **Stage 1 · 只扫描** | 发现候选 → 对抗裁决 → 建 Issue + 提案卡推 main。**不开发、不开 PR、不建 worktree** | 建 Issue、加 label、提交 `docs/proposals/`、push main | 建 Issue 幂等 + 预算预留 + 权限隔离 + 队列治理 |
-| **Stage 2 · 开发轮** | 全流程：选题 → 实现 → 评审 → PR → 收尾 | 上述 + 分支 / worktree / PR / 多次状态迁移 / 删除清理 | 完整 outbox 事务 + 状态派生函数 + 崩溃点矩阵 + CI 激活门 |
+| **Stage 1 · 只扫描** | 发现候选 → 对抗裁决 → 建 Issue + 提案卡发布到远端 main。**不开发、不开 PR、不建分支、不建 worktree** | 建 Issue、设 label、提交 `docs/proposals/`、**push main（改远端 ref）** | Stage 1 发布生命周期 + 自身 operation registry 与崩溃子矩阵 + 预算预留 + 权限隔离 + 队列治理 |
+| **Stage 2 · 开发轮** | 全流程：选题 → 实现 → 评审 → PR → 收尾 | 上述 + 分支 / worktree / PR / 多次状态迁移 / 删除清理 | 完整 outbox 事务 + 六维状态派生函数 + 全量崩溃矩阵 + 跨调用预算与截止 + CI 激活门 |
 
-Stage 1 先上线的理由：它的副作用只有「建对象」没有「改与删」，协议复杂度低一个量级，却能立刻暴露最不确定的东西——**选题质量**。若 finder/judge 产出的提案不值得做，后面所有工程都白搭。Stage 2 的设计在本 spec 中同样完整给出，不因分期而削减（§十五记录哪些条目属 Stage 2 才生效）。
+**Stage 1 的副作用面要如实描述**（评审 R3-03）：它没有 worktree、PR 和删除类操作，但**仍包含外部 create/update 与 main ref 变更**——push main 会改远端引用，设 label 会改 Issue，两者同样有并发、响应丢失与覆盖风险。把 Stage 1 说成「只建不改」会导致其 outbox 与崩溃矩阵被过度降级，这正是 v3 的错误。
+
+Stage 1 先上线的理由不变：协议复杂度低一个量级，却能立刻暴露最不确定的东西——**选题质量**。若 finder/judge 产出的提案不值得做，后面所有工程都白搭。Stage 2 的设计在本 spec 中同样完整给出，不因分期而削减（§十五记录每条在哪个阶段生效）。
+
+**Stage 1 的结束点**（评审 R3-01）：止于「提案卡已在**远端 main** 可见 + 发布收据写完」。建分支与 worktree 属 Stage 2，在 Stage 2 激活后才发生。
 
 ## 一、目标与问题陈述
 
@@ -87,7 +93,24 @@ Stage 1 先上线的理由：它的副作用只有「建对象」没有「改与
 
 label 是索引不是真值。每轮**先派生状态再路由**。
 
-### 5.1 正交事实维度
+### 5.0 Stage 1 发布生命周期（评审 R3-02）
+
+分期新增了「Issue 与提案卡联合发布」这一状态机，六维（§5.1）表达不了它——「只有 Issue」「本地已 commit 未 push」「已 push 但无收据」「全部完成」在六维里坍缩成同一个 tuple，Stage 1 的中断因此无法恢复。故 Stage 1 单列：
+
+| 状态 | 判定依据（全部为远端事实） |
+|---|---|
+| `candidate-selected` | outbox 有 `prepared` 的 operation，远端无对应 Issue |
+| `issue-created` | 存在含 `HARNESS-OP:<operation_id>` 的 Issue |
+| `labels-set` | 该 Issue 的 label 集合符合预期 |
+| `proposal-committed-local` | 专用 clone 本地有含 trailer `HARNESS-OP:<operation_id>` 的 commit，远端 main 尚无 |
+| `proposal-published` | **远端 main** 含该 operation 的 commit 或同一 proposal blob |
+| `publication-receipt-complete` | Issue 上存在对应 marker 的发布收据评论 |
+| `closed-by-user` | Issue 被用户关闭 |
+| `inconsistent` | 上述无法唯一判定 |
+
+关键点：`proposal-published` 必须查**远端** `docs/proposals/<issue>-<slug>.md` 的存在与 operation 绑定，而不是只看本地 commit。
+
+### 5.1 正交事实维度（Stage 2）
 
 先把观察归一化到互相独立的维度，再做判定（不把 label 写进判定条件）：
 
@@ -102,15 +125,19 @@ label 是索引不是真值。每轮**先派生状态再路由**。
 
 ### 5.2 有序判定（优先级从高到低，命中即停）
 
+**判定条件只允许使用 §5.1 的事实维度，不得出现 label**（label 不一致本身由第 10 条兜底）。
+
+0. attempt `superseded` → **不复活**：该 attempt 的分支/worktree 交给清理流程，Issue 回到队列由新 attempt 处理。此条必须先于第 6/7/8 条求值，否则 `superseded + branch absent` 会被误判为回落 proposed、`superseded + branch present` 会被误判为接续（评审 R3 指认）
 1. `closed-by-linked-merge` 或 PR `merged` → **待收尾**
 2. Issue `closed-by-user` → **用户终态**，记录原因，不再选中
 3. PR `closed-unmerged` → **rejected**，原因入拒绝记忆
 4. PR `open` 且 base `stale` → merge main 进 feature 分支、重跑受影响测试；冲突则 `blocked`
 5. PR `open` 且 `fresh` → **等待用户**，不动
-6. PR `none` 且 branch `present` 且 worktree `owned` → **接续**，从收据中的 `last_checkpoint` 继续
-7. PR `none` 且 branch `present` 且 worktree `absent`/`marker-mismatch` → 重建 worktree 后接续
-8. PR `none` 且 branch `absent` → 回落 `proposed`
-9. 其余任何组合（含 PR `multiple`、`proposed` 却有分支、`blocked` 却有 open PR、收据与远端事实不符、label 缺失或双状态） → **`needs-human-reconciliation`**，开哨兵评论并告警，**不猜**
+6. PR `none` 且 branch `present-at-receipted-SHA` 且 worktree `owned` → **接续**，从收据中的 `last_checkpoint` 继续
+7. PR `none` 且 branch `present`（含 `diverged`）且 worktree `absent`/`marker-mismatch` → 重建 worktree 后接续；`diverged` 需先核对收据 SHA，无法解释的分歧转第 10 条
+8. PR `none` 且 branch `absent` 且 attempt `none`/`active` → 回落 `proposed`
+9. PR `multiple` → **`needs-human-reconciliation`**
+10. 其余任何组合（含收据与远端事实不符、label 缺失或双状态、worktree `foreign`） → **`needs-human-reconciliation`**，开哨兵评论并告警，**不猜**
 
 **互斥完备性必须被机械证明**：以 property-based test 穷举六维度全组合，断言每个组合恰好落到一个结果，无重叠、无遗漏（评审 R2-02）。
 
@@ -128,12 +155,32 @@ GitHub 的建 Issue / 开 PR / 写评论**没有统一幂等接口**，「响应
 
 1. **任何副作用前**先落盘并 `fsync`：`operation_id`、natural key、payload hash、`phase=prepared`。
 2. 调用返回后写 `observed`；**响应不确定时禁止盲重试**，先按 natural key 查询远端。
-3. natural key 约定：
-   - Issue：标题/正文内嵌机器 marker `HARNESS-OP:<operation_id>`，建前建后均按 marker 搜索。
-   - PR：`repo + head branch + base branch`，重试前按 head 查现存 PR。
-   - receipt 评论：隐藏 marker / 固定首行。
-4. **label 迁移**：单次 replace-all（保留 `T*`/`size:*`/`lane:*` 辅助 label）或带期望旧值的 compare-and-set；不可 CAS 时把人工并发修改视为**冲突**而非覆盖，转 `needs-human-reconciliation`。
-5. 存储要求是「durable intent + 原子更新 + 崩溃恢复」；SQLite WAL 是直接选择，严格实现的 append-only journal + fsync + checksum 亦可（实现由 plan 定）。
+3. **唯一执行入口**（评审 R2-06 残留）：所有外部副作用**只能**经统一的 operation registry / outbox executor 发出；崩溃矩阵从该 registry **自动生成**。否则实现者随手加一处直连 `gh`/`git` 调用，矩阵永远不知道它存在。绕过 registry 的直接调用列入红线 gate。
+
+### 6.1 Stage 1 的 operation registry（上线前必须全覆盖）
+
+| operation | natural key / 恢复查询 |
+|---|---|
+| 创建 Issue | 正文内嵌 `HARNESS-OP:<operation_id>`，建前建后均按 marker 搜索 |
+| 设置初始 label | **优先随 Issue create 一次提交**；若单独发出，重试前先读当前 label 集 |
+| 写提案卡 + 本地 commit | 固定 proposal path + commit trailer `HARNESS-OP:<operation_id>` |
+| push main | 查询**远端 main** 是否已含该 operation 的 commit 或相同 proposal blob |
+| 写发布收据 | 固定 comment marker + operation ID |
+| 本地 ledger / 预算结算 | outbox operation ID |
+
+**main 并发更新**：push 遇 non-fast-forward 时**不得**另建第二张卡或第二个 Issue；应 fetch/merge 当前 main，把同一 operation 的 proposal commit 重放或合并后再 push，保持同一 operation lineage。
+
+### 6.2 Stage 2 追加的 natural key
+
+PR：`repo + head branch + base branch`，重试前按 head 查现存 PR；receipt 评论：隐藏 marker / 固定首行。
+
+### 6.3 label 迁移
+
+GitHub labels API **没有通用 compare-and-set**，replace-all 在读后写之间仍可能覆盖用户的并发修改。因此：迁移前先读当前 label 集并与预期旧值比对，不符即判**冲突**转 `needs-human-reconciliation`，**不覆盖**；replace-all 时必须原样保留 `T*`/`size:*`/`lane:*` 等辅助 label。
+
+### 6.4 存储
+
+要求是「durable intent + 原子更新 + 崩溃恢复」；SQLite WAL 是直接选择，严格实现的 append-only journal + fsync + checksum 亦可（技术选型由 plan 定，不是规格要求）。控制器崩溃后必须**双向 reconcile**（outbox ↔ 远端事实），不得单信任一方。
 
 ## 七、一轮的流程
 
@@ -154,27 +201,50 @@ GitHub 的建 Issue / 开 PR / 写评论**没有统一幂等接口**，「响应
 
 ### Phase B · 分段执行（评审 R2-01 修正）
 
-v2 的致命矛盾：既要求「agent 第一个可编译提交即 push」保证中断韧性，又要求「只有控制器能 push」——**不可能同时成立**，因为控制器在 Workflow 返回前无法介入。修正为**多次 Workflow 调用，控制器在段间接管**：
+v2 的致命矛盾：既要求「agent 第一个可编译提交即 push」保证中断韧性，又要求「只有控制器能 push」——**不可能同时成立**，因为控制器在 Workflow 返回前无法介入。修正为**多次 `claude -p` 调用，控制器在段间接管**：
 
 ```
 段 1  Workflow scrollz-propose
         扫描（4 lens 并行 finder）→ JS 去重 → 3 judge 对抗裁决（可跨模型 agentType）→ 排序选一
         ↓ 返回结构化候选，不产生任何外部副作用
-控制器  建 Issue（natural key 幂等）→ 冻结 attempt_id → 提案卡 docs/proposals/<issue>-<slug>.md
-        → 提交并推 main → 建分支 + worktree + .harness-owner → 写 intent receipt
-        ↓                                    【Stage 1 到此结束】
+控制器  建 Issue（natural key 幂等，label 随建一次提交）→ 冻结 attempt_id
+        → 写提案卡 docs/proposals/<issue>-<slug>.md（commit trailer 绑定 operation）
+        → push main（non-fast-forward 时 fetch/merge 后重放同一 operation）
+        → 写发布收据
+        ↓                      【★ Stage 1 到此结束 ★】
+        ↓                      【以下为 Stage 2，需 §十一 激活门通过】
+控制器  建分支 + worktree + .harness-owner → 写 intent receipt
+        ↓
 段 2  Workflow scrollz-implement（在既有 worktree 内，TDD）
         只允许 commit，**不允许 push**；到达 checkpoint 即返回
         ↓
 控制器  校验 commit（diff 路径白名单 + 红线 gate + 属主）→ push → 更新 last_checkpoint 收据
-        ↓ 未完成则回到段 2 下一段（多次调用，而非一次后台 Workflow 内部回调）
-段 3  Workflow scrollz-review（未参与实现的 reviewer，可跨模型）
+        ↓ 未完成则再起一次段 2 调用（多次 invocation，而非一次后台 Workflow 内部回调）
+段 3  Workflow scrollz-review（fresh session，未参与实现的 reviewer，可跨模型）
         ↓
 控制器  验证测试 receipt → gh pr create（含 Closes #N、被测 SHA、命令与退出码、测试数/skip 数、触碰面、评审结论）
         → label 迁移 → 写收据 → 结算预算与记账
 ```
 
-单轮 agent ≤ 12（工具建议 <15，并发上限 16）。
+#### B.1 上下文续接契约
+
+- propose / implement / review 使用**独立 session**；review **必须** fresh session 以保证独立性。
+- implement 的后续 segment 采用 **fresh invocation + durable checkpoint**，而非依赖 `--resume`：输入固定为 Issue 规格、base/head SHA、上一 checkpoint、剩余验收项、工作树状态。`--resume` 可作为优化，但 session **不是真值**——控制器或 session 丢失都不得影响恢复。
+- 明确不依赖 `resumeFromRunId`（同会话限定）。
+
+#### B.2 跨调用预算 grant（评审 R3）
+
+`--max-budget-usd` 是**每次 `claude -p` 调用**的独立上限，Workflow 的 `budget` 也只属于当前 run——多次 implement 会各自拿到完整 cap，不会自动继承「本轮剩余」。故控制器维护：
+
+```
+remaining_grant = round_reserved - settled_cost - outstanding_worst_case
+```
+
+每次调用前发放 `invocation_grant <= remaining_grant`，同时设置该次的 `--max-budget-usd` 与脚本内 `budget.total`；无最终 result 时按 grant 全额占用直到可对账。**agent 数（≤12）、turns、重试次数同样跨调用累计**，不是每个 Workflow 各自 ≤12。
+
+#### B.3 单调截止（评审 R3）
+
+`TimeoutStartSec`（建议 25 分钟）约束的是**整个控制器轮次**，不是每个子进程。控制器用单调时钟维护 `remaining_time = round_deadline - now`，每次 Workflow 的子进程超时与后台等待上限都不得超过剩余时间，并**预留** checkpoint、outbox 结算与 SIGTERM 清理的时间窗。否则第一次 implement 就能吃光 25 分钟，后面的 push、评审与记账永远没有执行窗口。
 
 ### Phase C · 记账退出
 
@@ -191,14 +261,26 @@ v2 的致命矛盾：既要求「agent 第一个可编译提交即 push」保证
 
 ## 九、权限、凭据与确定性纵深防线
 
-### 9.1 会话隔离（对抗作用域合并，评审 R2-04）
+### 9.1 会话隔离（对抗作用域合并，评审 R2-04 / R3）
 
-- 固定 `--setting-sources` 或专用 `--settings .claude/harness-settings.json`，**阻断用户级 332 条 Bash 授权、hooks 与 plugin 能力**进入 harness 会话。
-- `--disallowedTools "mcp__*"`：设计不依赖任何 MCP，且 headless 下 MCP 本就可能不可用。
-- `--permission-mode dontAsk` + 最小 allow；**禁止 `bypassPermissions`**。
-- deny 至少覆盖：`git push*`、`git remote *`、`git config *`、`gh *`、`systemctl *`、`fusermount*`、生产路径写入。仅禁 force push 远远不够。
+v3 写的「固定 `--setting-sources` **或** 专用 `--settings`」是伪协议：`--settings` 只覆盖同名键，未覆盖的 user/project/local permissions、hooks、plugins 仍然生效。必须给出**一个精确、经实测确认的启动组合**（flag 语义已核实）：
+
+```
+claude -p "/scrollz-round" \
+  --setting-sources project \            # 只加载项目作用域，屏蔽用户级 332 条 Bash 授权与 hooks/plugins
+  --settings .claude/harness-settings.json \
+  --strict-mcp-config \                  # 不提供 --mcp-config，等价于零 MCP（含 serena 的 execute_shell_command）
+  --tools "<按阶段收敛的内置工具集>" \    # Stage 1 不含 Bash/Edit/Write
+  --permission-mode dontAsk \
+  --max-turns <N> --max-budget-usd <grant> \
+  --output-format stream-json
+```
+
+- **Stage 1 的 `--tools` 不含 `Bash`/`Edit`/`Write`**——finder/judge 只需 `Read`/`Grep`/`Glob` 读仓库，全部外部动作由控制器执行。这使 §9.2 的多数防线在 Stage 1 直接不适用（评审 R2-05 前提）。
+- **禁止 `bypassPermissions` 与 `--dangerously-skip-permissions`**。
+- Stage 2 放开 Bash 时，deny 至少覆盖：`git push*`、`git remote *`、`git config *`、`gh *`、`systemctl *`、`fusermount*`、生产路径写入。仅禁 force push 远远不够。
 - **凭据清场**：agent 进程显式清除 `GH_TOKEN`/`GITHUB_TOKEN`/`SSH_AUTH_SOCK`/git credential helper 环境，设 `GIT_TERMINAL_PROMPT=0`。否则 systemd user 环境里现存的 `SSH_AUTH_SOCK` 足以让 agent 直接推 main。
-- `--max-turns`、`--max-budget-usd`、`--output-format stream-json` 固定给值；脚本内再用 `budget.remaining()` 二次收敛。
+- Round 0 必须**负向验证**：`system/init` 输出中无插件与 MCP 工具；agent 无法 `push main`、无法 `gh issue create`、无法经 MCP 间接执行 shell。只验 happy path 不算通过。
 - 被拒工具调用超阈值 → `harness:blocked` 并记账，不视为可绕过。
 
 ### 9.2 不做 OS 隔离前提下的确定性防线（评审 R2-05）
@@ -239,7 +321,12 @@ v2 的致命矛盾：既要求「agent 第一个可编译提交即 push」保证
 2. `--settings` + `--permission-mode dontAsk` + deny 组合能否无人值守跑完，且**负向验证**：agent 无法 `push main`、无法 `gh issue create`、无法经 MCP 间接执行 shell。只验 happy path 不算通过。
 3. 专用 PAT 实权：建/改 label、开 Issue、开 PR。
 4. GitHub runner 能力边界：`/dev/fuse`、`fusermount3`、loop 设备、`dm-flakey`/`dm-log-writes`、sudo、单 job 时长。
-5. **branch protection 激活收据**（评审 R2-11）：远端 main 现无保护，且专用 PAT 无 Administration 权限，无法自建或自查。需仓库 owner 一次性配置并留收据（保护已启用、required checks 精确名称、是否要求 up-to-date、是否禁 force push 与删除）；控制器每轮只读校验仍符合收据，不符即暂停自动开发。**若用户决定不用 branch protection，文档必须把「required」改称「控制器的 merge-readiness 条件」，不得混用术语。**
+5. **main 保护策略与 Stage 1 直推的共存**（评审 R2-11 / R3-04）。远端 main 现无保护，专用 PAT 无 Administration 权限，无法自建或自查。且存在真实冲突：Stage 2 若启用「必须走 PR」的 ruleset，Stage 1 每轮向 main 直推提案卡就不再成立。三条出路，**本 spec 推荐第一条**：
+   - **推荐：不启用阻断直推的保护**，把 spec 中的「required check」一律改称**控制器的 merge-readiness 条件**——CI 仍在 PR 上跑并可见，合并决定权本来就只在用户（单维护者仓库，保护带来的边际收益小于协议复杂度）。术语不得与 GitHub 的 required status checks 混用。
+   - 提案卡也走轻量 docs PR：保护可启用，但每张提案卡都要用户点一次合并，无人值守价值被削弱。
+   - ruleset 允许受限 bot bypass：权限面更大，必须有独立激活测试与审计，且控制器须严格校验提交只含单个 `docs/proposals/<issue>-<slug>.md`。
+
+   无论选哪条，都需 owner 一次性配置并留**激活收据**（保护是否启用、required checks 精确名称、是否要求 up-to-date、是否禁 force push 与删除）；控制器每轮只读校验仍符合收据，不符即暂停自动开发。
 
 **测试 receipt 硬要求**：本项目 FUSE 测试在缺 `/dev/fuse` 或 `fusermount` 时会打印 SKIP 后**成功返回**——「cargo test 绿」不证明挂载路径跑过。receipt 必须含被测 head SHA、命令、退出码、测试数、**skip 数**、以及「真实 FUSE 路径确实执行」的正向证据；skip 超阈值即判证据不足。
 
@@ -247,16 +334,43 @@ CI 分层预期：L0 `fmt`/`clippy`/`build`；L1 不需 FUSE 的测试；L2 需 
 
 ## 十二、队列治理
 
-- **软配额而非硬配额**（评审 R2-09）：候选分 `roadmap`/`defect`/`perf`/`hygiene` 四 lane，按 rolling N 次**实际开发选择**计算，且只对**当前 eligible** 候选生效（blocked、needs-decision、与在飞 PR 冲突、oracle 不成立者不参与）。欠额只**提高权重**不强制选择；只扫描期间只累计 deficit，不虚构选中。
-- **aging**：排队越久权重越高；队列治理必须能把 stale 项迁 `superseded`/`blocked` 释放容量，避免旧而不适用的候选永久占位。
-- **去重分两级**（评审 R2-08）：精确 operation/proposal ID 可硬去重；**fingerprint 只能产出 `possible_duplicate`**，交确定性字段与 judge 复核——fingerprint 的「规范化目标/不变量」由不可信模型生成，既可能误碰撞也可能被轻微改写绕过。
-- **拒绝可复议**：rejected 记录必须带 `reconsider_when` 与决定版本；条件满足、关联代码 SHA 变化或用户裁定变化后**自动失效**，不得成为永久去重键。保留人工 override 与 `supersedes` 关系。
-- **质量指标**：合并率、拒绝率、重复率、revert 率、首次评审通过率、proposal→PR 周期、各 lens 有效率；跌破门槛自动降级只扫描或暂停请求复核。
+### 12.1 Stage 1（只扫描期）
+
+Stage 1 没有「实际开发选择」，按开发选择计算的软配额在此**不适用**，只会无限累计 deficit（评审 R2-09/R3-05）。Stage 1 用：
+
+- `proposed` **总上限 + per-lane 上限**（约束每轮发布什么、发布多少）；
+- 精确 operation/proposal ID 硬去重；
+- `possible_duplicate` 复核；
+- user-closed Issue 的拒绝记忆；
+- typed `reconsider_when`（见 12.3）；
+- stale / superseded 清理。
+
+### 12.2 Stage 2（开发期）
+
+- **软配额而非硬配额**：候选分 `roadmap`/`defect`/`perf`/`hygiene` 四 lane，按 rolling N 次**实际开发选择**计算，且只对**当前 eligible** 候选生效（blocked、needs-decision、与在飞 PR 冲突、oracle 不成立者不参与）。欠额只**提高权重**不强制选择；只扫描期间只累计 deficit，不虚构选中。
+- **aging**：排队越久权重越高；治理必须能把 stale 项迁 `superseded`/`blocked` 释放容量，避免旧而不适用的候选永久占位。
+
+### 12.3 去重与复议（两级）
+
+- 精确 operation/proposal ID 可硬去重；**fingerprint 只能产出 `possible_duplicate`**，交确定性字段与 judge 复核——fingerprint 的「规范化目标/不变量」由不可信模型生成，既可能误碰撞也可能被轻微改写绕过。
+- **`reconsider_when` 必须是可执行谓词**，不能是自然语言，否则「自动失效」无从实现（评审 R2-08 残留）。允许的谓词类型：`main_sha_changed`、`dependency_issue_closed(#N)`、`decision_version_gt(v)`、`not_before(date)`。无法机器判断的条件只能转**人工复议**，不得伪装成自动。
+- rejected 记录必须带 `reconsider_when` 与决定版本；条件满足后自动失效，**不得成为永久去重键**。保留人工 override 与 `supersedes` 关系。
 
 ## 十三、可观测性、失败预算与熔断
 
-- 预算三档：per-round、per-day、rolling-24h，均带 §七 的**事前预留**。
-- 熔断：同类错误连续 N 次、日预算耗尽、质量指标跌破门槛 → 切 `paused`。
+### 13.1 分阶段的质量指标（评审 R3-05）
+
+指标 schema、阈值与熔断规则**按阶段分离**；切到 Stage 2 才开始累计开发类指标。**未定义值不得按 0 处理**，否则上线即误熔断。
+
+| 阶段 | 可观测指标 |
+|---|---|
+| Stage 1 | 提案被用户保留 / 关闭的比例、重复率、`needs-decision` 率、各 lens 采纳率 |
+| Stage 2 | 追加：合并率、拒绝率、revert 率、首次评审通过率、proposal→PR 周期 |
+
+### 13.2 预算与熔断
+
+- 预算三档：per-round、per-day、rolling-24h，均带 §七 的**事前预留**与跨调用 grant。
+- 熔断：同类错误连续 N 次、日预算耗尽、当前阶段的质量指标跌破门槛 → 切 `paused`。
 - 告警：专用哨兵 Issue + systemd `OnFailure`；stale `picked`/`in-pr` 超时告警；预检失败必须列明缺失项（如 PATH 缺 `claude`）并触发告警，而非静默重试。
 - 人工开关：`harness:paused` 哨兵 Issue 存在即暂停；提供只读诊断命令。
 
@@ -264,11 +378,15 @@ CI 分层预期：L0 `fmt`/`clippy`/`build`；L1 不需 FUSE 的测试；L2 需 
 
 ### 14.1 状态派生函数
 
-property-based test 穷举 §5.1 六维度全组合，断言每组合恰好命中一条判定、无重叠无遗漏，非规范组合唯一落到 `needs-human-reconciliation`。
+- **Stage 1**：穷举 §5.0 发布生命周期的可达状态与远端事实组合，断言中断后能唯一恢复（尤其区分「只有 Issue」「本地已 commit 未 push」「已 push 未写收据」「已完成」）。
+- **Stage 2**：property-based test 穷举 §5.1 六维度全组合，断言每组合恰好命中一条判定、无重叠无遗漏，非规范组合唯一落到 `needs-human-reconciliation`。
 
-### 14.2 崩溃点矩阵（从控制器的 operation 清单**自动生成**，非手写）
+### 14.2 崩溃点矩阵（从 §六 的 operation registry **自动生成**，非手写）
 
-每个 operation 至少四个崩溃点：`before-call` / `server-applied-response-lost` / `after-response-before-ledger` / `after-ledger`。覆盖对象必须包含：建 Issue、提案卡 commit、push main、建 worktree、写 `.harness-owner`、实现 commit、feature push、开 PR、label 迁移（含 replace-all 响应未知）、写 receipt、写 outbox/ledger，以及**收尾流程的独立矩阵**（关 Issue、删远端分支、删 worktree、文档 commit、push main、receipt）。断言不止「不重复」，还要「重启后最终状态一致」。
+每个 operation 至少四个崩溃点：`before-call` / `server-applied-response-lost` / `after-response-before-ledger` / `after-ledger`。断言不止「不重复」，还要「重启后最终状态一致」。
+
+- **Stage 1 子矩阵（上线前必须完成，不得延到 Stage 2）**：建 Issue、设 label、提案卡 commit、push main（含 non-fast-forward 重放）、写发布收据、写 outbox/ledger。
+- **Stage 2 追加**：建 worktree、写 `.harness-owner`、实现 commit、feature push、开 PR、label 迁移（含 replace-all 响应未知），以及**收尾流程的独立矩阵**（关 Issue、删远端分支、删 worktree、文档 commit、push main、receipt）。
 
 ### 14.3 真实环境验收
 
@@ -315,6 +433,20 @@ property-based test 穷举 §5.1 六维度全组合，断言每组合恰好命�
 | R2-10 红线 oracle 类型 | 采纳（§十） | Stage 2 |
 | R2-11 branch protection 收据 | 采纳（§十一.5） | Stage 2 |
 | R2-12 systemd PATH | 采纳（§三、§四、§十三） | Stage 1 |
+| R3-01 Stage 1 结束点越界 | 采纳，结束点前移至发布收据完成（§零、§七 Phase B） | Stage 1 |
+| R3-02 Stage 1 发布生命周期缺失 | 采纳（§5.0、§6.1、§14.1、§14.2） | Stage 1 |
+| R3-03 「只建不改」描述失准 | 采纳（§零） | Stage 1 |
+| R3-04 保护策略与直推冲突 | 采纳，推荐「不启用阻断直推的保护 + 改口径为 merge-readiness」（§十一.5），**待用户确认** | Stage 2 交界前 |
+| R3-05 指标混用与误熔断 | 采纳，指标按阶段分离、未定义值不补 0（§13.1） | Stage 1 |
+| R3 attempt 维度未参与判定 | 采纳，新增第 0 条 superseded 优先（§5.2） | Stage 2 |
+| R3 判定条件混入 label | 采纳，判定只用事实维度，label 不一致由兜底条处理（§5.2） | Stage 2 |
+| R3 registry 唯一入口 | 采纳（§六.3 唯一执行入口 + 红线 gate） | Stage 1 |
+| R3 label 无 CAS | 采纳，改为读-比对-冲突转人工（§6.3） | Stage 1 |
+| R3 跨调用预算 grant | 采纳（§七 B.2） | Stage 2 |
+| R3 单调截止 | 采纳（§七 B.3） | Stage 2 |
+| R3 上下文续接契约 | 采纳，fresh invocation + durable checkpoint（§七 B.1） | Stage 2 |
+| R3 `--settings` 伪协议 | 采纳，给出精确启动组合并已核实 flag 语义（§9.1） | Stage 1 |
+| R3 `reconsider_when` 需 typed | 采纳（§12.3） | Stage 1 |
 
 ## 十六、开放项（实施期确认，不阻塞本 spec）
 
