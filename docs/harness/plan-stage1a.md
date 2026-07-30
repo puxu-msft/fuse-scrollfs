@@ -707,8 +707,20 @@ class Outbox:
             (kind, natural_key)).fetchone()
         return self._row_to_op(row) if row else None
 
+    SUB_KINDS = ("commit_proposal", "push_main", "publication_receipt")
+
     def prepare(self, round_id: str, kind: str, natural_key: str,
                 payload: dict) -> Operation:
+        # 冻结隐式父指针：子 operation 的 natural_key **必须**等于 root 的
+        # operation_id。这是 root_of() 赖以工作的约定，写成断言以免被无意破坏。
+        if kind in self.SUB_KINDS:
+            parent = self.conn.execute(
+                "SELECT 1 FROM operations WHERE operation_id=? AND kind=?",
+                (natural_key, "publish_proposal")).fetchone()
+            if parent is None:
+                raise OperationConflict(
+                    f"{kind} 的 natural_key 必须是 publish_proposal 的 "
+                    f"operation_id，收到 {natural_key!r}")
         existing = self.get(kind, natural_key)
         if existing is not None:
             row = self.conn.execute(
@@ -734,6 +746,14 @@ class Outbox:
                 probe: Callable[[], dict | None]) -> dict | None:
         if op.phase in ("observed", "settled"):
             return op.result
+        # 重入（prepared / failed_retryable）：**先 probe 再决定是否 call**。
+        # 「artifact 已存在」不等于「事务已收敛」——崩在 after-call 时副作用
+        # 已落地而 op 仍是 prepared，直接重发会失败（如 git commit 报
+        # nothing to commit），probe-first 把它正式推进到 observed。
+        probed_first = probe()
+        if probed_first is not None:
+            self._mark(op, "observed", probed_first)
+            return probed_first
         _fault_check(op.kind, "before-call")
         try:
             result = call()
@@ -836,8 +856,18 @@ class Outbox:
         return self._row_to_op(row)
 
     def open_roots(self) -> list[Operation]:
-        """未结 operation 按 root 聚合去重：同一提案只恢复一次。"""
-        roots: dict[str, Operation] = {}
+        """尚未收敛的发布事务（评审 R5-C-02）。
+
+        不能只从 `open_operations()` 反推：Issue 建成后 root 已是 `observed`、
+        子 operation 也可能被 reconcile 转成 `observed`，此时未结集合为空，
+        但整条发布可能还没 push、没写收据。**root 只有在收据校验通过后才
+        `settled`**，所以直接查「非 settled / 非 failed_terminal 的 root」。
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM operations WHERE kind='publish_proposal'"
+            " AND phase NOT IN ('settled','failed_terminal')").fetchall()
+        roots = {r["operation_id"]: self._row_to_op(r) for r in rows}
+        # 子 operation 未结但 root 已 settled 属异常，一并纳入以免悬置
         for op in self.open_operations():
             root = self.root_of(op)
             roots.setdefault(root.operation_id, root)
@@ -1407,8 +1437,13 @@ class PublishWorktree:
         return sha
 
     def local_has_operation(self, operation_id: str) -> bool:
+        return self.operation_commit_sha(operation_id) is not None
+
+    def operation_commit_sha(self, operation_id: str) -> str | None:
+        """本地已存在的、属于该 operation 的提交 SHA（崩溃恢复要靠它认出提交）。"""
         out = self._git("log", "--grep", TRAILER + operation_id, "--format=%H")
-        return bool(out.strip())
+        lines = [l for l in out.splitlines() if l.strip()]
+        return lines[0] if lines else None
 
     def remote_has_operation(self, operation_id: str, rel_path: str) -> bool:
         self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
@@ -1969,6 +2004,17 @@ class CrashMatrixBase(unittest.TestCase):
                     if c["body"].startswith("HARNESS-RECEIPT")]
         self.assertEqual(len(receipts), 1, "发布收据必须唯一")
 
+        # 数据库终态 oracle：artifact 齐全 ≠ 事务收敛。若 operation 停在
+        # prepared，后续轮次会永久认为仍需恢复（评审 R5-C-03）
+        rows = self.conn.execute(
+            "SELECT kind, phase FROM operations").fetchall()
+        stuck = [(r["kind"], r["phase"]) for r in rows
+                 if r["phase"] not in ("observed", "settled")]
+        self.assertEqual(stuck, [], f"存在未收敛的 operation：{stuck}")
+        roots = [r for r in rows if r["kind"] == "publish_proposal"]
+        self.assertEqual([r["phase"] for r in roots], ["settled"],
+                         "收据校验通过后 root 必须 settled")
+
 
 class TestHappyPath(CrashMatrixBase):
     def test_publish_reaches_receipt_complete(self):
@@ -2239,23 +2285,24 @@ class Publisher:
         return self.publish(root.payload)
 
     def publish(self, candidate: dict, stop_after: str | None = None) -> dict:
-        # payload 必须足以在进程重启后**重建提案卡**：只存 title/slug 时
-        # 恢复路径拿不到 body_md/labels，卡片无从生成（评审 C-02）
+        """幂等发布。**每一步都无条件走 `outbox.execute`**——不再用
+        「artifact 已存在就跳过」的分支，那样 operation 会永远停在 prepared，
+        后续轮次将永久认为仍需恢复（评审 R5-C-03）。重入由 execute 的
+        probe-before-call 统一处理。
+        """
         op = self.outbox.prepare(
             self.round_id, "publish_proposal", candidate["fingerprint"],
             {k: candidate[k] for k in
              ("fingerprint", "title", "slug", "lane", "labels", "body_md")})
         self.last_operation_id = op.operation_id
         marker = OP_MARKER + op.operation_id
+        body = f"{candidate['body_md']}\n\n<!-- {marker} -->\n"
 
-        issue = self.gh.find_issue_by_marker(marker)
-        if issue is None:
-            body = f"{candidate['body_md']}\n\n<!-- {marker} -->\n"
-            issue = self.outbox.execute(
-                op,
-                call=lambda: self.gh.create_issue(
-                    candidate["title"], body, candidate["labels"]),
-                probe=lambda: self.gh.find_issue_by_marker(marker))
+        issue = self.outbox.execute(
+            op,
+            call=lambda: self.gh.create_issue(
+                candidate["title"], body, candidate["labels"]),
+            probe=lambda: self.gh.find_issue_by_marker(marker))
         number = issue["number"]
         rel_path = f"docs/proposals/{number}-{candidate['slug']}.md"
         self.queue.record(candidate["fingerprint"], candidate["lane"],
@@ -2263,70 +2310,74 @@ class Publisher:
         if stop_after == "issue":
             return {"issue": number, "state": State.ISSUE_CREATED}
 
-        # 重入时先把 operation 绑定关系装回工作区对象：operation_sha/path 只活在
-        # PublishWorktree 实例里，进程重启后必须从 outbox 恢复，否则 non-ff 重放
-        # 会以「未绑定 operation commit SHA」失败（评审 C-05）
+        # 重入时把绑定装回工作区对象；进程重启后这两个字段不存在于内存
         self.wt.operation_path = rel_path
         self.wt.operation_sha = self.outbox.commit_sha(op)
-
         self.wt.ensure(allow_reset=self.wt.operation_sha is None)
 
-        if not self.wt.remote_has_operation(op.operation_id, rel_path):
-            commit_op = self.outbox.prepare(
-                self.round_id, "commit_proposal", op.operation_id,
-                {"issue": number, "path": rel_path})
+        commit_op = self.outbox.prepare(
+            self.round_id, "commit_proposal", op.operation_id,
+            {"issue": number, "path": rel_path})
 
-            def do_commit():
-                self.wt.write_proposal(
-                    rel_path, self._card(candidate, number, op.operation_id))
-                sha = self.wt.commit(
-                    f"docs(proposals): #{number} {candidate['title']}",
-                    op.operation_id, rel_path)
-                # 立刻持久化 SHA：预检据此判断"有未推送提交、禁止 reset"
-                self.outbox.set_commit_sha(op, sha)
-                self.outbox.set_commit_sha(commit_op, sha)
-                return {"sha": sha}
+        def do_commit():
+            self.wt.write_proposal(
+                rel_path, self._card(candidate, number, op.operation_id))
+            sha = self.wt.commit(
+                f"docs(proposals): #{number} {candidate['title']}",
+                op.operation_id, rel_path)
+            self.outbox.set_commit_sha(op, sha)
+            self.outbox.set_commit_sha(commit_op, sha)
+            return {"sha": sha}
 
-            def probe_commit():
-                sha = self.outbox.commit_sha(commit_op)
-                return {"sha": sha} if sha else None
+        def probe_commit():
+            """已存在的提交（含崩在 after-call 的情形）必须被认出来。"""
+            sha = self.outbox.commit_sha(commit_op) or \
+                self.wt.operation_commit_sha(op.operation_id)
+            if not sha:
+                return None
+            self.outbox.set_commit_sha(op, sha)
+            self.outbox.set_commit_sha(commit_op, sha)
+            return {"sha": sha}
 
-            self.outbox.execute(commit_op, call=do_commit, probe=probe_commit)
-            self.wt.operation_sha = self.outbox.commit_sha(op)
+        self.outbox.execute(commit_op, call=do_commit, probe=probe_commit)
+        self.wt.operation_sha = self.outbox.commit_sha(op)
+        if stop_after == "commit":
+            return {"issue": number, "state": State.COMMITTED_LOCAL}
 
-            if stop_after == "commit":
-                return {"issue": number, "state": State.COMMITTED_LOCAL}
-
-            push_op = self.outbox.prepare(
-                self.round_id, "push_main", op.operation_id,
-                {"issue": number, "path": rel_path})
-            self.outbox.execute(
-                push_op,
-                call=lambda: (self.wt.push(), {"pushed": True})[1],
-                probe=lambda: ({"pushed": True}
-                               if self.wt.remote_has_operation(
-                                   op.operation_id, rel_path) else None))
+        push_op = self.outbox.prepare(
+            self.round_id, "push_main", op.operation_id,
+            {"issue": number, "path": rel_path})
+        self.outbox.execute(
+            push_op,
+            call=lambda: (self.wt.push(), {"pushed": True})[1],
+            probe=lambda: ({"pushed": True}
+                           if self.wt.remote_has_operation(
+                               op.operation_id, rel_path) else None))
         if stop_after == "push":
             return {"issue": number, "state": State.PUBLISHED}
 
-        if self.gh.find_comment_by_marker(number, marker) is None:
-            receipt_op = self.outbox.prepare(
-                self.round_id, "publication_receipt", op.operation_id,
-                {"issue": number})
-            body = (f"{RECEIPT_MARKER}\n"
-                    f"round={self.round_id}\n"
-                    f"{marker}\n"
-                    f"proposal={rel_path}\n"
-                    f"state={State.PUBLISHED}\n")
-            self.outbox.execute(
-                receipt_op,
-                call=lambda: self.gh.create_comment(number, body),
-                probe=lambda: self.gh.find_comment_by_marker(number, marker))
+        receipt_op = self.outbox.prepare(
+            self.round_id, "publication_receipt", op.operation_id,
+            {"issue": number, "path": rel_path})
+        receipt_body = (f"{RECEIPT_MARKER}\n"
+                        f"round={self.round_id}\n"
+                        f"{marker}\n"
+                        f"proposal={rel_path}\n"
+                        f"state={State.PUBLISHED}\n")
+        self.outbox.execute(
+            receipt_op,
+            call=lambda: self.gh.create_comment(number, receipt_body),
+            probe=lambda: self.gh.find_comment_by_marker(number, marker))
 
         issue = self.gh.find_issue_by_marker(marker)
         facts = self.collect_facts(op.operation_id, issue, rel_path,
                                    candidate["labels"])
-        return {"issue": number, "state": lifecycle.derive(facts)}
+        state = lifecycle.derive(facts)
+        if state == State.RECEIPT_COMPLETE:
+            # 只有收据校验通过，整条发布事务才算收敛
+            for finished in (commit_op, push_op, receipt_op, op):
+                self.outbox.settle(finished)
+        return {"issue": number, "state": state}
 
     @staticmethod
     def _card(candidate: dict, number: int, operation_id: str) -> str:
@@ -4027,6 +4078,7 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | **R3-C-04 待推检测查错集合** | **属实** | 不再从 `reconcile()` 返回值推导（已 observed 的 commit 不在未决集合里，推导恒 False）；改为 `unpushed_commits()` 直查「有 commit_sha 且对应 push_main 未 observed」 |
 | **R4-C-02 子 operation 恢复归属** | **属实** | 父子关联本已存在（子 operation 的 natural_key 即 root 的 operation_id），但 `resume()` 没解析它。新增 `root_of()` / `open_roots()`，`run_round` 按 root 聚合恢复；补「未结的是子 operation 时能找到 root」测试 |
 | **R4-C-03 覆盖表与实际登记不一致** | **属实**（覆盖表本身会确定性失败，只登记了 4/12） | 四条手写相位测试改为**表驱动循环覆盖全部 12 项**，每项独立 fixture + 关闭重开 SQLite；ResponseLost 测试保留为网络不确定性测试，明确不计入相位覆盖 |
+| **R5-C-02/C-03「artifact 存在 ≠ 事务收敛」** | **属实，且是统一根因** | ①`execute()` 对重入的 operation **先 probe 再决定是否 call**（崩在 after-call 时副作用已落地，重发会因 `nothing to commit` 失败）②`publish()` 删掉全部「artifact 已存在就跳过」分支，每步无条件走 `execute` ③root 只在收据校验通过后 `settle`，`open_roots()` 直查「非 settled 的 root」而非从未结集合反推 ④`assert_converged()` 增加数据库终态 oracle：无 operation 停在 prepared、root 必须 settled ⑤`prepare()` 断言子 operation 的 natural_key 必须是既有 root 的 operation_id，把隐式父指针冻住 |
 | M-15 probe 未测后台 Workflow 等待 | **属实** | Task 13 Step 1 的措辞已改：probe 只验工具/MCP 隔离；后台等待上限由 Task 13 Step 3 的真实 round（会启动 Workflow）观测并回填 spec §十六 |
 
 ## 执行状态（逐任务同步，跨会话据此判断进度）
