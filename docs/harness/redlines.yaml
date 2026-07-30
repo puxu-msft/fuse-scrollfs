@@ -1,0 +1,42 @@
+# docs/harness/redlines.yaml
+# 机器可判定红线清单（spec §十）。oracle 类型决定 gate 能断言什么。
+# gate 的结论只能是「规则命中 / 未命中」，不得声称自然语言不变量已被证明。
+version: 1
+rules:
+  - id: disk-format-magic
+    oracle: requires_decision
+    paths:
+      - crates/scrollz/src/archive/superblock.rs
+      - crates/scrollz/src/archive/format.rs
+    reason: 磁盘格式魔数与 superblock 布局属冻结契约，改动需用户裁决
+
+  - id: crash-safe-commit-order
+    oracle: manual_semantic_review
+    paths:
+      - crates/scrollz/src/store/
+      - crates/scrollz/src/archive/journal.rs
+    reason: 崩溃安全提交顺序无法由 diff 模式证明，自动 PR 一律阻断
+
+  - id: tail-journal-record-format
+    oracle: requires_tests
+    paths:
+      - crates/scrollz/src/archive/journal.rs
+    required_tests:
+      - crates/scrollz/tests/fault_injection.rs
+      - crates/scrollz/tests/append_tail_buffer.rs
+    reason: 尾日志 record 格式改动必须跑通故障注入与尾缓冲回归，且不得 skip
+
+  - id: frozen-adr-decisions
+    oracle: requires_decision
+    paths:
+      - docs/ADR.md
+    reason: 已生效 ADR 决策的修改必须由用户裁定
+
+  - id: harness-self-modification
+    oracle: deny_change
+    paths:
+      - .claude/skills/
+      - .claude/workflows/
+      - .claude/harness-settings.json
+      - .claude/scripts/harness/
+    reason: 禁止 harness 无人值守地重写自身控制逻辑；此类改动只能走独立 PR
