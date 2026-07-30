@@ -24,3 +24,7 @@ Thumbs.db
 # 临时 / 日志
 *.log
 /tmp-*
+
+# harness 运行时状态与工作区
+/.worktree/
+/.claude/state/
