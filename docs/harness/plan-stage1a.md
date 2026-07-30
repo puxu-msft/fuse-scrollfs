@@ -559,7 +559,8 @@ class TestOutbox(unittest.TestCase):
         self.assertEqual(result, {"number": 9})
         self.assertEqual(len(calls), 1, "探到已生效后不得再次调用")
 
-    def test_response_lost_and_not_applied_marks_failed(self):
+    def test_response_lost_and_not_applied_marks_failed_retryable(self):
+        """探不到不等于没生效——标可重试，交下一轮 reconcile，不能标死。"""
         op = self.ob.prepare("r1", "create_issue", "nk1", {"title": "x"})
         with self.assertRaises(ResponseLost):
             self.ob.execute(op, call=lambda: (_ for _ in ()).throw(
@@ -567,7 +568,44 @@ class TestOutbox(unittest.TestCase):
         row = self.conn.execute(
             "SELECT phase FROM operations WHERE operation_id=?",
             (op.operation_id,)).fetchone()
-        self.assertEqual(row["phase"], "failed")
+        self.assertEqual(row["phase"], "failed_retryable")
+        self.assertEqual(self.ob.unresolved(), [],
+                         "可重试的 operation 不得阻断下一轮预检")
+
+    def test_reconcile_adopts_late_visible_remote_object(self):
+        """远端索引延迟：本轮探不到，下一轮 reconcile 探到即转 observed。"""
+        op = self.ob.prepare("r1", "create_issue", "nk1", {"title": "x"})
+        with self.assertRaises(ResponseLost):
+            self.ob.execute(op, call=lambda: (_ for _ in ()).throw(
+                ResponseLost("boom")), probe=lambda: None)
+        still_open = self.ob.reconcile(
+            {"create_issue": lambda o: {"number": 11}})
+        self.assertEqual(still_open, [])
+        self.assertEqual(self.ob.get("create_issue", "nk1").result,
+                         {"number": 11})
+
+    def test_prepare_rejects_same_key_with_different_payload(self):
+        from harness.outbox import OperationConflict
+        self.ob.prepare("r1", "create_issue", "nk1", {"title": "x"})
+        with self.assertRaises(OperationConflict):
+            self.ob.prepare("r2", "create_issue", "nk1", {"title": "y"})
+
+    def test_fault_injection_stops_at_named_phase(self):
+        """HARNESS_FAULT 是测试专用的确定性崩溃开关（Task 13 的恢复验收依赖它）。"""
+        import os
+        from harness.outbox import InjectedFault
+        op = self.ob.prepare("r1", "create_issue", "nk1", {"title": "x"})
+        os.environ["HARNESS_FAULT"] = "create_issue:before-call"
+        try:
+            with self.assertRaises(InjectedFault):
+                self.ob.execute(op, call=lambda: {"number": 1},
+                                probe=lambda: None)
+        finally:
+            del os.environ["HARNESS_FAULT"]
+        row = self.conn.execute(
+            "SELECT phase FROM operations WHERE operation_id=?",
+            (op.operation_id,)).fetchone()
+        self.assertEqual(row["phase"], "prepared")
 
     def test_prepare_returns_existing_operation_for_same_natural_key(self):
         """幂等键：同一 natural key 重跑必须复用同一 operation，不新建。"""
@@ -609,6 +647,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -622,6 +661,24 @@ class ResponseLost(Exception):
 
 class OperationConflict(Exception):
     """同一 natural key 对应不同 payload：不得复用旧结果。"""
+
+
+class InjectedFault(Exception):
+    """HARNESS_FAULT 触发的确定性崩溃，仅用于恢复验收。"""
+
+
+def _fault_check(kind: str, phase: str) -> None:
+    """测试专用崩溃开关：HARNESS_FAULT=<kind>:<phase>。
+
+    只读进程环境变量，**不接受**任何来自模型输出或仓库文本的输入。
+    phase ∈ before-call | after-call | after-observe
+    """
+    spec = os.environ.get("HARNESS_FAULT")
+    if not spec:
+        return
+    want_kind, _, want_phase = spec.partition(":")
+    if want_kind == kind and want_phase == phase:
+        raise InjectedFault(f"注入崩溃于 {kind}:{phase}")
 
 
 @dataclass
@@ -677,8 +734,10 @@ class Outbox:
                 probe: Callable[[], dict | None]) -> dict | None:
         if op.phase in ("observed", "settled"):
             return op.result
+        _fault_check(op.kind, "before-call")
         try:
             result = call()
+            _fault_check(op.kind, "after-call")
         except ResponseLost:
             probed = probe()
             if probed is not None:
@@ -689,6 +748,7 @@ class Outbox:
             self._mark(op, "failed_retryable", None)
             raise
         self._mark(op, "observed", result)
+        _fault_check(op.kind, "after-observe")
         return result
 
     def pending(self, round_id: str) -> list[Operation]:
@@ -760,7 +820,7 @@ class Outbox:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd /home/xp/src/zipfs/.claude/scripts && /home/linuxbrew/.linuxbrew/bin/python3 -m unittest harness.tests.test_outbox -v`
-Expected: PASS，6 tests OK
+Expected: PASS，10 tests OK
 
 - [ ] **Step 5: 提交**
 
@@ -1918,6 +1978,32 @@ class TestCrashPoints(CrashMatrixBase):
         self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
         self.assert_converged()
 
+    def test_commit_sha_survives_process_restart(self):
+        """进程重启后必须能从 outbox 取回绑定 SHA，否则重放会失败（评审 C-05）。"""
+        p1 = self.publisher("r1")
+        p1.publish(CANDIDATE, stop_after="commit")
+        # 丢弃全部内存对象，重开 SQLite，模拟真正的进程重启
+        self.conn.close()
+        self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        self.wt = PublishWorktree(self.local, self.local / ".worktree/_publish")
+        self.queue = Queue(self.conn)
+        result = self.publisher("r2").publish(CANDIDATE)
+        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
+        self.assert_converged()
+
+    def test_precheck_does_not_reset_away_unpushed_commit(self):
+        """预检的 reset 不得毁掉待恢复提交——生产路径必须与测试路径一致。"""
+        from harness.outbox import Outbox
+        from harness.precheck import run_prechecks
+        p1 = self.publisher("r1")
+        p1.publish(CANDIDATE, stop_after="commit")
+        sha_before = run(self.wt.path, "rev-parse", "HEAD")
+        outbox = Outbox(self.conn)
+        run_prechecks(type("C", (), {"gh_token": "t"})(), self.gh, self.wt,
+                      outbox, tools=(), probes={})
+        self.assertEqual(run(self.wt.path, "rev-parse", "HEAD"), sha_before,
+                         "待推送提交被 reset 掉了")
+
     def test_worktree_wiped_between_rounds_still_converges(self):
         """本地工作区丢失但远端已发布：不得重新发布第二份。"""
         self.publisher("r1").publish(CANDIDATE, stop_after="push")
@@ -2017,16 +2103,49 @@ class Publisher:
         if stop_after == "issue":
             return {"issue": number, "state": State.ISSUE_CREATED}
 
-        self.wt.ensure()
+        # 重入时先把 operation 绑定关系装回工作区对象：operation_sha/path 只活在
+        # PublishWorktree 实例里，进程重启后必须从 outbox 恢复，否则 non-ff 重放
+        # 会以「未绑定 operation commit SHA」失败（评审 C-05）
+        self.wt.operation_path = rel_path
+        self.wt.operation_sha = self.outbox.commit_sha(op)
+
+        self.wt.ensure(allow_reset=self.wt.operation_sha is None)
+
         if not self.wt.remote_has_operation(op.operation_id, rel_path):
-            if not self.wt.local_has_operation(op.operation_id):
-                self.wt.write_proposal(rel_path, self._card(candidate, number,
-                                                            op.operation_id))
-                self.wt.commit(f"docs(proposals): #{number} {candidate['title']}",
-                               op.operation_id, rel_path)
+            commit_op = self.outbox.prepare(
+                self.round_id, "commit_proposal", op.operation_id,
+                {"issue": number, "path": rel_path})
+
+            def do_commit():
+                self.wt.write_proposal(
+                    rel_path, self._card(candidate, number, op.operation_id))
+                sha = self.wt.commit(
+                    f"docs(proposals): #{number} {candidate['title']}",
+                    op.operation_id, rel_path)
+                # 立刻持久化 SHA：预检据此判断"有未推送提交、禁止 reset"
+                self.outbox.set_commit_sha(op, sha)
+                self.outbox.set_commit_sha(commit_op, sha)
+                return {"sha": sha}
+
+            def probe_commit():
+                sha = self.outbox.commit_sha(commit_op)
+                return {"sha": sha} if sha else None
+
+            self.outbox.execute(commit_op, call=do_commit, probe=probe_commit)
+            self.wt.operation_sha = self.outbox.commit_sha(op)
+
             if stop_after == "commit":
                 return {"issue": number, "state": State.COMMITTED_LOCAL}
-            self.wt.push()
+
+            push_op = self.outbox.prepare(
+                self.round_id, "push_main", op.operation_id,
+                {"issue": number, "path": rel_path})
+            self.outbox.execute(
+                push_op,
+                call=lambda: (self.wt.push(), {"pushed": True})[1],
+                probe=lambda: ({"pushed": True}
+                               if self.wt.remote_has_operation(
+                                   op.operation_id, rel_path) else None))
         if stop_after == "push":
             return {"issue": number, "state": State.PUBLISHED}
 
@@ -2060,7 +2179,7 @@ class Publisher:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd /home/xp/src/zipfs/.claude/scripts && /home/linuxbrew/.linuxbrew/bin/python3 -m unittest harness.tests.test_publish_crash_matrix -v`
-Expected: PASS，9 tests OK
+Expected: PASS，11 tests OK
 
 - [ ] **Step 5: 提交**
 
@@ -2098,9 +2217,11 @@ class FakeWorktree:
     def __init__(self, clean=True):
         self._clean = clean
         self.ensured = False
+        self.allow_reset_seen = None
 
-    def ensure(self):
+    def ensure(self, allow_reset: bool = True):
         self.ensured = True
+        self.allow_reset_seen = allow_reset
 
     def is_clean(self):
         return self._clean
@@ -2521,7 +2642,12 @@ tools: Read, Grep, Glob
 export const meta = {
   name: 'scrollz-propose',
   description: 'scrollz harness 段 1：四视角扫描、去重、三方对抗裁决、选出一个候选',
-  phases: ['scan', 'judge'],
+  // phases 是 {title, detail} 对象数组；title 必须与下面 agent(opts.phase)
+  // 传的字符串**逐字相同**，否则进度分组对不上
+  phases: [
+    { title: 'Scan', detail: '四个视角并行扫描仓库，产出候选' },
+    { title: 'Judge', detail: '三方对抗裁决，任一否决即淘汰' },
+  ],
 };
 
 const CANDIDATE_SCHEMA = {
@@ -2600,7 +2726,7 @@ const found = await parallel(
       '扫描本仓库，按你的视角给出候选。严格遵循输出 schema。',
       {
         agentType: lens.agentType,
-        phase: 'scan',
+        phase: 'Scan',
         label: lens.lane,
         schema: CANDIDATE_SCHEMA,
       }
@@ -2642,7 +2768,7 @@ for (const candidate of ranked.slice(0, 3)) {
           JSON.stringify(candidate),
         {
           agentType: judgeType,
-          phase: 'judge',
+          phase: 'Judge',
           label: judgeType,
           schema: VERDICT_SCHEMA,
         }
@@ -2693,7 +2819,72 @@ description: scrollz 自主改进 harness 的一轮入口。由控制器以 head
 - 不要在没有 workflow 结果时编造候选。若 workflow 返回空数组，就输出空数组。
 ```
 
-- [ ] **Step 5: 校验 JSON/YAML 语法并提交**
+- [ ] **Step 5: 真实 Workflow 契约测试（必须在 Task 12 之前跑通）**
+
+> `node --check` 只查语法，查不出 API 形状错——本计划的 workflow 脚本已经因此错过一次（用了 `export default async function({args})` 与 `agent({agentType, prompt})`，静态检查全绿、运行时静默返回空候选）。因此必须真跑一次最小 workflow 冻结契约。**这是本计划第一次真实调用 `claude -p`，成本约 0.1 美元，不产生任何外部写入。**
+
+写一个只调一个 agent 的最小脚本：
+
+```javascript
+// .claude/workflows/scrollz-contract-probe.js
+export const meta = {
+  name: 'scrollz-contract-probe',
+  description: '冻结 Workflow API 契约：meta 形状、args 全局、agent 位置参数、schema 返回',
+  phases: [{ title: 'Probe', detail: '单 agent 结构化返回' }],
+};
+
+const SCHEMA = {
+  type: 'object',
+  required: ['echo', 'lens'],
+  properties: {
+    echo: { type: 'string' },
+    lens: { type: 'string' },
+  },
+};
+
+const token = args.token || 'missing';
+
+const res = await agent(
+  `只返回结构化结果：echo 字段填 "${token}"，lens 字段填 "roadmap"。不要读任何文件。`,
+  { agentType: 'harness-finder-roadmap', phase: 'Probe', label: 'probe', schema: SCHEMA }
+);
+
+return { echo: res.echo, lens: res.lens, args_seen: token };
+```
+
+写驱动 skill `.claude/skills/scrollz-contract-probe/SKILL.md`：
+
+```markdown
+---
+name: scrollz-contract-probe
+description: 冻结 Workflow API 契约的一次性探针，调用 scrollz-contract-probe workflow 并原样输出结果
+---
+
+调用 `Workflow` 工具，`workflow` 参数为 `scrollz-contract-probe`，`args` 为 `{"token": "CONTRACT-OK"}`。等待完成后，把返回值原样输出为单个 JSON 代码块，不加任何解释。
+```
+
+Run:
+```bash
+cd /home/xp/src/zipfs
+/home/xp/.local/bin/claude -p "/scrollz-contract-probe" \
+  --setting-sources project --settings .claude/harness-settings.json \
+  --strict-mcp-config --tools "Read,Grep,Glob,Skill,Workflow" \
+  --permission-mode dontAsk --max-turns 8 --max-budget-usd 0.20 \
+  --output-format stream-json | tee /tmp/contract-probe.jsonl | tail -3
+```
+
+Expected: 最后一条 `result` 事件的 `result` 字段里含 `"echo": "CONTRACT-OK"`、`"lens": "roadmap"`、`"args_seen": "CONTRACT-OK"`。
+
+**四项断言必须逐条对着 `/tmp/contract-probe.jsonl` 核**，任何一项不符就停下来重读 Workflow 工具 schema，不要猜：
+
+1. `system/init` 事件里 `tools` 恰为 `["Read","Grep","Glob","Skill","Workflow"]`，`mcp_servers` 与 `plugins` 均为空——隔离生效。
+2. `echo == "CONTRACT-OK"` —— `agent(prompt, opts)` 的**位置参数**形状正确。
+3. `args_seen == "CONTRACT-OK"` —— `args` 确实是**顶层全局**，不是函数参数。
+4. 返回的是**已按 schema 校验的对象**，脚本里没有任何文本解析代码。
+
+同时记录：从发起到 `result` 事件的实际耗时、进程是否等待后台 workflow 完成、退出码。**这三项就是 spec §十六「`claude -p` 后台等待行为」开放项的实测答案**，Task 13 Step 5 要回填进 spec。
+
+- [ ] **Step 6: 校验 JSON/YAML 语法并提交**
 
 Run:
 ```bash
@@ -2710,8 +2901,8 @@ node --check .claude/workflows/scrollz-propose.js 2>/dev/null || echo "node 不�
 Expected: `settings ok` / `redlines ok: 5 条`
 
 ```bash
-git add .claude/harness-settings.json .claude/rules .claude/agents .claude/workflows .claude/skills/scrollz-round docs/harness/redlines.yaml
-git commit -m "feat(harness): Claude 侧资产——会话 settings、agent 纪律、4 finder + 3 judge、propose workflow、入口 skill、红线清单" -- .claude/harness-settings.json .claude/rules .claude/agents .claude/workflows .claude/skills/scrollz-round docs/harness/redlines.yaml
+git add .claude/harness-settings.json .claude/rules .claude/agents .claude/workflows .claude/skills docs/harness/redlines.yaml
+git commit -m "feat(harness): Claude 侧资产——会话 settings、agent 纪律、4 finder + 3 judge、propose workflow、契约探针、入口 skill、红线清单" -- .claude/harness-settings.json .claude/rules .claude/agents .claude/workflows .claude/skills docs/harness/redlines.yaml
 ```
 
 ---
@@ -2792,6 +2983,25 @@ class TestParse(unittest.TestCase):
         self.assertEqual(res.init_tools, ["Read"])
         self.assertEqual(res.init_mcp_servers, [])
 
+    def test_fence_inside_json_string_does_not_truncate_payload(self):
+        """body_md 是 Markdown，内部可能含代码 fence——不得据此截断 payload。"""
+        lines = [json.dumps({"type": "result", "subtype": "success",
+                             "total_cost_usd": 0.1, "num_turns": 2,
+                             "result": '```json\n{"candidates":[{"title":"x",'
+                                       '"body_md":"example } ``` remainder"}]}\n```'})]
+        res = parse_stream_json(lines)
+        self.assertTrue(res.ok)
+        self.assertEqual(res.payload["candidates"][0]["title"], "x")
+        self.assertIn("```", res.payload["candidates"][0]["body_md"])
+
+    def test_missing_init_event_is_flagged(self):
+        """缺 init 事件时不得当作『干净』——absence-as-success 是假绿。"""
+        lines = [json.dumps({"type": "result", "subtype": "success",
+                             "total_cost_usd": 0.1, "num_turns": 1,
+                             "result": '{"candidates": []}'})]
+        res = parse_stream_json(lines)
+        self.assertFalse(res.init_seen)
+
     def test_unparseable_payload_is_not_ok(self):
         lines = [json.dumps({"type": "result", "subtype": "success",
                              "total_cost_usd": 0.1, "num_turns": 2,
@@ -2824,13 +3034,15 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 from dataclasses import dataclass, field
 
 from .config import CLAUDE
 
-_JSON_BLOCK = re.compile(r"```(?:json)?\s*([\[{][\s\S]*?[\]}])\s*```")
+# 不用正则从 fence 里"抠"JSON：payload 的 body_md 是 Markdown，内部完全可能
+# 含代码 fence；一旦某段以 `}` 收尾再跟 ```，正则会把字符串内部的 fence 当成
+# 外层结束，截出半个对象（实测反例：body_md="example } ``` remainder"）。
+# 改为按首尾边界剥壳，再对中间全文做一次 json.loads。
 
 
 @dataclass
@@ -2865,8 +3077,12 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
 
 
 def _extract_payload(text: str) -> dict | None:
-    match = _JSON_BLOCK.search(text or "")
-    blob = match.group(1) if match else (text or "").strip()
+    blob = (text or "").strip()
+    if blob.startswith("```"):
+        first_newline = blob.find("\n")
+        last_fence = blob.rfind("```")
+        if first_newline != -1 and last_fence > first_newline:
+            blob = blob[first_newline + 1:last_fence].strip()
     if not blob.startswith(("{", "[")):
         return None
     try:
@@ -3146,8 +3362,21 @@ def run_round(cfg, deps: Deps) -> dict:
     round_id = uuid.uuid4().hex[:12]
     started = time.monotonic()
 
+    # probes 必须真的传进去：reconcile({}) 什么都对不了账（评审 C-02）
+    probes = {
+        "publish_proposal": lambda op: deps.gh.find_issue_by_marker(
+            "HARNESS-OP:" + op.operation_id),
+        "publication_receipt": lambda op: deps.gh.find_comment_by_marker(
+            op.payload["issue"], "HARNESS-OP:" + op.natural_key),
+        "commit_proposal": lambda op: (
+            {"sha": deps.outbox.commit_sha(op)}
+            if deps.outbox.commit_sha(op) else None),
+        "push_main": lambda op: (
+            {"pushed": True} if deps.worktree.remote_has_operation(
+                op.natural_key, op.payload["path"]) else None),
+    }
     results = run_prechecks(cfg, deps.gh, deps.worktree, deps.outbox,
-                            tools=deps.tools or ())
+                            tools=deps.tools or (), probes=probes)
     try:
         assert_all_ok(results)
     except PrecheckFailed as exc:
@@ -3610,6 +3839,12 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | I-12 指标/熔断/告警未实施 | **属实** | 移交 1b |
 | I-13 Fake 无法表征真实 adapter | **属实** | 移交 1b 的真实 API 契约 smoke；1a 已在 Task 13 用真实 round 覆盖一次 wire shape。**search 索引延迟**的风险已由 C-02 的 `failed_retryable` + 下轮 reconcile 消化 |
 | I-14 缺执行状态与 kick-off | **属实** | 本版新增文末「执行状态」表与 [plan-stage1a-kickoff.md](./plan-stage1a-kickoff.md) |
+| **R2-C-01 meta.phases 形状 / 缺契约测试** | **属实** | `phases` 改为 `{title, detail}` 对象数组且与 `opts.phase` 逐字对齐；新增 Task 10 Step 5 真实 Workflow 契约测试（四项断言 + 顺带实测后台等待行为） |
+| **R2-C-02 测试与实现 phase 不一致 / git 副作用绕过 outbox / probes 未传** | **属实** | 旧测试期望改 `failed_retryable` 并加 4 条新测试；`commit_proposal` 与 `push_main` 纳入 outbox；Task 12 真正构造并传入四个 probe |
+| **R2-C-03 HARNESS_FAULT 只在散文里** | **属实**（我自己违反了禁占位符规则） | `_fault_check()` 落进 `outbox.execute` 的三个相位，并加注入测试 |
+| **R2-C-04 set_commit_sha 从未被调用** | **属实** | Publisher 在 commit 后立即持久化 SHA；`has_unpushed_commit` 因此才真正生效；补「预检不得 reset 掉待推送提交」测试 |
+| **R2-C-05 绑定字段跨进程丢失** | **属实** | 重入时从 outbox 取回 `commit_sha` 重绑；补「关闭并重开 SQLite 后仍收敛」测试 |
+| **R2-C-06 fence 反例** | **属实，我先前的反驳被推翻** | 反例实测复现（`body_md` 内含代码 fence 时截出半个对象）。放弃正则抠取，改为按首尾 fence 边界剥壳后整体 `json.loads`；补 fence-in-string 与 missing-init 两条回归测试 |
 | M-15 probe 未测后台 Workflow 等待 | **属实** | Task 13 Step 1 的措辞已改：probe 只验工具/MCP 隔离；后台等待上限由 Task 13 Step 3 的真实 round（会启动 Workflow）观测并回填 spec §十六 |
 
 ## 执行状态（逐任务同步，跨会话据此判断进度）
