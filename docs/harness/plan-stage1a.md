@@ -4085,7 +4085,7 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 
 | # | 任务 | 状态 | 验证证据 | 偏差 |
 |---|---|---|---|---|
-| 1 | 骨架 + schema | pending | | |
+| 1 | 骨架 + schema | **done** | `test_db` 3/3 绿（WAL、迁移幂等、natural key 唯一约束） | 无 |
 | 2 | 生命周期派生函数 | pending | | 已在 /tmp 离线验证通过（7 用例含 256 穷举） |
 | 3 | outbox | pending | | |
 | 4 | GitHub 层 + Fake | pending | | |
