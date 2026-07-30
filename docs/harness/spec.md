@@ -354,6 +354,11 @@ CI 分层预期：L0 `fmt`/`clippy`/`build`；L1 不需 FUSE 的测试；L2 需 
 
 ## 十二、队列治理
 
+> **阶段归属（评审 merged-13）**：本节的 `possible_duplicate` 语义相似度复核、user-closed 拒绝记忆、stale/superseded 清理、以及 §5.0 的完整 receipt binding（`binding_ok` 的真实计算），**均属 Stage 1b**，见 [plan-stage1b.md](./plan-stage1b.md) 的 B1/B2/B7。
+> Stage 1a 实现的是这些能力的**退化版**：`known_canonical_keys` 传空集、`classify()` 只返回 `new`/`exact_duplicate`/`rejected_active`、`binding_ok` 恒为 `True`（收据只按 marker 定位，不校验其中的 path 与远端 blob）。
+> **因此不得宣称「Stage 1a 逐条满足本节规格」。** 1a 的验收标准是「发布回路可靠且可崩溃恢复」，队列治理的完整语义由 1b 兑现——在 1b 完成前不得把节拍从 2 小时提到 30 分钟。
+
+
 ### 12.1 Stage 1（只扫描期）
 
 Stage 1 没有「实际开发选择」，按开发选择计算的软配额在此**不适用**，只会无限累计 deficit（评审 R2-09/R3-05）。Stage 1 用：
