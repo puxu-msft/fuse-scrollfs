@@ -4086,8 +4086,8 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | # | 任务 | 状态 | 验证证据 | 偏差 |
 |---|---|---|---|---|
 | 1 | 骨架 + schema | **done** | `test_db` 3/3 绿（WAL、迁移幂等、natural key 唯一约束） | 无 |
-| 2 | 生命周期派生函数 | pending | | 已在 /tmp 离线验证通过（7 用例含 256 穷举） |
-| 3 | outbox | pending | | |
+| 2 | 生命周期派生函数 | **done** | `test_lifecycle` 7/7 绿（含 256 组合穷举、八状态全可达） | 实现取自已验证的 PoC |
+| 3 | outbox | **done** | `test_outbox` 14/14 绿；关键两条：probe-before-call 认出既有 artifact、artifact 齐全但 root 未 settled 仍算待恢复 | 比计划多 4 条测试（父指针断言、root_of、open_roots、unpushed_commits） |
 | 4 | GitHub 层 + Fake | pending | | |
 | 5 | 发布工作区 | pending | | 已在 /tmp 离线验证并修 3 缺陷（重放身份 / prune 自愈 / 冲突 abort） |
 | 6 | 预算 | pending | | |
