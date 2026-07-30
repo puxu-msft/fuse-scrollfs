@@ -1,7 +1,15 @@
 import subprocess, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 from harness.config import GIT
-from harness.gitops import PublishWorktree
+from harness.gitops import (
+    AmbiguousOperation,
+    InvalidProposalPath,
+    NonFastForward,
+    PublishWorktree,
+    PushRejected,
+    ReplayConflict,
+)
 
 
 def run(cwd, *args):
@@ -116,7 +124,6 @@ class TestPublishWorktree(unittest.TestCase):
 
     def test_replay_conflict_aborts_cleanly_and_raises(self):
         """重放冲突：必须抛 ReplayConflict 且不留冲突残留。"""
-        from harness.gitops import ReplayConflict
         self.wt.ensure()
         self.wt.write_proposal("docs/proposals/1-demo.md", "# harness 版本\n")
         self.wt.commit("docs(proposals): add #1", "op123",
@@ -132,6 +139,212 @@ class TestPublishWorktree(unittest.TestCase):
             self.wt.push()
         self.assertEqual(run(self.wt.path, "status", "--porcelain"), "",
                          "冲突残留必须已 abort 清理")
+
+    # ------------------------------------------------------------ Critical：路径逃逸
+
+    def test_write_proposal_rejects_absolute_path(self):
+        self.wt.ensure()
+        outside = Path(self.tmp.name) / "abs-outside.txt"
+        with self.assertRaises(InvalidProposalPath):
+            self.wt.write_proposal(str(outside), "OVERWRITTEN")
+        self.assertFalse(outside.exists(), "非法输入不得产生任何文件")
+
+    def test_write_proposal_rejects_dotdot_escape(self):
+        self.wt.ensure()
+        outside = Path(self.tmp.name) / "outside.txt"
+        with self.assertRaises(InvalidProposalPath):
+            self.wt.write_proposal("../../../outside.txt", "OVERWRITTEN")
+        self.assertFalse(outside.exists(), "非法输入不得产生任何文件")
+
+    def test_write_proposal_rejects_nested_symlink_escape(self):
+        """严格模式正则本身能挡住字面 `..`，但挡不住中间目录是 symlink 的逃逸。"""
+        self.wt.ensure()
+        outside_dir = Path(self.tmp.name) / "outside-dir"
+        outside_dir.mkdir()
+        (self.wt.path / "docs").symlink_to(outside_dir, target_is_directory=True)
+        with self.assertRaises(InvalidProposalPath):
+            self.wt.write_proposal("docs/proposals/1-demo.md", "PWNED")
+        self.assertEqual(list(outside_dir.iterdir()), [],
+                         "symlink 逃逸也不得在工作区外产生文件")
+
+    def test_write_proposal_accepts_legal_path(self):
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.assertEqual(
+            (self.wt.path / "docs/proposals/1-demo.md").read_text(), "# demo\n")
+
+    def test_commit_rejects_illegal_rel_path(self):
+        self.wt.ensure()
+        with self.assertRaises(InvalidProposalPath):
+            self.wt.commit("bad", "op1", "../../../outside.txt")
+
+    # ------------------------------------------------------ Important #1：push 分类
+
+    def test_branch_protection_style_rejection_does_not_trigger_replay(self):
+        """pre-receive hook 拒绝、远端并未领先本地：不得触发重放，须原样报错。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+
+        hook = self.remote / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho 'policy: branch protection' >&2\nexit 1\n")
+        hook.chmod(0o755)
+
+        with mock.patch.object(self.wt, "_replay_onto_remote") as replay_spy:
+            with self.assertRaises(PushRejected):
+                self.wt.push()
+            replay_spy.assert_not_called()
+
+    def test_push_retry_exhausted_raises_after_exactly_three_pushes_two_replays(self):
+        """对手每次都能在我们 push 前抢先推进 main：3 次 push、2 次有效 replay，
+        异常保留最后一次 stderr。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+
+        racer = Path(self.tmp.name) / "racer"
+        subprocess.run([GIT, "clone", str(self.remote), str(racer)],
+                       check=True, capture_output=True)
+        run(racer, "config", "user.email", "racer@example.com")
+        run(racer, "config", "user.name", "racer")
+
+        push_count = {"n": 0}
+        real_run = subprocess.run
+
+        def fake_run(cmd, *a, **kw):
+            if isinstance(cmd, list) and cmd[:2] == [GIT, "push"]:
+                push_count["n"] += 1
+                real_run([GIT, "fetch", "origin", "main"], cwd=racer,
+                         capture_output=True, text=True)
+                real_run([GIT, "reset", "--hard", "origin/main"], cwd=racer,
+                         capture_output=True, text=True)
+                fname = f"race-{push_count['n']}.txt"
+                (racer / fname).write_text("x\n")
+                real_run([GIT, "add", fname], cwd=racer,
+                         capture_output=True, text=True)
+                real_run([GIT, "commit", "-m", f"race {push_count['n']}"],
+                         cwd=racer, capture_output=True, text=True)
+                real_run([GIT, "push", "origin", "main"], cwd=racer,
+                         capture_output=True, text=True)
+            return real_run(cmd, *a, **kw)
+
+        with mock.patch.object(self.wt, "_replay_onto_remote",
+                              wraps=self.wt._replay_onto_remote) as replay_spy:
+            with mock.patch("subprocess.run", side_effect=fake_run):
+                with self.assertRaises(NonFastForward) as ctx:
+                    self.wt.push()
+            self.assertEqual(replay_spy.call_count, 2,
+                             "3 次 push 只应触发 2 次 replay（第 3 次失败后直接抛出）")
+        self.assertEqual(push_count["n"], 3, "必须恰好尝试 3 次 push")
+        self.assertTrue(ctx.exception.last_stderr, "异常必须携带最后一次 stderr")
+        self.assertEqual(ctx.exception.attempts, 3)
+
+    # ------------------------------------------------ Important #2：ensure 静默改状态
+
+    def test_ensure_allow_reset_false_preserves_pending_commit_when_no_cherry_pick(self):
+        """无残留 cherry-pick/merge 时，allow_reset=False 不得改动待推 commit 的
+        HEAD 与 index。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        sha = self.wt.commit("docs(proposals): add #1", "op123",
+                             "docs/proposals/1-demo.md")
+
+        self.wt.ensure(allow_reset=False)
+
+        self.assertEqual(run(self.wt.path, "rev-parse", "HEAD"), sha,
+                         "allow_reset=False 时 HEAD 不得被改动")
+        self.assertEqual(run(self.wt.path, "status", "--porcelain"), "",
+                         "allow_reset=False 时 index 不得被改动")
+
+    # ------------------------------------------------ Important #3：operation 检测
+
+    def test_operation_id_prefix_does_not_collide(self):
+        """`op12` 不得命中 `op123` 的提交（子串 grep 的典型误判）。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+        self.assertIsNone(self.wt.operation_commit_sha("op12"))
+        self.assertFalse(self.wt.local_has_operation("op12"))
+
+    def test_duplicate_operation_marker_raises_ambiguous(self):
+        """同一 operation_id 命中多个提交：拒绝静默取第一条，须报一致性错误。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+        self.wt.write_proposal("docs/proposals/2-x.md", "# x\n")
+        self.wt.commit("docs(proposals): add #2 (duplicate marker)", "op123",
+                       "docs/proposals/2-x.md")
+        with self.assertRaises(AmbiguousOperation):
+            self.wt.operation_commit_sha("op123")
+
+    def test_remote_has_operation_requires_matching_changed_path(self):
+        """远端命中 marker 的提交若未恰好改动预期路径，须判为 False。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+        self.wt.push()
+        self.assertFalse(self.wt.remote_has_operation(
+            "op123", "docs/proposals/2-other.md"),
+            "trailer 命中但改动路径不符，不得判为 True")
+
+    # -------------------------------------------------------- Important #4：异常路径
+
+    def test_replay_conflict_raised_before_any_reset_when_operation_sha_missing(self):
+        """operation_sha 为 None 时，必须在任何 reset 之前就抛 ReplayConflict。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+        pre_head = run(self.wt.path, "rev-parse", "HEAD")
+
+        (self.local / "other.txt").write_text("other\n")
+        run(self.local, "add", "other.txt")
+        run(self.local, "commit", "-m", "other work")
+        run(self.local, "push", "origin", "main")
+
+        self.wt.operation_sha = None
+        with self.assertRaises(ReplayConflict):
+            self.wt._replay_onto_remote()
+        self.assertEqual(run(self.wt.path, "rev-parse", "HEAD"), pre_head,
+                         "operation_sha 缺失时不得先 reset 再报错")
+
+    def test_assert_single_path_blocks_multi_path_operation_commit(self):
+        """operation 提交若改了两个路径，_assert_single_path 必须阻断重放，
+        且远端 main 与 worktree HEAD 均不受影响。"""
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        target = self.wt.path / "docs/proposals/1-demo.md"
+        target.write_text("# demo\n")
+        extra = self.wt.path / "docs/proposals/extra.txt"
+        extra.write_text("extra\n")
+        run(self.wt.path, "add", "--",
+            "docs/proposals/1-demo.md", "docs/proposals/extra.txt")
+        run(self.wt.path, "-c", "user.name=scrollz-harness",
+            "-c", "user.email=harness@localhost", "commit", "-m",
+            "docs(proposals): add #1\n\nHARNESS-OP:op123\n")
+        self.wt.operation_sha = run(self.wt.path, "rev-parse", "HEAD")
+        self.wt.operation_path = "docs/proposals/1-demo.md"
+        pre_head = run(self.wt.path, "rev-parse", "HEAD")
+
+        (self.local / "other.txt").write_text("other\n")
+        run(self.local, "add", "other.txt")
+        run(self.local, "commit", "-m", "other work")
+        run(self.local, "push", "origin", "main")
+
+        with self.assertRaises(ReplayConflict):
+            self.wt._replay_onto_remote()
+
+        self.assertEqual(run(self.wt.path, "rev-parse", "HEAD"), pre_head,
+                         "多路径提交阻断后 worktree HEAD 不得被改动")
+        remote_head = run(self.local, "rev-parse", "origin/main")
+        self.assertEqual(
+            run(self.local, "log", "-1", "--format=%s", remote_head),
+            "other work", "远端 main 不得被污染")
 
 
 if __name__ == "__main__":
