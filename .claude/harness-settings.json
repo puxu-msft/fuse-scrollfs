@@ -1,6 +1,13 @@
 {
   "permissions": {
-    "allow": [],
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Skill",
+      "Workflow",
+      "TodoWrite"
+    ],
     "deny": [
       "Bash",
       "Edit",

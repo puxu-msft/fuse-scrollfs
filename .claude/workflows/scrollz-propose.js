@@ -135,6 +135,7 @@ const found = await parallel(
       '扫描本仓库，按你的视角给出候选。严格遵循输出 schema：顶层必须是 {"candidates":[...]}。',
       {
         agentType: lens.agentType,
+        model: 'sonnet',
         phase: 'Scan',
         label: lens.lane,
         schema: CANDIDATE_SCHEMA,
@@ -209,6 +210,7 @@ for (const candidate of ranked.slice(0, 3)) {
           '请裁决以上候选。',
         {
           agentType: judgeType,
+          model: 'sonnet',
           phase: 'Judge',
           label: judgeType,
           schema: JUDGE_SCHEMAS[judgeType],
