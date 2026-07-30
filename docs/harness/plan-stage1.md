@@ -988,7 +988,7 @@ git commit -m "feat(harness): GitHub 访问层与可注入故障的内存 Fake" 
 
 **Interfaces:**
 - Consumes: `config.Config`
-- Produces: `gitops.PublishWorktree(repo_root, worktree_path, remote="origin", branch="main")`，方法 `ensure() -> None`（创建或重置 detached worktree 到最新 `origin/main`）、`is_clean() -> bool`、`write_proposal(rel_path, content) -> None`、`commit(message, operation_id, rel_path) -> str`（返回 SHA，commit message 含 trailer `HARNESS-OP:<id>`）、`push() -> None`（`push origin HEAD:main`；non-ff 时 fetch + 重置 + 重放同一 operation 后重试，最多 3 次）、`remote_has_operation(operation_id, rel_path) -> bool`、`local_has_operation(operation_id) -> bool`
+- Produces: `gitops.NonFastForward`、`gitops.ReplayConflict`；`gitops.PublishWorktree(repo_root, worktree_path, remote="origin", branch="main")`，方法 `ensure() -> None`（**先 `worktree prune` 清掉目录已删但注册残留的登记**，再创建或重置 detached worktree 到最新 `origin/main`，并 abort 上一轮遗留的 cherry-pick/merge 半途状态）、`is_clean() -> bool`、`write_proposal(rel_path, content) -> None`、`commit(message, operation_id, rel_path) -> str`（返回 SHA，commit message 含 trailer `HARNESS-OP:<id>`）、`push() -> None`（`push origin HEAD:main`；non-ff 时 fetch + 重置 + 重放同一 operation 后重试，最多 3 次）、`remote_has_operation(operation_id, rel_path) -> bool`、`local_has_operation(operation_id) -> bool`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1079,6 +1079,56 @@ class TestPublishWorktree(unittest.TestCase):
         self.assertFalse(self.wt.remote_has_operation(
             "op999", "docs/proposals/2-x.md"))
 
+    def test_replayed_commit_keeps_harness_identity(self):
+        """重放后 committer 必须仍是 harness——否则无法分辨哪些提交是它做的。
+
+        本机实测：不固定身份时 committer 会变成仓库 local config 的人类身份。
+        """
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+        (self.local / "other.txt").write_text("other\n")
+        run(self.local, "add", "other.txt")
+        run(self.local, "commit", "-m", "other work")
+        run(self.local, "push", "origin", "main")
+
+        self.wt.push()
+
+        who = run(self.local, "log", "origin/main", "--grep", "HARNESS-OP:op123",
+                  "--format=%an <%ae>|%cn <%ce>")
+        self.assertEqual(who, "scrollz-harness <harness@localhost>|"
+                              "scrollz-harness <harness@localhost>")
+
+    def test_ensure_self_heals_when_worktree_dir_was_deleted(self):
+        """崩溃或人工清理删掉目录、注册残留：ensure() 必须自愈而非永久卡死。"""
+        import shutil
+        self.wt.ensure()
+        shutil.rmtree(self.wt.path)
+        self.wt.ensure()
+        self.assertTrue((self.wt.path / ".git").exists())
+        self.assertEqual(run(self.wt.path, "rev-parse", "HEAD"),
+                         run(self.local, "rev-parse", "origin/main"))
+
+    def test_replay_conflict_aborts_cleanly_and_raises(self):
+        """重放冲突：必须抛 ReplayConflict 且不留冲突残留。"""
+        from harness.gitops import ReplayConflict
+        self.wt.ensure()
+        self.wt.write_proposal("docs/proposals/1-demo.md", "# harness 版本\n")
+        self.wt.commit("docs(proposals): add #1", "op123",
+                       "docs/proposals/1-demo.md")
+        target = self.local / "docs/proposals"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "1-demo.md").write_text("# 他人版本\n")
+        run(self.local, "add", "docs/proposals/1-demo.md")
+        run(self.local, "commit", "-m", "conflicting")
+        run(self.local, "push", "origin", "main")
+
+        with self.assertRaises(ReplayConflict):
+            self.wt.push()
+        self.assertEqual(run(self.wt.path, "status", "--porcelain"), "",
+                         "冲突残留必须已 abort 清理")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -1107,10 +1157,18 @@ from .config import GIT
 
 TRAILER = "HARNESS-OP:"
 MAX_PUSH_RETRY = 3
+# 固定身份：commit 与 cherry-pick 都必须用它。否则重放后的 committer 会变成仓库
+# 本地配置里的人类身份（本机实测为 Pu Xu <puxu@microsoft.com>），
+# 「哪些提交是 harness 做的」就不再可查。
+IDENT = ("-c", "user.name=scrollz-harness", "-c", "user.email=harness@localhost")
 
 
 class NonFastForward(Exception):
     pass
+
+
+class ReplayConflict(Exception):
+    """重放时与他人改动冲突：本轮判失败，不静默重试。"""
 
 
 class PublishWorktree:
@@ -1132,13 +1190,23 @@ class PublishWorktree:
         self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
         target = self._git("rev-parse", f"{self.remote}/{self.branch}",
                            cwd=self.repo_root)
+        # 崩溃或人工清理会删掉目录却留下 worktree 注册；不 prune 会导致
+        # `worktree add` 报「already registered」而永久卡死（已实测）
+        self._git("worktree", "prune", cwd=self.repo_root)
         if not (self.path / ".git").exists():
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._git("worktree", "add", "--detach", str(self.path), target,
                       cwd=self.repo_root)
         else:
+            self._abort_in_progress()
             self._git("reset", "--hard", target)
             self._git("clean", "-fd")
+
+    def _abort_in_progress(self) -> None:
+        """清掉上一轮遗留的 cherry-pick / merge 半途状态。"""
+        for sub in ("cherry-pick", "merge"):
+            subprocess.run([GIT, sub, "--abort"], cwd=self.path,
+                           capture_output=True, text=True)
 
     def is_clean(self) -> bool:
         return self._git("status", "--porcelain") == ""
@@ -1151,9 +1219,7 @@ class PublishWorktree:
     def commit(self, message: str, operation_id: str, rel_path: str) -> str:
         self._git("add", "--", rel_path)
         full = f"{message}\n\n{TRAILER}{operation_id}\n"
-        self._git("-c", "user.name=scrollz-harness",
-                  "-c", "user.email=harness@localhost",
-                  "commit", "-m", full, "--", rel_path)
+        self._git(*IDENT, "commit", "-m", full, "--", rel_path)
         return self._git("rev-parse", "HEAD")
 
     def local_has_operation(self, operation_id: str) -> bool:
@@ -1196,13 +1262,19 @@ class PublishWorktree:
             "rev-list", "--reverse", f"{merge_base}..{head}").splitlines() if c]
         self._git("reset", "--hard", target)
         for commit in commits:
-            self._git("cherry-pick", commit)
+            proc = subprocess.run([GIT, *IDENT, "cherry-pick", commit],
+                                  cwd=self.path, capture_output=True, text=True)
+            if proc.returncode != 0:
+                subprocess.run([GIT, "cherry-pick", "--abort"], cwd=self.path,
+                               capture_output=True, text=True)
+                raise ReplayConflict(
+                    f"重放 {commit[:8]} 与远端冲突：{proc.stderr.strip()[:200]}")
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd /home/xp/src/zipfs/.claude/scripts && /home/linuxbrew/.linuxbrew/bin/python3 -m unittest harness.tests.test_gitops -v`
-Expected: PASS，4 tests OK
+Expected: PASS，7 tests OK
 
 - [ ] **Step 5: 提交**
 
