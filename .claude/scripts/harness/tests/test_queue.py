@@ -1,4 +1,4 @@
-import tempfile, unittest
+import tempfile, time, unittest
 from pathlib import Path
 from harness import db
 from harness.queue import Queue, fingerprint
@@ -20,6 +20,42 @@ class TestQueue(unittest.TestCase):
         b = fingerprint("加 CRC ", " 块完整性", "crates/scrollz/src/archive.rs",
                         "损坏块必须 fail-closed")
         self.assertEqual(a, b)
+
+    def test_fingerprint_table_driven_should_be_same(self):
+        base = fingerprint("Goal Text", "Invariant", "path/a.rs", "oracle text")
+        cases = [
+            ("大小写差异", fingerprint("goal text", "invariant", "path/a.rs",
+                                     "oracle text")),
+            ("tab 折叠", fingerprint("Goal\tText", "Invariant", "path/a.rs",
+                                   "oracle text")),
+            ("newline 折叠", fingerprint("Goal\nText", "Invariant", "path/a.rs",
+                                       "oracle text")),
+            ("多空格折叠", fingerprint("Goal   Text", "Invariant", "path/a.rs",
+                                     "oracle text")),
+            ("Unicode 空白（全角空格）", fingerprint("Goal　Text", "Invariant",
+                                                "path/a.rs", "oracle text")),
+            ("首尾空白", fingerprint("  Goal Text  ", "Invariant", "path/a.rs",
+                                   "oracle text")),
+        ]
+        for label, other in cases:
+            with self.subTest(label=label):
+                self.assertEqual(base, other)
+
+    def test_fingerprint_table_driven_should_differ(self):
+        goal, invariant, path, oracle = "goal", "invariant", "path/a.rs", "oracle"
+        base = fingerprint(goal, invariant, path, oracle)
+        # 字段顺序稳定 != 字段可交换：两两交换必须产生不同指纹。
+        swaps = [
+            ("goal<->invariant", fingerprint(invariant, goal, path, oracle)),
+            ("goal<->path", fingerprint(path, invariant, goal, oracle)),
+            ("goal<->oracle", fingerprint(oracle, invariant, path, goal)),
+            ("invariant<->path", fingerprint(goal, path, invariant, oracle)),
+            ("invariant<->oracle", fingerprint(goal, oracle, path, invariant)),
+            ("path<->oracle", fingerprint(goal, invariant, oracle, path)),
+        ]
+        for label, other in swaps:
+            with self.subTest(label=label):
+                self.assertNotEqual(base, other)
 
     def test_exact_duplicate_detected(self):
         fp = fingerprint("g", "i", "p", "o")
@@ -59,11 +95,145 @@ class TestQueue(unittest.TestCase):
         self.assertFalse(self.q.total_full(cap=4))
 
     def test_main_sha_changed_predicate(self):
+        sha_a = "a" * 40
+        sha_b = "b" * 40
         fp = fingerprint("g", "i", "p", "o")
         self.q.record(fp, "roadmap", "t", "rejected",
-                      reconsider_when="main_sha_changed:aaaa")
-        self.assertFalse(self.q.reconsider_ready(fp, {"main_sha": "aaaa"}))
-        self.assertTrue(self.q.reconsider_ready(fp, {"main_sha": "bbbb"}))
+                      reconsider_when=f"main_sha_changed:{sha_a}")
+        self.assertFalse(self.q.reconsider_ready(fp, {"main_sha": sha_a}))
+        self.assertTrue(self.q.reconsider_ready(fp, {"main_sha": sha_b}))
+
+    def test_main_sha_changed_rejects_non_sha_argument(self):
+        """评审复现的绕过：main_sha_changed:not-a-sha 不得被判定为 True。"""
+        fp = fingerprint("g", "i", "p", "o")
+        self.q.record(fp, "roadmap", "t", "rejected",
+                      reconsider_when="main_sha_changed:not-a-sha")
+        self.assertFalse(self.q.reconsider_ready(fp, {"main_sha": "deadbeef"}))
+        # ctx 侧传的 main_sha 若不是合法 SHA，同样不可判定为 True
+        fp2 = fingerprint("g2", "i", "p", "o")
+        self.q.record(fp2, "roadmap", "t", "rejected",
+                      reconsider_when=f"main_sha_changed:{'a' * 40}")
+        self.assertFalse(self.q.reconsider_ready(fp2, {"main_sha": "not-a-sha"}))
+
+    def test_main_sha_changed_accepts_64_char_sha256(self):
+        sha_a = "a" * 64
+        sha_b = "b" * 64
+        fp = fingerprint("g3", "i", "p", "o")
+        self.q.record(fp, "roadmap", "t", "rejected",
+                      reconsider_when=f"main_sha_changed:{sha_a}")
+        self.assertFalse(self.q.reconsider_ready(fp, {"main_sha": sha_a}))
+        self.assertTrue(self.q.reconsider_ready(fp, {"main_sha": sha_b}))
+
+    def test_dependency_issue_closed_predicate(self):
+        fp = fingerprint("g", "i", "p", "o")
+        self.q.record(fp, "defect", "t", "rejected",
+                      reconsider_when="dependency_issue_closed:42")
+        self.assertFalse(self.q.reconsider_ready(fp, {"closed_issues": [1, 2]}))
+        self.assertTrue(self.q.reconsider_ready(fp, {"closed_issues": [42]}))
+        # ctx 侧传字符串形式同样要能匹配（规范成整数集合后再比较）
+        self.assertTrue(self.q.reconsider_ready(fp, {"closed_issues": ["42"]}))
+
+    def test_dependency_issue_closed_rejects_malformed_argument(self):
+        """评审复现的绕过：空字符串参数 + 空字符串 closed_issues 不得判 True。"""
+        fp = fingerprint("g", "i", "p", "o")
+        self.q.record(fp, "defect", "t", "rejected",
+                      reconsider_when="dependency_issue_closed:")
+        self.assertFalse(self.q.reconsider_ready(fp, {"closed_issues": [""]}))
+
+        fp2 = fingerprint("g2", "i", "p", "o")
+        self.q.record(fp2, "defect", "t", "rejected",
+                      reconsider_when="dependency_issue_closed:0")
+        self.assertFalse(self.q.reconsider_ready(fp2, {"closed_issues": [0]}))
+
+        fp3 = fingerprint("g3", "i", "p", "o")
+        self.q.record(fp3, "defect", "t", "rejected",
+                      reconsider_when="dependency_issue_closed:-1")
+        self.assertFalse(self.q.reconsider_ready(fp3, {"closed_issues": [-1]}))
+
+    def test_decision_version_gt_predicate(self):
+        fp = fingerprint("g", "i", "p", "o")
+        self.q.record(fp, "roadmap", "t", "rejected",
+                      reconsider_when="decision_version_gt:2")
+        self.assertFalse(self.q.reconsider_ready(fp, {"decision_version": 2}))
+        self.assertTrue(self.q.reconsider_ready(fp, {"decision_version": 3}))
+
+    def test_decision_version_gt_rejects_negative_argument(self):
+        """评审复现的绕过：decision_version_gt:-1 + decision_version=0 不得判 True。"""
+        fp = fingerprint("g", "i", "p", "o")
+        self.q.record(fp, "roadmap", "t", "rejected",
+                      reconsider_when="decision_version_gt:-1")
+        self.assertFalse(self.q.reconsider_ready(fp, {"decision_version": 0}))
+
+    def test_typed_predicates_malformed_argument_whitespace_and_extra_colon(self):
+        # 前后有空白、含额外冒号——一律不可判定为 True。
+        fp = fingerprint("g", "i", "p", "o")
+        self.q.record(fp, "roadmap", "t", "rejected",
+                      reconsider_when="main_sha_changed: aaaa:bbbb")
+        self.assertFalse(self.q.reconsider_ready(fp, {"main_sha": "b" * 40}))
+
+        fp2 = fingerprint("g2", "i", "p", "o")
+        self.q.record(fp2, "roadmap", "t", "rejected",
+                      reconsider_when=f" main_sha_changed:{'a' * 40} ")
+        self.assertFalse(self.q.reconsider_ready(fp2, {"main_sha": "b" * 40}))
+
+    def test_classify_only_produces_declared_reachable_values(self):
+        """`classify()` 只声明并只可能返回三个值：new / exact_duplicate /
+        rejected_active。`possible_duplicate` 属 Stage 1b 扩展接口，本模块
+        故意不实现、不声明，因此不在此处断言其可达（评审 Important：接口
+        声明与实现必须一致，不能声明一个永远走不到的分支充数）。"""
+        reachable = set()
+
+        fp_new = fingerprint("new-goal", "i", "p", "o")
+        reachable.add(self.q.classify(
+            {"fingerprint": fp_new, "lane": "defect", "title": "t"}))
+
+        fp_dup = fingerprint("dup-goal", "i", "p", "o")
+        self.q.record(fp_dup, "defect", "t", "proposed")
+        reachable.add(self.q.classify(
+            {"fingerprint": fp_dup, "lane": "defect", "title": "t"}))
+
+        fp_rej = fingerprint("rejected-goal", "i", "p", "o")
+        self.q.record(fp_rej, "defect", "t", "rejected",
+                      reconsider_when="not_before:2099-01-01")
+        reachable.add(self.q.classify(
+            {"fingerprint": fp_rej, "lane": "defect", "title": "t"}))
+
+        self.assertEqual(reachable,
+                          {"new", "exact_duplicate", "rejected_active"})
+
+    def test_record_update_preserves_created_at_and_issue_number(self):
+        """`INSERT OR REPLACE` 会先删后插，重置 created_at 并清空未传入的
+        issue_number/reconsider_when（评审 Important）。改用 upsert 后：
+        - 首次写入的 created_at 必须在后续更新中保留；
+        - 更新调用若不传 issue_number（None），已有值不得被清空；
+        - state 未变化时 decided_at 不应被推进。
+        """
+        fp = fingerprint("g", "i", "p", "o")
+        self.q.record(fp, "defect", "t1", "proposed", issue_number=7,
+                      reconsider_when="not_before:2030-01-01")
+        row1 = self.q._get(fp)
+        created_at_1 = row1["created_at"]
+        decided_at_1 = row1["decided_at"]
+
+        time.sleep(0.01)
+        # 更新：不传 issue_number / reconsider_when，state 不变
+        self.q.record(fp, "defect", "t1-updated", "proposed")
+        row2 = self.q._get(fp)
+        self.assertEqual(row2["created_at"], created_at_1)  # 不可变字段保留
+        self.assertEqual(row2["issue_number"], 7)  # 未清空
+        self.assertEqual(row2["reconsider_when"], "not_before:2030-01-01")
+        self.assertEqual(row2["title"], "t1-updated")  # 可更新字段确实更新了
+        self.assertEqual(row2["decided_at"], decided_at_1)  # state 未变，不推进
+
+        time.sleep(0.01)
+        # 再更新：state 变化，decided_at 应该推进
+        self.q.record(fp, "defect", "t1-updated2", "rejected",
+                      reconsider_when="not_before:2031-01-01")
+        row3 = self.q._get(fp)
+        self.assertEqual(row3["created_at"], created_at_1)
+        self.assertGreater(row3["decided_at"], decided_at_1)
+        self.assertEqual(row3["state"], "rejected")
+        self.assertEqual(row3["reconsider_when"], "not_before:2031-01-01")
 
 
 if __name__ == "__main__":

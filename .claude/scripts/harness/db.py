@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS proposals (
     created_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_proposals_state ON proposals(state);
+
+CREATE TABLE IF NOT EXISTS invocations (
+    invocation_id TEXT PRIMARY KEY,
+    round_id      TEXT NOT NULL,
+    cost_usd      REAL NOT NULL,
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invocations_round ON invocations(round_id);
 """
 
 
