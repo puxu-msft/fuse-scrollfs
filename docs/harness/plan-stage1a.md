@@ -819,6 +819,30 @@ class Outbox:
             " ('prepared','failed_retryable')").fetchall()
         return [self._row_to_op(r) for r in rows]
 
+    def root_of(self, op: Operation) -> Operation:
+        """解析子 operation 所属的 root `publish_proposal`（评审 C-02）。
+
+        子 operation 建立时 natural_key 就是 root 的 operation_id，
+        父子关联已存在，无需额外列——但恢复路径必须显式解析它，
+        否则会把子 operation 的 payload 当作 candidate，缺字段直接崩。
+        """
+        if op.kind == "publish_proposal":
+            return op
+        row = self.conn.execute(
+            "SELECT * FROM operations WHERE operation_id=? AND kind=?",
+            (op.natural_key, "publish_proposal")).fetchone()
+        if row is None:
+            raise KeyError(f"{op.kind}/{op.natural_key} 找不到所属 publish_proposal")
+        return self._row_to_op(row)
+
+    def open_roots(self) -> list[Operation]:
+        """未结 operation 按 root 聚合去重：同一提案只恢复一次。"""
+        roots: dict[str, Operation] = {}
+        for op in self.open_operations():
+            root = self.root_of(op)
+            roots.setdefault(root.operation_id, root)
+        return list(roots.values())
+
     def settle(self, op: Operation) -> None:
         self._mark(op, "settled", op.result)
 
@@ -1899,7 +1923,12 @@ def run(cwd, *args):
 class CrashMatrixBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
+        self._build_fixture()
+
+    def _build_fixture(self):
+        """可重复调用：表驱动崩溃测试的每个相位都需要全新的仓库与库。"""
+        root = Path(self.tmp.name) / f"fx{len(list(Path(self.tmp.name).iterdir()))}"
+        root.mkdir(parents=True, exist_ok=True)
         self.remote = root / "remote.git"
         self.local = root / "local"
         subprocess.run([GIT, "init", "--bare", "-b", "main", str(self.remote)],
@@ -2058,37 +2087,37 @@ class TestCrashPoints(CrashMatrixBase):
         self.assertEqual(run(self.wt.path, "rev-parse", "HEAD"), sha_before,
                          "待推送提交被 reset 掉了")
 
-    def test_commit_already_applied_but_outbox_still_prepared(self):
-        """commit_proposal:after-call —— commit 已存在、outbox 仍 prepared。
-        重启后必须认出既有提交，不得产生第二个 commit。"""
-        self._crash_at("commit_proposal:after-call")
-        self._restart()
-        result = self.publisher("r2").publish(CANDIDATE)
-        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
-        self.assert_converged()
+    def test_every_required_crash_phase_recovers(self):
+        """表驱动：12 个 operation:phase 各崩一次，重启后都必须收敛到同一终态。
 
-    def test_commit_observed_then_process_exits(self):
-        """commit_proposal:after-observe —— SHA 已持久化，重启后应直接进入 push。"""
-        self._crash_at("commit_proposal:after-observe")
-        self._restart()
-        result = self.publisher("r2").publish(CANDIDATE)
-        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
-        self.assert_converged()
+        每个相位用全新 fixture，避免前一个相位的残留掩盖问题；
+        每次恢复前关闭并重开 SQLite、丢弃全部内存对象，模拟真正的进程重启。
+        """
+        for kind, phases in sorted(REQUIRED_CRASH_COVERAGE.items()):
+            for phase in sorted(phases):
+                point = f"{kind}:{phase}"
+                with self.subTest(point=point):
+                    self._build_fixture()
+                    self._crash_at(point)
+                    self._restart()
+                    result = self.publisher("r2").publish(CANDIDATE)
+                    self.assertEqual(result["state"], State.RECEIPT_COMPLETE,
+                                     f"{point} 恢复后未收敛")
+                    self.assert_converged()
 
-    def test_push_already_applied_but_outbox_still_prepared(self):
-        """push_main:after-call —— 远端已推进、outbox 仍 prepared。
-        重启后 probe 应确认已发布，不得重复 push 或重放。"""
-        self._crash_at("push_main:after-call")
+    def test_resume_from_sub_operation_finds_root(self):
+        """未结的是子 operation 时，恢复必须解析到 root，不能拿子 payload 当候选。"""
+        from harness.outbox import Outbox
+        self._crash_at("push_main:before-call")
         self._restart()
-        result = self.publisher("r2").publish(CANDIDATE)
-        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
-        self.assert_converged()
-
-    def test_push_observed_then_process_exits(self):
-        """push_main:after-observe —— 重启后应直接进入 receipt。"""
-        self._crash_at("push_main:after-observe")
-        self._restart()
-        result = self.publisher("r2").publish(CANDIDATE)
+        outbox = Outbox(self.conn)
+        open_ops = outbox.open_operations()
+        self.assertTrue(any(o.kind != "publish_proposal" for o in open_ops),
+                        "本场景应存在子 operation 未结")
+        roots = outbox.open_roots()
+        self.assertEqual(len(roots), 1, "同一提案的多个未结子 operation 应聚合为一个 root")
+        self.assertEqual(roots[0].kind, "publish_proposal")
+        result = self.publisher("r2").resume(open_ops[0].operation_id)
         self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
         self.assert_converged()
 
@@ -2110,6 +2139,11 @@ class TestCrashCoverageTable(unittest.TestCase):
     """
 
     def test_every_required_operation_phase_is_covered(self):
+        """防止将来有人删掉表驱动循环、改回手写而漏项。
+
+        ResponseLost 那几条测的是网络不确定性，**不计入**相位覆盖——
+        它们不经过 HARNESS_FAULT，持久化状态也不同，不能冒充相位测试。
+        """
         suite = unittest.TestLoader().loadTestsFromTestCase(TestCrashPoints)
         unittest.TextTestRunner(verbosity=0).run(suite)
         required = {f"{op}:{phase}"
@@ -2117,6 +2151,7 @@ class TestCrashCoverageTable(unittest.TestCase):
                     for phase in phases}
         missing = required - COVERED
         self.assertEqual(missing, set(), f"崩溃矩阵漏项：{sorted(missing)}")
+        self.assertEqual(len(required), 12, "required 相位数应为 4 operation × 3 phase")
 
 
 if __name__ == "__main__":
@@ -2189,13 +2224,19 @@ class Publisher:
     # ---- 发布 -------------------------------------------------------------
 
     def resume(self, operation_id: str) -> dict:
-        """按持久化 payload 续做一个未完成的发布，不重新扫描（评审 C-02）。"""
+        """按持久化 payload 续做一个未完成的发布，不重新扫描（评审 C-02）。
+
+        传入的可能是子 operation（commit_proposal / push_main /
+        publication_receipt），必须先解析到 root，否则会把子 operation 的
+        payload 当 candidate 用，缺 fingerprint/body_md 等字段直接崩。
+        """
         row = self.outbox.conn.execute(
-            "SELECT payload_json FROM operations WHERE operation_id=?",
+            "SELECT * FROM operations WHERE operation_id=?",
             (operation_id,)).fetchone()
         if row is None:
             raise KeyError(f"未知 operation {operation_id}")
-        return self.publish(json.loads(row["payload_json"]))
+        root = self.outbox.root_of(self.outbox._row_to_op(row))
+        return self.publish(root.payload)
 
     def publish(self, candidate: dict, stop_after: str | None = None) -> dict:
         # payload 必须足以在进程重启后**重建提案卡**：只存 title/slug 时
@@ -2298,7 +2339,7 @@ class Publisher:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd /home/xp/src/zipfs/.claude/scripts && /home/linuxbrew/.linuxbrew/bin/python3 -m unittest harness.tests.test_publish_crash_matrix -v`
-Expected: PASS，16 tests OK（含覆盖表校验）
+Expected: PASS，11 tests OK（其中表驱动那条含 12 个 subTest，覆盖表校验全绿）
 
 - [ ] **Step 5: 提交**
 
@@ -3515,14 +3556,17 @@ def run_round(cfg, deps: Deps) -> dict:
     # 恢复优先于新扫描：还有未结的 operation 时不得再起模型（评审 C-02）。
     # 否则「建 Issue 响应丢失 + 搜索暂不可见」会让下一轮另开一个候选，
     # 旧 operation 永久悬置，同一提案出现两个 Issue。
-    open_ops = deps.outbox.open_operations()
-    if open_ops:
+    # 按 root 聚合：同时有多个未结子 operation 时也只恢复一次，
+    # 且不会把子 operation 的 payload 误当作 candidate（评审 C-02）
+    open_roots = deps.outbox.open_roots()
+    if open_roots:
         publisher = Publisher(deps.outbox, deps.gh, deps.worktree,
                               deps.queue, round_id)
-        resumed = publisher.resume(open_ops[0].operation_id)
+        resumed = publisher.resume(open_roots[0].operation_id)
         budget.settle(round_id, day, 0.0)
         return {"round_id": round_id, "mode": "resume", "result": "resumed",
-                "issue": resumed["issue"], "state": resumed["state"]}
+                "issue": resumed["issue"], "state": resumed["state"],
+                "remaining_roots": len(open_roots) - 1}
 
     blocked_lanes = [lane for lane in ("roadmap", "defect", "perf", "hygiene")
                      if deps.queue.lane_full(lane, cfg.lane_cap)]
@@ -3981,6 +4025,8 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | **R3-C-02 恢复未优先于新扫描 / payload 不足以重建** | **属实** | `open_operations()` + `Publisher.resume()`：有未结 operation 时本轮不起模型，直接续做；`publish_proposal` payload 改存完整候选（fingerprint/title/slug/lane/labels/body_md） |
 | **R3-C-03 缺 commit/push 相位覆盖** | **属实**（评审给出了我要的具体失效模式） | 补 4 条真实 substrate 测试（commit/push 各 after-call、after-observe）+ `REQUIRED_CRASH_COVERAGE` 机器断言覆盖表，漏项即红。自动生成器仍留 Stage 2 |
 | **R3-C-04 待推检测查错集合** | **属实** | 不再从 `reconcile()` 返回值推导（已 observed 的 commit 不在未决集合里，推导恒 False）；改为 `unpushed_commits()` 直查「有 commit_sha 且对应 push_main 未 observed」 |
+| **R4-C-02 子 operation 恢复归属** | **属实** | 父子关联本已存在（子 operation 的 natural_key 即 root 的 operation_id），但 `resume()` 没解析它。新增 `root_of()` / `open_roots()`，`run_round` 按 root 聚合恢复；补「未结的是子 operation 时能找到 root」测试 |
+| **R4-C-03 覆盖表与实际登记不一致** | **属实**（覆盖表本身会确定性失败，只登记了 4/12） | 四条手写相位测试改为**表驱动循环覆盖全部 12 项**，每项独立 fixture + 关闭重开 SQLite；ResponseLost 测试保留为网络不确定性测试，明确不计入相位覆盖 |
 | M-15 probe 未测后台 Workflow 等待 | **属实** | Task 13 Step 1 的措辞已改：probe 只验工具/MCP 隔离；后台等待上限由 Task 13 Step 3 的真实 round（会启动 Workflow）观测并回填 spec §十六 |
 
 ## 执行状态（逐任务同步，跨会话据此判断进度）
