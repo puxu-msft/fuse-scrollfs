@@ -796,6 +796,29 @@ class Outbox:
             (op.operation_id,)).fetchone()
         return row["commit_sha"] if row else None
 
+    def unpushed_commits(self) -> list[Operation]:
+        """有本地提交但 push 尚未确认的 operation（评审 C-04）。
+
+        **不能**从 reconcile() 的返回值推导：正常完成 commit 后 operation 已是
+        `observed`，不在 reconcile 的未决集合里，于是 has_unpushed_commit 恒为
+        False，预检照样把待推提交 reset 掉。必须直查持久化事实。
+        """
+        rows = self.conn.execute(
+            "SELECT c.* FROM operations c"
+            " WHERE c.kind='commit_proposal' AND c.commit_sha IS NOT NULL"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM operations p"
+            "   WHERE p.kind='push_main' AND p.natural_key=c.natural_key"
+            "     AND p.phase IN ('observed','settled'))").fetchall()
+        return [self._row_to_op(r) for r in rows]
+
+    def open_operations(self) -> list[Operation]:
+        """尚未观察到结果的 operation：恢复优先于新扫描（评审 C-02）。"""
+        rows = self.conn.execute(
+            "SELECT * FROM operations WHERE phase IN"
+            " ('prepared','failed_retryable')").fetchall()
+        return [self._row_to_op(r) for r in rows]
+
     def settle(self, op: Operation) -> None:
         self._mark(op, "settled", op.result)
 
@@ -1931,7 +1954,38 @@ class TestHappyPath(CrashMatrixBase):
         self.assert_converged()
 
 
+# 机器可断言的覆盖表：手写矩阵允许，但漏项必须被测试本身抓住（评审 C-03）
+REQUIRED_CRASH_COVERAGE = {
+    "publish_proposal": {"before-call", "after-call", "after-observe"},
+    "commit_proposal": {"before-call", "after-call", "after-observe"},
+    "push_main": {"before-call", "after-call", "after-observe"},
+    "publication_receipt": {"before-call", "after-call", "after-observe"},
+}
+
+# 每个用例登记它覆盖的 operation:phase；下面的覆盖表测试据此校验无漏项
+COVERED: set[str] = set()
+
+
 class TestCrashPoints(CrashMatrixBase):
+    def _crash_at(self, point: str):
+        """用 HARNESS_FAULT 在指定 operation:phase 定点崩溃。"""
+        import os
+        from harness.outbox import InjectedFault
+        COVERED.add(point)
+        os.environ["HARNESS_FAULT"] = point
+        try:
+            with self.assertRaises(InjectedFault):
+                self.publisher("r1").publish(CANDIDATE)
+        finally:
+            del os.environ["HARNESS_FAULT"]
+
+    def _restart(self):
+        """丢弃全部内存对象并重开 SQLite，模拟真正的进程重启。"""
+        self.conn.close()
+        self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        self.wt = PublishWorktree(self.local, self.local / ".worktree/_publish")
+        self.queue = Queue(self.conn)
+
     def _resume_after_lost_but_applied(self, method: str):
         """服务端已生效、响应丢失：execute 会 probe 到对象并**正常返回**，
         不抛异常。首轮就应收敛，且底层 call 只发生一次。"""
@@ -2004,6 +2058,40 @@ class TestCrashPoints(CrashMatrixBase):
         self.assertEqual(run(self.wt.path, "rev-parse", "HEAD"), sha_before,
                          "待推送提交被 reset 掉了")
 
+    def test_commit_already_applied_but_outbox_still_prepared(self):
+        """commit_proposal:after-call —— commit 已存在、outbox 仍 prepared。
+        重启后必须认出既有提交，不得产生第二个 commit。"""
+        self._crash_at("commit_proposal:after-call")
+        self._restart()
+        result = self.publisher("r2").publish(CANDIDATE)
+        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
+        self.assert_converged()
+
+    def test_commit_observed_then_process_exits(self):
+        """commit_proposal:after-observe —— SHA 已持久化，重启后应直接进入 push。"""
+        self._crash_at("commit_proposal:after-observe")
+        self._restart()
+        result = self.publisher("r2").publish(CANDIDATE)
+        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
+        self.assert_converged()
+
+    def test_push_already_applied_but_outbox_still_prepared(self):
+        """push_main:after-call —— 远端已推进、outbox 仍 prepared。
+        重启后 probe 应确认已发布，不得重复 push 或重放。"""
+        self._crash_at("push_main:after-call")
+        self._restart()
+        result = self.publisher("r2").publish(CANDIDATE)
+        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
+        self.assert_converged()
+
+    def test_push_observed_then_process_exits(self):
+        """push_main:after-observe —— 重启后应直接进入 receipt。"""
+        self._crash_at("push_main:after-observe")
+        self._restart()
+        result = self.publisher("r2").publish(CANDIDATE)
+        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
+        self.assert_converged()
+
     def test_worktree_wiped_between_rounds_still_converges(self):
         """本地工作区丢失但远端已发布：不得重新发布第二份。"""
         self.publisher("r1").publish(CANDIDATE, stop_after="push")
@@ -2012,6 +2100,23 @@ class TestCrashPoints(CrashMatrixBase):
         result = self.publisher("r2").publish(CANDIDATE)
         self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
         self.assert_converged()
+
+
+class TestCrashCoverageTable(unittest.TestCase):
+    """防止手写矩阵将来再次漏项：每个 required operation:phase 都必须有用例登记。
+
+    注意：本测试依赖 TestCrashPoints 先跑过（unittest 按类名字母序，
+    TestCrashCoverageTable < TestCrashPoints），故显式先跑一遍它们。
+    """
+
+    def test_every_required_operation_phase_is_covered(self):
+        suite = unittest.TestLoader().loadTestsFromTestCase(TestCrashPoints)
+        unittest.TextTestRunner(verbosity=0).run(suite)
+        required = {f"{op}:{phase}"
+                    for op, phases in REQUIRED_CRASH_COVERAGE.items()
+                    for phase in phases}
+        missing = required - COVERED
+        self.assertEqual(missing, set(), f"崩溃矩阵漏项：{sorted(missing)}")
 
 
 if __name__ == "__main__":
@@ -2034,6 +2139,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'harness.publish'`
 """
 
 from __future__ import annotations
+
+import json
 
 from . import lifecycle
 from .gitops import PublishWorktree
@@ -2081,10 +2188,22 @@ class Publisher:
 
     # ---- 发布 -------------------------------------------------------------
 
+    def resume(self, operation_id: str) -> dict:
+        """按持久化 payload 续做一个未完成的发布，不重新扫描（评审 C-02）。"""
+        row = self.outbox.conn.execute(
+            "SELECT payload_json FROM operations WHERE operation_id=?",
+            (operation_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"未知 operation {operation_id}")
+        return self.publish(json.loads(row["payload_json"]))
+
     def publish(self, candidate: dict, stop_after: str | None = None) -> dict:
+        # payload 必须足以在进程重启后**重建提案卡**：只存 title/slug 时
+        # 恢复路径拿不到 body_md/labels，卡片无从生成（评审 C-02）
         op = self.outbox.prepare(
             self.round_id, "publish_proposal", candidate["fingerprint"],
-            {"title": candidate["title"], "slug": candidate["slug"]})
+            {k: candidate[k] for k in
+             ("fingerprint", "title", "slug", "lane", "labels", "body_md")})
         self.last_operation_id = op.operation_id
         marker = OP_MARKER + op.operation_id
 
@@ -2179,7 +2298,7 @@ class Publisher:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd /home/xp/src/zipfs/.claude/scripts && /home/linuxbrew/.linuxbrew/bin/python3 -m unittest harness.tests.test_publish_crash_matrix -v`
-Expected: PASS，11 tests OK
+Expected: PASS，16 tests OK（含覆盖表校验）
 
 - [ ] **Step 5: 提交**
 
@@ -2342,8 +2461,10 @@ def run_prechecks(cfg, gh, worktree, outbox,
                                    f"{tool} 不存在或不可执行" if not ok else "ok"))
 
     # 顺序不可调换：先对账，再决定能否 reset 工作区（评审 C-04）
-    pending = outbox.reconcile(probes or {})
-    has_unpushed_commit = any(outbox.commit_sha(op) for op in pending)
+    outbox.reconcile(probes or {})
+    # 待推提交必须直查持久化事实，不能从 reconcile 的返回值推导——
+    # 已 observed 的 commit operation 不在未决集合里，那样推导恒为 False
+    has_unpushed_commit = bool(outbox.unpushed_commits())
     try:
         worktree.ensure(allow_reset=not has_unpushed_commit)
         clean = worktree.is_clean()
@@ -3391,6 +3512,18 @@ def run_round(cfg, deps: Deps) -> dict:
         return {"round_id": round_id, "mode": "scan", "result": "budget-exhausted",
                 "detail": str(exc)}
 
+    # 恢复优先于新扫描：还有未结的 operation 时不得再起模型（评审 C-02）。
+    # 否则「建 Issue 响应丢失 + 搜索暂不可见」会让下一轮另开一个候选，
+    # 旧 operation 永久悬置，同一提案出现两个 Issue。
+    open_ops = deps.outbox.open_operations()
+    if open_ops:
+        publisher = Publisher(deps.outbox, deps.gh, deps.worktree,
+                              deps.queue, round_id)
+        resumed = publisher.resume(open_ops[0].operation_id)
+        budget.settle(round_id, day, 0.0)
+        return {"round_id": round_id, "mode": "resume", "result": "resumed",
+                "issue": resumed["issue"], "state": resumed["state"]}
+
     blocked_lanes = [lane for lane in ("roadmap", "defect", "perf", "hygiene")
                      if deps.queue.lane_full(lane, cfg.lane_cap)]
     if deps.queue.total_full(cfg.proposed_cap):
@@ -3845,6 +3978,9 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | **R2-C-04 set_commit_sha 从未被调用** | **属实** | Publisher 在 commit 后立即持久化 SHA；`has_unpushed_commit` 因此才真正生效；补「预检不得 reset 掉待推送提交」测试 |
 | **R2-C-05 绑定字段跨进程丢失** | **属实** | 重入时从 outbox 取回 `commit_sha` 重绑；补「关闭并重开 SQLite 后仍收敛」测试 |
 | **R2-C-06 fence 反例** | **属实，我先前的反驳被推翻** | 反例实测复现（`body_md` 内含代码 fence 时截出半个对象）。放弃正则抠取，改为按首尾 fence 边界剥壳后整体 `json.loads`；补 fence-in-string 与 missing-init 两条回归测试 |
+| **R3-C-02 恢复未优先于新扫描 / payload 不足以重建** | **属实** | `open_operations()` + `Publisher.resume()`：有未结 operation 时本轮不起模型，直接续做；`publish_proposal` payload 改存完整候选（fingerprint/title/slug/lane/labels/body_md） |
+| **R3-C-03 缺 commit/push 相位覆盖** | **属实**（评审给出了我要的具体失效模式） | 补 4 条真实 substrate 测试（commit/push 各 after-call、after-observe）+ `REQUIRED_CRASH_COVERAGE` 机器断言覆盖表，漏项即红。自动生成器仍留 Stage 2 |
+| **R3-C-04 待推检测查错集合** | **属实** | 不再从 `reconcile()` 返回值推导（已 observed 的 commit 不在未决集合里，推导恒 False）；改为 `unpushed_commits()` 直查「有 commit_sha 且对应 push_main 未 observed」 |
 | M-15 probe 未测后台 Workflow 等待 | **属实** | Task 13 Step 1 的措辞已改：probe 只验工具/MCP 隔离；后台等待上限由 Task 13 Step 3 的真实 round（会启动 Workflow）观测并回填 spec §十六 |
 
 ## 执行状态（逐任务同步，跨会话据此判断进度）
