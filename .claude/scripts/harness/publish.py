@@ -115,16 +115,41 @@ class Publisher:
             return {"sha": sha}
 
         def probe_commit():
-            """已存在的提交（含崩在 after-call 的情形）必须被认出来。"""
-            sha = self.outbox.commit_sha(commit_op) or \
-                self.wt.operation_commit_sha(op.operation_id)
+            """已存在的提交必须被现场核验，不能只信 SQLite 缓存的 SHA。
+
+            `wt.operation_commit_sha()` 对**当前** worktree 跑 `git log`，
+            只有该 SHA 仍在当前分支历史里可达时才算数——这就是"commit 对象
+            确实存在"的现场核验（评审 Critical 修法 1）。查不到时一律返回
+            None，绝不退回未经核验的 SQLite 缓存值，否则一个已随 worktree
+            丢失的旧 SHA 会被当成"已提交"，进而在 push 阶段把裸 HEAD
+            当成"已推送"（评审复现的正是这条链路）。
+            """
+            sha = self.wt.operation_commit_sha(op.operation_id)
             if not sha:
                 return None
             self.outbox.set_commit_sha(op, sha)
             self.outbox.set_commit_sha(commit_op, sha)
             return {"sha": sha}
 
-        self.outbox.execute(commit_op, call=do_commit, probe=probe_commit)
+        # `outbox.execute()` 对 phase 已是 observed/settled 的 operation 会
+        # 直接短路返回缓存结果，不会重新探测——这是它的既定契约（本模块不改
+        # `outbox.py`）。但缓存里的 SHA 可能已不再是当前仓库里真实存在的
+        # 对象：崩在本地 commit 之后、push 之前时 `_publish` worktree 可能
+        # 被删或丢失，新建的 worktree 从 origin/main 重新检出，旧 SHA 不再
+        # 可达（评审 Critical）。因此在委托给 `outbox.execute()` 之前，先
+        # 显式核验一次：只有当 SQLite 认为已提交、但现场核验不到该提交时，
+        # 才需要绕过短路、从 root 的完整 payload 重新生成提案提交（评审
+        # Critical 修法 3）。
+        #
+        # 这里不会造成远端重复提案：若该 operation 已经推送成功，`ensure()`
+        # 重建的 worktree 会从 origin/main 检出，而 origin/main 此时已包含
+        # 那个提交，`operation_commit_sha()` 会在新 worktree 里重新找到它
+        # （它现在是主线历史的一部分），从而不会触发再生成。
+        cached_sha = self.outbox.commit_sha(commit_op)
+        if cached_sha and not self.wt.operation_commit_sha(op.operation_id):
+            do_commit()
+        else:
+            self.outbox.execute(commit_op, call=do_commit, probe=probe_commit)
         self.wt.operation_sha = self.outbox.commit_sha(op)
         if stop_after == "commit":
             return {"issue": number, "state": State.COMMITTED_LOCAL}
@@ -132,6 +157,13 @@ class Publisher:
         push_op = self.outbox.prepare(
             self.round_id, "push_main", op.operation_id,
             {"issue": number, "path": rel_path})
+        # push 之前必须确认当前 HEAD 确实包含该 operation 绑定的提交——
+        # 不能仅凭"上面刚做过核验"就假定成立，任何遗漏路径都不能把一个
+        # 不含提案卡的 HEAD 当作"待推送"去 push（评审 Critical 修法 2）。
+        if not self.wt.operation_commit_sha(op.operation_id):
+            raise RuntimeError(
+                f"push 前置核验失败：operation {op.operation_id} 的提交在"
+                f"当前 worktree 历史中不可达，拒绝 push 一个不含提案卡的 HEAD")
         self.outbox.execute(
             push_op,
             call=lambda: (self.wt.push(), {"pushed": True})[1],

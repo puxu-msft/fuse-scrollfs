@@ -1,4 +1,4 @@
-"""崩溃点子矩阵：每个 operation 四个崩溃点，重启后必须收敛且不重复。"""
+"""崩溃点子矩阵：每个 operation 三个注入相位，重启后必须收敛且不重复。"""
 
 import subprocess, tempfile, unittest
 from pathlib import Path
@@ -123,16 +123,23 @@ COVERED: set[str] = set()
 
 class TestCrashPoints(CrashMatrixBase):
     def _crash_at(self, point: str):
-        """用 HARNESS_FAULT 在指定 operation:phase 定点崩溃。"""
+        """用 HARNESS_FAULT 在指定 operation:phase 定点崩溃。
+
+        `COVERED.add(point)` 必须放在 `assertRaises` 确认异常真的抛出**之后**
+        才登记——登记的应是"这个点被实际触达并崩溃过"，而不是"循环遍历过
+        这个 required 字符串"（评审 Important #1）。若 `HARNESS_FAULT` 写错、
+        或该 phase 从未被 `_fault_check()` 命中，`assertRaises` 会让上层
+        subTest 失败，但覆盖表本身不该在那种情况下也标记"已覆盖"。
+        """
         import os
         from harness.outbox import InjectedFault
-        COVERED.add(point)
         os.environ["HARNESS_FAULT"] = point
         try:
             with self.assertRaises(InjectedFault):
                 self.publisher("r1").publish(CANDIDATE)
         finally:
             del os.environ["HARNESS_FAULT"]
+        COVERED.add(point)
 
     def _restart(self):
         """丢弃全部内存对象并重开 SQLite，模拟真正的进程重启。"""
@@ -172,7 +179,18 @@ class TestCrashPoints(CrashMatrixBase):
     def test_receipt_response_lost_not_applied(self):
         self._resume_after_lost_not_applied("create_comment")
 
-    def test_crash_after_local_commit_before_push(self):
+    def test_checkpoint_after_local_commit_before_push(self):
+        """局部 checkpoint 测试：用 `stop_after` 提前返回模拟"只做到这一步"，
+        不是模拟进程中止（不经过 kill/信号），随后直接调
+        `Publisher.publish()` 恢复，也不走 `run_round → precheck →
+        open_roots → resume` 的生产恢复链路（评审 Important #2）。
+
+        它验证的是"如果只做到 commit 这一步，从这个中间状态重新调用
+        publish() 能否收敛"，这本身有价值，但证明力不等于表驱动的 12 相位
+        矩阵（`test_every_required_crash_phase_recovers`）——那才是经由
+        `HARNESS_FAULT` 真实抛出异常、并模拟完整进程重启的崩溃恢复测试。
+        真实崩溃恢复的生产入口集成测试见 Task 12。
+        """
         p = self.publisher("r1")
         p.publish(CANDIDATE, stop_after="commit")
         self.assertTrue(self.wt.local_has_operation(p.last_operation_id))
@@ -180,7 +198,11 @@ class TestCrashPoints(CrashMatrixBase):
         self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
         self.assert_converged()
 
-    def test_crash_after_push_before_receipt(self):
+    def test_checkpoint_after_push_before_receipt(self):
+        """局部 checkpoint 测试，同上——`stop_after="push"` 提前返回，不经过
+        生产恢复入口。见 `test_checkpoint_after_local_commit_before_push`
+        的 docstring（评审 Important #2）。
+        """
         p = self.publisher("r1")
         p.publish(CANDIDATE, stop_after="push")
         result = self.publisher("r2").publish(CANDIDATE)
@@ -256,6 +278,35 @@ class TestCrashPoints(CrashMatrixBase):
         self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
         self.assert_converged()
 
+    def test_worktree_lost_after_commit_before_push_regenerates_commit(self):
+        """本地 commit 完成、尚未 push 时 worktree 丢失：必须重新生成提案提交
+        并真正 push，不能把已失效的旧 SHA 当作"已推送"上报（评审 Critical）。
+
+        与 `test_worktree_wiped_between_rounds_still_converges` 的区别：那个
+        用例在 **push 之后** 丢 worktree，origin/main 已经带着提案提交，新建的
+        worktree 天然把它继承回来。本用例在 **push 之前** 丢 worktree——
+        origin/main 上还没有提案提交，`ensure(allow_reset=False)` 重建的
+        worktree HEAD 就是裸的 origin/main，旧 SHA 已不在其祖先链上。
+
+        修复前的实现里，`probe_commit()` 先信 SQLite 缓存的旧 SHA、从不核对
+        它是否仍在当前 worktree 历史里，于是 push 会把这个裸 HEAD（等于
+        origin/main 自己）当成"已推送"，远端根本没有提案卡，而账本却把
+        commit/push 两个 operation 都记成 observed，永久卡在 inconsistent、
+        无法再恢复。
+        """
+        p1 = self.publisher("r1")
+        p1.publish(CANDIDATE, stop_after="commit")
+        self.assertTrue(self.wt.local_has_operation(p1.last_operation_id),
+                        "前置条件：commit 必须先在本地真实存在")
+        # 模拟本地 worktree 丢失（磁盘故障/误删），而不是正常 push 后的清理
+        subprocess.run([GIT, "worktree", "remove", "--force",
+                        str(self.wt.path)], cwd=self.local, capture_output=True)
+        self._restart()
+
+        result = self.publisher("r2").publish(CANDIDATE)
+        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
+        self.assert_converged()
+
 
 class TestCrashCoverageTable(unittest.TestCase):
     """防止手写矩阵将来再次漏项：每个 required operation:phase 都必须有用例登记。
@@ -271,7 +322,11 @@ class TestCrashCoverageTable(unittest.TestCase):
         它们不经过 HARNESS_FAULT，持久化状态也不同，不能冒充相位测试。
         """
         suite = unittest.TestLoader().loadTestsFromTestCase(TestCrashPoints)
-        unittest.TextTestRunner(verbosity=0).run(suite)
+        result = unittest.TextTestRunner(verbosity=0).run(suite)
+        self.assertTrue(
+            result.wasSuccessful(),
+            f"重跑 TestCrashPoints 时出现失败/错误，覆盖表不可信："
+            f"failures={result.failures!r} errors={result.errors!r}")
         required = {f"{op}:{phase}"
                     for op, phases in REQUIRED_CRASH_COVERAGE.items()
                     for phase in phases}
