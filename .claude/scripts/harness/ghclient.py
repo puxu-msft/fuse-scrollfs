@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from typing import Callable, Protocol, runtime_checkable
 
 from .config import GH, Config
@@ -18,6 +19,26 @@ from .outbox import ResponseLost, TerminalOperationError
 
 # 单次 gh 调用超时：卡住的 gh 不应耗尽整轮 deadline。
 DEFAULT_TIMEOUT_S = 30.0
+
+# 自然键恢复（评审 Critical）：GitHub Search 是异步索引的，一次或数次
+# `search/issues` 无结果**不能**证明 Issue 未创建——探测阴性可能只是索引
+# 尚未追上。`find_issue_by_marker()` 因此改用 `GET /repos/{slug}/issues`
+# 直接分页扫描：这条路径不经过 Search 索引，是强一致的（写入后立即可见）。
+#
+# 扫描窗口有界（默认最近 500 个 Issue/PR，5 页 × 100/页）：自然键恢复要
+# 找的必然是**本次调用刚创建**的对象，几乎总在第一页；多留几页只是为了
+# 兜住『同时有其他人在建 Issue』的正常竞争。这个有界窗口不是『尽力而为
+# 之后放弃』的妥协——只要窗口内没找到，语义就从『不确定』变为『在最近
+# 活动范围内确定未创建』，而不再是『Search 索引没追上』那种不确定性。
+_RECOVERY_LIST_PAGE_SIZE = 100
+_RECOVERY_LIST_MAX_PAGES = 5
+
+# 列表端点本身仍可能遭遇 5xx / 超时等传输层瞬时错误——那与『索引延迟』是
+# 两类不同的不确定性，但同样不能被误读成『确认未创建』。用有界退避重试
+# 吸收瞬时抖动；重试耗尽后必须原样抛出异常（而不是悄悄返回 None），让
+# 调用方（`Outbox.execute()`）把这一轮判定为『结果未知』，绝不因为一次
+# 探测失败就重新调用 `create_issue()` 开出第二个对象。
+_RECOVERY_RETRY_BACKOFFS_S = (1.0, 2.0, 4.0)
 
 # 传输层中断标志：连接在请求执行期间断开，服务端是否已处理不可知。
 # 覆盖：普通超时、连接重置/拒绝/中断、EOF 类、HTTP/2 流重置、broken pipe、
@@ -98,13 +119,16 @@ class GitHubClient(Protocol):
 
 class GhCli:
     def __init__(self, cfg: Config, runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-                 timeout: float = DEFAULT_TIMEOUT_S):
+                 timeout: float = DEFAULT_TIMEOUT_S,
+                 sleep: Callable[[float], None] = time.sleep):
         self.cfg = cfg
         self.slug = cfg.repo_slug
         # 可注入的 subprocess 执行器：测试喂真实 GitHub 形状的响应/分页 stdout/
         # 各种 stderr，且不访问公网。默认用真的 subprocess.run。
         self._runner = runner
         self._timeout = timeout
+        # 可注入的退避 sleep：测试用它跳过真实等待，验证退避次数/顺序。
+        self._sleep = sleep
 
     def _run(self, args: list[str], parse: bool = True, mutation: bool = False):
         env = {"GH_TOKEN": self.cfg.gh_token, "PATH": "/usr/bin:/bin",
@@ -170,10 +194,62 @@ class GhCli:
         return self._normalize_issue(self._run(args, mutation=True))
 
     def find_issue_by_marker(self, marker: str) -> dict | None:
-        data = self._run(["api", "-X", "GET", "search/issues", "-f",
-                          f'q=repo:{self.slug} in:body "{marker}"'])
-        items = data.get("items", [])
-        return self._normalize_issue(items[0]) if items else None
+        """自然键恢复（评审 Critical）：直接分页扫描 Issue 列表，不经过
+        Search 索引。
+
+        GitHub Search 是异步索引的：`search/issues` 阴性结果**不能**证明
+        Issue 未创建，只能证明『索引尚未追上』。旧实现在 `create_issue`
+        响应丢失后，靠这一探测阴性重新调用 `create_issue`，会对同一提案
+        开出两个 Issue——这正是整套 outbox 设计要防止的事。
+
+        改用 `GET /repos/{slug}/issues?state=all&sort=created&direction=desc`
+        按页扫描：这是对资源本身的直接查询（非搜索索引），GitHub REST 的
+        主资源端点由主库直接支持，创建后立即强一致可见——不同于文档明确
+        标注『索引可能滞后一分钟』的 Search API。扫描窗口有界
+        （`_RECOVERY_LIST_MAX_PAGES` 页 × `_RECOVERY_LIST_PAGE_SIZE` 个/页，
+        按创建时间倒序）——自然键恢复要找的必然是**最近**创建的对象，几乎
+        总在第一页；窗口内未命中即确定性地判定『在最近活动范围内未创建』，
+        不是『放弃』。
+
+        列表请求本身若遇到 5xx/超时等瞬时传输错误，用有界退避重试吸收
+        抖动；重试耗尽后**原样向上抛出异常**，绝不悄悄当作『未找到』——
+        否则调用方会把这次不确定误读为确定阴性，进而重发 `create_issue`。
+
+        未在本调用内的窗口中找到，**不代表永久放弃**：`Outbox.reconcile()`
+        每轮都会重新调用本方法（评审点 3 的『有上限的延迟重试』因此落在
+        跨轮次的既有基础设施上，而不是在这里另起一个阻塞式重试循环）——
+        单次调用内部只重试传输层错误，不重试『真实查无』。
+        """
+        for page in range(1, _RECOVERY_LIST_MAX_PAGES + 1):
+            items = self._list_issues_page_with_retry(page)
+            for item in items:
+                if marker in (item.get("body") or ""):
+                    return self._normalize_issue(item)
+            if len(items) < _RECOVERY_LIST_PAGE_SIZE:
+                break  # 已到最后一页，窗口内确定未命中
+        return None
+
+    def _list_issues_page_with_retry(self, page: int) -> list[dict]:
+        """单页 Issue 列表查询，遇 5xx/超时等瞬时错误时按有界退避重试。
+
+        重试耗尽后原样抛出 `TransientReadError`——调用方（`find_issue_
+        by_marker` 的上层，最终是 `Outbox.reconcile()`/`Outbox.execute()`
+        的 probe 回调）必须能区分『查询失败，结果未知』与『查过了，确实
+        没有』，绝不能把前者悄悄折叠成后者。
+        """
+        args = ["api", "-X", "GET", f"repos/{self.slug}/issues",
+                "-f", "state=all", "-f", "sort=created", "-f", "direction=desc",
+                "-f", f"per_page={_RECOVERY_LIST_PAGE_SIZE}", "-f", f"page={page}"]
+        attempt = 0
+        while True:
+            try:
+                data = self._run(args)
+                return data or []
+            except TransientReadError:
+                if attempt >= len(_RECOVERY_RETRY_BACKOFFS_S):
+                    raise
+                self._sleep(_RECOVERY_RETRY_BACKOFFS_S[attempt])
+                attempt += 1
 
     def list_labels(self) -> list[str]:
         pages = self._run_array(["api", f"repos/{self.slug}/labels", "--paginate"])

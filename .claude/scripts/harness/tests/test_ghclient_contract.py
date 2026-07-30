@@ -118,12 +118,14 @@ class TestIssueLabelDtoNormalization(unittest.TestCase):
         gh = GhCli(_cfg(), runner=transport)
         self.assertEqual(gh.get_issue_labels(7), ["bug"])
 
-    def test_find_issue_by_marker_normalizes_search_result_labels(self):
+    def test_find_issue_by_marker_normalizes_list_result_labels(self):
+        """评审 Critical 之后：`find_issue_by_marker` 改走直接列表端点
+        （`repos/{slug}/issues`，返回裸数组），不再是 Search 的
+        `{"items": [...]}` 包裹形状——此处响应形状同步更新。"""
         transport = FakeGhTransport()
-        transport.queue(stdout=json.dumps({
-            "items": [{"number": 3, "body": "x HARNESS-OP:abc",
-                       "labels": [{"name": "harness"}]}],
-        }))
+        transport.queue(stdout=json.dumps(
+            [{"number": 3, "body": "x HARNESS-OP:abc",
+              "labels": [{"name": "harness"}]}]))
         gh = GhCli(_cfg(), runner=transport)
         found = gh.find_issue_by_marker("HARNESS-OP:abc")
         self.assertEqual(found["labels"], ["harness"])
@@ -289,6 +291,105 @@ class TestUncoveredMethodsArgvAndParsing(unittest.TestCase):
         self.assertIn("labels=harness", argv)
         self.assertIn("state=open", argv)
         self.assertIn("--paginate", argv)
+
+
+class TestFindIssueByMarkerStronglyConsistentScan(unittest.TestCase):
+    """评审 Critical：`find_issue_by_marker` 不得依赖异步索引的 Search API。
+
+    覆盖：改用直接分页扫描（强一致资源端点，非 Search）、扫描窗口有界、
+    列表请求瞬时错误的有界退避重试、以及重试耗尽必须原样抛出异常而不是
+    悄悄返回 None（避免调用方把『查询失败』误读为『确定未创建』）。
+    """
+
+    def test_uses_direct_issue_list_endpoint_not_search(self):
+        """必须走 `repos/{slug}/issues`，绝不能是 `search/issues`——
+        后者才是本次评审要防的『异步索引，阴性不可信』的来源。"""
+        transport = FakeGhTransport()
+        transport.queue(stdout=json.dumps(
+            [{"number": 3, "body": "x HARNESS-OP:abc", "labels": []}]))
+        gh = GhCli(_cfg(), runner=transport)
+        found = gh.find_issue_by_marker("HARNESS-OP:abc")
+        self.assertEqual(found["number"], 3)
+        argv = transport.calls[0]
+        self.assertIn("repos/acme/widgets/issues", argv)
+        self.assertNotIn("search/issues", argv)
+
+    def test_finds_marker_on_first_page(self):
+        transport = FakeGhTransport()
+        transport.queue(stdout=json.dumps(
+            [{"number": 5, "body": "unrelated", "labels": []},
+             {"number": 6, "body": "y HARNESS-OP:xyz", "labels": []}]))
+        gh = GhCli(_cfg(), runner=transport)
+        found = gh.find_issue_by_marker("HARNESS-OP:xyz")
+        self.assertEqual(found["number"], 6)
+        self.assertEqual(len(transport.calls), 1, "命中第一页不应再翻页")
+
+    def test_scans_multiple_pages_within_bounded_window(self):
+        """第一页恰好满员（100 条）但未命中，必须继续翻到第二页。"""
+        from harness.ghclient import _RECOVERY_LIST_PAGE_SIZE
+        full_page = [{"number": i, "body": "noise", "labels": []}
+                     for i in range(_RECOVERY_LIST_PAGE_SIZE)]
+        transport = FakeGhTransport()
+        transport.queue(stdout=json.dumps(full_page))
+        transport.queue(stdout=json.dumps(
+            [{"number": 999, "body": "z HARNESS-OP:deep", "labels": []}]))
+        gh = GhCli(_cfg(), runner=transport)
+        found = gh.find_issue_by_marker("HARNESS-OP:deep")
+        self.assertEqual(found["number"], 999)
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("page=1", transport.calls[0])
+        self.assertIn("page=2", transport.calls[1])
+
+    def test_not_found_within_window_returns_none_without_scanning_forever(self):
+        """未满页即代表已到最后一页：不再继续翻页，也不视为『不确定』。"""
+        transport = FakeGhTransport()
+        transport.queue(stdout=json.dumps(
+            [{"number": 1, "body": "noise", "labels": []}]))
+        gh = GhCli(_cfg(), runner=transport)
+        self.assertIsNone(gh.find_issue_by_marker("HARNESS-OP:nope"))
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_transient_error_retries_with_bounded_backoff_then_succeeds(self):
+        """列表请求先遇到 502，退避后重试成功——必须真的调用了 sleep，
+        且用的是有界退避表，而不是无限重试或立即失败。"""
+        transport = FakeGhTransport()
+        transport.queue(returncode=1, stderr="gh: Bad Gateway (HTTP 502)")
+        transport.queue(stdout=json.dumps(
+            [{"number": 1, "body": "x HARNESS-OP:retry-ok", "labels": []}]))
+        sleeps: list[float] = []
+        gh = GhCli(_cfg(), runner=transport, sleep=sleeps.append)
+        found = gh.find_issue_by_marker("HARNESS-OP:retry-ok")
+        self.assertEqual(found["number"], 1)
+        self.assertEqual(len(transport.calls), 2, "必须真的重试了一次")
+        self.assertEqual(len(sleeps), 1, "重试前必须退避一次")
+        self.assertGreater(sleeps[0], 0)
+
+    def test_retry_exhausted_raises_instead_of_silently_returning_none(self):
+        """核心断言（评审 Critical）：重试耗尽后必须原样抛出异常，绝不能
+        把『结果未知』悄悄折叠成 None——那会让调用方误判为『确定未创建』
+        进而重发 create_issue，制造第二个 Issue。"""
+        from harness.ghclient import (TransientReadError,
+                                      _RECOVERY_RETRY_BACKOFFS_S)
+        transport = FakeGhTransport()
+        for _ in range(len(_RECOVERY_RETRY_BACKOFFS_S) + 1):
+            transport.queue(returncode=1, stderr="gh: Bad Gateway (HTTP 502)")
+        sleeps: list[float] = []
+        gh = GhCli(_cfg(), runner=transport, sleep=sleeps.append)
+        with self.assertRaises(TransientReadError):
+            gh.find_issue_by_marker("HARNESS-OP:unknown-outcome")
+        self.assertEqual(len(sleeps), len(_RECOVERY_RETRY_BACKOFFS_S),
+                         "重试次数必须等于有界退避表长度，不多不少")
+
+    def test_timeout_during_recovery_scan_raises_not_none(self):
+        """超时同样是『结果不确定』，重试耗尽后仍必须抛出而不是返回 None。"""
+        from harness.ghclient import (TransientReadError,
+                                      _RECOVERY_RETRY_BACKOFFS_S)
+        transport = FakeGhTransport()
+        for _ in range(len(_RECOVERY_RETRY_BACKOFFS_S) + 1):
+            transport.queue_timeout()
+        gh = GhCli(_cfg(), runner=transport, sleep=lambda s: None)
+        with self.assertRaises(TransientReadError):
+            gh.find_issue_by_marker("HARNESS-OP:timeout-case")
 
 
 if __name__ == "__main__":

@@ -4,15 +4,22 @@ from harness import db
 from harness.config import GIT
 from harness.gitops import PublishWorktree
 from harness.outbox import Outbox, TerminalOperationError
-from harness.precheck import PrecheckFailed, assert_all_ok, run_prechecks
+from harness.precheck import (PrecheckFailed, assert_all_ok, inspect_facts,
+                              run_prechecks)
+from harness.publish import Publisher
+from harness.queue import Queue, fingerprint
 from harness.tests.fakes import FakeGitHub
 
 
 class FakeWorktree:
-    def __init__(self, clean=True):
+    def __init__(self, clean=True, path=None):
         self._clean = clean
         self.ensured = False
         self.allow_reset_seen = None
+        # 只有显式传入 path 时才设置该属性——保持默认『无 path 属性』行为
+        # 不变（`_worktree_exists()` 据此判为『尚未创建』），既有用例依赖此。
+        if path is not None:
+            self.path = path
 
     def ensure(self, allow_reset: bool = True):
         self.ensured = True
@@ -227,6 +234,87 @@ class TestPrecheck(unittest.TestCase):
                          "存在 failed_terminal 时不得触碰发布工作区")
         with self.assertRaises(PrecheckFailed):
             assert_all_ok(results)
+
+
+class TestInspectFacts(unittest.TestCase):
+    """`inspect_facts()`：纯读事实诊断，供 `doctor` 使用（评审 Important-2）。
+
+    必须证明两件事：(1) 存在未完成 root 时**必须**把它报出来，不能假绿；
+    (2) 全程绝不触碰 worktree——即便 worktree 存在且脏，也只读报告，
+    不调用 `ensure()`。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        self.addCleanup(self.conn.close)
+        db.migrate(self.conn)
+        self.outbox = Outbox(self.conn)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_clean_state_is_all_ok(self):
+        results = inspect_facts(Cfg(), FakeGitHub("WRITE"), FakeWorktree(),
+                                self.outbox, tools=("/usr/bin/git",))
+        self.assertTrue(all(r.ok for r in results), [r.detail for r in results])
+
+    def test_prepared_root_is_reported_not_hidden(self):
+        """复现评审场景：库里存在一个 prepared root（Issue 已建，卡片/
+        push/收据未完成）时，`inspect_facts()` 必须把它报出来，且
+        `FakeWorktree.ensured` 必须为 False——纯读诊断绝不能触碰 worktree。
+
+        `run_prechecks()` 修复前的 `doctor` 只查 `outbox_resolved`（只看
+        `failed_terminal`），对这种 `prepared` root 视而不见、全绿放行；
+        本测试确认 `inspect_facts()` 不会重蹈同一个假绿。
+        """
+        gh = FakeGitHub("WRITE")
+        candidate = {
+            "fingerprint": "fp-inspect-1", "title": "t", "slug": "s",
+            "lane": "defect", "labels": ["harness"], "body_md": "b",
+        }
+        worktree = FakeWorktree()
+        publisher = Publisher(self.outbox, gh, worktree, Queue(self.conn), "r0")
+        publisher.publish(candidate, stop_after="issue")
+        # 前置状态必须真的是「未收敛 root」，否则下面的断言测的是从未
+        # 发生过的场景（oracle-must-match-the-claim）
+        self.assertTrue(self.outbox.open_roots(),
+                        "前置状态必须先造出一个未收敛 root")
+
+        inspect_worktree = FakeWorktree()
+        results = inspect_facts(Cfg(), gh, inspect_worktree, self.outbox,
+                                tools=("/usr/bin/git",))
+
+        open_roots_check = [r for r in results if r.name == "open_roots"]
+        self.assertEqual(len(open_roots_check), 1)
+        self.assertFalse(open_roots_check[0].ok,
+                         "存在未收敛 root 时 inspect_facts 必须报告失败项，不能假绿")
+        self.assertFalse(
+            inspect_worktree.ensured,
+            "纯读诊断绝不能调用 worktree.ensure()（即便存在未完成 root）")
+
+    def test_never_touches_worktree_even_when_dirty(self):
+        # 需要一个『看起来已存在』的工作区（`.git` 目录存在），
+        # 否则 `_worktree_exists()` 判它尚未创建，测不到 dirty 分支。
+        wt_path = Path(self.tmp.name) / "wt"
+        (wt_path / ".git").mkdir(parents=True)
+        worktree = FakeWorktree(clean=False, path=wt_path)
+        results = inspect_facts(Cfg(), FakeGitHub("WRITE"), worktree,
+                                self.outbox, tools=("/usr/bin/git",))
+        self.assertFalse(worktree.ensured,
+                         "inspect_facts 绝不能调用 worktree.ensure()")
+        state_check = [r for r in results if r.name == "worktree_state"]
+        self.assertEqual(len(state_check), 1)
+        self.assertIn("dirty", state_check[0].detail)
+
+    def test_failed_terminal_operation_is_reported(self):
+        op = self.outbox.prepare("r0", "publish_proposal", "nk", {})
+        self.outbox._mark(op, "failed_terminal", None)
+        results = inspect_facts(Cfg(), FakeGitHub("WRITE"), FakeWorktree(),
+                                self.outbox, tools=("/usr/bin/git",))
+        outbox_check = [r for r in results if r.name == "outbox_resolved"]
+        self.assertEqual(len(outbox_check), 1)
+        self.assertFalse(outbox_check[0].ok)
 
 
 def _run_git(cwd, *args):

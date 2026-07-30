@@ -158,3 +158,71 @@ def assert_all_ok(results: list[CheckResult]) -> None:
     if failed:
         lines = "\n".join(f"  - {r.name}: {r.detail}" for r in failed)
         raise PrecheckFailed(f"预检失败 {len(failed)} 项：\n{lines}")
+
+
+def inspect_facts(cfg, gh, worktree, outbox,
+                  tools: tuple[str, ...] = DEFAULT_TOOLS) -> list[CheckResult]:
+    """纯读事实诊断（评审 Important-2）：绝不 reconcile、绝不 fetch、绝不
+    `worktree.ensure()`、绝不 reset——只报告当前持久化与工作区的只读事实。
+
+    与 `run_prechecks()` 分离：那是生产 round 用的、带副作用的预检入口，
+    语义完全不变，仍是 `doctor` 之外一切生产路径唯一入口。本函数专供
+    `doctor` 之类的只读授权诊断使用。修复前 `doctor` 直接调用
+    `run_prechecks()`：它不传 `probes`（`outbox.reconcile({})` 什么都对
+    不了账）、且只查 `outbox_resolved`（只看 `failed_terminal`），于是
+    存在一个尚未完成的 `prepared` root（Issue 已建、卡片/push/收据未完成）
+    时，`doctor` 会先对发布工作区做 fetch/prune/reset 等副作用，**且仍然
+    全绿返回**——起不到『第一道纯只读授权门』的作用（评审已用 FakeWorktree
+    复现：doctor 返回 0，`worktree.ensure()` 被调用过，同时 `open_roots=1`）。
+
+    本函数据此把 `open_roots` / `open_operations` / `failed_terminal` /
+    待推送 commit 数量都纳入门槛项（非空即 `ok=False`）；worktree 是否
+    dirty 只作为只读事实附带报告，不参与门槛判定——清理/reset 的取舍属于
+    生产预检 `run_prechecks()` 的职责，纯读诊断只负责如实呈现现状。
+    """
+    results: list[CheckResult] = list(_inspect_preconditions(cfg, gh, tools))
+
+    open_roots = outbox.open_roots()
+    results.append(CheckResult(
+        "open_roots", len(open_roots) == 0,
+        ("存在 " + str(len(open_roots)) + " 个未收敛的发布事务：" +
+         ", ".join(f"{r.kind}/{r.natural_key}" for r in open_roots))
+        if open_roots else "ok"))
+
+    open_ops = outbox.open_operations()
+    results.append(CheckResult(
+        "open_operations", len(open_ops) == 0,
+        ("存在 " + str(len(open_ops)) + " 个未决 operation：" +
+         ", ".join(f"{o.kind}/{o.natural_key}" for o in open_ops))
+        if open_ops else "ok"))
+
+    results.append(_outbox_resolved_check(outbox))
+
+    unpushed = outbox.unpushed_commits()
+    results.append(CheckResult(
+        "unpushed_commits", len(unpushed) == 0,
+        ("存在 " + str(len(unpushed)) + " 个待推送 commit：" +
+         ", ".join(o.natural_key for o in unpushed))
+        if unpushed else "ok"))
+
+    results.append(_inspect_worktree_state_readonly(worktree))
+    return results
+
+
+def _inspect_worktree_state_readonly(worktree) -> CheckResult:
+    """只读呈现发布工作区当前状态：存在与否、若存在是否 dirty。
+
+    绝不调用 `worktree.ensure()`——那会 fetch/prune/(reset --hard + clean
+    -fd)，与『纯读』矛盾。是否 dirty 只作为事实呈现（`ok` 恒为 True），
+    不在这里判定是否允许继续——那是 `run_prechecks()` /
+    `_check_publish_worktree_clean()` 的职责，两者刻意保持独立入口。
+    """
+    if not _worktree_exists(worktree):
+        return CheckResult("worktree_state", True, "工作区尚未创建（未初始化）")
+    try:
+        clean = worktree.is_clean()
+    except Exception as exc:
+        return CheckResult("worktree_state", False, repr(exc))
+    return CheckResult(
+        "worktree_state", True,
+        "ok（clean）" if clean else "存在未提交改动（dirty，仅报告，不清理）")

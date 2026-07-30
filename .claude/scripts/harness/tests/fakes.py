@@ -23,6 +23,9 @@ class FakeGitHub:
         self._next_number = 1
         self._faults: dict[str, bool] = {}
         self.calls: list[str] = []
+        # 索引延迟模拟（评审 Critical，回归测试专用）：见
+        # `simulate_delayed_marker_visibility()` / `find_issue_by_marker_delayed()`。
+        self._delayed_visible_after: dict[str, int] = {}
 
     def fail_next(self, method: str, applied: bool) -> None:
         self._faults[method] = applied
@@ -51,10 +54,44 @@ class FakeGitHub:
         return self._maybe_fail("create_issue", apply)
 
     def find_issue_by_marker(self, marker: str) -> dict | None:
+        """强一致查询：直接扫描内存里的全部 Issue，无任何延迟——这正是
+        `GhCli.find_issue_by_marker()` 修复后（改用直接列表端点而非
+        Search 索引）想要保证的语义：创建后立即可见，不存在『探测阴性
+        ≠ 确定未创建』这类不确定性。生产代码路径（`Publisher`/`round.py`）
+        只调用这一个方法作为 natural-key 恢复探测。
+        """
         for issue in self.issues.values():
             if marker in issue["body"]:
                 return issue
         return None
+
+    def simulate_delayed_marker_visibility(self, marker: str,
+                                           calls_until_visible: int) -> None:
+        """模拟『对象已创建，但按 marker 探测时暂不可见』（如异步 Search
+        索引延迟）：接下来 `calls_until_visible` 次
+        `find_issue_by_marker_delayed(marker)` 调用返回 None，即便匹配的
+        Issue 已经存在；用于构造对照测试，证明『探测阴性 → 重发
+        create_issue』这条路径在探测本身不可靠时确实会产生重复对象
+        （评审 Critical：GitHub Search 是异步索引的，阴性结果不能证明
+        对象未创建）。
+
+        `find_issue_by_marker()`（生产代码实际调用的方法）**不**受此影响
+        ——它模拟的是修复后『直接列表扫描，强一致』的语义。本方法只影响
+        `find_issue_by_marker_delayed()`，后者仅供回归测试构造对照组，
+        生产代码从不调用它。
+        """
+        self._delayed_visible_after[marker] = calls_until_visible
+
+    def find_issue_by_marker_delayed(self, marker: str) -> dict | None:
+        """仅供回归测试构造对照组：模拟旧版基于 Search 索引、可能延迟可见
+        的探测语义。生产代码从不调用这个方法——真实探测入口是
+        `find_issue_by_marker()`。
+        """
+        remaining = self._delayed_visible_after.get(marker, 0)
+        if remaining > 0:
+            self._delayed_visible_after[marker] = remaining - 1
+            return None
+        return self.find_issue_by_marker(marker)
 
     def list_labels(self) -> list[str]:
         return sorted(self.labels)
