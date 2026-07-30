@@ -8,6 +8,10 @@ rules:
     paths:
       - crates/scrollz/src/archive/superblock.rs
       - crates/scrollz/src/archive/format.rs
+      - crates/scrollz/src/archive/mod.rs
+      - crates/scrollz/src/archive/writer.rs
+      - crates/scrollz/src/archive/reader.rs
+      - crates/scrollz/src/archive/updater.rs
     reason: 磁盘格式魔数与 superblock 布局属冻结契约，改动需用户裁决
 
   - id: crash-safe-commit-order
@@ -15,6 +19,8 @@ rules:
     paths:
       - crates/scrollz/src/store/
       - crates/scrollz/src/archive/journal.rs
+      - crates/scrollz/src/archive/updater.rs
+      - crates/scrollz/src/store/shadow.rs
     reason: 崩溃安全提交顺序无法由 diff 模式证明，自动 PR 一律阻断
 
   - id: tail-journal-record-format
@@ -39,4 +45,7 @@ rules:
       - .claude/workflows/
       - .claude/harness-settings.json
       - .claude/scripts/harness/
-    reason: 禁止 harness 无人值守地重写自身控制逻辑；此类改动只能走独立 PR
+      - .claude/agents/
+      - .claude/rules/
+      - docs/harness/redlines.yaml
+    reason: 禁止 harness 无人值守地重写自身控制逻辑（含 finder/judge 提示词、不可信输入纪律、红线清单本身）；此类改动只能走独立 PR

@@ -1,13 +1,15 @@
-// .claude/workflows/scrollz-contract-probe.js
 export const meta = {
   name: 'scrollz-contract-probe',
   description: '冻结 Workflow API 契约：meta 形状、args 全局、agent 位置参数、schema 返回',
   phases: [{ title: 'Probe', detail: '单 agent 结构化返回' }],
 };
 
+// .claude/workflows/scrollz-contract-probe.js
+
 const SCHEMA = {
   type: 'object',
   required: ['echo', 'lens'],
+  additionalProperties: false,
   properties: {
     echo: { type: 'string' },
     lens: { type: 'string' },
