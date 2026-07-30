@@ -80,6 +80,23 @@ def _check_text(candidate: dict, field_name: str, max_len: int,
         errors.append(f"{field_name} 超过长度上限 {max_len}")
 
 
+def _candidates_shape_error(candidates) -> str | None:
+    """信任边界处的最外层结构校验（评审 Critical A）：在任何 `.get("lane")`
+    之类的解引用之前，先确认 `candidates` 本身是列表、且每个元素都是
+    对象。顶层不是列表（例如模型返回 `candidates` 为字符串列表、字典、
+    `None`）或列表内混入非对象元素（例如 `None`、字符串）都必须在这里
+    就地判定为非法，而不是让 `c.get("lane")` 直接 `AttributeError` 崩溃
+    ——那样会让 round 永久悬挂在 `mode=pending, result=None`。
+    """
+    if not isinstance(candidates, list):
+        return (f"candidates 顶层形状非法，必须是列表，实际类型 "
+                f"{type(candidates).__name__}")
+    for i, c in enumerate(candidates):
+        if not isinstance(c, dict):
+            return f"candidates[{i}] 不是对象，实际类型 {type(c).__name__}"
+    return None
+
+
 def validate_candidate(candidate: dict) -> list[str]:
     """在任何 outbox intent 或外部副作用之前，对模型返回的 candidate 做完整
     校验（评审 Critical #2）。返回错误列表；非空即拒绝，不得先创建 Issue
@@ -184,6 +201,48 @@ def run_round(cfg, deps: Deps) -> dict:
     budget = Budget(deps.conn, cfg.round_budget_usd, cfg.daily_budget_usd)
     day = _today()
 
+    # 单一 finalize 边界（评审 Critical C）：`progress` 记录本轮到目前为止
+    # 已知的账本元数据。`Publisher.publish()`、GitHub、Git 或 SQLite 抛出
+    # 的任何未预期异常，都会被下面唯一的 `except Exception` 捕获并据此结算
+    # 账本——成本已知（invoke 已返回）则记实际值，未知则按该 round 的预留
+    # 上限计费（与既有「结果未知按最坏值」语义一致）；随后原样重新抛出，
+    # 绝不吞错。修复前只覆盖了显式 `return` 分支，未预期异常会让 round
+    # 永久停在 `mode=pending, result=None, ended_at=None,
+    # reserved_usd=<本轮预留>` 未释放的状态，若干次故障即可把日预算吃空、
+    # harness 静默停摆。
+    progress = {"mode": "scan", "cost_known": False, "cost": 0.0,
+                "turns": None, "denials": None, "exit_code": None}
+
+    def _finalize_unhandled_exception() -> None:
+        row = deps.conn.execute(
+            "SELECT reserved_usd, ended_at FROM rounds WHERE round_id=?",
+            (round_id,)).fetchone()
+        if row is None:
+            # 异常发生在本轮任何账本行建立之前（`reserve()`/
+            # `open_round_record()` 都还没跑到）：本轮从未占用预算，建一条
+            # `reserved_usd=0` 的账本行留痕即可，不需要额外结算。
+            budget.open_round_record(round_id, mode=progress["mode"])
+        elif row["ended_at"] is None:
+            if progress["cost_known"]:
+                budget.settle(round_id, day, progress["cost"])
+            else:
+                # 成本未知：按该 round 自己的预留上限全额计费（worst-case，
+                # 与 `abandon()`/`settle_orphaned()` 同一语义）。
+                budget.abandon(round_id, day)
+        budget.record_outcome(
+            round_id, mode=progress["mode"], result="unhandled-exception",
+            turns=progress["turns"], denials=progress["denials"],
+            exit_code=progress["exit_code"])
+
+    try:
+        return _run_round_body(cfg, deps, round_id, started, budget, day, progress)
+    except Exception:
+        _finalize_unhandled_exception()
+        raise
+
+
+def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
+                    budget: Budget, day: str, progress: dict) -> dict:
     # probes 必须真的传进去：reconcile({}) 什么都对不了账（评审 C-02）
     probes = {
         "publish_proposal": lambda op: deps.gh.find_issue_by_marker(
@@ -229,6 +288,9 @@ def run_round(cfg, deps: Deps) -> dict:
             pass
         # 恢复轮不得创建新的模型预算预留：只建一条 reserved_usd=0 的账本行。
         budget.open_round_record(round_id, mode="resume")
+        progress["mode"] = "resume"
+        progress["cost_known"] = True
+        progress["cost"] = 0.0
         publisher = Publisher(deps.outbox, deps.gh, deps.worktree,
                               deps.queue, round_id)
         resumed = publisher.resume(orphan_root.operation_id)
@@ -270,6 +332,14 @@ def run_round(cfg, deps: Deps) -> dict:
     invocation = deps.invoke(prompt=prompt, tools=STAGE1_TOOLS, grant_usd=grant,
                              max_turns=cfg.max_turns, settings_path=SETTINGS_PATH,
                              cwd=str(cfg.repo_root), timeout_s=timeout_s)
+    # 从这里开始，若后续任何步骤（发布、账本写入之外的路径）抛出未预期
+    # 异常，finalize 边界至少能按本次调用的真实 turns/denials/exit_code
+    # 与已知成本结算，而不是完全空白（评审 Critical C）。
+    progress["turns"] = invocation.turns
+    progress["denials"] = invocation.denials
+    progress["exit_code"] = invocation.exit_code
+    progress["cost_known"] = True
+    progress["cost"] = invocation.cost_usd
 
     if not invocation.ok or invocation.payload is None:
         budget.abandon(round_id, day)
@@ -292,6 +362,20 @@ def run_round(cfg, deps: Deps) -> dict:
                 "detail": "；".join(drift_problems)}
 
     candidates = invocation.payload.get("candidates", [])
+    # 结构校验必须先于任何解引用（评审 Critical A）：`candidates` 顶层非
+    # 列表，或列表内混入非对象元素时，下面 `c.get("lane")` 会直接
+    # `AttributeError` 崩溃——那样 round 会永久悬挂在
+    # `mode=pending, result=None, reserved_usd` 未释放的状态。在这里就地
+    # 判定为结构化的 `invalid-candidate` 结算路径，写完整账本、释放预留。
+    shape_error = _candidates_shape_error(candidates)
+    if shape_error is not None:
+        budget.settle(round_id, day, invocation.cost_usd)
+        budget.record_outcome(round_id, mode="scan", result="invalid-candidate",
+                              turns=invocation.turns, denials=invocation.denials,
+                              exit_code=invocation.exit_code)
+        return {"round_id": round_id, "mode": "scan", "result": "invalid-candidate",
+                "detail": shape_error}
+
     eligible = [c for c in candidates if c.get("lane") not in blocked_lanes]
     if not eligible:
         budget.settle(round_id, day, invocation.cost_usd)

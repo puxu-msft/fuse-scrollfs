@@ -18,6 +18,38 @@ from .precheck import inspect_facts
 from .queue import Queue
 from .round import SETTINGS_PATH, STAGE1_TOOLS, Deps, run_round
 
+# `invoke()` 统一走 `claude_runner._extract_payload()`：只接受形如
+# `{"candidates": [...]}` 的对象，且要求「单个 JSON 代码块，不加任何解释」
+# （评审 Critical B）。probe 若仍要求模型「回复 OK，不要调用任何工具」，
+# 模型正确遵从提示词后 `_extract_payload("OK")` 返回 None，`res.ok` 恒为
+# False——probe 在设计上永远不可能通过。这里选择方案一：让 probe 的提示词
+# 直接要求返回 parser 能接受的确定性 payload，而不是给 probe 另开一条独立
+# 判定路径。理由：probe 本就复用同一个 `invoke()`/`parse_stream_json()`
+# 管线来验证「Stage 1 隔离生效」，若再引入第二套响应判定逻辑，反而制造了
+# 一条只有 probe 会走、生产 round 永远不会走的代码路径——这条路径本身就可能
+# 藏着与真实契约不一致的假绿。让 probe 与生产 round 共用同一份「模型必须吐出
+# 单个 JSON 代码块」契约，才是真正验证了这条契约本身可行。
+_PROBE_REPLY_JSON = '{"candidates": []}'
+PROBE_PROMPT = ("回复恰好一个 JSON 代码块，不要调用任何工具、不要输出任何其他"
+                f"文字：\n```json\n{_PROBE_REPLY_JSON}\n```")
+# 模型若严格遵从上面的提示词，应当原样回显这个代码块——这是 probe 的
+# 「真实接缝」测试要喂给 `parse_stream_json()` 的确切文本，而不是手工构造的
+# `payload={"candidates": []}`。
+PROBE_EXPECTED_REPLY = f"```json\n{_PROBE_REPLY_JSON}\n```"
+
+
+def _publish_or_resume_succeeded(result: dict) -> bool:
+    """新发布与恢复共用同一个成功谓词（评审 Critical B）：终态必须是
+    `publication-receipt-complete` 才算真正收敛。
+
+    修复前：`result="published"` 无条件判定退出 0，即便 `state` 是
+    `inconsistent` 或 `proposal-published`（收据未核验通过）；只有
+    `resumed` 路径额外检查了 `RECEIPT_COMPLETE`。两条路径的成功语义必须
+    一致，否则一次「Issue 已建、收据未核验」的半途而废发布会被 systemd
+    误报为成功。
+    """
+    return result.get("state") == State.RECEIPT_COMPLETE
+
 
 def _wire(cfg):
     conn = db.connect(cfg.state_db)
@@ -54,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "probe":
-        res = invoke(prompt="回复 OK，不要调用任何工具。", tools=STAGE1_TOOLS,
+        res = invoke(prompt=PROBE_PROMPT, tools=STAGE1_TOOLS,
                      grant_usd=0.10, max_turns=2, settings_path=SETTINGS_PATH,
                      cwd=str(cfg.repo_root), timeout_s=180, env=dict(os.environ))
         print(json.dumps({
@@ -98,13 +130,15 @@ def main(argv: list[str] | None = None) -> int:
                 queue=Queue(conn), invoke=invoke)
     result = run_round(cfg, deps)
     print(json.dumps(result, ensure_ascii=False))
-    if result["result"] in ("published", "no-candidate", "duplicate"):
+    if result["result"] in ("no-candidate", "duplicate"):
         return 0
-    # 恢复轮只有真正收敛（发布收据核验通过）才算成功；仍处于 inconsistent
-    # 或任何未收敛的中间态都必须非零退出，否则一次半途而废的恢复会被
-    # systemd 误报为成功（评审 Important #5）。
-    if result["result"] == "resumed" and result.get("state") == State.RECEIPT_COMPLETE:
-        return 0
+    # 新发布（`published`）与恢复（`resumed`）共用同一个成功谓词（评审
+    # Critical B）：终态必须是 `publication-receipt-complete` 才算真正收敛。
+    # 修复前 `published` 无条件判 0，即便 `state` 是 `inconsistent` 或
+    # `proposal-published`（收据未核验通过）——一次半途而废的发布会被
+    # systemd 误报为成功。
+    if result["result"] in ("published", "resumed"):
+        return 0 if _publish_or_resume_succeeded(result) else 1
     return 1
 
 

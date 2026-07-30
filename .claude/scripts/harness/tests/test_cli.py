@@ -69,9 +69,76 @@ class TestCliRoundExitCode(unittest.TestCase):
                   "issue": 1, "state": State.RECEIPT_COMPLETE}
         self.assertEqual(self._run_with_result(result), 0)
 
+    def test_published_with_inconsistent_state_exits_nonzero(self):
+        """真实反例（评审 Critical B）：`result="published"` 曾无条件退出
+        0，即便 `state` 是 `inconsistent`（收据核验发现绑定冲突）。新发布
+        与恢复必须共用同一个成功谓词——终态必须是
+        `publication-receipt-complete` 才退出 0。"""
+        result = {"round_id": "r1", "mode": "scan", "result": "published",
+                  "issue": 1, "state": State.INCONSISTENT}
+        self.assertEqual(self._run_with_result(result), 1)
+
+    def test_published_with_proposal_published_state_exits_nonzero(self):
+        """真实反例（评审 Critical B）：`state="proposal-published"` 表示
+        收据尚未核验通过（`receipt_present` 为 False），旧实现同样会被
+        无条件判 0。"""
+        result = {"round_id": "r1", "mode": "scan", "result": "published",
+                  "issue": 1, "state": State.PUBLISHED}
+        self.assertEqual(self._run_with_result(result), 1)
+
     def test_budget_exhausted_exits_nonzero(self):
         result = {"round_id": "r1", "mode": "scan", "result": "budget-exhausted"}
         self.assertEqual(self._run_with_result(result), 1)
+
+
+class TestCliProbePromptParserSeam(unittest.TestCase):
+    """真实接缝测试（评审 Critical B）：probe 实际会发出的提示词
+    （`cli.PROBE_PROMPT`）要求模型回复什么，就把该回复原样喂给
+    `parse_stream_json()`，断言 probe 的判定与之一致——不允许再手工构造
+    `payload={"candidates": []}` 绕过「提示词 → parser」这段接缝。
+
+    修复前的反例：旧提示词是「回复 OK，不要调用任何工具」，模型正确遵从后
+    `_extract_payload("OK")` 返回 None，`res.ok` 恒为 False，probe 在设计上
+    永远不可能通过——而旧的单测全部手工构造了合法 payload，从未真正验证过
+    这条提示词能否产生一个会被 parser 接受的回复。
+    """
+
+    def _stream_lines(self, result_text: str) -> list[str]:
+        import json as _json
+        init_event = _json.dumps({
+            "type": "system", "subtype": "init",
+            "tools": sorted(cli.STAGE1_TOOLS.split(",")),
+            "mcp_servers": [], "plugins": [],
+        })
+        result_event = _json.dumps({
+            "type": "result", "subtype": "success",
+            "total_cost_usd": 0.01, "num_turns": 1,
+            "result": result_text,
+        })
+        return [init_event, result_event]
+
+    def test_prompt_expected_reply_parses_to_accepted_payload(self):
+        """模型若严格遵从 `cli.PROBE_PROMPT`，应回复
+        `cli.PROBE_EXPECTED_REPLY`——把这段文本原样喂给
+        `parse_stream_json()`，必须得到 `ok=True` 且
+        `payload == {"candidates": []}`。"""
+        from harness.claude_runner import parse_stream_json
+
+        lines = self._stream_lines(cli.PROBE_EXPECTED_REPLY)
+        result = parse_stream_json(lines)
+        self.assertTrue(result.ok, f"protocol_errors={result.protocol_errors}")
+        self.assertEqual(result.payload, {"candidates": []})
+
+    def test_old_prompt_reply_would_have_failed_the_parser(self):
+        """正控：旧提示词「回复 OK，不要调用任何工具」对应的模型回复
+        `"OK"` 喂给同一个 parser 必须失败——证明本测试确实在验证这段接缝，
+        而不是无论输入什么都通过。"""
+        from harness.claude_runner import parse_stream_json
+
+        lines = self._stream_lines("OK")
+        result = parse_stream_json(lines)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.payload)
 
 
 class TestCliProbeExitCode(unittest.TestCase):
@@ -99,6 +166,23 @@ class TestCliProbeExitCode(unittest.TestCase):
             init_mcp_servers=[], init_plugins=[], init_errors=[],
             protocol_errors=[])
         self.assertEqual(self._run_with_invocation(inv), 0)
+
+    def test_probe_command_invokes_with_probe_prompt(self):
+        """wiring 检查（评审 Critical B）：`main(["probe"])` 实际传给
+        `invoke()` 的 `prompt` 必须是 `cli.PROBE_PROMPT`——防止提示词与
+        `TestCliProbePromptParserSeam` 验证的文本各说各话。"""
+        cfg = _Cfg(self.root)
+        inv = InvocationResult(
+            True, {"candidates": []}, 0.01, 1, exit_code=0,
+            init_seen=True, init_tools=sorted(cli.STAGE1_TOOLS.split(",")),
+            init_mcp_servers=[], init_plugins=[], init_errors=[],
+            protocol_errors=[])
+        with mock.patch.object(cli, "load_config", return_value=cfg), \
+             mock.patch.object(cli, "_wire",
+                               return_value=(mock.Mock(), mock.Mock(), mock.Mock())), \
+             mock.patch.object(cli, "invoke", return_value=inv) as mock_invoke:
+            cli.main(["probe"])
+        self.assertEqual(mock_invoke.call_args.kwargs["prompt"], cli.PROBE_PROMPT)
 
     def test_nonzero_exit_code_with_clean_init_fails(self):
         """真实反例：claude 进程退出 1，但 init 事件本身看着干净——旧实现

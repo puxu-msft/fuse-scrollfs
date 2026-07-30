@@ -546,6 +546,45 @@ class TestRunRoundRejectsInvalidCandidate(unittest.TestCase):
     def test_non_bool_needs_decision_produces_zero_side_effects(self):
         self._assert_zero_side_effects({"needs_decision": "yes"})
 
+    def _assert_zero_side_effects_for_payload(self, payload: dict):
+        """真实反例复现（评审 Critical A）：`candidates` 顶层形状非法（字符串
+        列表/字典/None）或元素非对象（None）时，旧实现在
+        `eligible = [c for c in candidates if c.get("lane") ...]` 处直接
+        `AttributeError` 崩溃，round 永久悬挂在 `mode=pending, result=None`、
+        `reserved_usd` 未释放。修复后必须走结构化 `invalid-candidate` 结算：
+        零 Issue、零 operation、零 git 改动，且账本完整结算。
+        """
+        inv = _clean_invocation(True, payload, 0.1, 3)
+        result = run_round(self.cfg, self._deps(inv))
+        self.assertEqual(result["result"], "invalid-candidate")
+        self.assertEqual(len(self.gh.issues), 0, "非法顶层形状不得产生 Issue")
+        self.assertEqual(len(Outbox(self.conn).open_operations()), 0,
+                         "非法顶层形状不得产生 operation")
+        head_after = run(self.local, "rev-parse", "HEAD")
+        head_before = run(self.remote, "rev-parse", "HEAD")
+        self.assertEqual(head_after, head_before, "非法顶层形状不得产生 git 改动")
+        row = self._round_row_via_status()
+        self.assertIsNotNone(row["ended_at"], "账本必须已完整结算（预留已释放）")
+
+    def _round_row_via_status(self):
+        return self.conn.execute(
+            "SELECT ended_at, reserved_usd, settled_usd FROM rounds"
+            " ORDER BY started_at DESC LIMIT 1").fetchone()
+
+    def test_candidates_as_list_of_strings_produces_zero_side_effects(self):
+        self._assert_zero_side_effects_for_payload(
+            {"candidates": ["not-an-object"]})
+
+    def test_candidates_as_dict_produces_zero_side_effects(self):
+        self._assert_zero_side_effects_for_payload(
+            {"candidates": {"lane": "defect"}})
+
+    def test_candidates_as_none_produces_zero_side_effects(self):
+        self._assert_zero_side_effects_for_payload({"candidates": None})
+
+    def test_candidates_element_none_produces_zero_side_effects(self):
+        self._assert_zero_side_effects_for_payload({"candidates": [None]})
+
     def test_charges_full_reservation_on_invalid_candidate(self):
         """非法 candidate 仍然消耗了一次真实模型调用，必须按实际花费入账，
         不能因为拒绝发布就悄悄免单。"""
@@ -647,6 +686,65 @@ class TestRoundLedgerFinalize(unittest.TestCase):
         row = self._round_row(result["round_id"])
         self.assertEqual(row["result"], "invalid-candidate")
         self.assertEqual(row["turns"], 3)
+
+    def test_unexpected_exception_during_publish_is_still_fully_settled(self):
+        """评审 Critical C 复现：`create_issue()` 抛一个普通 transport
+        `RuntimeError`（不是 outbox 认识的 `ResponseLost`/
+        `TerminalOperationError`）。修复前只有显式 `return` 分支才写账本，
+        这里的异常会一路冒穿 `run_round()`，round 永久停在
+        `mode=pending, result=None, ended_at=None, reserved_usd=1.0`——
+        有限次数的故障会积累成永久预算占用，最终把日预算吃空。
+
+        修复后：异常仍必须继续向上传播（不得被吞掉），且账本必须已完整
+        结算——`ended_at` 非空、预留已释放、`result="unhandled-exception"`、
+        `turns`/`exit_code` 取自本次真实调用。
+        """
+        inv = _clean_invocation(True, CANDIDATE_PAYLOAD, 0.25, 6, exit_code=0)
+        deps = self._deps(inv)
+        with mock.patch.object(
+                self.gh, "create_issue",
+                side_effect=RuntimeError("transport 故障，非 outbox 已知异常")):
+            with self.assertRaises(RuntimeError):
+                run_round(self.cfg, deps)
+
+        row = self.conn.execute(
+            "SELECT mode, result, turns, exit_code, ended_at, reserved_usd,"
+            " settled_usd FROM rounds ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["result"], "unhandled-exception")
+        self.assertIsNotNone(row["ended_at"], "异常路径也必须完整结算账本")
+        self.assertAlmostEqual(row["settled_usd"], 0.25,
+                               msg="成本已知（invoke 已返回）必须记实际值")
+        self.assertEqual(row["turns"], 6)
+        self.assertEqual(row["exit_code"], 0)
+
+        day_row = self.conn.execute(
+            "SELECT reserved_usd, settled_usd FROM budget_days").fetchone()
+        self.assertAlmostEqual(day_row["reserved_usd"], 0.0,
+                               msg="异常路径也必须释放预留，不能永久占用日预算")
+        self.assertAlmostEqual(day_row["settled_usd"], 0.25)
+
+    def test_unexpected_exception_before_invoke_charges_worst_case(self):
+        """成本未知（异常发生在 `invoke()` 返回之前，例如 prechecks 之后、
+        `budget.reserve()` 之后的某个未预期故障）时，必须按该 round 的
+        预留上限全额计费（与既有 `abandon()` worst-case 语义一致），而不是
+        记 0 元悄悄免单。"""
+        def _boom(*a, **kw):
+            raise RuntimeError("reserve 之后、invoke 之前的未预期故障")
+
+        deps = self._deps(None)
+        deps.queue.lane_full = _boom  # type: ignore[method-assign]
+
+        with self.assertRaises(RuntimeError):
+            run_round(self.cfg, deps)
+
+        row = self.conn.execute(
+            "SELECT result, ended_at, settled_usd FROM rounds"
+            " ORDER BY started_at DESC LIMIT 1").fetchone()
+        self.assertEqual(row["result"], "unhandled-exception")
+        self.assertIsNotNone(row["ended_at"])
+        self.assertAlmostEqual(row["settled_usd"], self.cfg.round_budget_usd,
+                               msg="成本未知必须按预留上限全额计费")
 
 
 if __name__ == "__main__":
