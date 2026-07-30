@@ -9,6 +9,11 @@ class TestDb(unittest.TestCase):
         self.path = Path(self.tmp.name) / "harness.db"
 
     def tearDown(self):
+        # 先关连接再删目录：否则 SQLite 连接随 GC 关闭会触发
+        # ResourceWarning，掩盖真正的资源泄漏信号
+        conn = getattr(self, "conn", None)
+        if conn is not None:
+            conn.close()
         self.tmp.cleanup()
 
     def test_connect_enables_wal_and_foreign_keys(self):

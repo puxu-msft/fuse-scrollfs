@@ -12,6 +12,11 @@ class TestQueue(unittest.TestCase):
         self.q = Queue(self.conn)
 
     def tearDown(self):
+        # 先关连接再删目录：否则 SQLite 连接随 GC 关闭会触发
+        # ResourceWarning，掩盖真正的资源泄漏信号
+        conn = getattr(self, "conn", None)
+        if conn is not None:
+            conn.close()
         self.tmp.cleanup()
 
     def test_fingerprint_is_stable_and_order_insensitive_to_whitespace(self):
