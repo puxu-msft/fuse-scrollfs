@@ -1,8 +1,11 @@
-# scrollz 自主改进 harness · Stage 1 实施计划
+# scrollz 自主改进 harness · Stage 1a 实施计划
+
+> 版本：v2（rev cfd6bb9 经 gpt-souls:reviewer 对抗评审判 needs-rework，Critical 7 / Important 7 / Minor 1，本版逐条处置；处置台账见文末）。
+> 用户 2026-07-30 裁定把 Stage 1 再拆一层：**1a 打通发布回路并低频运行（2 小时一轮），1b 补齐治理与可观测后提到 30 分钟一轮**。1b 的范围见 [plan-stage1b.md](./plan-stage1b.md)，本文只做 1a。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 建成 Stage 1「只扫描」harness——定时无人值守起轮，agent 扫描并对抗裁决出一个改进提案，控制器建 GitHub Issue 并把提案卡发布到远端 main，全过程可崩溃恢复、有预算硬上限。
+**Goal:** 建成 Stage 1a——每 2 小时无人值守起轮，agent 扫描并对抗裁决出一个改进提案，控制器建 GitHub Issue 并把提案卡发布到远端 main；全过程可崩溃恢复、有预算硬上限、agent 无任何写能力。治理与可观测（远端队列对账、拒绝记忆、机器红线 gate、质量指标、连续错误熔断、rolling-24h、OnFailure 告警）属 1b，**已登记不得静默省略**。
 
 **Architecture:** 三层信任（§四）：确定性 Python 控制器独占全部副作用；`Workflow` 脚本只做模型侧编排；agent 只读仓库、只产出结构化候选，不持凭据。状态真值在 GitHub，本地 SQLite 只存 durable intent（outbox）与账本。Stage 1 的结束点是「提案卡在远端 main 可见 + 发布收据写完」，**不建分支、不建 worktree、不开 PR**。
 
@@ -211,7 +214,9 @@ CREATE TABLE IF NOT EXISTS operations (
     payload_json TEXT NOT NULL DEFAULT '{}',
     payload_hash TEXT NOT NULL,
     phase        TEXT NOT NULL CHECK (phase IN
-                   ('prepared','observed','settled','failed')),
+                   ('prepared','observed','settled',
+                    'failed_retryable','failed_terminal')),
+    commit_sha   TEXT,
     result_json  TEXT,
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL
@@ -497,6 +502,12 @@ git commit -m "feat(harness): Stage 1 发布生命周期有序派生函数 + 256
 
 `execute` 的语义（spec §六）：`call()` 是真正的外部写调用，`probe()` 是按 natural key 的远端查询。流程为——落盘 `prepared` → 调 `call()` → 成功则写 `observed`+结果 → **调用抛异常或结果不确定时先 `probe()`，探到已生效就采纳其结果，探不到才允许重试**。绝不盲重试。
 
+三条必须成立的性质（评审 C-02）：
+
+1. **`failed` 必须分型**。探不到 ⇒ `failed_retryable`（下一轮可重试）；语义性失败（如 422 label 不存在）⇒ `failed_terminal`（转人工）。若统一记 `failed`，预检会把它当未决而终止本轮，**流程永远进不到重试**，形成死锁。
+2. **`prepare` 必须比对 `payload_hash`**。同一 natural key 但 payload 不同 ⇒ 抛 `OperationConflict`，不得复用旧结果。
+3. **`reconcile()` 在预检期间先跑**：对所有 `prepared` / `failed_retryable` 的 operation 重新 `probe`，探到即转 `observed`。只有 reconcile 之后仍无法判定的才算 unresolved。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -609,6 +620,10 @@ class ResponseLost(Exception):
     """外部调用结果不确定：可能已在服务端生效。禁止盲重试。"""
 
 
+class OperationConflict(Exception):
+    """同一 natural key 对应不同 payload：不得复用旧结果。"""
+
+
 @dataclass
 class Operation:
     operation_id: str
@@ -639,6 +654,12 @@ class Outbox:
                 payload: dict) -> Operation:
         existing = self.get(kind, natural_key)
         if existing is not None:
+            row = self.conn.execute(
+                "SELECT payload_hash FROM operations WHERE operation_id=?",
+                (existing.operation_id,)).fetchone()
+            if row["payload_hash"] != _hash(payload):
+                raise OperationConflict(
+                    f"{kind}/{natural_key} 的 payload 与既有记录不一致，拒绝复用")
             return existing
         now = time.time()
         op_id = uuid.uuid4().hex
@@ -663,7 +684,9 @@ class Outbox:
             if probed is not None:
                 self._mark(op, "observed", probed)
                 return probed
-            self._mark(op, "failed", None)
+            # 探不到：可能真的没生效，也可能是远端索引延迟。标可重试，
+            # 由下一轮 reconcile 再探，绝不在此处盲目重发。
+            self._mark(op, "failed_retryable", None)
             raise
         self._mark(op, "observed", result)
         return result
@@ -675,10 +698,43 @@ class Outbox:
         return [self._row_to_op(r) for r in rows]
 
     def unresolved(self) -> list[Operation]:
+        """reconcile 之后仍无法判定的 operation。预检据此 fail closed。"""
         rows = self.conn.execute(
-            "SELECT * FROM operations WHERE phase IN ('prepared','failed')"
-        ).fetchall()
+            "SELECT * FROM operations WHERE phase='failed_terminal'").fetchall()
         return [self._row_to_op(r) for r in rows]
+
+    def reconcile(self, probes: dict) -> list[Operation]:
+        """对未决 operation 重新探测远端事实（预检期间调用，先于任何写操作）。
+
+        probes: {kind: callable(op) -> dict | None}
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM operations WHERE phase IN"
+            " ('prepared','failed_retryable')").fetchall()
+        still_open = []
+        for row in rows:
+            op = self._row_to_op(row)
+            probe = probes.get(op.kind)
+            if probe is None:
+                still_open.append(op)
+                continue
+            observed = probe(op)
+            if observed is not None:
+                self._mark(op, "observed", observed)
+            else:
+                still_open.append(op)
+        return still_open
+
+    def set_commit_sha(self, op: Operation, sha: str) -> None:
+        self.conn.execute(
+            "UPDATE operations SET commit_sha=?, updated_at=? WHERE operation_id=?",
+            (sha, time.time(), op.operation_id))
+
+    def commit_sha(self, op: Operation) -> str | None:
+        row = self.conn.execute(
+            "SELECT commit_sha FROM operations WHERE operation_id=?",
+            (op.operation_id,)).fetchone()
+        return row["commit_sha"] if row else None
 
     def settle(self, op: Operation) -> None:
         self._mark(op, "settled", op.result)
@@ -1178,6 +1234,16 @@ class PublishWorktree:
         self.path = Path(worktree_path)
         self.remote = remote
         self.branch = branch
+        # 本轮 operation 绑定的提案卡提交；重放只允许动它
+        self.operation_sha: str | None = None
+        self.operation_path: str | None = None
+
+    def _assert_single_path(self, sha: str) -> None:
+        changed = [f for f in self._git(
+            "show", "--name-only", "--format=", sha).splitlines() if f.strip()]
+        if changed != [self.operation_path]:
+            raise ReplayConflict(
+                f"提交 {sha[:8]} 改动了 {changed}，预期只有 {self.operation_path}")
 
     def _git(self, *args: str, cwd: Path | None = None) -> str:
         proc = subprocess.run([GIT, *args], cwd=cwd or self.path,
@@ -1186,7 +1252,13 @@ class PublishWorktree:
             raise RuntimeError(f"git {' '.join(args)}: {proc.stderr.strip()}")
         return proc.stdout.strip()
 
-    def ensure(self) -> None:
+    def ensure(self, allow_reset: bool = True) -> None:
+        """allow_reset=False 时只保证工作区存在，**绝不 reset**（评审 C-04）。
+
+        崩溃在「本地 commit 已完成、尚未 push」时，若预检无脑 reset --hard，
+        会先把待恢复的提交删掉，再去发现有未决 operation——
+        §5.0 的 proposal-committed-local 恢复态在真实 round 里将永远到不了。
+        """
         self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
         target = self._git("rev-parse", f"{self.remote}/{self.branch}",
                            cwd=self.repo_root)
@@ -1197,10 +1269,12 @@ class PublishWorktree:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._git("worktree", "add", "--detach", str(self.path), target,
                       cwd=self.repo_root)
-        else:
+        elif allow_reset:
             self._abort_in_progress()
             self._git("reset", "--hard", target)
             self._git("clean", "-fd")
+        else:
+            self._abort_in_progress()
 
     def _abort_in_progress(self) -> None:
         """清掉上一轮遗留的 cherry-pick / merge 半途状态。"""
@@ -1220,7 +1294,10 @@ class PublishWorktree:
         self._git("add", "--", rel_path)
         full = f"{message}\n\n{TRAILER}{operation_id}\n"
         self._git(*IDENT, "commit", "-m", full, "--", rel_path)
-        return self._git("rev-parse", "HEAD")
+        sha = self._git("rev-parse", "HEAD")
+        self.operation_sha = sha
+        self.operation_path = rel_path
+        return sha
 
     def local_has_operation(self, operation_id: str) -> bool:
         out = self._git("log", "--grep", TRAILER + operation_id, "--format=%H")
@@ -1252,14 +1329,18 @@ class PublishWorktree:
         raise NonFastForward("push 重试耗尽")
 
     def _replay_onto_remote(self) -> None:
-        """把本轮 operation 的提交重放到最新远端之上，保持同一 lineage。"""
-        head = self._git("rev-parse", "HEAD")
+        """只重放**本 operation 绑定的那一个提交**（评审 C-05）。
+
+        不能重放 merge-base..HEAD 的全部提交：`_publish` 里可能因上一轮异常或
+        人工操作残留其它提交，那样会把不属于本 operation 的改动推上 main。
+        """
+        if self.operation_sha is None:
+            raise ReplayConflict("未绑定 operation commit SHA，拒绝重放")
+        self._assert_single_path(self.operation_sha)
         self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
         target = self._git("rev-parse", f"{self.remote}/{self.branch}",
                            cwd=self.repo_root)
-        merge_base = self._git("merge-base", head, target)
-        commits = [c for c in self._git(
-            "rev-list", "--reverse", f"{merge_base}..{head}").splitlines() if c]
+        commits = [self.operation_sha]
         self._git("reset", "--hard", target)
         for commit in commits:
             proc = subprocess.run([GIT, *IDENT, "cherry-pick", commit],
@@ -1422,22 +1503,39 @@ class Budget:
         return self.round_budget
 
     def settle(self, round_id: str, day: str, actual_usd: float) -> None:
+        """幂等：已结算的 round 再次调用是 no-op（评审 I-09）。
+
+        释放额度用该 round **实际记录的 reserved_usd**，而不是当前配置值——
+        配置改过之后用配置值会释放错数量。
+        """
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            row = self.conn.execute(
+                "SELECT reserved_usd, ended_at FROM rounds WHERE round_id=?",
+                (round_id,)).fetchone()
+            if row is None or row["ended_at"] is not None:
+                self.conn.execute("COMMIT")
+                return
+            reserved = row["reserved_usd"]
+            charged = min(max(actual_usd, 0.0), reserved)
             self.conn.execute(
                 "UPDATE budget_days SET reserved_usd = MAX(reserved_usd - ?, 0),"
                 " settled_usd = settled_usd + ? WHERE day=?",
-                (self.round_budget, actual_usd, day))
+                (reserved, charged, day))
             self.conn.execute(
                 "UPDATE rounds SET settled_usd=?, ended_at=? WHERE round_id=?",
-                (actual_usd, time.time(), round_id))
+                (charged, time.time(), round_id))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
 
     def abandon(self, round_id: str, day: str) -> None:
-        self.settle(round_id, day, self.round_budget)
+        """结果未知：按该 round 的预留全额计费。同样幂等。"""
+        row = self.conn.execute(
+            "SELECT reserved_usd FROM rounds WHERE round_id=?",
+            (round_id,)).fetchone()
+        self.settle(round_id, day, row["reserved_usd"] if row else 0.0)
 
     def record_invocation(self, round_id: str, cost_usd: float) -> None:
         self.conn.execute(
@@ -1774,8 +1872,19 @@ class TestHappyPath(CrashMatrixBase):
 
 
 class TestCrashPoints(CrashMatrixBase):
-    def _crash_then_resume(self, method: str, applied: bool):
-        self.gh.fail_next(method, applied=applied)
+    def _resume_after_lost_but_applied(self, method: str):
+        """服务端已生效、响应丢失：execute 会 probe 到对象并**正常返回**，
+        不抛异常。首轮就应收敛，且底层 call 只发生一次。"""
+        self.gh.fail_next(method, applied=True)
+        result = self.publisher("r1").publish(CANDIDATE)
+        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
+        self.assertEqual(self.gh.calls.count(method), 1,
+                         "探到已生效后不得重发")
+        self.assert_converged()
+
+    def _resume_after_lost_not_applied(self, method: str):
+        """服务端未生效：可恢复错误必须传播，下一轮重试后收敛。"""
+        self.gh.fail_next(method, applied=False)
         with self.assertRaises(ResponseLost):
             self.publisher("r1").publish(CANDIDATE)
         result = self.publisher("r2").publish(CANDIDATE)
@@ -1783,16 +1892,16 @@ class TestCrashPoints(CrashMatrixBase):
         self.assert_converged()
 
     def test_create_issue_response_lost_but_applied(self):
-        self._crash_then_resume("create_issue", applied=True)
+        self._resume_after_lost_but_applied("create_issue")
 
     def test_create_issue_response_lost_not_applied(self):
-        self._crash_then_resume("create_issue", applied=False)
+        self._resume_after_lost_not_applied("create_issue")
 
     def test_receipt_response_lost_but_applied(self):
-        self._crash_then_resume("create_comment", applied=True)
+        self._resume_after_lost_but_applied("create_comment")
 
     def test_receipt_response_lost_not_applied(self):
-        self._crash_then_resume("create_comment", applied=False)
+        self._resume_after_lost_not_applied("create_comment")
 
     def test_crash_after_local_commit_before_push(self):
         p = self.publisher("r1")
@@ -2090,7 +2199,8 @@ class CheckResult:
 
 
 def run_prechecks(cfg, gh, worktree, outbox,
-                  tools: tuple[str, ...] = DEFAULT_TOOLS) -> list[CheckResult]:
+                  tools: tuple[str, ...] = DEFAULT_TOOLS,
+                  probes: dict | None = None) -> list[CheckResult]:
     results: list[CheckResult] = []
 
     token_ok = bool(getattr(cfg, "gh_token", ""))
@@ -2110,11 +2220,15 @@ def run_prechecks(cfg, gh, worktree, outbox,
         results.append(CheckResult(f"tool:{tool}", ok,
                                    f"{tool} 不存在或不可执行" if not ok else "ok"))
 
+    # 顺序不可调换：先对账，再决定能否 reset 工作区（评审 C-04）
+    pending = outbox.reconcile(probes or {})
+    has_unpushed_commit = any(outbox.commit_sha(op) for op in pending)
     try:
-        worktree.ensure()
+        worktree.ensure(allow_reset=not has_unpushed_commit)
         clean = worktree.is_clean()
-        results.append(CheckResult("publish_worktree_clean", clean,
-                                   "发布工作区有未提交改动" if not clean else "ok"))
+        results.append(CheckResult(
+            "publish_worktree_clean", clean or has_unpushed_commit,
+            "发布工作区有未提交改动" if not clean else "ok"))
     except Exception as exc:
         results.append(CheckResult("publish_worktree_clean", False, repr(exc)))
 
@@ -2396,13 +2510,66 @@ tools: Read, Grep, Glob
 ```javascript
 // .claude/workflows/scrollz-propose.js
 // 段 1：扫描 → 去重 → 对抗裁决 → 选一。不产生任何外部副作用。
-// 注意：脚本内无文件系统访问、无 Date.now()/Math.random()；IO 全部由 agent 完成。
+//
+// API 形状按 Workflow 工具 schema：
+//   - 文件必须以 `export const meta = {...}` 纯字面量开头（不可引用变量）
+//   - 其余为顶层 async 代码，`args` 是全局，不是函数参数
+//   - agent(prompt, opts)：prompt 是第一个位置参数
+//   - 传 schema 时直接返回已校验的结构化对象，**不要**自己解析文本
+//   - 无文件系统访问、无 Date.now()/Math.random()
+
+export const meta = {
+  name: 'scrollz-propose',
+  description: 'scrollz harness 段 1：四视角扫描、去重、三方对抗裁决、选出一个候选',
+  phases: ['scan', 'judge'],
+};
+
+const CANDIDATE_SCHEMA = {
+  type: 'object',
+  required: ['candidates'],
+  properties: {
+    candidates: {
+      type: 'array',
+      maxItems: 3,
+      items: {
+        type: 'object',
+        required: ['title', 'goal', 'invariant', 'primary_path', 'oracle',
+                   'evidence', 'touched_paths', 'size', 'priority',
+                   'needs_decision', 'body_md', 'slug'],
+        properties: {
+          title: { type: 'string' },
+          goal: { type: 'string' },
+          invariant: { type: 'string' },
+          primary_path: { type: 'string' },
+          oracle: { type: 'string' },
+          evidence: { type: 'string' },
+          touched_paths: { type: 'array', items: { type: 'string' } },
+          size: { type: 'string', enum: ['S', 'M', 'L'] },
+          priority: { type: 'string', enum: ['T0', 'T1', 'T2', 'T3', 'T4'] },
+          needs_decision: { type: 'boolean' },
+          body_md: { type: 'string' },
+          slug: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+const VERDICT_SCHEMA = {
+  type: 'object',
+  required: ['verdict', 'reason'],
+  properties: {
+    verdict: { type: 'string', enum: ['pass', 'reject', 'needs_decision'] },
+    reason: { type: 'string' },
+    evidence: { type: 'string' },
+  },
+};
 
 const LENSES = [
-  { type: 'harness-finder-roadmap', lane: 'roadmap' },
-  { type: 'harness-finder-code', lane: 'defect' },
-  { type: 'harness-finder-bench', lane: 'perf' },
-  { type: 'harness-finder-hygiene', lane: 'hygiene' },
+  { agentType: 'harness-finder-roadmap', lane: 'roadmap' },
+  { agentType: 'harness-finder-code', lane: 'defect' },
+  { agentType: 'harness-finder-bench', lane: 'perf' },
+  { agentType: 'harness-finder-hygiene', lane: 'hygiene' },
 ];
 
 const JUDGES = [
@@ -2414,78 +2581,89 @@ const JUDGES = [
 const PRIORITY_ORDER = { T0: 0, T1: 1, T2: 2, T3: 3, T4: 4 };
 const SIZE_ORDER = { S: 0, M: 1, L: 2 };
 
-function parseJson(text, fallback) {
-  try {
-    const match = text.match(/\[[\s\S]*\]|\{[\s\S]*\}/);
-    return match ? JSON.parse(match[0]) : fallback;
-  } catch (e) {
-    return fallback;
-  }
+// 与 Python 侧 queue.fingerprint 使用同一规范化协议：四字段以 \x1f 连接，
+// 空白折叠 + 转小写。Python 侧再取 sha256[:32]；此处只做 key 归一，
+// 真正的硬去重由控制器完成（脚本内无 crypto）。
+function canonicalKey(c) {
+  return [c.goal, c.invariant, c.primary_path, c.oracle]
+    .map((x) => String(x || '').trim().toLowerCase().replace(/\s+/g, ' '))
+    .join('\x1f');
 }
 
-function dedupe(candidates, knownFingerprints, blockedLanes) {
-  const seen = new Set(knownFingerprints);
-  const out = [];
-  for (const c of candidates) {
-    if (!c || !c.title || !c.oracle) continue;
-    if (blockedLanes.includes(c.lane)) continue;
-    const key = [c.goal, c.invariant, c.primary_path, c.oracle]
-      .map((s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' '))
-      .join('');
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push({ ...c, dedupe_key: key });
-  }
-  return out;
+const blockedLanes = args.blocked_lanes || [];
+const knownKeys = new Set(args.known_keys || []);
+const inflightPaths = args.inflight_paths || [];
+
+const found = await parallel(
+  LENSES.map((lens) => async () => {
+    const res = await agent(
+      '扫描本仓库，按你的视角给出候选。严格遵循输出 schema。',
+      {
+        agentType: lens.agentType,
+        phase: 'scan',
+        label: lens.lane,
+        schema: CANDIDATE_SCHEMA,
+      }
+    );
+    const list = (res && res.candidates) || [];
+    return list.map((c) => ({ ...c, lane: lens.lane }));
+  })
+);
+
+const seen = new Set(knownKeys);
+const deduped = [];
+for (const c of found.flat()) {
+  if (!c || !c.title || !c.oracle) continue;
+  if (blockedLanes.includes(c.lane)) continue;
+  const key = canonicalKey(c);
+  if (seen.has(key)) continue;
+  seen.add(key);
+  deduped.push({ ...c, canonical_key: key });
 }
 
-export default async function ({ args }) {
-  const knownFingerprints = args.known_fingerprints || [];
-  const blockedLanes = args.blocked_lanes || [];
-  const inflightPaths = args.inflight_paths || [];
+if (deduped.length === 0) {
+  return { candidates: [], reason: 'no-candidate-after-dedupe' };
+}
 
-  const found = await parallel(
-    LENSES.map((lens) => async () => {
-      const res = await agent({
-        agentType: lens.type,
-        prompt: '扫描本仓库，按你的视角给出候选。只输出 JSON 数组。',
-      });
-      return parseJson(res.text, []).map((c) => ({ ...c, lane: lens.lane }));
+const ranked = deduped.sort((a, b) => {
+  const p = (PRIORITY_ORDER[a.priority] ?? 9) - (PRIORITY_ORDER[b.priority] ?? 9);
+  if (p !== 0) return p;
+  return (SIZE_ORDER[a.size] ?? 9) - (SIZE_ORDER[b.size] ?? 9);
+});
+
+const rejected = [];
+for (const candidate of ranked.slice(0, 3)) {
+  const verdicts = await parallel(
+    JUDGES.map((judgeType) => async () => {
+      const res = await agent(
+        '裁决以下候选。在飞变更触碰面：' +
+          JSON.stringify(inflightPaths) +
+          '\n候选：' +
+          JSON.stringify(candidate),
+        {
+          agentType: judgeType,
+          phase: 'judge',
+          label: judgeType,
+          schema: VERDICT_SCHEMA,
+        }
+      );
+      return { judge: judgeType, ...res };
     })
   );
 
-  const candidates = dedupe(found.flat(), knownFingerprints, blockedLanes);
-  if (candidates.length === 0) return { candidates: [] };
-
-  const ranked = candidates.sort((a, b) => {
-    const p = (PRIORITY_ORDER[a.priority] ?? 9) - (PRIORITY_ORDER[b.priority] ?? 9);
-    if (p !== 0) return p;
-    return (SIZE_ORDER[a.size] ?? 9) - (SIZE_ORDER[b.size] ?? 9);
-  });
-
-  for (const candidate of ranked.slice(0, 3)) {
-    const verdicts = await parallel(
-      JUDGES.map((judgeType) => async () => {
-        const res = await agent({
-          agentType: judgeType,
-          prompt:
-            '裁决以下候选。在飞变更触碰面：' +
-            JSON.stringify(inflightPaths) +
-            '\n候选：' +
-            JSON.stringify(candidate) +
-            '\n只输出 JSON 对象。',
-        });
-        return { judge: judgeType, ...parseJson(res.text, { verdict: 'reject', reason: '输出不可解析' }) };
-      })
-    );
-
-    if (verdicts.some((v) => v.verdict === 'reject')) continue;
-    const needsDecision = verdicts.some((v) => v.verdict === 'needs_decision');
-    return { candidates: [{ ...candidate, needs_decision: needsDecision, verdicts }] };
+  if (verdicts.some((v) => v.verdict === 'reject')) {
+    rejected.push({ title: candidate.title, verdicts });
+    continue;
   }
-
-  return { candidates: [], rejected: ranked.slice(0, 3).length };
+  const needsDecision =
+    candidate.needs_decision || verdicts.some((v) => v.verdict === 'needs_decision');
+  return {
+    candidates: [{ ...candidate, needs_decision: needsDecision, verdicts }],
+    rejected,
+  };
 }
+
+return { candidates: [], rejected };
 ```
 
 - [ ] **Step 4: 写入口 skill**
@@ -2645,6 +2823,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'harness.claude_runner'
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -2663,8 +2842,11 @@ class InvocationResult:
     denials: int = 0
     exit_code: int = 0
     raw_tail: str = ""
+    init_seen: bool = False          # 未见 init 事件时不得宣称「无 Bash、无 MCP」
     init_tools: list[str] = field(default_factory=list)
     init_mcp_servers: list = field(default_factory=list)
+    init_plugins: list = field(default_factory=list)
+    init_errors: list = field(default_factory=list)
 
 
 def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
@@ -2696,8 +2878,11 @@ def _extract_payload(text: str) -> dict | None:
 
 def parse_stream_json(lines) -> InvocationResult:
     cost, turns, ok, payload = 0.0, 0, False, None
+    init_seen = False
     init_tools: list[str] = []
     init_mcp: list = []
+    init_plugins: list = []
+    init_errors: list = []
     tail: list[str] = []
     for line in lines:
         line = line.strip()
@@ -2709,8 +2894,12 @@ def parse_stream_json(lines) -> InvocationResult:
         except json.JSONDecodeError:
             continue
         if event.get("type") == "system" and event.get("subtype") == "init":
+            init_seen = True
             init_tools = event.get("tools", [])
             init_mcp = event.get("mcp_servers", [])
+            init_plugins = event.get("plugins", [])
+            init_errors = (event.get("plugin_errors", [])
+                           + event.get("mcp_server_errors", []))
         elif event.get("type") == "result":
             cost = float(event.get("total_cost_usd", 0.0))
             turns = int(event.get("num_turns", 0))
@@ -2718,17 +2907,20 @@ def parse_stream_json(lines) -> InvocationResult:
                 payload = _extract_payload(event.get("result", ""))
                 ok = payload is not None
     return InvocationResult(ok=ok, payload=payload, cost_usd=cost, turns=turns,
-                            raw_tail="\n".join(tail[-5:]), init_tools=init_tools,
-                            init_mcp_servers=init_mcp)
+                            raw_tail="\n".join(tail[-5:]), init_seen=init_seen,
+                            init_tools=init_tools, init_mcp_servers=init_mcp,
+                            init_plugins=init_plugins, init_errors=init_errors)
 
 
 def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,
            settings_path: str, cwd: str, timeout_s: float,
            env: dict | None = None) -> InvocationResult:
     argv = build_argv(prompt, tools, grant_usd, max_turns, settings_path)
-    safe_env = dict(env or {})
-    # 凭据清场：agent 进程不得看到 token 与 SSH agent
-    for key in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+    # 从完整环境出发再删凭据：只给 GIT_TERMINAL_PROMPT 会丢掉 HOME/PATH 等
+    # claude 运行所必需的变量（评审 C-06）
+    safe_env = dict(env if env is not None else os.environ)
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK",
+                "GIT_ASKPASS", "SSH_ASKPASS"):
         safe_env.pop(key, None)
     safe_env["GIT_TERMINAL_PROMPT"] = "0"
     try:
@@ -2739,8 +2931,11 @@ def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,
                                 raw_tail=str(exc)[-500:])
     result = parse_stream_json(proc.stdout.splitlines())
     result.exit_code = proc.returncode
-    if proc.returncode != 0 and not result.raw_tail:
-        result.raw_tail = proc.stderr[-500:]
+    if proc.returncode != 0:
+        # 退出码非 0 时即便 stdout 里恰好有 success result 也不得判 ok
+        result.ok = False
+        if not result.raw_tail:
+            result.raw_tail = proc.stderr[-500:]
     return result
 ```
 
@@ -3072,18 +3267,31 @@ def main(argv: list[str] | None = None) -> int:
                      grant_usd=0.10, max_turns=2, settings_path=SETTINGS_PATH,
                      cwd=str(cfg.repo_root), timeout_s=180, env=dict(os.environ))
         print(json.dumps({
-            "exit_code": res.exit_code,
-            "init_tools": res.init_tools,
-            "init_mcp_servers": res.init_mcp_servers,
+            "exit_code": res.exit_code, "init_seen": res.init_seen,
+            "init_tools": res.init_tools, "init_mcp_servers": res.init_mcp_servers,
+            "init_plugins": res.init_plugins, "init_errors": res.init_errors,
             "cost_usd": res.cost_usd,
         }, ensure_ascii=False, indent=2))
-        forbidden = {"Bash", "Edit", "Write"}
-        leaked = forbidden.intersection(res.init_tools)
-        mcp_leaked = bool(res.init_mcp_servers)
-        if leaked or mcp_leaked:
-            print(f"负向验证失败：泄漏工具={sorted(leaked)} MCP={res.init_mcp_servers}")
+        # 缺 init 事件不得当作「干净」——absence-as-success 是典型假绿
+        if not res.init_seen:
+            print("负向验证失败：未观察到 system/init 事件，无法证明隔离生效")
             return 1
-        print("负向验证通过：无 Bash/Edit/Write，无 MCP")
+        expected = set(STAGE1_TOOLS.split(","))
+        actual = set(res.init_tools)
+        problems = []
+        if actual != expected:
+            problems.append(f"工具集不等：多={sorted(actual - expected)} "
+                            f"少={sorted(expected - actual)}")
+        if res.init_mcp_servers:
+            problems.append(f"MCP 未清空：{res.init_mcp_servers}")
+        if res.init_plugins:
+            problems.append(f"插件未清空：{res.init_plugins}")
+        if res.init_errors:
+            problems.append(f"加载报错：{res.init_errors}")
+        if problems:
+            print("负向验证失败：" + "；".join(problems))
+            return 1
+        print(f"负向验证通过：工具集恰为 {sorted(expected)}，无 MCP、无插件")
         return 0
 
     deps = Deps(conn=conn, gh=gh, worktree=worktree, outbox=Outbox(conn),
@@ -3142,28 +3350,97 @@ Expected: `负向验证通过：无 Bash/Edit/Write，无 MCP`，且退出码 0�
 
 - [ ] **Step 2: 建 label（首次真实写入，可逆）**
 
-Run:
+> **授权门**：以下每一步都会在公开仓库产生真实、外部可见的变更。**逐步执行，每步完成后确认结果再进行下一步**；任一步失败先停下来看残留，不要连跑。
+
+原先的 shell 冒号解析脚本有确定性缺陷（`harness:proposed` 会被折成 `name=harness, color=proposed`，且 `| tail -1` 吞掉退出码、漏建 `T0`–`T4`），改为表驱动并逐条校验退出码：
+
+```python
+# 一次性引导脚本，存 .claude/scripts/harness/bootstrap_labels.py
+"""建立 harness 所需的全部 label。幂等：已存在则跳过。"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+
+from harness.config import GH, load_config
+
+LABELS = [
+    ("harness", "0e8a16", "harness 自动产出"),
+    ("harness:proposed", "1d76db", "候选提案，未开工"),
+    ("harness:blocked", "b60205", "卡住，需人工"),
+    ("harness:needs-decision", "d93f0b", "触及冻结红线，需用户裁决"),
+    ("harness:rejected", "cccccc", "已否决"),
+    ("harness:paused", "000000", "暂停哨兵"),
+    ("lane:roadmap", "c5def5", "来源 lane"),
+    ("lane:defect", "c5def5", "来源 lane"),
+    ("lane:perf", "c5def5", "来源 lane"),
+    ("lane:hygiene", "c5def5", "来源 lane"),
+    ("size:S", "ededed", "规模"),
+    ("size:M", "ededed", "规模"),
+    ("size:L", "ededed", "规模"),
+    ("T0", "5319e7", "ROADMAP 优先级"),
+    ("T1", "5319e7", "ROADMAP 优先级"),
+    ("T2", "5319e7", "ROADMAP 优先级"),
+    ("T3", "5319e7", "ROADMAP 优先级"),
+    ("T4", "5319e7", "ROADMAP 优先级"),
+]
+
+
+def main() -> int:
+    cfg = load_config()
+    env = {"GH_TOKEN": cfg.gh_token, "PATH": "/usr/bin:/bin"}
+    listing = subprocess.run(
+        [GH, "api", f"repos/{cfg.repo_slug}/labels", "--paginate",
+         "--jq", ".[].name"],
+        capture_output=True, text=True, env=env)
+    if listing.returncode != 0:
+        print("读取 label 失败：", listing.stderr.strip())
+        return 1
+    existing = set(listing.stdout.split())
+
+    created, skipped, failed = [], [], []
+    for name, color, desc in LABELS:
+        if name in existing:
+            skipped.append(name)
+            continue
+        proc = subprocess.run(
+            [GH, "api", f"repos/{cfg.repo_slug}/labels", "-X", "POST",
+             "-f", f"name={name}", "-f", f"color={color}",
+             "-f", f"description={desc}"],
+            capture_output=True, text=True, env=env)
+        (created if proc.returncode == 0 else failed).append(
+            name if proc.returncode == 0 else f"{name}: {proc.stderr.strip()[:80]}")
+
+    # 回读校验：不信任写调用的返回，只信远端事实
+    verify = subprocess.run(
+        [GH, "api", f"repos/{cfg.repo_slug}/labels", "--paginate",
+         "--jq", ".[].name"], capture_output=True, text=True, env=env)
+    final = set(verify.stdout.split())
+    missing = [n for n, _, _ in LABELS if n not in final]
+
+    print(f"新建 {len(created)}，已存在 {len(skipped)}，失败 {len(failed)}")
+    for f in failed:
+        print("  FAIL", f)
+    if missing:
+        print("回读后仍缺失：", missing)
+        return 1
+    print("全部 18 个 label 就位")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+Run: `cd /home/xp/src/zipfs/.claude/scripts && /home/linuxbrew/.linuxbrew/bin/python3 -m harness.bootstrap_labels`
+Expected: `全部 18 个 label 就位`，退出码 0。
+
 ```bash
 cd /home/xp/src/zipfs
-TOK=$(sed -n 's/^GH_TOKEN=//p' ~/.config/scrollz-harness/env)
-for spec in "harness:0e8a16:harness 自动产出" \
-            "harness:proposed:1d76db:候选提案，未开工" \
-            "harness:blocked:b60205:卡住，需人工" \
-            "harness:needs-decision:d93f0b:触及冻结红线，需用户裁决" \
-            "harness:rejected:cccccc:已否决" \
-            "harness:paused:000000:暂停哨兵" \
-            "lane:roadmap:c5def5:lane" "lane:defect:c5def5:lane" \
-            "lane:perf:c5def5:lane" "lane:hygiene:c5def5:lane" \
-            "size:S:ededed:规模" "size:M:ededed:规模" "size:L:ededed:规模"; do
-  name="${spec%%:*}"; rest="${spec#*:}"
-  case "$name" in harness) name="harness"; color="${rest%%:*}"; desc="${rest#*:}";;
-    *) name="${spec%%:*}:${rest%%:*}"; rest2="${rest#*:}"; color="${rest2%%:*}"; desc="${rest2#*:}";;
-  esac
-  GH_TOKEN="$TOK" gh label create "$name" --color "$color" --description "$desc" 2>&1 | tail -1
-done
-GH_TOKEN="$TOK" gh label list | head -30
+git add .claude/scripts/harness/bootstrap_labels.py
+git commit -m "feat(harness): label 引导脚本，表驱动 + 回读校验" -- .claude/scripts/harness/bootstrap_labels.py
 ```
-Expected: label 全部创建成功（已存在时 `gh` 报 already exists，可忽略）。
 
 - [ ] **Step 3: 手工跑一轮真实 round，验证端到端**
 
@@ -3209,11 +3486,11 @@ StandardError=append:%h/.local/state/scrollz-harness/round.log
 ```ini
 # ~/.config/systemd/user/scrollz-harness.timer
 [Unit]
-Description=每 30 分钟起一轮 scrollz harness
+Description=每 2 小时起一轮 scrollz harness（1a 低频；1b 完成后提到 30 分钟）
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=30min
+OnUnitActiveSec=2h
 AccuracySec=1min
 Persistent=true
 
@@ -3237,14 +3514,23 @@ systemctl --user list-timers scrollz-harness.timer --no-pager
 
 - [ ] **Step 5: 中断韧性验收 + 文档接线 + 提交**
 
-崩溃恢复实测（spec §14.3 第 2 条）：
+崩溃恢复实测（spec §14.3 第 2 条）。**不要用 `timeout -s KILL 20` 随机杀**——它多半杀在模型推理阶段，证明不了 outbox 恢复。用定点故障注入，指定在哪个 operation 的哪个阶段崩：
+
 ```bash
 cd /home/xp/src/zipfs/.claude/scripts
-timeout -s KILL 20 /home/linuxbrew/.linuxbrew/bin/python3 -m harness.cli round || echo "已强杀"
-/home/linuxbrew/.linuxbrew/bin/python3 -m harness.cli doctor    # 应报未决 operation
-/home/linuxbrew/.linuxbrew/bin/python3 -m harness.cli round     # 应接续并收敛
+# HARNESS_FAULT=<operation kind>:<phase>，phase ∈ before-call|after-call|after-observe
+for point in publish_proposal:after-call publish_proposal:after-observe \
+             publication_receipt:before-call; do
+  echo "=== 注入 $point ==="
+  HARNESS_FAULT="$point" /home/linuxbrew/.linuxbrew/bin/python3 -m harness.cli round \
+    || echo "  已按预期在 $point 中断"
+  /home/linuxbrew/.linuxbrew/bin/python3 -m harness.cli doctor | rg -i "outbox|worktree"
+  /home/linuxbrew/.linuxbrew/bin/python3 -m harness.cli round
+done
 ```
-Expected: 第二次 round 完成同一提案，`gh issue list --label harness` 中**不出现重复 Issue**，远端 main 中同一 `HARNESS-OP` 只有一个提交。
+Expected: 每次注入后的下一轮都收敛到 `publication-receipt-complete`；三轮结束后 `gh issue list --label harness` 中**每个提案只有一个 Issue**，远端 main 中每个 `HARNESS-OP` 只有一个提交。
+
+> `HARNESS_FAULT` 的读取点在 `outbox.execute` 内（仅当环境变量存在时生效），Task 3 实现时一并加入；它是**测试专用**的确定性崩溃开关，不接受任何来自模型或仓库文本的输入。
 
 写 `docs/proposals/README.md`：
 
@@ -3303,6 +3589,46 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | §八.3 不可信输入纪律 | Task 10 `.claude/rules/harness-agent-discipline.md` |
 
 **未覆盖且属意**：§五 5.1/5.2 六维派生函数、§8 收尾模式、§9.2 测试 launcher、§十一 CI 与激活门——全部是 Stage 2 范围，spec §十五台账已标注。
+
+**移交 Stage 1b（已登记，不得静默省略）**：远端队列对账与拒绝记忆、`possible_duplicate` 复核回路、机器红线 gate、Stage 1 质量指标与阈值、连续错误熔断、rolling-24h 预算、systemd `OnFailure` 告警、paused 哨兵的创建与维护。这些在 1a 缺席期间由「2 小时低频 + 每轮预算硬上限 + 预检 fail closed」兜底；**1b 未完成前不得把节拍提到 30 分钟**。详见 [plan-stage1b.md](./plan-stage1b.md)。
+
+## 评审处置台账（rev cfd6bb9 的 Critical 7 / Important 7 / Minor 1）
+
+| 条目 | 判定 | 处置 |
+|---|---|---|
+| C-01 Workflow API 形状错 | **属实**（已用工具 schema 核实） | Task 10 全量重写：`export const meta` 字面量 + 顶层 `args` + `agent(prompt, opts)` + `schema` 结构化返回，删除自写文本解析 |
+| C-02 outbox 死锁且未包住副作用 | **属实** | Task 1 schema 加 `failed_retryable`/`failed_terminal` 与 `commit_sha`；Task 3 加 payload_hash 比对、`OperationConflict`、`reconcile()`；`unresolved()` 只返回 terminal |
+| C-03 崩溃矩阵有必然失败的测试 | **属实** | Task 8 拆成 `_resume_after_lost_but_applied`（断言首轮收敛且 call 只发一次）与 `_resume_after_lost_not_applied`（断言异常传播后重试收敛） |
+| C-04 预检 reset 先毁掉待恢复提交 | **属实**（我的 PoC 因绕过预检而测不到） | `ensure(allow_reset)` + 预检顺序改为**先 reconcile 再决定能否 reset**，有未推送 operation commit 时禁止 reset |
+| C-05 重放范围过宽 | **属实** | 只 cherry-pick `operation_sha` 绑定的那一个提交，且 `_assert_single_path` 校验它只改预期路径 |
+| C-06 parse_stream_json 缺陷 | **部分不成立** | 「嵌套 JSON 解析不了」经实测**证伪**（回溯可正确解析，三种输入全通过），不改正则；其余五条属实并已修：`init_seen`、plugins/errors 检查、env 从 `os.environ` 出发、退出码非 0 强制 `ok=False`、probe 改为工具集**相等**断言。`--verbose` 本版 help 未要求，列为 Round 0 核实项 |
+| C-07 label 脚本解析错 | **属实**（实测 `harness:proposed`→`name=harness,color=proposed`） | 改为表驱动 `bootstrap_labels.py`，逐条查退出码 + 回读校验，补齐 `T0`–`T4`，共 18 个 label |
+| I-08 `binding_ok` 恒真 | **属实** | 移交 1b：收据需记录并比对 operation ID / proposal path / blob SHA / commit SHA。1a 期间收据只作辅助证据，判定以远端 commit+path 为准 |
+| I-09 结算不幂等、缺 rolling-24h | **属实** | 幂等已修（按 round 记录的 `reserved_usd` 释放、已结算则 no-op）；rolling-24h 移交 1b |
+| I-10 队列治理自欺 | **属实** | 移交 1b（远端对账、拒绝记忆、possible_duplicate、统一指纹协议）。1a 的 `known_keys` 由本地 DB 提供，指纹归一协议已在 Workflow 脚本与 `queue.fingerprint` 两侧写明同一规范化步骤 |
+| I-11 红线只有提示词 | **属实** | 移交 1b 的控制器 gate；1a 由 `harness-judge-redline` + `needs_decision` label 兜底（Stage 1 的产出只有 Issue，红线误判的后果是「多开一个待裁决 Issue」而非改代码） |
+| I-12 指标/熔断/告警未实施 | **属实** | 移交 1b |
+| I-13 Fake 无法表征真实 adapter | **属实** | 移交 1b 的真实 API 契约 smoke；1a 已在 Task 13 用真实 round 覆盖一次 wire shape。**search 索引延迟**的风险已由 C-02 的 `failed_retryable` + 下轮 reconcile 消化 |
+| I-14 缺执行状态与 kick-off | **属实** | 本版新增文末「执行状态」表与 [plan-stage1a-kickoff.md](./plan-stage1a-kickoff.md) |
+| M-15 probe 未测后台 Workflow 等待 | **属实** | Task 13 Step 1 的措辞已改：probe 只验工具/MCP 隔离；后台等待上限由 Task 13 Step 3 的真实 round（会启动 Workflow）观测并回填 spec §十六 |
+
+## 执行状态（逐任务同步，跨会话据此判断进度）
+
+| # | 任务 | 状态 | 验证证据 | 偏差 |
+|---|---|---|---|---|
+| 1 | 骨架 + schema | pending | | |
+| 2 | 生命周期派生函数 | pending | | 已在 /tmp 离线验证通过（7 用例含 256 穷举） |
+| 3 | outbox | pending | | |
+| 4 | GitHub 层 + Fake | pending | | |
+| 5 | 发布工作区 | pending | | 已在 /tmp 离线验证并修 3 缺陷（重放身份 / prune 自愈 / 冲突 abort） |
+| 6 | 预算 | pending | | |
+| 7 | 队列治理 | pending | | |
+| 8 | 发布编排 + 崩溃矩阵 | pending | | |
+| 9 | 预检 | pending | | |
+| 10 | Claude 侧资产 | pending | | |
+| 11 | claude -p 调用层 | pending | | |
+| 12 | 轮次编排 + CLI | pending | | |
+| 13 | systemd + 真机验收 | pending | | 含授权门，逐步执行 |
 
 **2. 占位符扫描**：无 TBD/TODO；每个代码步骤均给出完整可运行代码；每个测试步骤均给出完整断言。
 

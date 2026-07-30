@@ -1,13 +1,14 @@
 # scrollz 自主改进 harness / Spec
 
-> 状态：**v6，Stage 1 已判 ready，待用户复核**。v1（9c5e1ab）/ v2（6831bda）/ v3（94048c3）/ v4（d0cda3a）/ v5（36f1a8b）经 gpt-souls:reviewer 四轮对抗评审；v6 按用户 2026-07-30 的仓库内布局偏好与 Web UI 规划调整配置。处置台账见 §十五。
+> 状态：**v7，Stage 1a 计划已按评审整改**。v1（9c5e1ab）/ v2（6831bda）/ v3（94048c3）/ v4（d0cda3a）/ v5（36f1a8b）经 gpt-souls:reviewer 四轮对抗评审；v6 按用户 2026-07-30 的仓库内布局偏好与 Web UI 规划调整配置。处置台账见 §十五。
 > 撰写日期 2026-07-29，末次修订 2026-07-30。本文回答「做什么、为什么」；「怎么做」由后续 [plan.md](./plan.md) 承载。
 
 ## 零、交付分期（用户 2026-07-29 裁定）
 
 | 阶段 | 范围 | 副作用面 | 需要的协议强度 |
 |---|---|---|---|
-| **Stage 1 · 只扫描** | 发现候选 → 对抗裁决 → 建 Issue + 提案卡发布到远端 main。**不开发、不开 PR、不建分支、不建 worktree** | 建 Issue、设 label、提交 `docs/proposals/`、**push main（改远端 ref）** | Stage 1 发布生命周期 + 自身 operation registry 与崩溃子矩阵 + 预算预留 + 权限隔离 + 队列治理 |
+| **Stage 1a · 发布回路** | 发现候选 → 对抗裁决 → 建 Issue + 提案卡发布到远端 main。**不开发、不开 PR、不建分支、不建 worktree**。节拍 **2 小时** | 建 Issue、设 label、提交 `docs/proposals/`、**push main（改远端 ref）** | 发布生命周期 + operation registry 与崩溃子矩阵 + 预算预留 + 权限隔离 |
+| **Stage 1b · 治理与可观测** | 远端队列对账、拒绝记忆、机器红线 gate、质量指标、连续错误熔断、rolling-24h、OnFailure 告警。完成后节拍提到 **30 分钟** | 同 1a | 上述 + 跨语言指纹一致性 + 真实 API 契约 smoke |
 | **Stage 2 · 开发轮** | 全流程：选题 → 实现 → 评审 → PR → 收尾 | 上述 + 分支 / worktree / PR / 多次状态迁移 / 删除清理 | 完整 outbox 事务 + 六维状态派生函数 + 全量崩溃矩阵 + 跨调用预算与截止 + CI 激活门 |
 
 **Stage 1 的副作用面要如实描述**（评审 R3-03）：它没有 worktree、PR 和删除类操作，但**仍包含外部 create/update 与 main ref 变更**——push main 会改远端引用，设 label 会改 Issue，两者同样有并发、响应丢失与覆盖风险。把 Stage 1 说成「只建不改」会导致其 outbox 与崩溃矩阵被过度降级，这正是 v3 的错误。
@@ -44,7 +45,7 @@ Stage 1 先上线的理由不变：协议复杂度低一个量级，却能立刻
 | 分支策略 | **merge-based**，不做 rebase 纪律 | 允许大量 merge 提交 |
 | GitHub 写身份 | **专用 fine-grained PAT**（属 `puxu-msft`，仅本仓库 Contents/Issues/Pull requests: write + Metadata: read），存仓库外，systemd 注入 `GH_TOKEN` | 现 `gh` 账号 `puxu_microsoft` 对本仓库仅 READ（已实测），跑不通状态机 |
 | 生产数据隔离 | **不做 OS 级隔离**（用户裁定「无需隔离」） | 改以 §九 确定性纵深防线替代；OS 隔离降为 optional，见 §十五 |
-| 交付方式 | **分两阶段**（§零） | |
+| 交付方式 | **分三阶段**：Stage 1a（发布回路，2h 节拍）→ Stage 1b（治理与可观测，提到 30min）→ Stage 2（开发轮）（§零） | 用户 2026-07-30 在计划评审后追加 1a/1b 拆分 |
 | 目录布局 | **仓库内**：`.claude/{agents,rules,scripts,skills,workflows}`、`.worktree/<task>`、`docs/`（用户 2026-07-30 偏好） | 取代早期的「仓库外专用 clone」方案，隔离目标不变（§四） |
 | 运行时状态 | **SQLite**（`.claude/state/harness.db`），控制器用 **Python 3** | 由 Web UI 规划倒推（§十六、§十七） |
 | Web UI | **Stage 3，后续另开 spec**；现在只保证不堵路 | 用户 2026-07-30 提出 |
