@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 import sqlite3
 import time
@@ -164,3 +165,64 @@ class Budget:
             "SELECT COALESCE(SUM(cost_usd),0) AS spent FROM invocations"
             " WHERE round_id=?", (round_id,)).fetchone()["spent"]
         return max(row["reserved_usd"] - spent, 0.0)
+
+    def open_round_record(self, round_id: str, mode: str) -> None:
+        """为不消耗新预算的 round（例如恢复轮、预检失败轮、预算耗尽轮）建立
+        账本记录，`reserved_usd=0`——不做日预算占用校验、不触碰
+        `budget_days`（评审 Important #6/#7：轮次账本统一化，但恢复轮/早期
+        失败轮不得凭空产生新的预算占用）。幂等：同 `round_id` 已存在则不
+        重复插入（`INSERT OR IGNORE`）。
+        """
+        self.conn.execute(
+            "INSERT OR IGNORE INTO rounds(round_id, mode, started_at,"
+            " reserved_usd, denials) VALUES(?,?,?,0,0)",
+            (round_id, mode, time.time()))
+
+    def record_outcome(self, round_id: str, *, mode: str | None = None,
+                       result: str | None = None, turns: int | None = None,
+                       denials: int | None = None,
+                       exit_code: int | None = None) -> None:
+        """写入本轮非金额的结算元数据：mode/result/turns/denials/exit_code
+        （评审 Important #6/#7）。
+
+        只更新传入的非 `None` 字段，绝不触碰 `reserved_usd`/`settled_usd`/
+        `ended_at`——那些字段仍由 `reserve()`/`settle()`/`abandon()` 独占
+        管理，避免两条路径互相覆盖导致账目对不上。幂等：可对同一 `round_id`
+        多次调用。要求该 round 已存在一行记录（由 `reserve()` 或
+        `open_round_record()` 建立），否则抛错——不得对着一个不存在的 round
+        静默写入。
+        """
+        row = self.conn.execute(
+            "SELECT round_id FROM rounds WHERE round_id=?",
+            (round_id,)).fetchone()
+        if row is None:
+            raise BudgetError(f"未知 round：{round_id}")
+        self.conn.execute(
+            "UPDATE rounds SET"
+            "  mode=COALESCE(?, mode),"
+            "  result=COALESCE(?, result),"
+            "  turns=COALESCE(?, turns),"
+            "  denials=COALESCE(?, denials),"
+            "  exit_code=COALESCE(?, exit_code)"
+            " WHERE round_id=?",
+            (mode, result, turns, denials, exit_code, round_id))
+
+    def settle_orphaned(self, round_id: str) -> None:
+        """结算一个不属于本轮、崩溃前留下悬挂预留的旧 round（评审 Critical
+        #1 修法 2）。
+
+        必须按该 round **自己 `started_at` 所在的日历日**结算，不能用
+        「今天」——否则会把不属于今天的 `budget_days` 行错误扣减，而真正
+        持有那份预留的旧日期行则永久悬挂。结果未知时按其 `reserved_usd`
+        全额计费（worst-case，与 `abandon()` 同一语义）。已结算过（`ended_at`
+        非空）则是安全的 no-op。
+        """
+        row = self.conn.execute(
+            "SELECT reserved_usd, ended_at, started_at FROM rounds"
+            " WHERE round_id=?", (round_id,)).fetchone()
+        if row is None:
+            raise BudgetError(f"未知 round：{round_id}")
+        if row["ended_at"] is not None:
+            return
+        day = dt.datetime.fromtimestamp(row["started_at"]).date().isoformat()
+        self.settle(round_id, day, row["reserved_usd"])

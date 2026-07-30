@@ -12,8 +12,9 @@ from .claude_runner import invoke
 from .config import load_config
 from .ghclient import GhCli
 from .gitops import PublishWorktree
+from .lifecycle import State
 from .outbox import Outbox
-from .precheck import run_prechecks
+from .precheck import inspect_facts
 from .queue import Queue
 from .round import SETTINGS_PATH, STAGE1_TOOLS, Deps, run_round
 
@@ -35,7 +36,11 @@ def main(argv: list[str] | None = None) -> int:
     conn, gh, worktree = _wire(cfg)
 
     if args.command == "doctor":
-        results = run_prechecks(cfg, gh, worktree, Outbox(conn))
+        # `doctor` 是第一道纯只读授权诊断门：绝不 reconcile、绝不
+        # fetch/reset 发布工作区，也不能对尚未收敛的 `prepared` root 假绿
+        # （评审 Important-2）。生产 round 路径仍走带副作用的
+        # `run_prechecks()`，两者刻意分离。
+        results = inspect_facts(cfg, gh, worktree, Outbox(conn))
         for r in results:
             print(f"[{'ok ' if r.ok else 'FAIL'}] {r.name}: {r.detail}")
         return 0 if all(r.ok for r in results) else 1
@@ -65,6 +70,15 @@ def main(argv: list[str] | None = None) -> int:
         expected = set(STAGE1_TOOLS.split(","))
         actual = set(res.init_tools)
         problems = []
+        # `res.ok` 只覆盖 stream 协议本身是否干净；进程退出码非 0（例如 claude
+        # 因参数错误提前退出）与残留的 protocol_errors 都必须显式再查一遍，
+        # 否则「init 事件看着干净」会被误判为整体成功（评审 Important #5）。
+        if not res.ok:
+            problems.append("res.ok 为 False（stream 不干净或非成功终态）")
+        if res.exit_code != 0:
+            problems.append(f"进程退出码非 0：{res.exit_code}")
+        if res.protocol_errors:
+            problems.append(f"协议错误：{res.protocol_errors}")
         if actual != expected:
             problems.append(f"工具集不等：多={sorted(actual - expected)} "
                             f"少={sorted(expected - actual)}")
@@ -84,7 +98,14 @@ def main(argv: list[str] | None = None) -> int:
                 queue=Queue(conn), invoke=invoke)
     result = run_round(cfg, deps)
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["result"] in ("published", "no-candidate", "duplicate") else 1
+    if result["result"] in ("published", "no-candidate", "duplicate"):
+        return 0
+    # 恢复轮只有真正收敛（发布收据核验通过）才算成功；仍处于 inconsistent
+    # 或任何未收敛的中间态都必须非零退出，否则一次半途而废的恢复会被
+    # systemd 误报为成功（评审 Important #5）。
+    if result["result"] == "resumed" and result.get("state") == State.RECEIPT_COMPLETE:
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import datetime as dt
 import tempfile, unittest
 from pathlib import Path
 from harness import db
@@ -145,6 +146,102 @@ class TestBudget(unittest.TestCase):
         self.b.record_invocation("r1", "inv-1", 0.4)  # 重放
         self.b.record_invocation("r1", "inv-1", 0.4)  # 再重放
         self.assertAlmostEqual(self.b.remaining_grant("r1"), 0.6)
+
+    def test_open_round_record_does_not_touch_daily_budget(self):
+        """恢复轮/早期失败轮不消耗新预算：`open_round_record()` 只建一条
+        `reserved_usd=0` 的账本行，绝不占用 `budget_days`（评审 Important
+        #6/#7）。"""
+        self.b.open_round_record("r-resume", mode="resume")
+        row = self.conn.execute(
+            "SELECT mode, reserved_usd FROM rounds WHERE round_id=?",
+            ("r-resume",)).fetchone()
+        self.assertEqual(row["mode"], "resume")
+        self.assertAlmostEqual(row["reserved_usd"], 0.0)
+        day_row = self.conn.execute(
+            "SELECT reserved_usd, settled_usd FROM budget_days"
+            " WHERE day=?", (DAY,)).fetchone()
+        self.assertIsNone(day_row, "open_round_record 不得触碰 budget_days")
+
+    def test_open_round_record_is_idempotent(self):
+        self.b.open_round_record("r1", mode="resume")
+        self.b.open_round_record("r1", mode="resume")  # 重复调用不得报错
+        rows = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM rounds WHERE round_id=?",
+            ("r1",)).fetchall()
+        self.assertEqual(rows[0]["n"], 1)
+
+    def test_record_outcome_updates_only_specified_fields(self):
+        self.b.reserve("r1", DAY)
+        self.b.record_outcome("r1", result="published", turns=5, denials=1,
+                              exit_code=0)
+        row = self.conn.execute(
+            "SELECT mode, result, turns, denials, exit_code, reserved_usd"
+            " FROM rounds WHERE round_id=?", ("r1",)).fetchone()
+        self.assertEqual(row["result"], "published")
+        self.assertEqual(row["turns"], 5)
+        self.assertEqual(row["denials"], 1)
+        self.assertEqual(row["exit_code"], 0)
+        # mode 未在本次调用传入，不得被覆盖成 None
+        self.assertEqual(row["mode"], "pending")
+        # reserved_usd 完全不受影响——record_outcome 不得触碰金额字段
+        self.assertAlmostEqual(row["reserved_usd"], 1.0)
+
+    def test_record_outcome_is_idempotent(self):
+        self.b.reserve("r1", DAY)
+        self.b.record_outcome("r1", result="published", turns=5)
+        self.b.record_outcome("r1", result="published", turns=5)  # 重放
+        row = self.conn.execute(
+            "SELECT result, turns FROM rounds WHERE round_id=?",
+            ("r1",)).fetchone()
+        self.assertEqual(row["result"], "published")
+        self.assertEqual(row["turns"], 5)
+
+    def test_record_outcome_unknown_round_raises(self):
+        with self.assertRaises(BudgetError):
+            self.b.record_outcome("no-such-round", result="published")
+
+    def test_settle_orphaned_settles_against_its_own_started_at_day(self):
+        """结算悬挂预留必须按该 round 自己 `started_at` 所在的日历日，不能
+        用「今天」——否则会错误扣减不属于它的 `budget_days` 行，而真正持有
+        那份预留的旧日期行则永久悬挂（评审 Critical #1 修法 2）。"""
+        old_day = "2026-01-01"
+        self.b.reserve("orphan", old_day)
+        # 手工把 started_at 改到那一天对应的时间戳，模拟「昨天预留、今天恢复」
+        old_ts = dt.datetime.fromisoformat(old_day).timestamp()
+        self.conn.execute(
+            "UPDATE rounds SET started_at=? WHERE round_id=?",
+            (old_ts, "orphan"))
+
+        self.b.settle_orphaned("orphan")
+
+        old_day_row = self.conn.execute(
+            "SELECT reserved_usd, settled_usd FROM budget_days"
+            " WHERE day=?", (old_day,)).fetchone()
+        self.assertAlmostEqual(old_day_row["reserved_usd"], 0.0)
+        self.assertAlmostEqual(old_day_row["settled_usd"], 1.0)
+        # 「今天」这一天完全不应被触及
+        today_row = self.conn.execute(
+            "SELECT * FROM budget_days WHERE day=?", (DAY,)).fetchone()
+        self.assertIsNone(today_row)
+
+    def test_settle_orphaned_is_idempotent(self):
+        """`reserve()` 用 `time.time()` 写 `started_at`，而 `settle_orphaned()`
+        按 `started_at` 反推日历日结算——与本文件里手工传入的 `DAY` 常量
+        （用作 `budget_days.day` 的显式参数）并非同一件事。这里按
+        `settle_orphaned()` 实际会计算出的真实今天日期查账，而不是硬编码
+        的 `DAY` 常量，否则断言会查询一个从未被写入的行。"""
+        real_today = dt.date.today().isoformat()
+        self.b.reserve("orphan", real_today)
+        self.b.settle_orphaned("orphan")
+        self.b.settle_orphaned("orphan")  # 已结算，no-op
+        row = self.conn.execute(
+            "SELECT settled_usd FROM budget_days WHERE day=?",
+            (real_today,)).fetchone()
+        self.assertAlmostEqual(row["settled_usd"], 1.0)
+
+    def test_settle_orphaned_unknown_round_raises(self):
+        with self.assertRaises(BudgetError):
+            self.b.settle_orphaned("no-such-round")
 
 
 if __name__ == "__main__":
