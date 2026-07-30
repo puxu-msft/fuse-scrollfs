@@ -44,6 +44,21 @@ class TestFakeContract(unittest.TestCase):
             self.gh.create_issue("t", "b HARNESS-OP:xyz", [])
         self.assertIsNone(self.gh.find_issue_by_marker("HARNESS-OP:xyz"))
 
+    def test_ensure_label_fault_injection_covered(self):
+        """发现 5：ensure_label 也会进 outbox（写操作），必须支持故障注入。"""
+        from harness.outbox import ResponseLost
+        self.gh.fail_next("ensure_label", applied=True)
+        with self.assertRaises(ResponseLost):
+            self.gh.ensure_label("harness", "ededed", "desc")
+        self.assertIn("harness", self.gh.list_labels())
+
+    def test_ensure_label_fault_not_applied_leaves_nothing(self):
+        from harness.outbox import ResponseLost
+        self.gh.fail_next("ensure_label", applied=False)
+        with self.assertRaises(ResponseLost):
+            self.gh.ensure_label("harness", "ededed", "desc")
+        self.assertNotIn("harness", self.gh.list_labels())
+
 
 if __name__ == "__main__":
     unittest.main()
