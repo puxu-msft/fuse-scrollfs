@@ -28,3 +28,7 @@ Thumbs.db
 # harness 运行时状态与工作区
 /.worktree/
 /.claude/state/
+
+# Python 字节码
+__pycache__/
+*.pyc
