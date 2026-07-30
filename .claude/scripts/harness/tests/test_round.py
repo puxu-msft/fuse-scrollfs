@@ -1,11 +1,14 @@
 import subprocess, tempfile, unittest
 from pathlib import Path
+from unittest import mock
 from harness import db
 from harness.claude_runner import InvocationResult
 from harness.config import GIT
 from harness.gitops import PublishWorktree
 from harness.outbox import Outbox
-from harness.queue import Queue
+from harness.publish import Publisher
+from harness.queue import Queue, fingerprint
+from harness import round as round_module
 from harness.round import Deps, run_round
 from harness.tests.fakes import FakeGitHub
 
@@ -119,6 +122,90 @@ class TestRound(unittest.TestCase):
         self.assertEqual(result["result"], "precheck-failed")
         rows = self.conn.execute("SELECT COUNT(*) AS n FROM budget_days").fetchone()
         self.assertEqual(rows["n"], 0, "预检失败不得预留预算")
+
+    def test_open_root_resumes_without_invoking_model(self):
+        """恢复优先于新扫描：有未结 root 时绝不起模型（评审 C-02）。
+
+        先用一次 stop_after="issue" 的 publish() 制造一个 observed-但-未-settled
+        的 publish_proposal root（Issue 已建、卡片未提交/未 push/收据未写），
+        这正是「建 Issue 响应丢失」之后真实会留下的持久化状态。随后传入的
+        `invoke` 是被调用即失败的哨兵——一旦 run_round 在有未结 root 时仍去
+        起模型，本测试必须变红。
+        """
+        candidate = dict(CANDIDATE_PAYLOAD["candidates"][0])
+        candidate["fingerprint"] = fingerprint(
+            candidate["goal"], candidate["invariant"],
+            candidate["primary_path"], candidate["oracle"])
+        prior_publisher = Publisher(Outbox(self.conn), self.gh, self.wt,
+                                    Queue(self.conn), "prior-round")
+        prior_publisher.publish(candidate, stop_after="issue")
+
+        # 制造后的状态必须真的是「未结 root」，否则下面的断言是在测一个
+        # 从未发生过的场景（core-must-match-the-claim）。
+        outbox = Outbox(self.conn)
+        self.assertTrue(outbox.open_roots(), "前置状态必须先造出一个未结 root")
+
+        sentinel_invoke = mock.Mock(
+            side_effect=AssertionError("有未结 root 时不得起模型"))
+        deps = Deps(conn=self.conn, gh=self.gh, worktree=self.wt,
+                   outbox=Outbox(self.conn), queue=Queue(self.conn),
+                   invoke=sentinel_invoke, tools=("/usr/bin/git",))
+
+        result = run_round(self.cfg, deps)
+
+        sentinel_invoke.assert_not_called()
+        self.assertEqual(result["mode"], "resume")
+        self.assertEqual(result["result"], "resumed")
+        row = self.conn.execute(
+            "SELECT settled_usd FROM rounds WHERE round_id=?",
+            (result["round_id"],)).fetchone()
+        self.assertAlmostEqual(row["settled_usd"], 0.0,
+                               msg="恢复轮不应产生新的模型花费")
+
+    def test_remaining_time_budget_is_passed_to_invoke_as_timeout(self):
+        """单调截止：剩余时间被真实传给 invoke，且必须小于整轮截止。
+
+        用受控的 `time.monotonic()` 序列模拟「round 开始后已经过 200 秒」，
+        断言 `invoke` 实际收到的 `timeout_s` 等于 `ROUND_DEADLINE_S - 200`，
+        既为正数、不超过整轮截止，也严格小于整轮截止——即确实为
+        checkpoint/结算预留了时间窗，不是把整轮时间全部塞给模型。
+        """
+        seen_timeouts = []
+
+        def capturing_invoke(**kw):
+            seen_timeouts.append(kw.get("timeout_s"))
+            return InvocationResult(True, {"candidates": []}, 0.01, 1)
+
+        deps = self._deps(None)
+        deps.invoke = capturing_invoke
+
+        elapsed = 200.0
+        times = [1_000_000.0, 1_000_000.0 + elapsed]
+        state = {"n": 0}
+
+        def fake_monotonic():
+            idx = min(state["n"], len(times) - 1)
+            state["n"] += 1
+            return times[idx]
+
+        with mock.patch.object(round_module.time, "monotonic",
+                               side_effect=fake_monotonic):
+            run_round(self.cfg, deps)
+
+        self.assertEqual(len(seen_timeouts), 1, "invoke 必须恰好被调用一次")
+        timeout_s = seen_timeouts[0]
+        self.assertIsNotNone(
+            timeout_s, "timeout_s 必须真的把 remaining_time 传给 invoke，"
+                      "而不是被忽略或传 None")
+        self.assertGreater(timeout_s, 0)
+        self.assertLessEqual(timeout_s, round_module.ROUND_DEADLINE_S)
+        self.assertLess(
+            timeout_s, round_module.ROUND_DEADLINE_S,
+            "必须为 checkpoint/结算预留时间窗，不能把整轮时间全部给模型")
+        self.assertAlmostEqual(
+            timeout_s, round_module.ROUND_DEADLINE_S - elapsed,
+            msg="timeout_s 必须等于 round_deadline 减去已流逝的单调时间，"
+               "而不是任意常量")
 
 
 if __name__ == "__main__":
