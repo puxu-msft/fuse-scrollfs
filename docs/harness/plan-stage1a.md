@@ -4088,14 +4088,14 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | 1 | 骨架 + schema | **done** | `test_db` 3/3 绿（WAL、迁移幂等、natural key 唯一约束） | 无 |
 | 2 | 生命周期派生函数 | **done** | `test_lifecycle` 7/7 绿（含 256 组合穷举、八状态全可达） | 实现取自已验证的 PoC |
 | 3 | outbox | **done** | `test_outbox` 14/14 绿；关键两条：probe-before-call 认出既有 artifact、artifact 齐全但 root 未 settled 仍算待恢复 | 比计划多 4 条测试（父指针断言、root_of、open_roots、unpushed_commits） |
-| 4 | GitHub 层 + Fake | pending | | |
-| 5 | 发布工作区 | pending | | 已在 /tmp 离线验证并修 3 缺陷（重放身份 / prune 自愈 / 冲突 abort） |
-| 6 | 预算 | pending | | |
-| 7 | 队列治理 | pending | | |
-| 8 | 发布编排 + 崩溃矩阵 | pending | | |
-| 9 | 预检 | pending | | |
-| 10 | Claude 侧资产 | pending | | |
-| 11 | claude -p 调用层 | pending | | |
+| 4 | GitHub 层 + Fake | **done** | 45d0196 实施 → 评审 ❌ → f858b2c 修复 → **复审 ✅ Approved**；33 用例（含 24 条 adapter contract） | 评审五条全闭合：分页 --slurp 展平、Issue DTO 规范化 labels→list[str]、写/读错误分型 + timeout、GitHubClient(Protocol) + 可注入执行器、Fake 写方法全经故障注入。残余 2 Minor 不阻塞 |
+| 5 | 发布工作区 | 修复中 | 6c81d2b 实施 7/7 → 评审 ❌ | **Critical：路径逃逸**（评审复现 `write_proposal('../../../x')` 写到工作区外）；另 push 失败分类过宽、allow_reset=False 仍 abort、grep 模糊匹配、缺 3 条异常路径测试、ResourceWarning |
+| 6 | 预算 | 修复中 | 591a48b 实施 5/5 → 评审 ❌ | **Critical：同 round 重复 reserve 留永久幽灵预留**（评审复现）；另 overrun 静默截断、崩溃测试没重开连接、record_invocation 非幂等 |
+| 7 | 队列治理 | 修复中 | 591a48b 实施 7/7 → 评审 ❌ | typed 谓词只验前缀不验参数（评审复现 `main_sha_changed:not-a-sha` → True）；possible_duplicate 不可达；INSERT OR REPLACE 抹历史 |
+| 8 | 发布编排 + 崩溃矩阵 | 待开工 | | 依赖 4/5/6/7 修完 |
+| 9 | 预检 | 修复中 | 600769c 实施 7/7 → 评审 ❌ | **实施者错误「校正」引入死锁**（open_operations 阻断 → 恢复路径永不可达），协调者已改回 unresolved 并加不变量测试，评审确认改回正确；另判 dirty 检查假绿（先 clean 再宣布 clean）、paused 时仍改工作区 |
+| 10 | Claude 侧资产 | 修复中 | aba911b 实施 14 文件 → 评审 ❌ | **Critical：两个 workflow 未以 export const meta 开头 + 契约探针未跑**；另 finder 数组/对象契约矛盾、labels 缺失、参数名漂移、缺 additionalProperties:false、judge schema 不一致、**红线路径大半写错**（MAGIC 实在 archive/mod.rs、提交顺序在 updater.rs）、自修改红线漏 agents/rules/redlines 自身 |
+| 11 | claude -p 调用层 | 修复中 | 076911c 实施 8/8 → 评审 ❌ | **Critical：硬权限契约只活在测试输入里**（`build_argv(tools="default")` 照样生成带写能力 argv）；另多 result/多 init 静默覆盖、非法行忽略、cost 异常、init_seen 不强制、env 漏 GH_CONFIG_DIR/GIT_CONFIG_*、invoke() 零测试 |
 | 12 | 轮次编排 + CLI | pending | | |
 | 13 | systemd + 真机验收 | pending | | 含授权门，逐步执行 |
 
