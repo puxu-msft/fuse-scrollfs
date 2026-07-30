@@ -470,7 +470,18 @@ Stage 1 没有「实际开发选择」，按开发选择计算的软配额在此
 
 ## 十六、开放项（实施期确认，不阻塞本 spec）
 
-- `claude -p` 后台等待的真实上限与退出码形态——Round 0 实测。
+- ~~`claude -p` 后台等待的真实上限与退出码形态~~——**已由 2026-07-31 的真实契约探针实测关闭**，结论见下。
+
+**契约探针实测结论（2026-07-31，`scrollz-contract-probe`，两次调用共约 1.35 美元，零外部写入）**：
+
+| 发现 | 结论 | 处置 |
+|---|---|---|
+| `--output-format stream-json` **强制要求 `--verbose`** | `claude --help` 未标明，只有真跑才报 `Error: When using --print, --output-format=stream-json requires --verbose` | 已加入 `build_argv` 固定 argv |
+| `--permission-mode dontAsk` **拒绝所有不在 `permissions.allow` 里的工具** | 原 `harness-settings.json` 只写 deny、allow 为空，入口 skill 调 `Workflow` 被拒并重试至烧完预算。**allow 列表才是主防线，deny 是纵深** | 已显式 allow `Read/Grep/Glob/Skill/Workflow/TodoWrite` |
+| Workflow API 形状 | `export const meta` 首字节、顶层 `args` 全局、`agent(prompt, opts)` 位置参数、`schema` 直接返回已校验对象——**四项全部实测通过**，脚本内零解析代码 | 契约已冻结 |
+| 隔离生效 | init 事件的 `tools` 恰为请求的五个，`mcp_servers` 与 `plugins` 均空，被拒工具调用 0 次 | 负向验证通过 |
+| **成本远高于假设** | 单 agent、仅回显字符串的 workflow 花费 **$0.9985**（opus-5，cacheRead 249k）——agent 继承默认模型与完整全局上下文 | 已给 finder/judge 显式指定 `model: 'sonnet'`；真实每轮成本待 Task 13 首轮实测后回填并据此校准预算与节拍 |
+
 - 具体数值：每轮 token/美元预算、重试次数、熔断阈值 N、队列上限、skip 数阈值、lane 配额窗口 N——先给保守硬上限，实测后只调优不新建。
 
 **已从开放项转为裁定**（因 §十七 Web UI 与仓库内布局偏好）：
