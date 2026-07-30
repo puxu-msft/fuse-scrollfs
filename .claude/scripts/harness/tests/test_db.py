@@ -18,11 +18,13 @@ class TestDb(unittest.TestCase):
 
     def test_connect_enables_wal_and_foreign_keys(self):
         conn = db.connect(self.path)
+        self.addCleanup(conn.close)
         self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "wal")
         self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
     def test_migrate_is_idempotent(self):
         conn = db.connect(self.path)
+        self.addCleanup(conn.close)
         db.migrate(conn)
         db.migrate(conn)
         tables = {r[0] for r in conn.execute(
@@ -34,6 +36,7 @@ class TestDb(unittest.TestCase):
 
     def test_operations_natural_key_is_unique_per_kind(self):
         conn = db.connect(self.path)
+        self.addCleanup(conn.close)
         db.migrate(conn)
         conn.execute(
             "INSERT INTO operations(operation_id, round_id, kind, natural_key,"

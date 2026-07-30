@@ -10,6 +10,9 @@ class TestBudget(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        # 幂等：测试体内可能已手动 close()，tearDown 再 close 一次是安全的
+        # no-op（sqlite3.Connection.close 允许重复调用）。
+        self.addCleanup(self.conn.close)
         db.migrate(self.conn)
         self.b = Budget(self.conn, round_budget_usd=1.0, daily_budget_usd=2.5)
 

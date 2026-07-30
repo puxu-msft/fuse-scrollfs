@@ -14,7 +14,7 @@ import subprocess
 from typing import Callable, Protocol, runtime_checkable
 
 from .config import GH, Config
-from .outbox import ResponseLost
+from .outbox import ResponseLost, TerminalOperationError
 
 # 单次 gh 调用超时：卡住的 gh 不应耗尽整轮 deadline。
 DEFAULT_TIMEOUT_S = 30.0
@@ -41,10 +41,19 @@ def _classify_failure(args: list[str], stderr: str, mutation: bool) -> Exception
     """把一次非零退出的 gh 调用分类为确定性失败还是结果不确定。
 
     mutation=True（写操作）：
-      - 4xx 业务拒绝 → 确定性失败（RuntimeError）
-      - 5xx / 传输中断 → 结果不确定，服务端可能已生效（ResponseLost）
+      - 4xx 业务拒绝 → 确定性失败（`TerminalOperationError`）：重试用**同一
+        payload**必然得到同一拒绝，需人工介入（改 payload 或修凭据），
+        outbox 据此把 operation 标记为 `failed_terminal` 并阻断本轮。
+        含 401/403：这两者可能是凭据问题而非请求本身有误，但无论哪种，
+        **不改变凭据**盲目重试都不会让同一调用成功——修复凭据本身就是一次
+        人工介入动作，与「确定性失败需要人工介入」的语义一致，因此仍归入
+        `TerminalOperationError` 而非 `ResponseLost`（`ResponseLost` 的语义
+        是『服务端可能已生效、值得 probe 补救』，401/403 从未生效，probe
+        补救无意义）。
+      - 5xx / 传输中断 → 结果不确定，服务端可能已生效（`ResponseLost`）
     mutation=False（只读）：
-      - 4xx 业务拒绝 → 确定性失败（RuntimeError）
+      - 4xx 业务拒绝 → 确定性失败（`RuntimeError`，维持原语义不变——只读
+        路径不进 outbox，不需要 `failed_terminal` 状态机）
       - 5xx / 传输中断 → 可重试的瞬时错误（TransientReadError），
         不使用 ResponseLost——只读没有『已生效』的含义。
     未能归类的错误一律视为确定性失败（保守默认，不无凭据地当作可能已生效）。
@@ -55,11 +64,11 @@ def _classify_failure(args: list[str], stderr: str, mutation: bool) -> Exception
         code = int(match.group(1))
         if code >= 500:
             return ResponseLost(msg) if mutation else TransientReadError(msg)
-        return RuntimeError(msg)
+        return TerminalOperationError(msg) if mutation else RuntimeError(msg)
     lower = stderr.lower()
     if any(marker in lower for marker in _TRANSPORT_MARKERS):
         return ResponseLost(msg) if mutation else TransientReadError(msg)
-    return RuntimeError(msg)
+    return TerminalOperationError(msg) if mutation else RuntimeError(msg)
 
 
 @runtime_checkable

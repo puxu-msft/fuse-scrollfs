@@ -73,6 +73,15 @@ def _inspect_preconditions(cfg, gh, tools: tuple[str, ...]) -> list[CheckResult]
     return results
 
 
+def _outbox_resolved_check(outbox) -> CheckResult:
+    unresolved = outbox.unresolved()
+    return CheckResult(
+        "outbox_resolved", not unresolved,
+        f"存在 {len(unresolved)} 个未决 operation：" +
+        ", ".join(f"{o.kind}/{o.natural_key}" for o in unresolved)
+        if unresolved else "ok")
+
+
 def _prepare_publish_worktree(outbox, worktree, probes: dict) -> list[CheckResult]:
     """第二层：有副作用。第一层全部通过后才会执行到这里。"""
     results: list[CheckResult] = []
@@ -85,21 +94,26 @@ def _prepare_publish_worktree(outbox, worktree, probes: dict) -> list[CheckResul
         # （评审 Minor-3）：既不能凭它判断 has_unpushed_commit，也不能
         # 让 ensure() 在一个我们没能核实过的状态上执行 reset/clean。
         results.append(CheckResult("outbox_reconcile", False, repr(exc)))
-    else:
-        # 待推提交必须直查持久化事实，不能从 reconcile 的返回值推导——
-        # 已 observed 的 commit operation 不在未决集合里，那样推导恒为 False
-        has_unpushed_commit = bool(outbox.unpushed_commits())
-        results.append(_check_publish_worktree_clean(worktree, has_unpushed_commit))
+        # unresolved() 是纯读查询、不碰 worktree，仍可补进结构化结果里，
+        # 但即便它恰好是 ok 也不改变本轮已失败的事实（reconcile 失败已
+        # 足以 fail closed）。
+        results.append(_outbox_resolved_check(outbox))
+        return results
 
-    # 只有 failed_terminal 才阻断本轮。**不能**用 open_operations()——
-    # 那会让 prepared / failed_retryable 也阻断预检，于是 run_round 直接返回
-    # precheck-failed，「恢复优先于新扫描」的路径永远走不到，形成死锁。
-    unresolved = outbox.unresolved()
-    results.append(CheckResult(
-        "outbox_resolved", not unresolved,
-        f"存在 {len(unresolved)} 个未决 operation：" +
-        ", ".join(f"{o.kind}/{o.natural_key}" for o in unresolved)
-        if unresolved else "ok"))
+    # 评审 Important-2：先查 failed_terminal，再决定是否触碰发布工作区。
+    # 之前的顺序是 unpushed_commits() → worktree ensure/reset → 最后才查
+    # outbox_resolved，于是已存在 failed_terminal 时，本该立即停下交人工
+    # 的这一轮，仍会先对发布工作区做 fetch/prune/reset 等副作用。
+    # 只有确认无未决的确定性失败之后，才允许继续往下走。
+    resolved_check = _outbox_resolved_check(outbox)
+    results.append(resolved_check)
+    if not resolved_check.ok:
+        return results  # 绝不再触碰 worktree
+
+    # 待推提交必须直查持久化事实，不能从 reconcile 的返回值推导——
+    # 已 observed 的 commit operation 不在未决集合里，那样推导恒为 False
+    has_unpushed_commit = bool(outbox.unpushed_commits())
+    results.append(_check_publish_worktree_clean(worktree, has_unpushed_commit))
 
     return results
 

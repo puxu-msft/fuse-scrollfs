@@ -24,6 +24,17 @@ class OperationConflict(Exception):
     """同一 natural key 对应不同 payload：不得复用旧结果。"""
 
 
+class TerminalOperationError(Exception):
+    """确定性外部失败：重试无意义，需人工介入。
+
+    与 `ResponseLost`（结果不确定，可能已生效，允许重试/probe）互斥：
+    这类失败已确定**未生效**且再次以相同 payload 调用会得到相同拒绝
+    （例如 GitHub 422 业务校验拒绝）。`Outbox.execute()` 捕获后把
+    operation 原子标记为 `failed_terminal` 并原样重新抛出——绝不吞掉，
+    也绝不当作可重试的 `failed_retryable`。
+    """
+
+
 class InjectedFault(Exception):
     """HARNESS_FAULT 触发的确定性崩溃，仅用于恢复验收。"""
 
@@ -87,6 +98,22 @@ class Outbox:
                 "SELECT payload_hash FROM operations WHERE operation_id=?",
                 (existing.operation_id,)).fetchone()
             if row["payload_hash"] != _hash(payload):
+                # 去向决定（评审 Important-1 附带项）：payload 冲突同样是需要
+                # 人工介入、重试无意义的确定性失败——盲目复用旧结果不安全，
+                # 而反复 prepare() 只会一直撞同一个 OperationConflict。选择
+                # 复用 `failed_terminal`（而非另设哨兵状态），使其自动纳入
+                # 既有的 `unresolved()` / 预检 `outbox_resolved` 闸门，无需
+                # 再让 precheck/reconcile 认识一个新状态。
+                #
+                # 只标记冲突所在的 operation 及其 root 事务，且仅当尚未
+                # `settled`——已收敛的发布不得被这类冲突倒着改写历史（后到
+                # 的冲突 payload 不能追溯性地推翻一次已核验的成功发布）。
+                if existing.phase != "settled":
+                    self._mark(existing, "failed_terminal", None)
+                    root = self.root_of(existing)
+                    if root.operation_id != existing.operation_id \
+                            and root.phase != "settled":
+                        self._mark(root, "failed_terminal", None)
                 raise OperationConflict(
                     f"{kind}/{natural_key} 的 payload 与既有记录不一致，拒绝复用")
             return existing
@@ -124,6 +151,13 @@ class Outbox:
                 self._mark(op, "observed", probed)
                 return probed
             self._mark(op, "failed_retryable", None)
+            raise
+        except TerminalOperationError:
+            # 确定性失败：重试无意义，需人工介入。原子标记后原样重新抛出——
+            # 绝不吞掉（不然调用方会误以为本次调用成功返回了 None），也绝
+            # 不降级为 failed_retryable（那会让恢复路径每轮重试同一个必然
+            # 失败的动作，见评审 Important-1）。
+            self._mark(op, "failed_terminal", None)
             raise
         self._mark(op, "observed", result)
         _fault_check(op.kind, "after-observe")

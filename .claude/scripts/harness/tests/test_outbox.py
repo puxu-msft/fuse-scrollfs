@@ -1,7 +1,8 @@
 import os, tempfile, unittest
 from pathlib import Path
 from harness import db
-from harness.outbox import InjectedFault, OperationConflict, Outbox, ResponseLost
+from harness.outbox import (InjectedFault, OperationConflict, Outbox,
+                             ResponseLost, TerminalOperationError)
 
 
 class TestOutbox(unittest.TestCase):
@@ -131,6 +132,76 @@ class TestOutbox(unittest.TestCase):
             "SELECT phase FROM operations WHERE operation_id=?",
             (op.operation_id,)).fetchone()
         self.assertEqual(row["phase"], "prepared")
+
+    def test_terminal_operation_error_marks_failed_terminal_and_reraises(self):
+        """评审 Important-1：确定性业务拒绝（如 422）必须落进 failed_terminal，
+        且异常必须原样向上传播——不得被吞掉，调用方需要知道本次调用失败了。
+        """
+        op = self.ob.prepare("r1", "publish_proposal", "nk1", {"title": "x"})
+        with self.assertRaises(TerminalOperationError):
+            self.ob.execute(op, call=lambda: (_ for _ in ()).throw(
+                TerminalOperationError("422 Validation Failed")),
+                probe=lambda: None)
+        row = self.conn.execute(
+            "SELECT phase FROM operations WHERE operation_id=?",
+            (op.operation_id,)).fetchone()
+        self.assertEqual(row["phase"], "failed_terminal")
+        self.assertEqual(len(self.ob.unresolved()), 1,
+                         "failed_terminal 必须被 unresolved() 捕获以阻断预检")
+
+    def test_terminal_operation_error_does_not_consult_probe_again(self):
+        """`execute()` 的首次 probe 是通用重入检查（对所有 kind 一视同仁），
+        与故障处理无关。确定性失败发生后不应该**再次**调用 probe 去做『其实
+        已生效』式的补救——那是 ResponseLost 专属语义。"""
+        probe_calls = []
+
+        def probe():
+            probe_calls.append(1)
+            return None
+
+        op = self.ob.prepare("r1", "publish_proposal", "nk1", {"title": "x"})
+        with self.assertRaises(TerminalOperationError):
+            self.ob.execute(
+                op,
+                call=lambda: (_ for _ in ()).throw(TerminalOperationError("x")),
+                probe=probe)
+        self.assertEqual(len(probe_calls), 1,
+                         "只应有 execute() 开头那一次通用重入 probe，不应为"
+                         "确定性失败额外再 probe 一次")
+
+    def test_operation_conflict_marks_existing_and_root_failed_terminal(self):
+        """去向决定：payload 冲突同样需要人工介入，复用 failed_terminal 状态，
+        使其自动纳入 unresolved() / 预检 outbox_resolved 闸门。"""
+        root = self.ob.prepare("r1", "publish_proposal", "fp1", {"title": "x"})
+        sub = self.ob.prepare("r1", "commit_proposal", root.operation_id,
+                              {"issue": 1})
+        with self.assertRaises(OperationConflict):
+            self.ob.prepare("r2", "commit_proposal", root.operation_id,
+                            {"issue": 2})
+        sub_row = self.conn.execute(
+            "SELECT phase FROM operations WHERE operation_id=?",
+            (sub.operation_id,)).fetchone()
+        root_row = self.conn.execute(
+            "SELECT phase FROM operations WHERE operation_id=?",
+            (root.operation_id,)).fetchone()
+        self.assertEqual(sub_row["phase"], "failed_terminal")
+        self.assertEqual(root_row["phase"], "failed_terminal")
+        unresolved_ids = {o.operation_id for o in self.ob.unresolved()}
+        self.assertIn(sub.operation_id, unresolved_ids)
+        self.assertIn(root.operation_id, unresolved_ids)
+
+    def test_operation_conflict_does_not_overwrite_settled_root(self):
+        """已收敛（settled）的发布不得被后到的冲突 payload 倒着改写历史。"""
+        root = self.ob.prepare("r1", "publish_proposal", "fp1", {"title": "x"})
+        self.ob.execute(root, call=lambda: {"number": 1}, probe=lambda: None)
+        self.ob.settle(root)
+        with self.assertRaises(OperationConflict):
+            self.ob.prepare("r2", "publish_proposal", "fp1", {"title": "y"})
+        row = self.conn.execute(
+            "SELECT phase FROM operations WHERE operation_id=?",
+            (root.operation_id,)).fetchone()
+        self.assertEqual(row["phase"], "settled",
+                         "settled 的 root 不得被冲突检测降级")
 
     def test_unpushed_commits_detects_commit_without_push(self):
         root = self.ob.prepare("r1", "publish_proposal", "fp1", {"title": "x"})

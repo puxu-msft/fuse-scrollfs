@@ -3,7 +3,7 @@ from pathlib import Path
 from harness import db
 from harness.config import GIT
 from harness.gitops import PublishWorktree
-from harness.outbox import Outbox
+from harness.outbox import Outbox, TerminalOperationError
 from harness.precheck import PrecheckFailed, assert_all_ok, run_prechecks
 from harness.tests.fakes import FakeGitHub
 
@@ -52,6 +52,7 @@ class TestPrecheck(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        self.addCleanup(self.conn.close)
         db.migrate(self.conn)
         self.outbox = Outbox(self.conn)
 
@@ -92,6 +93,23 @@ class TestPrecheck(unittest.TestCase):
                                 self.outbox, tools=("/usr/bin/git",))
         self.assertTrue(any(r.name == "outbox_resolved" and not r.ok
                             for r in results))
+
+    def test_terminal_failed_operations_never_touch_worktree(self):
+        """评审 Important-2：已存在 failed_terminal 时，预检必须在触碰发布
+        工作区之前就停下——之前的顺序是 unpushed_commits() → worktree
+        ensure/reset → 最后才查 outbox_resolved，于是本该立即交人工介入的
+        这一轮，仍会先对发布工作区做 fetch/prune/reset 等副作用。"""
+        op = self.outbox.prepare("r0", "publish_proposal", "nk", {})
+        self.outbox._mark(op, "failed_terminal", None)
+        worktree = FakeWorktree()
+        results = run_prechecks(Cfg(), FakeGitHub("WRITE"), worktree,
+                                self.outbox, tools=("/usr/bin/git",))
+        self.assertTrue(any(r.name == "outbox_resolved" and not r.ok
+                            for r in results))
+        self.assertFalse(worktree.ensured,
+                         "存在 failed_terminal 时不得调用 worktree.ensure()")
+        with self.assertRaises(PrecheckFailed):
+            assert_all_ok(results)
 
     def test_pending_operations_do_not_block_the_round(self):
         """prepared / failed_retryable **不得**阻断预检。
@@ -161,6 +179,55 @@ class TestPrecheck(unittest.TestCase):
         with self.assertRaises(PrecheckFailed):
             assert_all_ok(results)
 
+    def test_deterministic_422_blocks_round_and_precheck_end_to_end(self):
+        """Important-1 端到端：Fake transport 返回 422 → 真实 GhCli 抛
+        TerminalOperationError → Outbox.execute 标记 failed_terminal 并
+        重新抛出 → 下一轮 run_prechecks 判 outbox_resolved 失败，且绝不
+        触碰发布工作区（即使当时并无待推提交）。
+
+        这条覆盖此前评审指出的死代码路径：生产路径此前从不产生
+        failed_terminal（它只在测试里靠私有 _mark() 人工制造），
+        本测试证明现在生产路径（ghclient → outbox）真能走到这一状态。
+        """
+        import json
+        from harness.config import Config
+        from harness.ghclient import GhCli
+        from harness.tests.fakes import FakeGhTransport
+
+        cfg = Config(
+            repo_root=Path(self.tmp.name), state_db=Path(self.tmp.name) / "h.db",
+            publish_worktree=Path(self.tmp.name) / "wt", repo_slug="acme/widgets",
+            gh_token="fake-token", round_budget_usd=1.0, daily_budget_usd=5.0,
+            max_turns=10, proposed_cap=20, lane_cap=6)
+        transport = FakeGhTransport()
+        transport.queue(returncode=1, stderr='{"message":"Validation Failed"}'
+                                              "\ngh: Validation Failed (HTTP 422)")
+        real_gh = GhCli(cfg, runner=transport)
+
+        op = self.outbox.prepare("r1", "publish_proposal", "fp1",
+                                 {"title": "t", "body_md": "b"})
+        with self.assertRaises(TerminalOperationError):
+            self.outbox.execute(
+                op,
+                call=lambda: real_gh.create_issue("t", "b", []),
+                probe=lambda: None)
+        row = self.conn.execute(
+            "SELECT phase FROM operations WHERE operation_id=?",
+            (op.operation_id,)).fetchone()
+        self.assertEqual(row["phase"], "failed_terminal")
+
+        worktree = FakeWorktree()
+        results = run_prechecks(Cfg(), FakeGitHub("WRITE"), worktree,
+                                self.outbox, tools=("/usr/bin/git",))
+        outbox_check = [r for r in results if r.name == "outbox_resolved"]
+        self.assertEqual(len(outbox_check), 1)
+        self.assertFalse(outbox_check[0].ok,
+                         "422 造成的 failed_terminal 必须阻断本轮预检")
+        self.assertFalse(worktree.ensured,
+                         "存在 failed_terminal 时不得触碰发布工作区")
+        with self.assertRaises(PrecheckFailed):
+            assert_all_ok(results)
+
 
 def _run_git(cwd, *args):
     return subprocess.run([GIT, *args], cwd=cwd, capture_output=True,
@@ -199,6 +266,7 @@ class TestPrecheckRealWorktreeIntegration(unittest.TestCase):
         self.wt.ensure()
 
         self.conn = db.connect(root / "h.db")
+        self.addCleanup(self.conn.close)
         db.migrate(self.conn)
         self.outbox = Outbox(self.conn)
 

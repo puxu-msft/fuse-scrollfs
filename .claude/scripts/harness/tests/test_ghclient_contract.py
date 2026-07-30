@@ -12,7 +12,7 @@ from pathlib import Path
 
 from harness.config import Config
 from harness.ghclient import GhCli, GitHubClient, TransientReadError
-from harness.outbox import ResponseLost
+from harness.outbox import ResponseLost, TerminalOperationError
 from harness.tests.fakes import FakeGhTransport, FakeGitHub
 
 
@@ -132,12 +132,43 @@ class TestIssueLabelDtoNormalization(unittest.TestCase):
 class TestResponseLostClassification(unittest.TestCase):
     """发现 3：表驱动覆盖确定性 4xx / 5xx / 超时 / 截断 JSON / 普通成功。"""
 
-    def test_mutation_deterministic_4xx_raises_runtime_error(self):
+    def test_mutation_deterministic_4xx_raises_terminal_operation_error(self):
+        """评审 Important-1：确定性 422 业务拒绝必须是 TerminalOperationError
+        （outbox 据此标记 failed_terminal），而不是普通 RuntimeError（那会
+        被 Outbox.execute() 的兜底放过，永远卡在 prepared）。"""
         transport = FakeGhTransport()
         transport.queue(returncode=1, stderr='{"message":"Validation Failed"}'
                                               "\ngh: Validation Failed (HTTP 422)")
         gh = GhCli(_cfg(), runner=transport)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(TerminalOperationError):
+            gh.create_issue("t", "b", [])
+
+    def test_mutation_401_raises_terminal_operation_error(self):
+        """401/403 可能是凭据问题而非请求本身有误，但不改凭据盲目重试
+        同一调用不会成功——修凭据本身就是一次人工介入，语义上仍是
+        TerminalOperationError（而非『可能已生效、值得 probe』的
+        ResponseLost）。"""
+        transport = FakeGhTransport()
+        transport.queue(returncode=1, stderr="gh: Bad credentials (HTTP 401)")
+        gh = GhCli(_cfg(), runner=transport)
+        with self.assertRaises(TerminalOperationError):
+            gh.create_comment(1, "body")
+
+    def test_mutation_403_raises_terminal_operation_error(self):
+        transport = FakeGhTransport()
+        transport.queue(returncode=1, stderr="gh: Forbidden (HTTP 403)")
+        gh = GhCli(_cfg(), runner=transport)
+        with self.assertRaises(TerminalOperationError):
+            gh.replace_labels(1, ["x"])
+
+    def test_mutation_unclassified_failure_raises_terminal_operation_error(self):
+        """无 HTTP 状态码、无传输中断标志的未知失败：保守默认为确定性失败，
+        不无凭据地当作可能已生效（沿用原语义，只是异常类型从 RuntimeError
+        改为 TerminalOperationError）。"""
+        transport = FakeGhTransport()
+        transport.queue(returncode=1, stderr="gh: something inexplicable happened")
+        gh = GhCli(_cfg(), runner=transport)
+        with self.assertRaises(TerminalOperationError):
             gh.create_issue("t", "b", [])
 
     def test_readonly_deterministic_4xx_raises_runtime_error(self):
