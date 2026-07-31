@@ -4,6 +4,36 @@
 > 权威文档：规格 [spec.md](./spec.md) v7 · 1a 计划 [plan-stage1a.md](./plan-stage1a.md) · 1b 冻结范围 [plan-stage1b.md](./plan-stage1b.md)
 > 进度账本：`.superpowers/sdd/progress.md`（git-ignored，崩溃后靠它 + `git log` 恢复认知）
 
+## ⚑ 当前阶段：控制流重写（ADR-002 已采纳）
+
+**Stage 1a 的发布回路已真机跑通并发布过 Issue #1，但扇出层要整条替换。** 用户 2026-07-31 裁定：控制流设计不当，应在更低层接管对话，实现精细化 fork/retry；**先在 zipfs 跑通，再由同伴搬进 `~/src/my-ade`**；**2 小时定时器在重写完成前不启用**。
+
+- 决策：[adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md)
+- 事实基础：[../../exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md)（四条全部 confirmed，$0.52，零外部副作用）
+- 实施计划：`plan-control-flow-rewrite.md`（撰写中）
+
+### 根因：控制器不拥有对话链上的任何一个环节
+
+它只拥有起点（argv）与终点（stdout 解析），中间全靠**请求模型配合**。三次真机失败是同一形态——**我请求了，模型答应了，然后没做到**：模型原话「我会等待完成通知后再取结果，不会在此之前结束本轮」，紧接着 `stop_reason: end_turn`。它不是不听话，是 `-p` 模式下**它没有「跨回合等待」这个动作**。
+
+`TaskOutput(block=true)` 与 workflow 内 `safeAgent` 重试都是在这条链上加补丁，没改所有权。
+
+### PoC 中三条**改变设计**的实测结果
+
+| 结果 | 影响 |
+|---|---|
+| 「每次 stdin 输入恰好一个顶层 `result`」这个**全称命题被真实反例推翻**（后台 `Task` 路径上进程存活时会出现第二个 result） | 扇出**不得**用内联 `Task`，必须一子任务一个顶层 process/session |
+| `--max-budget-usd 0.001` 实际花掉 **$0.048197** | CLI 预算是**滞后停止触发器，不是硬费用上限**。所幸 `budget.settle` 早已按「不截断 + 标 `budget_breach`」设计，未引入新缺口 |
+| 本地分类器自动放行的安全 Bash **不产生** `can_use_tool` | stdio 拦截是增强，`--tools` allowlist 与 permissions 仍须是主边界 |
+
+已验实且可直接用的：stdin 行格式、多轮上下文保留、`control_response` 的 deny 与 `updatedInput` 机械改写（文件系统 oracle）、`--session-id` 预分配 + `--resume --fork-session` 只重试失败会话而不影响兄弟、`--agents <json>` 完全内联定义 agent（**迁移 my-ade 时不必依赖目标仓库内的 `.claude/agents/*.md`**）。
+
+未验证：消息级 `forkSession(upToMessageId)`、长期运行/传输断流恢复、全部 built-in tool 的分类。
+
+### 不受重写影响的模块（接口是「一个候选」，与扇出如何产生无关）
+
+`outbox` · `budget` · `queue` · `publish` · `lifecycle` · `gitops` · `precheck` · `db` —— **不要顺手重构它们**。
+
 ## ✅ Stage 1a 发布回路已真机跑通（2026-07-31）
 
 **Issue #1 已创建、提案卡 `d2ca47e` 已进远端 main、outbox 四个 operation 全部 `settled`。**
