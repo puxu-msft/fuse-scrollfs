@@ -36,6 +36,11 @@ _CLEAN_INIT_TOOLS = sorted(round_module.STAGE1_TOOLS.split(","))
 
 
 def _clean_invocation(ok, payload, cost, turns, **kw):
+    # 「干净的 stream」按定义包含一个可解析的终态 result 事件，因此成本必然
+    # 已知。假件默认 cost_known=False 会让失败轮的结算路径测不到真实行为
+    # ——真实的「成本未知」只发生在超时/进程被杀（那种情形直接构造
+    # InvocationResult，不走本 helper）。
+    kw.setdefault("cost_known", True)
     kw.setdefault("init_seen", True)
     kw.setdefault("init_tools", _CLEAN_INIT_TOOLS)
     kw.setdefault("init_mcp_servers", [])
@@ -378,6 +383,51 @@ class TestRound(unittest.TestCase):
         self.assertEqual(second["result"], "duplicate")
         self.assertEqual(deps.queue.known_canonical_keys(), [expected],
                          "被判重复的候选没有进去重集——下一轮还会重来，永久卡死")
+
+    def test_failed_invocation_settles_at_known_cost_not_full_reserve(self):
+        """成本已知时不得按预留满额计费（评审 rmf-05）。
+
+        `abandon()` 的语义是「结果未知按最坏值计费」，在成本**真的**未知时正确。
+        但 `invocation-failed` 分支里成本往往是已知的——终态 result 事件的
+        cost/turns 解析独立于 subtype，代码自己前两行刚把它存进 progress。
+
+        为什么这条重要：预算观察期的判据是「复核 budget_days 实际花费，据此定
+        真实日上限」。真机今日 $41.07 里只有 $5.57 来自实测，其余约 86% 是
+        reserved_usd 的原样回填。**偏置方向恰好是「看起来花得比实际多」**——
+        它会让人把上限定得过高，正好是这次观察想避免的错误方向。
+        """
+        deps = self._deps(None)
+
+        def failing_invoke(**kw):
+            # ok=False 但成本已知：终态事件解析到了 cost 与 turns
+            return _clean_invocation(False, None, 0.37, 4)
+
+        deps.invoke = failing_invoke
+        out = run_round(self.cfg, deps)
+        self.assertEqual(out["result"], "invocation-failed")
+
+        row = self.conn.execute(
+            "SELECT reserved_usd, settled_usd FROM rounds WHERE round_id=?",
+            (out["round_id"],)).fetchone()
+        self.assertAlmostEqual(row["settled_usd"], 0.37, places=6,
+                               msg="按预留满额计费，账本被虚构花费污染")
+        self.assertNotAlmostEqual(row["settled_usd"], row["reserved_usd"],
+                                  places=6)
+
+    def test_failed_invocation_with_unknown_cost_still_charges_worst_case(self):
+        """成本**真的**未知时（超时、进程被杀）仍按最坏值——这是保守的正确行为。"""
+        deps = self._deps(None)
+
+        def timing_out(**kw):
+            return InvocationResult(False, None, 0.0, 0, exit_code=124,
+                                    raw_tail="timeout", init_seen=False)
+
+        deps.invoke = timing_out
+        out = run_round(self.cfg, deps)
+        row = self.conn.execute(
+            "SELECT reserved_usd, settled_usd FROM rounds WHERE round_id=?",
+            (out["round_id"],)).fetchone()
+        self.assertAlmostEqual(row["settled_usd"], row["reserved_usd"], places=6)
 
     def test_remaining_time_budget_is_passed_to_invoke_as_timeout(self):
         """单调截止：剩余时间被真实传给 invoke，且必须小于整轮截止。

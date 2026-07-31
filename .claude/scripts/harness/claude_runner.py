@@ -129,6 +129,11 @@ class InvocationResult:
     denials: int = 0
     exit_code: int = 0
     raw_tail: str = ""
+    # 终态 result 事件里解析到了合法的 total_cost_usd —— 这是「成本已知」的
+    # **显式** oracle。不能拿 `turns > 0` 或 `cost > 0` 反推：前者是另一个字段，
+    # 后者分不清「真的花了 0」与「没解析到」。失败轮该按实测成本还是按预留满额
+    # 计费，取决于这一位（评审 rmf-05）。
+    cost_known: bool = False
     init_seen: bool = False          # 未见 init 事件时不得宣称「无 Bash、无 MCP」
     init_tools: list[str] = field(default_factory=list)
     init_mcp_servers: list = field(default_factory=list)
@@ -243,8 +248,9 @@ def _coerce_nonneg_int(value, field_name: str,
 
 
 def _parse_terminal_result(event: dict,
-                           protocol_errors: list[str]) -> tuple[float, int, bool, dict | None]:
-    """解析单个 terminal result 事件，返回 (cost, turns, ok, payload)。
+                           protocol_errors: list[str]
+                           ) -> tuple[float, int, bool, dict | None, bool]:
+    """解析单个 terminal result 事件，返回 (cost, turns, ok, payload, cost_known)。
 
     cost/turns 校验独立于 subtype：即便是 error_max_turns 之类的失败事件，
     预算账本仍要记它花了多少钱、跑了多少轮，所以字段本身必须合法，只是
@@ -256,14 +262,14 @@ def _parse_terminal_result(event: dict,
     turns = _coerce_nonneg_int(event.get("num_turns"), "num_turns",
                               protocol_errors)
     if cost is None or turns is None:
-        return 0.0, 0, False, None
+        return 0.0, 0, False, None, False
     if event.get("subtype") != "success":
-        return cost, turns, False, None
+        return cost, turns, False, None, True
     payload = _extract_payload(event.get("result", ""))
     if payload is None:
         protocol_errors.append("unparseable or malformed payload in success result")
-        return cost, turns, False, None
-    return cost, turns, True, payload
+        return cost, turns, False, None, True
+    return cost, turns, True, payload, True
 
 
 def parse_stream_json(lines) -> InvocationResult:
@@ -271,6 +277,7 @@ def parse_stream_json(lines) -> InvocationResult:
     payload: dict | None = None
     result_ok = False
     init_seen = False
+    cost_known = False
     init_count = 0
     result_count = 0
     init_tools: list[str] = []
@@ -308,8 +315,8 @@ def parse_stream_json(lines) -> InvocationResult:
         elif event.get("type") == "result":
             result_count += 1
             if result_count == 1:
-                cost, turns, result_ok, payload = _parse_terminal_result(
-                    event, protocol_errors)
+                cost, turns, result_ok, payload, cost_known = (
+                    _parse_terminal_result(event, protocol_errors))
             # 第二个及以后的 terminal result：无论 success 还是 error，都不
             # 得让它把 ok/payload 重新粘回去或维持旧值——见下方 init_count/
             # result_count 汇总校验。
@@ -326,6 +333,7 @@ def parse_stream_json(lines) -> InvocationResult:
     ok = result_ok and init_seen and not protocol_errors
 
     return InvocationResult(ok=ok, payload=payload, cost_usd=cost, turns=turns,
+                            cost_known=cost_known,
                             raw_tail="\n".join(tail[-5:]), init_seen=init_seen,
                             init_tools=init_tools, init_mcp_servers=init_mcp,
                             init_plugins=init_plugins, init_errors=init_errors,

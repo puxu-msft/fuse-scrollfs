@@ -200,6 +200,15 @@ def _capability_drift_problems(invocation: InvocationResult) -> list[str]:
     return problems
 
 
+def _settle_failed(budget: Budget, round_id: str, day: str,
+                   invocation: InvocationResult) -> None:
+    """失败轮的结算：成本已知按实测，未知才按预留满额（评审 rmf-05）。"""
+    if invocation.cost_known:
+        budget.settle(round_id, day, invocation.cost_usd)
+    else:
+        budget.abandon(round_id, day)
+
+
 def run_round(cfg, deps: Deps) -> dict:
     round_id = uuid.uuid4().hex[:12]
     started = time.monotonic()
@@ -363,7 +372,13 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     progress["cost"] = invocation.cost_usd
 
     if not invocation.ok or invocation.payload is None:
-        budget.abandon(round_id, day)
+        # 成本已知就按实测结算——`abandon()` 的「按预留满额计费」语义只适用于
+        # 成本**真的**未知（超时、进程被杀、终态事件没解析到）。失败轮的成本
+        # 往往是已知的：cost/turns 的解析独立于 subtype。
+        # 为什么不能将就：预算观察期的判据是「复核 budget_days 实际花费」，而
+        # 满额回填的偏置方向恰好是「看起来花得比实际多」，会让日上限定得过高
+        # ——正是这次观察想避免的方向（评审 rmf-05）。
+        _settle_failed(budget, round_id, day, invocation)
         budget.record_outcome(round_id, mode="scan", result="invocation-failed",
                               turns=invocation.turns, denials=invocation.denials,
                               exit_code=invocation.exit_code)
@@ -375,7 +390,7 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     # Stage 1 集合。漂移即判失败并按最坏值记账，不得继续使用其 candidates。
     drift_problems = _capability_drift_problems(invocation)
     if drift_problems:
-        budget.abandon(round_id, day)
+        _settle_failed(budget, round_id, day, invocation)
         budget.record_outcome(round_id, mode="scan", result="capability-drift",
                               turns=invocation.turns, denials=invocation.denials,
                               exit_code=invocation.exit_code)
