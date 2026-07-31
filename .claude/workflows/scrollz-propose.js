@@ -100,20 +100,55 @@ const JUDGE_SCHEMAS = {
 // 传输层故障隔离：`API Error: Server error mid-response` 是上游传输故障，不是
 // agent 失败。真机实测（2026-07-31）：roadmap finder 撞上一次该错误，异常穿透
 // parallel() 导致整个 workflow `aborted`，已跑完的三个 finder 与全部 judge 工作
-// 一起作废、$6.12 预算白烧。因此每个 agent 调用都必须就地重试一次再降级，
+// 一起作废、$6.12 预算白烧。因此每个 agent 调用都必须就地重试再降级，
 // **绝不让单个 agent 的传输故障终止整轮编排**。
+//
+// 重试次数取 3 而非 1：传输层故障会**连续多次**出现，一次重试挡不住一段抖动。
+const MAX_AGENT_ATTEMPTS = 3;
+
+// 样板错误去重：连续的同类传输故障之间没有信息含量——第 3 条
+// "API Error: Server error mid-response" 不比第 1 条多告诉任何事，逐条堆进
+// degraded 只会把真正有区别的失败淹掉。因此按「同 agent + 同规范化错误」折叠
+// 成一条并计数，只有**不同**的错误才新增记录。
+function normalizeError(err) {
+  return String((err && err.message) || err)
+    // 不能用 \b 卡边界：请求 ID 常以 `req_9f3a…` 形式出现，下划线是词字符，
+    // `\b` 在 `_9` 处不成立，ID 会原样留下、去重随即失效（node 实测证伪过）。
+    .replace(/\d{10,}/g, '<ts>')                // 时间戳（先于 ID，避免被吃掉）
+    .replace(/[0-9a-f]{8,}/gi, '<id>')           // 请求 ID / trace ID
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+}
+
+function recordDegraded(degraded, opts, error, attempts) {
+  const hit = degraded.find(
+    (d) => d.agentType === opts.agentType && d.label === opts.label && d.error === error
+  );
+  if (hit) {
+    hit.occurrences += 1;
+    hit.attempts += attempts;
+    return;
+  }
+  degraded.push({
+    label: opts.label,
+    agentType: opts.agentType,
+    error,
+    occurrences: 1,
+    attempts,
+  });
+}
+
 async function safeAgent(prompt, opts, degraded) {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let lastError = 'unknown';
+  for (let attempt = 1; attempt <= MAX_AGENT_ATTEMPTS; attempt++) {
     try {
       return await agent(prompt, opts);
     } catch (err) {
-      if (attempt === 1) {
-        degraded.push({ label: opts.label, agentType: opts.agentType,
-                        error: String((err && err.message) || err).slice(0, 300) });
-        return null;
-      }
+      lastError = normalizeError(err);
     }
   }
+  recordDegraded(degraded, opts, lastError, MAX_AGENT_ATTEMPTS);
   return null;
 }
 
