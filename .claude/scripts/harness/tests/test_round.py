@@ -429,6 +429,49 @@ class TestRound(unittest.TestCase):
             (out["round_id"],)).fetchone()
         self.assertAlmostEqual(row["settled_usd"], row["reserved_usd"], places=6)
 
+    def test_degraded_round_with_no_candidate_is_not_a_clean_noop(self):
+        """全降级轮不得与「仓库确实没东西可提」混为一谈（评审 rmf-03）。
+
+        修复传输故障隔离**之前**，一个 agent 挂掉会让整轮 aborted →
+        invocation-failed → exit 1，systemd 看得见。修复**之后**同样的故障变成
+        `candidates: []` → `no-candidate` → exit 0，systemd 记成功。
+        隔离是对的，但它把「响亮的失败」换成了「安静的成功」——2 小时节拍下
+        这可以持续一整天而无人察觉。
+        """
+        payload = {"candidates": [],
+                   "degraded": [{"agentType": "harness-judge-redline",
+                                 "label": "harness-judge-redline",
+                                 "error": "API Error: Server error mid-response",
+                                 "occurrences": 3, "attempts": 9}]}
+        deps = self._deps(_clean_invocation(True, payload, 0.42, 3))
+        out = run_round(self.cfg, deps)
+
+        self.assertEqual(out["result"], "no-candidate-degraded")
+        self.assertIn("harness-judge-redline", out["detail"])
+        row = self.conn.execute(
+            "SELECT result FROM rounds WHERE round_id=?",
+            (out["round_id"],)).fetchone()
+        self.assertEqual(row["result"], "no-candidate-degraded",
+                         "降级证据没进账本——事后无法与真正的空轮区分")
+
+    def test_clean_no_candidate_round_stays_a_clean_noop(self):
+        """没有降级时，空轮仍是干净的空轮——不得把静默换成噪声。"""
+        deps = self._deps(_clean_invocation(True, {"candidates": [],
+                                                   "degraded": []}, 0.05, 3))
+        out = run_round(self.cfg, deps)
+        self.assertEqual(out["result"], "no-candidate")
+
+    def test_published_round_still_surfaces_partial_degradation(self):
+        """部分降级但发布成功：仍算成功，但降级证据必须带出来。"""
+        payload = {"candidates": list(CANDIDATE_PAYLOAD["candidates"]),
+                   "degraded": [{"agentType": "harness-finder-bench",
+                                 "label": "perf", "error": "boom",
+                                 "occurrences": 1, "attempts": 3}]}
+        deps = self._deps(_clean_invocation(True, payload, 0.5, 4))
+        out = run_round(self.cfg, deps)
+        self.assertEqual(out["result"], "published")
+        self.assertIn("harness-finder-bench", out.get("degraded_detail", ""))
+
     def test_remaining_time_budget_is_passed_to_invoke_as_timeout(self):
         """单调截止：剩余时间被真实传给 invoke，且必须小于整轮截止。
 

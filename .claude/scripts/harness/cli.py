@@ -144,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
                 queue=Queue(conn), invoke=invoke)
     result = run_round(cfg, deps)
     print(json.dumps(result, ensure_ascii=False))
+    # `no-candidate-degraded` **刻意**不在这里：它表示本轮有 agent 反复失败后
+    # 被跳过，与「仓库确实没东西可提」是两件事，必须让 systemd 看见（评审 rmf-03）。
     if result["result"] in ("no-candidate", "duplicate"):
         return 0
     # 新发布（`published`）与恢复（`resumed`）共用同一个成功谓词（评审

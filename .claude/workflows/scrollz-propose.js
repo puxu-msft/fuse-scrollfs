@@ -216,7 +216,9 @@ for (const c of found.flat()) {
 }
 
 if (deduped.length === 0) {
-  return { candidates: [], reason: 'no-candidate-after-dedupe' };
+  // 三个 return 点形状必须一致：早退时丢掉 degraded，会让「4 个 finder 全挂」
+  // 这条最可能发生的路径反而**什么证据都不留**（评审 rmf-03 实测 12 次尝试全丢）。
+  return { candidates: [], rejected: [], degraded, reason: 'no-candidate-after-dedupe' };
 }
 
 const ranked = deduped.sort((a, b) => {

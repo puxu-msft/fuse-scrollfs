@@ -200,6 +200,24 @@ def _capability_drift_problems(invocation: InvocationResult) -> list[str]:
     return problems
 
 
+def _describe_degraded(degraded: list) -> str:
+    """把降级记录压成一行可读摘要，供 round.log 与账本 detail 使用。
+
+    只取 agentType/occurrences/attempts 三项：错误原文已在 workflow 侧按同类
+    折叠过（连续的同类传输故障之间没有信息含量），这里再全文带出只会淹掉
+    真正有区别的失败。
+    """
+    parts = []
+    for d in degraded:
+        if not isinstance(d, dict):
+            continue
+        parts.append(
+            f"{d.get('agentType') or d.get('label') or '?'}"
+            f"×{d.get('occurrences', 1)}"
+            f"（{d.get('attempts', '?')} 次尝试）")
+    return "降级 agent：" + "、".join(parts) if parts else ""
+
+
 def _settle_failed(budget: Budget, round_id: str, day: str,
                    invocation: InvocationResult) -> None:
     """失败轮的结算：成本已知按实测，未知才按预留满额（评审 rmf-05）。"""
@@ -412,13 +430,25 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
         return {"round_id": round_id, "mode": "scan", "result": "invalid-candidate",
                 "detail": shape_error}
 
+    # 降级证据（某个 finder/judge 反复失败后被跳过）。它必须被读出来并进账本
+    # ——否则一轮花了真金白银、只是裁决通道挂了，对外表现却与「仓库确实没东西
+    # 可提」完全不可区分（评审 rmf-03）。
+    degraded = invocation.payload.get("degraded") or []
+    degraded_detail = _describe_degraded(degraded)
+
     eligible = [c for c in candidates if c.get("lane") not in blocked_lanes]
     if not eligible:
+        # 有降级 = 不是干净的空轮。用不同的 result 值让它在账本与退出码上都可见；
+        # 没有降级时保持 `no-candidate`，不把静默换成噪声。
+        result = "no-candidate-degraded" if degraded else "no-candidate"
         budget.settle(round_id, day, invocation.cost_usd)
-        budget.record_outcome(round_id, mode="scan", result="no-candidate",
+        budget.record_outcome(round_id, mode="scan", result=result,
                               turns=invocation.turns, denials=invocation.denials,
                               exit_code=invocation.exit_code)
-        return {"round_id": round_id, "mode": "scan", "result": "no-candidate"}
+        out = {"round_id": round_id, "mode": "scan", "result": result}
+        if degraded:
+            out["detail"] = degraded_detail
+        return out
 
     candidate = dict(eligible[0])
 
@@ -467,5 +497,7 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     budget.record_outcome(round_id, mode="scan", result="published",
                           turns=invocation.turns, denials=invocation.denials,
                           exit_code=invocation.exit_code)
-    return {"round_id": round_id, "mode": "scan", "result": "published",
+    out_extra = {"degraded_detail": degraded_detail} if degraded else {}
+    return {**out_extra,
+            "round_id": round_id, "mode": "scan", "result": "published",
             "issue": published["issue"], "state": published["state"]}
