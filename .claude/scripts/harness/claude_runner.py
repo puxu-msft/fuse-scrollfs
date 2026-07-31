@@ -28,6 +28,9 @@ from .config import CLAUDE
 # Stage 1 允许的工具集：只读探测 + Skill/Workflow 调用，不含任何写能力。
 # build_argv() 强制 tools 解析后恰好等于这个集合——多一个、少一个、换成
 # "default" 都会被拒绝，而不是原样传给 claude 子进程。
+# 后台 workflow 等待上限（毫秒）：需大于单次 invocation 的 timeout_s
+BG_WAIT_CEILING_MS = 1_200_000
+
 STAGE1_ALLOWED_TOOLS = frozenset({"Read", "Grep", "Glob", "Skill", "Workflow"})
 
 
@@ -297,6 +300,13 @@ def _sanitize_env(env: dict) -> dict:
         if key == "GIT_CONFIG_COUNT" or key.startswith(_GIT_CONFIG_INDEXED_PREFIXES):
             safe_env.pop(key, None)
     safe_env["GIT_TERMINAL_PROMPT"] = "0"
+    # 真机实测（2026-07-31 首轮）：workflow 起 4 个并行 finder 时，Workflow
+    # 工具走"后台启动"路径并立刻返回 run ID；外层模型宣布"等完成再输出"后
+    # **结束了本轮**，会话一退后台任务即被 kill，round 报 invocation-failed。
+    # 契约探针当时没暴露这点，因为它只起一个 agent、很快就同步返回。
+    # 显式抬高 print 模式的后台等待上限，使 claude -p 真正等到 workflow 收敛。
+    # 该值必须大于单次 invocation 的 timeout_s，否则先被这里截断。
+    safe_env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = str(BG_WAIT_CEILING_MS)
     # 禁止 git 读取系统级 gitconfig（credential.helper 等可能藏在这里）。
     safe_env["GIT_CONFIG_NOSYSTEM"] = "1"
     return safe_env

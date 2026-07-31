@@ -329,9 +329,12 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
               f'{{"blocked_lanes": {blocked_lanes!r}, "known_canonical_keys": [],'
               f' "inflight_paths": []}}').replace("'", '"')
 
-    invocation = deps.invoke(prompt=prompt, tools=STAGE1_TOOLS, grant_usd=grant,
-                             max_turns=cfg.max_turns, settings_path=SETTINGS_PATH,
-                             cwd=str(cfg.repo_root), timeout_s=timeout_s)
+    # 外层会话的唯一职责是调 Workflow 再原样回显 JSON，不需要 opus。
+    # 真机实测：首轮外层用 opus-5 花了 $0.6466，占该轮总成本 $0.87 的 74%。
+    invocation = deps.invoke(
+        model="sonnet", prompt=prompt, tools=STAGE1_TOOLS, grant_usd=grant,
+        max_turns=cfg.max_turns, settings_path=SETTINGS_PATH,
+        cwd=str(cfg.repo_root), timeout_s=timeout_s)
     # 从这里开始，若后续任何步骤（发布、账本写入之外的路径）抛出未预期
     # 异常，finalize 边界至少能按本次调用的真实 turns/denials/exit_code
     # 与已知成本结算，而不是完全空白（评审 Critical C）。

@@ -10,7 +10,11 @@ description: scrollz 自主改进 harness 的一轮入口。由控制器以 head
 ## 你必须做的
 
 1. 调用 `Workflow` 工具，`workflow` 参数为 `scrollz-propose`，`args` 取自控制器通过提示词传入的 JSON（含 `known_canonical_keys`、`blocked_lanes`、`inflight_paths`）。`known_canonical_keys` 是 Workflow 内 `canonicalKey()` 规范化后的候选原文 key 集合（四字段拼接、转小写、折叠空白），**不是** sha256 摘要，去重时按原文比对，而非按指纹比对。
-2. 等待 workflow 完成。
+2. **等待 workflow 真正完成，拿到它的返回值再继续。**
+
+   `Workflow` 工具在编排规模较大时会走「后台启动」路径、**立刻返回一个 run ID 而不是结果**。这时**绝不能结束本轮**——真机实测过一次：外层宣布「等完成后我会输出」然后结束了回合，会话一退后台任务立即被 kill，整轮报 `invocation-failed` 且白烧预算。
+
+   正确做法：收到 run ID 后继续等待该 workflow 的完成通知；通知到达后读取其返回值。**在拿到实际返回值之前，不要产出最终消息。**
 3. 把 workflow 的返回值**原样**作为最后一条消息输出，格式为单个 JSON 代码块，不加任何解释。
 
 ## labels 分工
