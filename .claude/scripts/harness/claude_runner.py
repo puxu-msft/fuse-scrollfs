@@ -31,6 +31,19 @@ from .config import CLAUDE
 # 后台 workflow 等待上限（毫秒）：需大于单次 invocation 的 timeout_s
 BG_WAIT_CEILING_MS = 1_200_000
 
+# 无人值守 agent 的模型必须钉死为**规范 ID**，不能用 `sonnet` 这类别名：别名
+# 的解析会被父进程的 ANTHROPIC_MODEL 改写。真机实测（2026-07-31）：交互会话里
+# `ANTHROPIC_MODEL=opus[1m]` 使 `--model sonnet` 解析成 `sonnet[1m]`——同一句
+# "Reply with exactly: OK" 花 $0.1918，而 `--model claude-sonnet-5` 只花
+# $0.1439。模型档位由环境决定，成本与行为就都不可预测。
+DEFAULT_AGENT_MODEL = "claude-sonnet-5"
+
+# 本模块**自己**要设进子进程环境的 CLAUDE_*/ANTHROPIC_* 变量。除这些之外，
+# 父进程的同前缀变量一律清除（见 _sanitize_env）。
+_HARNESS_OWNED_CLAUDE_ENV = frozenset({
+    "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
+})
+
 STAGE1_ALLOWED_TOOLS = frozenset({"Read", "Grep", "Glob", "Skill", "Workflow"})
 
 
@@ -298,6 +311,16 @@ def _sanitize_env(env: dict) -> dict:
         safe_env.pop(key, None)
     for key in list(safe_env):
         if key == "GIT_CONFIG_COUNT" or key.startswith(_GIT_CONFIG_INDEXED_PREFIXES):
+            safe_env.pop(key, None)
+    # 父会话的 CLAUDE_*/ANTHROPIC_* 控制变量一律清除，再由本模块显式设回需要
+    # 的那几个。这里必须是**前缀级 deny-by-default**，不能列黑名单：真机实测
+    # （2026-07-31）里泄漏进来的是 `ANTHROPIC_MODEL=opus[1m]`（把模型换成溢价
+    # 档位）与 `CLAUDE_CODE_ENABLE_TASKS=0`（禁掉后台任务基础设施，多 agent
+    # workflow 一起就被 kill），两者都不在任何预想的黑名单上。无人值守 agent
+    # 拿到什么模型、有什么运行时能力，不能取决于「谁启动了它」。
+    for key in list(safe_env):
+        if (key.startswith(("ANTHROPIC_", "CLAUDE_"))
+                and key not in _HARNESS_OWNED_CLAUDE_ENV):
             safe_env.pop(key, None)
     safe_env["GIT_TERMINAL_PROMPT"] = "0"
     # 真机实测（2026-07-31 首轮）：workflow 起 4 个并行 finder 时，Workflow

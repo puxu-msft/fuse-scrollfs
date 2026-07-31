@@ -4,6 +4,7 @@ import subprocess
 import unittest
 
 from harness.claude_runner import (
+    DEFAULT_AGENT_MODEL, _HARNESS_OWNED_CLAUDE_ENV,
     STAGE1_ALLOWED_TOOLS,
     UnsafeInvocationError,
     build_argv,
@@ -439,6 +440,53 @@ class TestInvoke(unittest.TestCase):
                     runner=runner)
         self.assertFalse(res.ok)
         self.assertEqual(res.exit_code, 124)
+
+    def test_parent_claude_control_vars_cannot_reach_the_child(self):
+        """父进程的 CLAUDE_CODE_*/ANTHROPIC_* 控制变量必须被清除。
+
+        真机实测（2026-07-31）：交互会话把 `ANTHROPIC_MODEL=opus[1m]` 与
+        `CLAUDE_CODE_ENABLE_TASKS=0` 透传给了 headless 子进程，导致
+        (a) `--model sonnet` 被解析成溢价的 `sonnet[1m]`；
+        (b) 后台任务基础设施被禁用，多 agent workflow 一起即被 kill。
+        无人值守 agent 的模型与运行时能力不得由「谁启动了它」决定。
+        """
+        runner = FakeRunner(result=subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stdout=self._valid_stdout(),
+            stderr=""))
+        hostile = {
+            "HOME": "/home/x", "PATH": "/usr/bin:/bin",
+            "ANTHROPIC_MODEL": "opus[1m]",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku",
+            "ANTHROPIC_SMALL_FAST_MODEL": "whatever",
+            "CLAUDE_CODE_ENABLE_TASKS": "0",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "935793",
+            "CLAUDE_CODE_CHILD_SESSION": "1",
+            "CLAUDE_CODE_SESSION_ID": "babd6c5f-dead-beef",
+            "CLAUDE_EFFORT": "high",
+            "CLAUDE_PID": "6538",
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90",
+        }
+        invoke(prompt="/x", tools=VALID_TOOLS, grant_usd=0.5, max_turns=5,
+              settings_path="s.json", cwd="/tmp", timeout_s=5.0,
+              env=hostile, runner=runner)
+        passed = runner.calls[0]["env"]
+        leaked = [k for k in passed
+                  if (k.startswith(("ANTHROPIC_", "CLAUDE_"))
+                      and k not in _HARNESS_OWNED_CLAUDE_ENV)]
+        self.assertEqual(leaked, [],
+                         f"父会话控制变量泄漏到 headless 子进程: {leaked}")
+        self.assertEqual(passed["HOME"], "/home/x")
+        self.assertEqual(passed["PATH"], "/usr/bin:/bin")
+
+    def test_model_is_pinned_to_a_canonical_id_not_an_alias(self):
+        """别名会被 ANTHROPIC_MODEL 影响，必须传规范 ID。"""
+        argv = build_argv("/x", VALID_TOOLS, 0.5, 5, "s.json",
+                          model=DEFAULT_AGENT_MODEL)
+        self.assertIn("--model", argv)
+        picked = argv[argv.index("--model") + 1]
+        self.assertNotIn("[", picked, "不得使用带上下文变体后缀的模型名")
+        self.assertTrue(picked.startswith("claude-"),
+                        f"必须是规范模型 ID，实际 {picked!r}")
 
     def test_cwd_is_passed_through_correctly(self):
         runner = FakeRunner(result=subprocess.CompletedProcess(

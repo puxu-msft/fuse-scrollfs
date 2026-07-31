@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .budget import Budget, BudgetError
-from .claude_runner import InvocationResult
+from .claude_runner import InvocationResult, DEFAULT_AGENT_MODEL
 from .precheck import PrecheckFailed, assert_all_ok, run_prechecks
 from .publish import Publisher
 from .queue import Queue, fingerprint
@@ -332,7 +332,7 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     # 外层会话的唯一职责是调 Workflow 再原样回显 JSON，不需要 opus。
     # 真机实测：首轮外层用 opus-5 花了 $0.6466，占该轮总成本 $0.87 的 74%。
     invocation = deps.invoke(
-        model="sonnet", prompt=prompt, tools=STAGE1_TOOLS, grant_usd=grant,
+        model=DEFAULT_AGENT_MODEL, prompt=prompt, tools=STAGE1_TOOLS, grant_usd=grant,
         max_turns=cfg.max_turns, settings_path=SETTINGS_PATH,
         cwd=str(cfg.repo_root), timeout_s=timeout_s)
     # 从这里开始，若后续任何步骤（发布、账本写入之外的路径）抛出未预期
