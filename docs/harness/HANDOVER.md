@@ -4,24 +4,43 @@
 > 权威文档：规格 [spec.md](./spec.md) v7 · 1a 计划 [plan-stage1a.md](./plan-stage1a.md) · 1b 冻结范围 [plan-stage1b.md](./plan-stage1b.md)
 > 进度账本：`.superpowers/sdd/progress.md`（git-ignored，崩溃后靠它 + `git log` 恢复认知）
 
-## ⛔ 当前阻断项（2026-07-31 真机首轮暴露）
+## ⛔ 当前阻断项（2026-07-31 真机首轮暴露）：成本，而非正确性
 
-**`claude -p` + 后台 Workflow 的组合跑不通，Stage 1a 无法完成首轮。**
+**三个结构性缺陷已全部修复并提交，propose 回路真机跑通；剩下的唯一阻断项是每轮成本超预算。**
 
-工具文档原文：「Workflows run in the background — this tool returns immediately with a task ID, and a `<task-notification>` arrives when the workflow completes.」
+### 已修复的三个缺陷（都只有真机能暴露）
 
-实测两轮（各约 $0.9，共 $3.0，账本已如实结算、零残留）：
-- `scrollz-propose` 要起 4 finder + 3 judge，Workflow 立即返回 run ID
-- 外层模型宣布「等完成后输出」后**结束本轮**（`stop_reason: end_turn`，`num_turns: 2`）
-- 会话随之退出，后台任务被 `killed`，round 报 `invocation-failed`
+| # | 缺陷 | 根因 | 提交 |
+|---|---|---|---|
+| 1 | 多 agent workflow 一起就被 kill | 交互会话把 `CLAUDE_CODE_ENABLE_TASKS=0` 透传给子进程，后台任务基础设施被禁用 | afddd32 |
+| 2 | 模型档位与成本不可控 | `ANTHROPIC_MODEL=opus[1m]` 透传，使 `--model sonnet` 解析成溢价的 `sonnet[1m]`（同一句话 $0.1918 vs $0.1439） | afddd32 |
+| 3 | 模型宣布"等待完成"后结束回合，任务被 stopped | `-p` 模式下模型**没有跨回合等待这个动作**，提示词层面修不了 | 后一提交 |
 
-契约探针当初能过，是因为它只起 **1 个 agent**、几十秒完成，通知在模型收 turn 前就到了——**这个差异掩盖了结构性问题**。
+1、2 的修法是 **`CLAUDE_*`/`ANTHROPIC_*` 前缀级 deny-by-default + 显式认证白名单**，不是黑名单——泄漏的两个变量都不在任何预想的黑名单上。无人值守 agent 拿到什么模型、有什么运行时能力，不得取决于谁启动它。
 
-已尝试且无效：设 `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=1_200_000`、强化 skill 措辞明禁「拿到 run ID 就收 turn」。均已提交（aed62e3），但都不解决根因：这是「模型需跨回合等待」与「`claude -p` 单轮结束即退出」之间的结构性冲突，提示词层面修不了。
+3 的修法是让等待变成**同一回合内的一次工具调用**：`TaskOutput(task_id=…, block=true)`。实测生效——模型阻塞了 133 秒（`duration_api_ms: 132964`、`stop_reason: tool_use`），不再 `end_turn`。
 
-**建议方案（未实施，需评审）**：把扇出从**模型驱动**改为**控制器驱动**——控制器逐个 `claude -p` 调用 finder/judge（每次 `--tools` 收敛、带 schema、同步返回结构化 JSON），在 Python 侧做去重与裁决编排，不再使用 Workflow 工具。这更符合 spec §四「控制器是可信控制面」的原则：编排逻辑本就该在确定性代码里，而不是交给模型的回合生命周期。代价是调用次数增加（7 次而非 1 次），收益是不依赖任何后台任务语义。
+**一个连带缺陷**：`round.STAGE1_TOOLS` 是第二份硬编码工具集，加 `TaskOutput` 时立刻与 allowlist 漂移，被 `build_argv` 入口强制拦下。拦住是对的，但已改为从 `STAGE1_ALLOWED_TOOLS` 派生，让漂移**无法发生**。
 
-替代方案：缩小 workflow 规模到能在单回合内完成（脆弱，阈值未知，不推荐）。
+### 剩下的阻断项：每轮成本 >$3，approved 节拍不成立
+
+最后一轮真机（轮预算 $3.00）：跑满 **828 秒 API 时间**、花 **$3.19** 仍被预算截断，未产出候选。
+
+成本结构（`modelUsage`，claude-sonnet-5、contextWindow 200000）：
+
+| 项 | 量 | 说明 |
+|---|---|---|
+| cacheCreation | 310,864 | 7 个 agent 各自付一份 ~44k 系统上下文——**这是固定底价** |
+| cacheRead | 3,509,551 | 深度仓库扫描 |
+| output | 62,412 | agent 写了很长的分析 |
+
+外推：2 小时节拍 = 12 轮/日 → **>$38/日**（上限 $20）；目标的 30 分钟节拍 = 48 轮/日 → **>$150/日**。
+
+**每轮起 7 个 agent（4 finder + 3 judge）在当前预算下不可行**，这是待裁决项，不是可以自行削减的东西。
+
+### 真机零副作用（每次失败后都核过）
+
+Issue 0 条、`origin/main` 仍 `9b498e9`、outbox 0 条 operation、账本逐轮正确结算并释放预留（含一次 `unhandled-exception` 也被 finalize 边界兜住）。**fail-closed 在六次真实失败中全部成立。**
 
 ## 一句话现状
 
