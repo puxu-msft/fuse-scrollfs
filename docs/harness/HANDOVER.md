@@ -4,47 +4,46 @@
 > 权威文档：规格 [spec.md](./spec.md) v7 · 1a 计划 [plan-stage1a.md](./plan-stage1a.md) · 1b 冻结范围 [plan-stage1b.md](./plan-stage1b.md)
 > 进度账本：`.superpowers/sdd/progress.md`（git-ignored，崩溃后靠它 + `git log` 恢复认知）
 
-## ⛔ 当前阻断项（2026-07-31 真机首轮暴露）：成本，而非正确性
+## ✅ Stage 1a 发布回路已真机跑通（2026-07-31）
 
-**三个结构性缺陷已全部修复并提交，propose 回路真机跑通；剩下的唯一阻断项是每轮成本超预算。**
+**Issue #1 已创建、提案卡 `d2ca47e` 已进远端 main、outbox 四个 operation 全部 `settled`。**
 
-### 已修复的三个缺陷（都只有真机能暴露）
+- Issue：<https://github.com/puxu-msft/fuse-scrollfs/issues/1>，label 全部由控制器确定性派生（`harness` / `harness:proposed` / `lane:perf` / `size:S` / `T0`），agent 未构造任何 `harness:*`
+- 提案卡：`docs/proposals/1-t0-ratio-1mib-vs-a-reversal.md`
+- 生命周期：`publish_proposal` → `commit_proposal` → `push_main` → `publication_receipt`，四个 operation 全 `settled`，末态 `publication-receipt-complete`
+- 成本：该轮 $5.45
 
-| # | 缺陷 | 根因 | 提交 |
+### 跑通前修掉的五个缺陷（都只有真机能暴露）
+
+| # | 缺陷 | 根因 | 修法 |
 |---|---|---|---|
-| 1 | 多 agent workflow 一起就被 kill | 交互会话把 `CLAUDE_CODE_ENABLE_TASKS=0` 透传给子进程，后台任务基础设施被禁用 | afddd32 |
-| 2 | 模型档位与成本不可控 | `ANTHROPIC_MODEL=opus[1m]` 透传，使 `--model sonnet` 解析成溢价的 `sonnet[1m]`（同一句话 $0.1918 vs $0.1439） | afddd32 |
-| 3 | 模型宣布"等待完成"后结束回合，任务被 stopped | `-p` 模式下模型**没有跨回合等待这个动作**，提示词层面修不了 | 后一提交 |
+| 1 | 多 agent workflow 一起就被 kill | 交互会话把 `CLAUDE_CODE_ENABLE_TASKS=0` 透传给子进程 | `CLAUDE_*`/`ANTHROPIC_*` 前缀级 deny-by-default + 显式认证白名单 |
+| 2 | 模型档位与成本不可控 | `ANTHROPIC_MODEL=opus[1m]` 透传，`--model sonnet` 解析成溢价的 `sonnet[1m]` | 同上；并把模型钉成规范 ID `claude-sonnet-5` |
+| 3 | 模型宣布"等待完成"后结束回合，任务被 stopped | **`-p` 模式下模型没有跨回合等待这个动作**，提示词层面修不了 | 同回合内 `TaskOutput(block=true)` 阻塞（实测阻塞 133s 生效） |
+| 4 | 工具集两处硬编码，加 `TaskOutput` 时立刻漂移 | `round.STAGE1_TOOLS` 是第二份真相 | 从 `STAGE1_ALLOWED_TOOLS` 派生，让漂移无法发生 |
+| 5 | 一个 finder 的 `API Error` 让整轮 workflow `aborted`，$6.12 白烧 | 异常穿透 `parallel()`；传输层故障被当成 agent 失败 | `safeAgent()` 就地重试一次再降级；**降级的 judge 按否决处理**（红线守卫拿不到裁决必须拦下） |
 
-1、2 的修法是 **`CLAUDE_*`/`ANTHROPIC_*` 前缀级 deny-by-default + 显式认证白名单**，不是黑名单——泄漏的两个变量都不在任何预想的黑名单上。无人值守 agent 拿到什么模型、有什么运行时能力，不得取决于谁启动它。
+附带的成本治理：judge 短路——任一否决即淘汰，故 redline 一旦 `reject`，另外两个 judge 不可能改变结果，跑它们纯属浪费。redline 永远第一个跑且永不跳过。
 
-3 的修法是让等待变成**同一回合内的一次工具调用**：`TaskOutput(task_id=…, block=true)`。实测生效——模型阻塞了 133 秒（`duration_api_ms: 132964`、`stop_reason: tool_use`），不再 `end_turn`。
+### 方法论：为什么这些全部逃过了 285 个测试 + 四轮合并态评审
 
-**一个连带缺陷**：`round.STAGE1_TOOLS` 是第二份硬编码工具集，加 `TaskOutput` 时立刻与 allowlist 漂移，被 `build_argv` 入口强制拦下。拦住是对的，但已改为从 `STAGE1_ALLOWED_TOOLS` 派生，让漂移**无法发生**。
+**它们无一存在于代码逻辑中。** 1、2 是**进程环境**缺陷，3 是**运行时生命周期**缺陷，5 是**上游传输故障下的编排语义**缺陷。测试构造自己的环境、自己的 fake runner、自己的 happy path，撞不上任何一条。
+可推广的判据：**凡是"由谁启动我""我活多久""上游抖动时编排怎么办"这三类问题，离线测试系统性地看不见**，只能靠真机跑。
 
-### 剩下的阻断项：每轮成本 >$3，approved 节拍不成立
+## 预算：观察期（用户 2026-07-31 裁决）
 
-最后一轮真机（轮预算 $3.00）：跑满 **828 秒 API 时间**、花 **$3.19** 仍被预算截断，未产出候选。
+用户裁决：**不压缩设计**（保持 4 finder + 3 judge 与当前扫描深度），抬高预算；**日上限先不设硬顶，观察一周实际花费后再定**。
 
-成本结构（`modelUsage`，claude-sonnet-5、contextWindow 200000）：
+当前配置（`~/.config/scrollz-harness/env`）：`HARNESS_ROUND_BUDGET_USD=6.00`、`HARNESS_DAILY_BUDGET_USD=500.00`。**每轮上限保留为熔断器**——无人值守下这是唯一能拦住单轮失控的闸门；日上限 500 是观察档，不是目标值。
 
-| 项 | 量 | 说明 |
-|---|---|---|
-| cacheCreation | 310,864 | 7 个 agent 各自付一份 ~44k 系统上下文——**这是固定底价** |
-| cacheRead | 3,509,551 | 深度仓库扫描 |
-| output | 62,412 | agent 写了很长的分析 |
-
-外推：2 小时节拍 = 12 轮/日 → **>$38/日**（上限 $20）；目标的 30 分钟节拍 = 48 轮/日 → **>$150/日**。
-
-**每轮起 7 个 agent（4 finder + 3 judge）在当前预算下不可行**，这是待裁决项，不是可以自行削减的东西。
-
-### 真机零副作用（每次失败后都核过）
-
-Issue 0 条、`origin/main` 仍 `9b498e9`、outbox 0 条 operation、账本逐轮正确结算并释放预留（含一次 `unhandled-exception` 也被 finalize 边界兜住）。**fail-closed 在六次真实失败中全部成立。**
+**观察终点（不写下来的"暂定"会默认变成"永久"）**：
+- 期限：2026-08-07 复核 `budget_days` 实际花费，据此定真实日上限。
+- 现象触发（先到者为准，不必等到期）：**任何单日 > $80 立刻回来重估**；或连续三轮 `budget_exhausted`，说明每轮上限 $6 仍不够，需要先查是否又出现了不收敛的重跑。
+- 已知外推：单轮 $5.45 × 2 小时节拍 12 轮/日 ≈ **$65/日**；30 分钟节拍 48 轮/日 ≈ **$260/日**。提节拍前必须先看观察期数据。
 
 ## 一句话现状
 
-**Task 1–12 已实施完毕，283 测试全绿，合并态四轮评审已判 `ready-for-real-run`。Task 13 前 3 步（doctor / probe / 建 label）已真机通过；第 4 步首轮 round 被上述阻断项卡住。**
+**Task 1–12 已实施完毕，283 测试全绿，合并态四轮评审已判 `ready-for-real-run`。Task 13 前 3 步（doctor / probe / 建 label）已真机通过；第 4 步首轮 round 已跑通。**
 
 Task 13 真机进度：
 | 步骤 | 结果 |
@@ -53,8 +52,9 @@ Task 13 真机进度：
 | 1. doctor 纯只读 | ✅ 全绿退出 0，零状态变化 |
 | 2. probe 花钱零写入 | ✅ 退出 0，工具集恰为五个、无 MCP/插件，$0.202 |
 | 3. 建 18 个 label | ✅ name+color+description 逐项一致，幂等复跑 0 新建 |
-| 4. 首轮真实 round | ⛔ 被阻断项卡住（两轮失败，零残留、账本正确） |
-| 5-7. 恢复验收 / 装单元 / 启定时器 | 未开始 |
+| 4. 首轮真实 round | ✅ Issue #1 + 提案卡 d2ca47e，四 operation 全 settled |
+| 5. 三轮故障注入恢复验收 | 进行中 |
+| 6-7. 装 systemd 单元 / 启定时器 | 未开始 |
 
 ## 已建成的东西
 
