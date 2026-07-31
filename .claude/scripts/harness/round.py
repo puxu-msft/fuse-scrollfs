@@ -425,6 +425,13 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
         candidate["goal"], candidate["invariant"],
         candidate["primary_path"], candidate["oracle"])
     if deps.queue.classify(candidate) != "new":
+        # 被判重复的候选也要进去重集，否则系统学不会：本修复之前就已存在的提案
+        # （真机的 Issue #1，其 canonical key 已无法回填——提案卡只有 body_md
+        # 五节，fingerprint 又不可逆）会每轮被重新提出、每轮在这里被丢弃、每轮
+        # 都不被记住，形成永久卡死：每 2 小时烧掉一整轮的钱且仓库零产出。
+        # 只在这里记不影响正确性：能走到这里说明它确实已在 proposals 里在册。
+        deps.queue.remember_canonical_key(candidate["fingerprint"],
+                                          candidate.get("canonical_key"))
         budget.settle(round_id, day, invocation.cost_usd)
         budget.record_outcome(round_id, mode="scan", result="duplicate",
                               turns=invocation.turns, denials=invocation.denials,

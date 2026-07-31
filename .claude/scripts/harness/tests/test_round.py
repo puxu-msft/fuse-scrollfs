@@ -335,6 +335,42 @@ class TestRound(unittest.TestCase):
         args = _json.loads(blob)   # 非法 JSON 会在这里炸
         self.assertEqual(args["known_canonical_keys"], [nasty])
 
+    def test_duplicate_candidate_still_teaches_the_dedup_memory(self):
+        """被判重复的候选也必须进去重集，否则系统学不会（rmf-02 修复的自身缺口）。
+
+        `remember_canonical_key` 原先只在**发布成功**后调用。于是在本修复之前就
+        已存在的提案（如真机的 Issue #1）永远进不了去重集：它每轮都会被重新提出、
+        每轮都在最后一步被判 duplicate 丢弃、每轮都不会被记住——**永久卡死**，
+        每 2 小时烧掉一整轮的钱且仓库零产出。
+
+        这条是「修复本身要复核有无引入新缺口」的实例：`known_canonical_keys` 接上
+        了，但喂给它的写入点覆盖不全，整体活性并没有恢复。
+        """
+        deps = self._deps(None)
+        dup_fp = None
+
+        cand = dict(CANDIDATE_PAYLOAD["candidates"][0])
+        cand["canonical_key"] = "dup-canonical-key"
+
+        def invoke_dup(**kw):
+            return _clean_invocation(True, {"candidates": [cand]}, 0.01, 1)
+
+        deps.invoke = invoke_dup
+        # 先让它发布一次，拿到 fingerprint
+        first = run_round(self.cfg, deps)
+        self.assertEqual(first["result"], "published")
+        self.assertEqual(deps.queue.known_canonical_keys(), ["dup-canonical-key"])
+
+        # 清掉记忆，模拟「修复前就已存在的提案」：proposals 有行，proposal_keys 没有
+        deps.queue.conn.execute("DELETE FROM proposal_keys")
+        deps.queue.conn.commit()
+        self.assertEqual(deps.queue.known_canonical_keys(), [])
+
+        second = run_round(self.cfg, deps)
+        self.assertEqual(second["result"], "duplicate")
+        self.assertEqual(deps.queue.known_canonical_keys(), ["dup-canonical-key"],
+                         "被判重复的候选没有进去重集——下一轮还会重来，永久卡死")
+
     def test_remaining_time_budget_is_passed_to_invoke_as_timeout(self):
         """单调截止：剩余时间被真实传给 invoke，且必须小于整轮截止。
 
