@@ -304,6 +304,37 @@ class TestRound(unittest.TestCase):
         self.assertIn("known_canonical_keys", args)
         self.assertNotIn("known_fingerprints", args)
 
+    def test_known_canonical_keys_are_actually_carried_into_the_prompt(self):
+        """接线断言（评审 rmf-02）：在册提案的 key 必须真的进 prompt。
+
+        上一条测试只断言了**键名**，`[]` 也能通过——它挡不住「跨轮去重被硬编码
+        关闭」这个缺陷，事实上该缺陷正是在它全绿的情况下上线的。这里断言**值**。
+
+        key 里刻意放撇号、双引号与 \x1f 分隔符：prompt 曾用 `repr()` 再把 `'`
+        换成 `"` 来拼 JSON，这类字符会直接产出非法 JSON，而下游是要当 JSON 解析的。
+        """
+        import json as _json
+
+        nasty = "goal's \"quoted\"\x1finv\x1fpath\x1foracle"
+        self.deps_queue_seed = None
+        deps = self._deps(None)
+        deps.queue.record(fp="fp-known", lane="perf", title="t",
+                          state="proposed", issue_number=7)
+        deps.queue.remember_canonical_key("fp-known", nasty)
+
+        seen = []
+
+        def capturing_invoke(**kw):
+            seen.append(kw.get("prompt"))
+            return _clean_invocation(True, {"candidates": []}, 0.01, 1)
+
+        deps.invoke = capturing_invoke
+        run_round(self.cfg, deps)
+
+        _, _, blob = seen[0].partition("\n")
+        args = _json.loads(blob)   # 非法 JSON 会在这里炸
+        self.assertEqual(args["known_canonical_keys"], [nasty])
+
     def test_remaining_time_budget_is_passed_to_invoke_as_timeout(self):
         """单调截止：剩余时间被真实传给 invoke，且必须小于整轮截止。
 

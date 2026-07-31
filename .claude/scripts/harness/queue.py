@@ -65,6 +65,41 @@ class Queue:
         return self.conn.execute(
             "SELECT * FROM proposals WHERE fingerprint=?", (fp,)).fetchone()
 
+    def remember_canonical_key(self, fp: str, canonical_key: str | None) -> None:
+        """记住某提案的 canonical key，供后续轮次跨轮去重（评审 rmf-02）。
+
+        `canonical_key` 缺失时**跳过而不是报错**：少一条去重记忆是退化，把一次
+        本该成功的发布变成异常则是事故。
+
+        首写为准（`INSERT OR IGNORE`）：同一 fingerprint 的 canonical key 按定义
+        不会变（两者都由同四个字段导出），若真的对不上，那是上游出了问题，此时
+        保留最早的记录比让它被静默覆盖更容易查。
+        """
+        if not canonical_key:
+            return
+        self.conn.execute(
+            "INSERT OR IGNORE INTO proposal_keys(fingerprint, canonical_key,"
+            " created_at) VALUES(?,?,?)",
+            (fp, canonical_key, time.time()))
+        self.conn.commit()
+
+    def known_canonical_keys(self) -> list[str]:
+        """在册提案的 canonical key 集合，用于让 finder 跳过已提过的候选。
+
+        只取 `state='proposed'` 的在册提案：已关闭的提案是否可以重提，属于拒绝
+        记忆的语义（Stage 1b B2），不在这里替它做决定。
+
+        JOIN 而非直接全表取：`proposal_keys` 是纯追加的，提案被删/被换状态后它的
+        行仍在，直接取会把早已不在册的 key 也塞进去重集，从而**永久**屏蔽掉一个
+        本该可以重提的方向。
+        """
+        rows = self.conn.execute(
+            "SELECT k.canonical_key FROM proposal_keys AS k"
+            " JOIN proposals AS p ON p.fingerprint = k.fingerprint"
+            " WHERE p.state = 'proposed'"
+            " ORDER BY k.created_at").fetchall()
+        return [r[0] for r in rows]
+
     def classify(self, candidate: dict) -> str:
         """返回 `"new"` / `"exact_duplicate"` / `"rejected_active"` 之一。
 

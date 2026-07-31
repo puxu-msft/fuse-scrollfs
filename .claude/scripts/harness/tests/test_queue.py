@@ -241,5 +241,61 @@ class TestQueue(unittest.TestCase):
         self.assertEqual(row3["reconsider_when"], "not_before:2031-01-01")
 
 
+
+class TestCanonicalKeyMemory(unittest.TestCase):
+    """跨轮去重的记忆（评审 rmf-02）。
+
+    `known_canonical_keys` 此前被硬编码为 `[]`，而它是 workflow 里 `seen` 集合
+    的唯一外部来源——等于把跨轮去重整个关掉。控制器其实**已经收到**
+    `canonical_key`（Workflow 的 `pickCandidateFields` 会输出），却把它列进
+    "放行但不用"的可选字段后丢弃；而 `proposals` 只存 sha256 摘要，摘要不可逆，
+    不补存就永远反推不出 canonical key。
+
+    最坏形态是：每 2 小时花掉一整轮的钱跑完全部 finder 与 judge，最后在最后一步
+    被判 duplicate 丢弃，退出码 0，systemd 记成功，仓库零产出，而且**没有任何
+    机制让下一轮的结果不一样**。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        db.migrate(self.conn)
+        self.addCleanup(self.conn.close)
+        self.q = Queue(self.conn)
+
+    def _publish(self, fp, key, state="proposed"):
+        self.q.record(fp=fp, lane="perf", title="t", state=state,
+                      issue_number=1)
+        self.q.remember_canonical_key(fp, key)
+
+    def test_remembered_key_comes_back(self):
+        self._publish("fp1", "goal\x1finv\x1fpath\x1foracle")
+        self.assertEqual(self.q.known_canonical_keys(),
+                         ["goal\x1finv\x1fpath\x1foracle"])
+
+    def test_only_live_proposals_contribute(self):
+        """已关闭的提案不进去重集：是否重提由 1b 的拒绝记忆决定，不是这里。"""
+        self._publish("fp1", "live-key", state="proposed")
+        self._publish("fp2", "closed-key", state="closed-by-user")
+        self.assertEqual(self.q.known_canonical_keys(), ["live-key"])
+
+    def test_remember_is_idempotent_and_first_write_wins(self):
+        self._publish("fp1", "original")
+        self.q.remember_canonical_key("fp1", "changed-later")
+        self.assertEqual(self.q.known_canonical_keys(), ["original"])
+
+    def test_key_without_a_proposal_row_does_not_leak(self):
+        self.q.remember_canonical_key("orphan", "orphan-key")
+        self.assertEqual(self.q.known_canonical_keys(), [])
+
+    def test_missing_canonical_key_is_skipped_not_fatal(self):
+        """候选没带 canonical_key 时只是少一条记忆，不得阻断发布。"""
+        self.q.record(fp="fp9", lane="perf", title="t",
+                      state="proposed", issue_number=9)
+        self.q.remember_canonical_key("fp9", None)
+        self.assertEqual(self.q.known_canonical_keys(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

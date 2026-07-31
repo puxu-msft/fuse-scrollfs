@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS proposals (
 );
 CREATE INDEX IF NOT EXISTS idx_proposals_state ON proposals(state);
 
+-- 提案的 canonical key（评审 rmf-02）。单独一张纯追加表而不是给 proposals 加列：
+-- 既有表定义不改是本库的不变量。proposals 只存 sha256 摘要，摘要不可逆，因此
+-- 跨轮去重所需的原文 key 必须单独留存，否则 known_canonical_keys 永远只能传空集，
+-- 跨轮去重等于关闭。
+CREATE TABLE IF NOT EXISTS proposal_keys (
+    fingerprint   TEXT PRIMARY KEY,
+    canonical_key TEXT NOT NULL,
+    created_at    REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS invocations (
     invocation_id TEXT PRIMARY KEY,
     round_id      TEXT NOT NULL,

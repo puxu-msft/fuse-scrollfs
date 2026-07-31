@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -329,9 +330,19 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
                           f" {CLEANUP_RESERVE_S:.0f}s"}
     timeout_s = remaining - CLEANUP_RESERVE_S
 
-    prompt = ("/scrollz-round\n"
-              f'{{"blocked_lanes": {blocked_lanes!r}, "known_canonical_keys": [],'
-              f' "inflight_paths": []}}').replace("'", '"')
+    # 跨轮去重的记忆（评审 rmf-02）：这里曾经硬编码 `[]`，而它是 workflow 里
+    # `seen` 集合的唯一外部来源——传空等于把跨轮去重整个关掉，于是每轮都可能
+    # 花掉一整轮的钱重新提出同一个候选，最后在最后一步被判 duplicate 丢弃。
+    known_keys = deps.queue.known_canonical_keys()
+
+    # 用 json.dumps 而不是 `repr()` 再把 ' 换成 "：canonical key 是四个自由文本
+    # 字段拼出来的，里面完全可能含撇号、双引号或 \x1f 分隔符，repr 加字符替换
+    # 会产出非法 JSON，而这个 prompt 正是要被下游当 JSON 解析的。
+    prompt = "/scrollz-round\n" + json.dumps(
+        {"blocked_lanes": blocked_lanes,
+         "known_canonical_keys": known_keys,
+         "inflight_paths": []},
+        ensure_ascii=False)
 
     # 外层会话的唯一职责是调 Workflow 再原样回显 JSON，不需要 opus。
     # 真机实测：首轮外层用 opus-5 花了 $0.6466，占该轮总成本 $0.87 的 74%。
@@ -425,6 +436,9 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
 
     publisher = Publisher(deps.outbox, deps.gh, deps.worktree, deps.queue, round_id)
     published = publisher.publish(candidate)
+    # 发布成功后才记 canonical key：没发出去的候选不该占用去重名额。
+    deps.queue.remember_canonical_key(candidate["fingerprint"],
+                                      candidate.get("canonical_key"))
     budget.settle(round_id, day, invocation.cost_usd)
     budget.record_outcome(round_id, mode="scan", result="published",
                           turns=invocation.turns, denials=invocation.denials,
