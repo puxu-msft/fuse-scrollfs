@@ -4,9 +4,38 @@
 > 权威文档：规格 [spec.md](./spec.md) v7 · 1a 计划 [plan-stage1a.md](./plan-stage1a.md) · 1b 冻结范围 [plan-stage1b.md](./plan-stage1b.md)
 > 进度账本：`.superpowers/sdd/progress.md`（git-ignored，崩溃后靠它 + `git log` 恢复认知）
 
+## ⛔ 当前阻断项（2026-07-31 真机首轮暴露）
+
+**`claude -p` + 后台 Workflow 的组合跑不通，Stage 1a 无法完成首轮。**
+
+工具文档原文：「Workflows run in the background — this tool returns immediately with a task ID, and a `<task-notification>` arrives when the workflow completes.」
+
+实测两轮（各约 $0.9，共 $3.0，账本已如实结算、零残留）：
+- `scrollz-propose` 要起 4 finder + 3 judge，Workflow 立即返回 run ID
+- 外层模型宣布「等完成后输出」后**结束本轮**（`stop_reason: end_turn`，`num_turns: 2`）
+- 会话随之退出，后台任务被 `killed`，round 报 `invocation-failed`
+
+契约探针当初能过，是因为它只起 **1 个 agent**、几十秒完成，通知在模型收 turn 前就到了——**这个差异掩盖了结构性问题**。
+
+已尝试且无效：设 `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=1_200_000`、强化 skill 措辞明禁「拿到 run ID 就收 turn」。均已提交（aed62e3），但都不解决根因：这是「模型需跨回合等待」与「`claude -p` 单轮结束即退出」之间的结构性冲突，提示词层面修不了。
+
+**建议方案（未实施，需评审）**：把扇出从**模型驱动**改为**控制器驱动**——控制器逐个 `claude -p` 调用 finder/judge（每次 `--tools` 收敛、带 schema、同步返回结构化 JSON），在 Python 侧做去重与裁决编排，不再使用 Workflow 工具。这更符合 spec §四「控制器是可信控制面」的原则：编排逻辑本就该在确定性代码里，而不是交给模型的回合生命周期。代价是调用次数增加（7 次而非 1 次），收益是不依赖任何后台任务语义。
+
+替代方案：缩小 workflow 规模到能在单回合内完成（脆弱，阈值未知，不推荐）。
+
 ## 一句话现状
 
-**Task 1–12 已实施完毕并全部经过对抗评审与修复，205 测试全绿；Task 13（真机验收）尚未开工，且合并态评审判定 `needs-rework`——在 5 个 blocker 全部关闭前，不得执行任何真实 GitHub 写入、main push 或 timer 启用。**
+**Task 1–12 已实施完毕，283 测试全绿，合并态四轮评审已判 `ready-for-real-run`。Task 13 前 3 步（doctor / probe / 建 label）已真机通过；第 4 步首轮 round 被上述阻断项卡住。**
+
+Task 13 真机进度：
+| 步骤 | 结果 |
+|---|---|
+| 代码推送 origin/main | ✅ 9b498e9（改走 HTTPS + PAT，SSH agent 无密钥会打死无人值守 push——真机才暴露） |
+| 1. doctor 纯只读 | ✅ 全绿退出 0，零状态变化 |
+| 2. probe 花钱零写入 | ✅ 退出 0，工具集恰为五个、无 MCP/插件，$0.202 |
+| 3. 建 18 个 label | ✅ name+color+description 逐项一致，幂等复跑 0 新建 |
+| 4. 首轮真实 round | ⛔ 被阻断项卡住（两轮失败，零残留、账本正确） |
+| 5-7. 恢复验收 / 装单元 / 启定时器 | 未开始 |
 
 ## 已建成的东西
 
