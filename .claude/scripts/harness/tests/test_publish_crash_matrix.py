@@ -186,6 +186,62 @@ class TestCrashPoints(CrashMatrixBase):
         self.assertEqual(len(unresolved), 1,
                          "failed_terminal 必须被 unresolved() 捕获以阻断预检")
 
+    def test_after_call_crash_with_delayed_probe_never_recreates_issue(self):
+        """真实进程崩溃发生在 `create_issue` 已在服务端生效之后、写
+        `observed` 之前（`HARNESS_FAULT=publish_proposal:after-call`，模拟
+        真实进程崩溃：`except ResponseLost` 根本捕获不到它）。重启（真实
+        丢弃内存对象、重开 SQLite）后，生产路径 `find_issue_by_marker()`
+        连续多轮探测阴性（模拟索引/端点最终一致性延迟）。全程
+        `create_issue` 必须只被调用一次，最终收敛到 `failed_terminal`
+        交人工介入，绝不重新发起第二次 `create_issue`。
+
+        修复前的失效模式（根因）：`prepared` 同时表示『打算调用』与『尚未
+        调用』。崩在 after-call 时 op 若仍显示 `prepared`，下一轮的通用
+        重入 probe 一旦阴性，就会被直接放行去重新调用 `call()`——产生
+        第二个 Issue。
+        """
+        import os
+        from harness.outbox import InjectedFault
+        os.environ["HARNESS_FAULT"] = "publish_proposal:after-call"
+        try:
+            with self.assertRaises(InjectedFault):
+                self.publisher("r1").publish(CANDIDATE)
+        finally:
+            del os.environ["HARNESS_FAULT"]
+
+        # 真重连：丢弃全部内存对象，重开 SQLite
+        self._restart()
+        outbox = Outbox(self.conn)
+        op = outbox.get("publish_proposal", CANDIDATE["fingerprint"])
+        self.assertIsNotNone(op)
+        self.assertEqual(
+            op.phase, "failed_retryable",
+            "崩在 after-call 之后，mutation 边界必须已持久化为不确定态，"
+            "不得仍停留在 prepared")
+        self.assertEqual(self.gh.calls.count("create_issue"), 1)
+
+        marker = f"HARNESS-OP:{op.operation_id}"
+        # 模拟生产路径探测延迟：接下来若干轮 find_issue_by_marker 均阴性，
+        # 覆盖整个观察窗口，确保测试期间探测始终探不到已存在的 Issue
+        self.gh.simulate_delayed_marker_visibility(
+            marker, calls_until_visible=Outbox.UNCERTAIN_WINDOW + 5)
+
+        for round_id in ("r2", "r3"):
+            with self.assertRaises(ResponseLost):
+                self.publisher(round_id).publish(CANDIDATE)
+            self._restart()
+
+        with self.assertRaises(TerminalOperationError):
+            self.publisher("r4").publish(CANDIDATE)
+        self._restart()
+
+        self.assertEqual(
+            self.gh.calls.count("create_issue"), 1,
+            "跨多轮真重连、探测持续阴性，create_issue 全程只应被调用一次")
+        unresolved = Outbox(self.conn).unresolved()
+        self.assertEqual(len(unresolved), 1,
+                         "窗口耗尽后必须落进 failed_terminal，交人工介入")
+
     def test_create_issue_response_lost_but_applied(self):
         self._resume_after_lost_but_applied("create_issue")
 

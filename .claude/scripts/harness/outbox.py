@@ -187,6 +187,22 @@ class Outbox:
                 f"{op.kind}/{op.natural_key} 仍处于观察窗内"
                 f"（第 {updated.uncertain_observations} 次阴性读取），暂不重发")
         _fault_check(op.kind, "before-call")
+        # 持久化『mutation 边界已越过』（根因修复，2026-07-31）：在真正调用
+        # 外部 `call()` 之前，把 op 从 `prepared` 转成 `failed_retryable`
+        # 信封（0 次观察）。选型：复用既有 `failed_retryable`/uncertain 信封
+        # 而非新增 `call_started` phase——`db.py` 不在本次改动白名单内，新增
+        # phase 需要改 CHECK 约束枚举（DB 迁移），复用信封则无需触碰 db.py。
+        #
+        # 动机：`prepared` 同时表示『打算调用』与『尚未调用』，`execute()`
+        # 只在 `phase=='failed_retryable'` 时才会走『阴性读取只累计观察、
+        # 绝不重发 call()』的分支；若崩溃/未捕获异常发生在 call() 成功
+        # 之后、`_mark(observed)` 之前，op 若仍停在 `prepared`，下一轮的
+        # 通用重入 probe 一旦阴性（探测延迟/最终一致性窗口，或恢复 probe
+        # 自身抛异常导致 `record_uncertain_observation()` 根本执行不到）
+        # 就会被直接放行去重新调用 `call()`，造成重复副作用（如二次
+        # `create_issue`）。提前到这里持久化，使得此后任何路径的阴性读取
+        # 都必须先过『累计观察、窗口耗尽才转 failed_terminal』这道闸门。
+        self._mark_call_boundary_crossed(op)
         try:
             result = call()
             _fault_check(op.kind, "after-call")
@@ -278,6 +294,38 @@ class Outbox:
             "   WHERE p.kind='push_main' AND p.natural_key=c.natural_key"
             "     AND p.phase IN ('observed','settled'))").fetchall()
         return [self._row_to_op(r) for r in rows]
+
+    def _mark_call_boundary_crossed(self, op: Operation) -> None:
+        """在调用外部 `call()` 之前持久化『mutation 边界已越过』（根因修复，
+        2026-07-31）：把 op 从 `prepared` 转成 `failed_retryable`、
+        `uncertain_observations=0` 的信封。
+
+        与 `record_uncertain_observation()` 共用同一个保留信封格式，仅
+        `observations` 初值为 0、`first_seen_at` 为 None（尚无阴性观察，
+        只是『即将/已经调用外部副作用，结果尚不确定』）。这样此后任何路径
+        （`execute()` 重入、`reconcile()`）读到该 op 时，`phase` 都已经是
+        `failed_retryable`，会强制先走『先 probe，阴性只累计观察、绝不
+        授权重发 `call()`』这条路径——即使本次崩溃发生在真正调用 `call()`
+        成功之后、`_mark(observed)` 之前（真实进程崩溃、或恢复 probe 自身
+        抛出异常导致 `record_uncertain_observation()` 未被执行到），也不会
+        因为 op 仍显示为 `prepared` 而被误判为『从未越过 mutation 边界』
+        进而重新发起一次 `call()`。
+
+        `test_prepared_ops_are_not_counted_as_uncertain` 固化的语义不受
+        影响：那个用例里的 op 从未进入 `execute()`（只 `prepare()` 过），
+        本方法从未被调用，phase 仍是 `prepared`。
+        """
+        now = time.time()
+        envelope = {_UNCERTAIN_KEY: True, "observations": 0,
+                   "first_seen_at": None}
+        self.conn.execute(
+            "UPDATE operations SET phase='failed_retryable', result_json=?,"
+            " updated_at=? WHERE operation_id=?",
+            (json.dumps(envelope, ensure_ascii=False), now, op.operation_id))
+        op.phase = "failed_retryable"
+        op.result = None
+        op.uncertain_observations = 0
+        op.uncertain_first_seen_at = None
 
     def record_uncertain_observation(self, op: Operation) -> Operation:
         """结果不确定后的阴性读取只增加观察计数，绝不授权重发（评审

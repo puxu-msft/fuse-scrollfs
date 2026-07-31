@@ -73,6 +73,67 @@ class TestOutbox(unittest.TestCase):
         self.assertEqual(self.ob.unresolved(), [],
                          "可重试的 operation 不得阻断下一轮预检")
 
+    def test_response_lost_then_recovery_probe_raises_still_blocks_resend(self):
+        """mutation 抛 `ResponseLost`，紧接着 post-call 恢复 probe **自身抛出
+        读取异常**（如 `TransientReadError`/超时）：`record_uncertain_
+        observation()` 根本执行不到（异常会在 `probe()` 调用处直接向上
+        传播，绕过 execute() 里唯一会调用它的那一行）。
+
+        根因修复验证点：`_mark_call_boundary_crossed()` 已经在调用底层
+        `call()` **之前**把 op 持久化为 `failed_retryable`（0 次观察）。
+        因此即便这一轮 `record_uncertain_observation()` 未被执行到，重启
+        （真实丢弃内存对象、重开 SQLite）后 op 的 phase 也已经是
+        `failed_retryable`，下一轮重入必须走『先 probe、阴性只累计观察、
+        绝不重发 call()』这条路径，`call()` 不得被再次调用；且 uncertain
+        计数在此后仍能正常继续累计。
+        """
+        from pathlib import Path
+
+        class _TransientReadError(Exception):
+            """模拟恢复 probe 自身的读取异常（超时/连接中断等）。"""
+
+        call_count = {"n": 0}
+        probe_count = {"n": 0}
+
+        def call():
+            call_count["n"] += 1
+            raise ResponseLost("connection reset")
+
+        def probe_first_none_then_raises():
+            # execute() 顶部的通用重入 probe（call() 之前）第一次调用时，
+            # op 还是全新的 prepared——回真实系统里对应『还没发起过 call()，
+            # 探测自然阴性』；第二次调用发生在 ResponseLost 之后的『post-call
+            # 恢复 probe』位置，这里模拟它自身抛出读取异常。
+            probe_count["n"] += 1
+            if probe_count["n"] == 1:
+                return None
+            raise _TransientReadError("read timeout")
+
+        op = self.ob.prepare("r1", "publish_proposal", "nk1", {"title": "x"})
+        with self.assertRaises(_TransientReadError):
+            self.ob.execute(op, call=call, probe=probe_first_none_then_raises)
+        self.assertEqual(call_count["n"], 1)
+
+        # 真重连：丢弃全部内存对象，重开 SQLite（不同于同进程内简单重读）
+        self.conn.close()
+        db_path = Path(self.tmp.name) / "h.db"
+        self.conn = db.connect(db_path)
+        self.ob = Outbox(self.conn)
+
+        reread = self.ob.get("publish_proposal", "nk1")
+        self.assertEqual(
+            reread.phase, "failed_retryable",
+            "即便恢复 probe 本身抛异常，mutation 边界的持久化不得依赖它，"
+            "重启后仍必须是 failed_retryable")
+
+        # 下一轮：探测阴性（真读取异常已恢复正常、但仍未观察到已生效证据）
+        with self.assertRaises(ResponseLost):
+            self.ob.execute(reread, call=call, probe=lambda: None)
+        self.assertEqual(call_count["n"], 1,
+                         "重启后阴性读取绝不得授权重发底层 call()")
+        self.assertEqual(reread.uncertain_observations, 1,
+                         "uncertain 计数必须能在此后继续累计")
+
     def test_reconcile_adopts_late_visible_remote_object(self):
         op = self.ob.prepare("r1", "publish_proposal", "nk1", {"title": "x"})
         with self.assertRaises(ResponseLost):
