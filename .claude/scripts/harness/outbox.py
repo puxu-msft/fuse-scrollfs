@@ -62,6 +62,18 @@ class Operation:
     payload: dict
     phase: str
     result: dict | None
+    # 结果不确定的跨轮次有界观察窗（评审 Critical A）：阴性读取不授权重发，
+    # 只记录『已观察次数、首次观察时刻』。持久化在 result_json 的保留信封
+    # 里（见 `_UNCERTAIN_KEY`），不新增 DB 列、不改变既有 phase 取值语义。
+    uncertain_observations: int = 0
+    uncertain_first_seen_at: float | None = None
+
+
+# result_json 内的保留信封键：把『结果不确定』的观察计数与首次观察时刻
+# 存进本来就有的 result_json 列（该列对 failed_retryable 状态原本恒为
+# NULL），避免为此新增 DB 列。反序列化时一旦命中该键，`Operation.result`
+# 保持 None（该信封不是真实外部结果），与既有语义一致。
+_UNCERTAIN_KEY = "__uncertain__"
 
 
 def _hash(payload: dict) -> str:
@@ -71,6 +83,21 @@ def _hash(payload: dict) -> str:
 
 class Outbox:
     SUB_KINDS = ("commit_proposal", "push_main", "publication_receipt")
+
+    # 崩溃矩阵机器可派生的来源（spec §十四 14.2）：Stage 1 的全部 operation
+    # kind 与 `_fault_check()` 认识的全部相位。测试必须从这两个常量的笛卡尔
+    # 积生成覆盖表，不得再手写清单——否则生产新增 operation 而测试忘记同步
+    # 时，测试仍会全绿（评审 Critical B）。
+    OPERATION_KINDS = ("publish_proposal", "commit_proposal",
+                       "push_main", "publication_receipt")
+    FAULT_PHASES = ("before-call", "after-call", "after-observe")
+
+    # 结果不确定的跨轮次有界观察窗（评审 Critical A）：连续这么多次『阴性
+    # 读取』（探测不到已生效的证据）之后仍不确定，才转 `failed_terminal`
+    # 交人工介入。窗口内的任何阴性读取都**不得**授权重发 `call()`——那正是
+    # 会把『索引/端点暂不可见』误判为『确定未创建』、进而对同一提案发出
+    # 第二次 `create_issue` 的失效模式。
+    UNCERTAIN_WINDOW = 3
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -141,6 +168,24 @@ class Outbox:
         if probed_first is not None:
             self._mark(op, "observed", probed_first)
             return probed_first
+        if op.phase == "failed_retryable":
+            # 评审 Critical A：本 operation 此前已经历过一次 ResponseLost
+            # （唯一会把 phase 置为 failed_retryable 的路径），且这次重入的
+            # 探测**再次**是阴性。任何阴性读取都不得立即授权重发底层
+            # `call()`——一次探测阴性无法证明『确实未创建』，可能只是探测
+            # 本身暂不可靠（索引/端点的最终一致性窗口）。因此这里只累计
+            # 观察次数，继续等待；只有跨轮次窗口耗尽仍拿不到确凿证据，才
+            # 转 `failed_terminal` 交人工介入，绝不猜测式地重发。
+            updated = self.record_uncertain_observation(op)
+            if updated.uncertain_observations >= self.UNCERTAIN_WINDOW:
+                self._mark(op, "failed_terminal", None)
+                raise TerminalOperationError(
+                    f"{op.kind}/{op.natural_key} 结果历经"
+                    f" {updated.uncertain_observations} 次跨轮次阴性读取仍"
+                    f"不确定，判定为需人工介入（拒绝盲目重发）")
+            raise ResponseLost(
+                f"{op.kind}/{op.natural_key} 仍处于观察窗内"
+                f"（第 {updated.uncertain_observations} 次阴性读取），暂不重发")
         _fault_check(op.kind, "before-call")
         try:
             result = call()
@@ -150,7 +195,7 @@ class Outbox:
             if probed is not None:
                 self._mark(op, "observed", probed)
                 return probed
-            self._mark(op, "failed_retryable", None)
+            self.record_uncertain_observation(op)
             raise
         except TerminalOperationError:
             # 确定性失败：重试无意义，需人工介入。原子标记后原样重新抛出——
@@ -224,6 +269,34 @@ class Outbox:
             "     AND p.phase IN ('observed','settled'))").fetchall()
         return [self._row_to_op(r) for r in rows]
 
+    def record_uncertain_observation(self, op: Operation) -> Operation:
+        """结果不确定后的阴性读取只增加观察计数，绝不授权重发（评审
+        Critical A）。持久化『已观察次数、首次观察时刻』，跨轮次累计——
+        `Outbox.execute()`/`reconcile()` 崩溃重启后仍能读回同一计数，不会
+        把窗口重置为 0 从而无限期地"每轮都当作第一次"。
+
+        phase 维持 `failed_retryable`（DB CHECK 约束枚举不变，不新增
+        db.py 迁移）：这类 operation 本就需要下一轮 reconcile/execute 重新
+        尝试判定，与既有『可重试』语义一致；真正决定"窗口耗尽转
+        failed_terminal"的判定逻辑由调用方按 `uncertain_observations` 与
+        自己的窗口上限比较后调用 `_mark(op, 'failed_terminal', None)`。
+        """
+        now = time.time()
+        first_seen = (op.uncertain_first_seen_at
+                      if op.uncertain_first_seen_at is not None else now)
+        count = op.uncertain_observations + 1
+        envelope = {_UNCERTAIN_KEY: True, "observations": count,
+                   "first_seen_at": first_seen}
+        self.conn.execute(
+            "UPDATE operations SET phase='failed_retryable', result_json=?,"
+            " updated_at=? WHERE operation_id=?",
+            (json.dumps(envelope, ensure_ascii=False), now, op.operation_id))
+        op.phase = "failed_retryable"
+        op.result = None
+        op.uncertain_observations = count
+        op.uncertain_first_seen_at = first_seen
+        return op
+
     def set_commit_sha(self, op: Operation, sha: str) -> None:
         self.conn.execute(
             "UPDATE operations SET commit_sha=?, updated_at=? WHERE operation_id=?",
@@ -249,8 +322,22 @@ class Outbox:
 
     @staticmethod
     def _row_to_op(row: sqlite3.Row) -> Operation:
+        raw_result = (json.loads(row["result_json"])
+                     if row["result_json"] else None)
+        # 保留信封解包：`result_json` 里若是 `record_uncertain_observation()`
+        # 写入的信封（而非真实外部调用结果），拆成 `uncertain_observations`/
+        # `uncertain_first_seen_at`，`result` 保持 None——语义上这从来不是
+        # 一次成功的外部结果。
+        if isinstance(raw_result, dict) and raw_result.get(_UNCERTAIN_KEY):
+            return Operation(
+                operation_id=row["operation_id"], round_id=row["round_id"],
+                kind=row["kind"], natural_key=row["natural_key"],
+                payload=json.loads(row["payload_json"]), phase=row["phase"],
+                result=None,
+                uncertain_observations=raw_result["observations"],
+                uncertain_first_seen_at=raw_result["first_seen_at"])
         return Operation(
             operation_id=row["operation_id"], round_id=row["round_id"],
             kind=row["kind"], natural_key=row["natural_key"],
             payload=json.loads(row["payload_json"]), phase=row["phase"],
-            result=json.loads(row["result_json"]) if row["result_json"] else None)
+            result=raw_result)

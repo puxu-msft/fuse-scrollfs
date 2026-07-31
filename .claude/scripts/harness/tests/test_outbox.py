@@ -203,6 +203,38 @@ class TestOutbox(unittest.TestCase):
         self.assertEqual(row["phase"], "settled",
                          "settled 的 root 不得被冲突检测降级")
 
+    def test_record_uncertain_observation_persists_count_and_first_seen(self):
+        """评审 Critical A：跨轮次有界观察窗必须持久化，重启后不重置为 0。
+
+        `execute()` 遇到 ResponseLost 且 probe 阴性时，已经会调用
+        `record_uncertain_observation()` 把 op 计数推到 1（见下方 execute()
+        调用），本用例只需在此基础上验证持久化/重启/再累加。
+        """
+        op = self.ob.prepare("r1", "publish_proposal", "nk1", {"title": "x"})
+        with self.assertRaises(ResponseLost):
+            self.ob.execute(op, call=lambda: (_ for _ in ()).throw(
+                ResponseLost("boom")), probe=lambda: None)
+        self.assertEqual(op.uncertain_observations, 1)
+        first_seen = op.uncertain_first_seen_at
+        self.assertIsNotNone(first_seen)
+
+        # 模拟进程重启：重新从 DB 读回同一 operation
+        reread = self.ob.get("publish_proposal", "nk1")
+        self.assertEqual(reread.uncertain_observations, 1)
+        self.assertEqual(reread.uncertain_first_seen_at, first_seen)
+        self.assertIsNone(reread.result, "信封不是真实外部结果，result 须为 None")
+        self.assertEqual(reread.phase, "failed_retryable")
+
+        # 再观察一次：计数累加，首次观察时刻不变
+        again = self.ob.record_uncertain_observation(reread)
+        self.assertEqual(again.uncertain_observations, 2)
+        self.assertEqual(again.uncertain_first_seen_at, first_seen)
+
+    def test_fresh_operation_has_zero_uncertain_observations(self):
+        op = self.ob.prepare("r1", "publish_proposal", "nk1", {"title": "x"})
+        self.assertEqual(op.uncertain_observations, 0)
+        self.assertIsNone(op.uncertain_first_seen_at)
+
     def test_unpushed_commits_detects_commit_without_push(self):
         root = self.ob.prepare("r1", "publish_proposal", "fp1", {"title": "x"})
         commit_op = self.ob.prepare("r1", "commit_proposal", root.operation_id, {})

@@ -6,7 +6,7 @@ from harness import db
 from harness.config import GIT
 from harness.gitops import PublishWorktree
 from harness.lifecycle import State
-from harness.outbox import Outbox, ResponseLost
+from harness.outbox import Outbox, ResponseLost, TerminalOperationError
 from harness.publish import Publisher
 from harness.queue import Queue, fingerprint
 from harness.tests.fakes import FakeGitHub
@@ -109,12 +109,11 @@ class TestHappyPath(CrashMatrixBase):
         self.assert_converged()
 
 
-# 机器可断言的覆盖表：手写矩阵允许，但漏项必须被测试本身抓住（评审 C-03）
+# 机器派生的覆盖表（评审 Critical B）：不再手写，从 `Outbox.OPERATION_KINDS`
+# × `Outbox.FAULT_PHASES` 的笛卡尔积生成——生产 registry 新增 operation 时
+# 测试自动同步，不会因为忘记手写一行而悄悄漏项。
 REQUIRED_CRASH_COVERAGE = {
-    "publish_proposal": {"before-call", "after-call", "after-observe"},
-    "commit_proposal": {"before-call", "after-call", "after-observe"},
-    "push_main": {"before-call", "after-call", "after-observe"},
-    "publication_receipt": {"before-call", "after-call", "after-observe"},
+    kind: set(Outbox.FAULT_PHASES) for kind in Outbox.OPERATION_KINDS
 }
 
 # 每个用例登记它覆盖的 operation:phase；下面的覆盖表测试据此校验无漏项
@@ -159,13 +158,33 @@ class TestCrashPoints(CrashMatrixBase):
         self.assert_converged()
 
     def _resume_after_lost_not_applied(self, method: str):
-        """服务端未生效：可恢复错误必须传播，下一轮重试后收敛。"""
+        """服务端未生效：评审 Critical A 之后，阴性读取不再立即授权重发。
+
+        `record_uncertain_observation()` 的跨轮次有界观察窗（`Outbox.
+        UNCERTAIN_WINDOW`）内，每一轮 resume 都只累计『仍不确定』的观察
+        次数，绝不重新调用底层 `call()`——即便探测持续阴性、即便该阴性
+        其实反映了『真的没创建』这个事实（本场景 `applied=False` 正是如此），
+        outbox 也无法仅凭一次或多次阴性读取区分『真没创建』与『延迟未
+        可见』，因此**不猜**：窗口耗尽后转 `failed_terminal`，交人工介入。
+        """
         self.gh.fail_next(method, applied=False)
         with self.assertRaises(ResponseLost):
             self.publisher("r1").publish(CANDIDATE)
-        result = self.publisher("r2").publish(CANDIDATE)
-        self.assertEqual(result["state"], State.RECEIPT_COMPLETE)
-        self.assert_converged()
+        self.assertEqual(self.gh.calls.count(method), 1)
+        # 窗口内的后续轮次只累计观察，绝不重发底层调用
+        for _ in range(Outbox.UNCERTAIN_WINDOW - 2):
+            with self.assertRaises(ResponseLost):
+                self.publisher("r2").publish(CANDIDATE)
+        self.assertEqual(self.gh.calls.count(method), 1,
+                         "窗口内任何阴性读取都不得授权重发底层调用")
+        # 窗口耗尽：转 failed_terminal，交人工介入，绝不猜测式地再重发
+        with self.assertRaises(TerminalOperationError):
+            self.publisher("r3").publish(CANDIDATE)
+        self.assertEqual(self.gh.calls.count(method), 1,
+                         "窗口耗尽后仍不得重发——转人工而非猜测")
+        unresolved = Outbox(self.conn).unresolved()
+        self.assertEqual(len(unresolved), 1,
+                         "failed_terminal 必须被 unresolved() 捕获以阻断预检")
 
     def test_create_issue_response_lost_but_applied(self):
         self._resume_after_lost_but_applied("create_issue")
@@ -333,6 +352,42 @@ class TestCrashCoverageTable(unittest.TestCase):
         missing = required - COVERED
         self.assertEqual(missing, set(), f"崩溃矩阵漏项：{sorted(missing)}")
         self.assertEqual(len(required), 12, "required 相位数应为 4 operation × 3 phase")
+
+        # 评审 Critical B 附带项：registry 中不得存在未被测试覆盖的
+        # operation——即 `Outbox.OPERATION_KINDS` 必须与
+        # `REQUIRED_CRASH_COVERAGE` 的 key 完全一致，不多不少。
+        self.assertEqual(set(Outbox.OPERATION_KINDS),
+                         set(REQUIRED_CRASH_COVERAGE.keys()),
+                         "Outbox.OPERATION_KINDS 与覆盖表 key 不一致——"
+                         "registry 里存在未被覆盖表纳入的 operation，或反之")
+
+    def test_regression_probe_detects_added_operation_as_missing(self):
+        """回归探测（评审 Critical B）：证明"registry 派生"这条链路真的能
+        发现漏项，而不是一个无论如何都通过的空检查——临时向
+        `Outbox.OPERATION_KINDS` 追加一个假 operation，派生出的 required
+        集合必须包含它、且不在 `COVERED` 里（因为没有任何用例真的跑过它），
+        验证完毕立即移除，不污染其余测试。
+        """
+        fake_kind = "fake_op_for_regression_probe"
+        original = Outbox.OPERATION_KINDS
+        Outbox.OPERATION_KINDS = original + (fake_kind,)
+        try:
+            derived = {kind: set(Outbox.FAULT_PHASES)
+                      for kind in Outbox.OPERATION_KINDS}
+            required = {f"{op}:{phase}"
+                        for op, phases in derived.items()
+                        for phase in phases}
+            missing = required - COVERED
+            expected_missing = {f"{fake_kind}:{phase}"
+                                for phase in Outbox.FAULT_PHASES}
+            self.assertEqual(
+                missing, expected_missing,
+                "追加假 operation 后，派生覆盖表必须能识别出它未被覆盖——"
+                "若这里不等于预期，说明覆盖表检测本身失去了抓漏项的能力")
+        finally:
+            Outbox.OPERATION_KINDS = original
+        self.assertEqual(Outbox.OPERATION_KINDS, original,
+                         "验证完毕后必须恢复原始 registry，不得污染其余测试")
 
 
 if __name__ == "__main__":

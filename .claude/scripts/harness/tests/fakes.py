@@ -23,9 +23,11 @@ class FakeGitHub:
         self._next_number = 1
         self._faults: dict[str, bool] = {}
         self.calls: list[str] = []
-        # 索引延迟模拟（评审 Critical，回归测试专用）：见
-        # `simulate_delayed_marker_visibility()` / `find_issue_by_marker_delayed()`。
+        # 生产路径读延迟模拟（评审 Critical A）：见
+        # `simulate_delayed_marker_visibility()`——现在直接作用于生产代码
+        # 实际调用的 `find_issue_by_marker()` 本身。
         self._delayed_visible_after: dict[str, int] = {}
+        self.read_calls: list[tuple] = []
 
     def fail_next(self, method: str, applied: bool) -> None:
         self._faults[method] = applied
@@ -54,12 +56,19 @@ class FakeGitHub:
         return self._maybe_fail("create_issue", apply)
 
     def find_issue_by_marker(self, marker: str) -> dict | None:
-        """强一致查询：直接扫描内存里的全部 Issue，无任何延迟——这正是
-        `GhCli.find_issue_by_marker()` 修复后（改用直接列表端点而非
-        Search 索引）想要保证的语义：创建后立即可见，不存在『探测阴性
-        ≠ 确定未创建』这类不确定性。生产代码路径（`Publisher`/`round.py`）
-        只调用这一个方法作为 natural-key 恢复探测。
+        """natural-key 恢复探测——生产代码路径（`Publisher`/`round.py`）唯一
+        调用的探测方法。默认强一致（无延迟），但支持通过
+        `simulate_delayed_marker_visibility()` 在**这同一个生产路径方法**上
+        注入暂不可见的阴性读取（评审 Critical A：故障注入必须覆盖生产路径
+        本身，不能只有一个专门的、生产代码从不调用的替身方法才会延迟——
+        否则测不出『生产路径读延迟导致重复创建』这个真实失效模式）。
         """
+        remaining = self._delayed_visible_after.get(marker, 0)
+        if remaining > 0:
+            self._delayed_visible_after[marker] = remaining - 1
+            self.read_calls.append(("find_issue_by_marker", marker))
+            return None
+        self.read_calls.append(("find_issue_by_marker", marker))
         for issue in self.issues.values():
             if marker in issue["body"]:
                 return issue
@@ -67,31 +76,14 @@ class FakeGitHub:
 
     def simulate_delayed_marker_visibility(self, marker: str,
                                            calls_until_visible: int) -> None:
-        """模拟『对象已创建，但按 marker 探测时暂不可见』（如异步 Search
-        索引延迟）：接下来 `calls_until_visible` 次
-        `find_issue_by_marker_delayed(marker)` 调用返回 None，即便匹配的
-        Issue 已经存在；用于构造对照测试，证明『探测阴性 → 重发
-        create_issue』这条路径在探测本身不可靠时确实会产生重复对象
-        （评审 Critical：GitHub Search 是异步索引的，阴性结果不能证明
-        对象未创建）。
-
-        `find_issue_by_marker()`（生产代码实际调用的方法）**不**受此影响
-        ——它模拟的是修复后『直接列表扫描，强一致』的语义。本方法只影响
-        `find_issue_by_marker_delayed()`，后者仅供回归测试构造对照组，
-        生产代码从不调用它。
+        """模拟『对象已创建，但按 marker 探测时暂不可见』（如异步索引延迟、
+        或直接列表端点的最终一致性窗口）：接下来 `calls_until_visible` 次
+        `find_issue_by_marker(marker)` 调用返回 None，即便匹配的 Issue 已经
+        存在。作用于**生产代码实际调用的方法本身**（评审 Critical A），
+        不再只有一个专门的、生产代码从不调用的『delayed』替身方法才会
+        延迟——那样测不出生产路径自己读延迟时的真实行为。
         """
         self._delayed_visible_after[marker] = calls_until_visible
-
-    def find_issue_by_marker_delayed(self, marker: str) -> dict | None:
-        """仅供回归测试构造对照组：模拟旧版基于 Search 索引、可能延迟可见
-        的探测语义。生产代码从不调用这个方法——真实探测入口是
-        `find_issue_by_marker()`。
-        """
-        remaining = self._delayed_visible_after.get(marker, 0)
-        if remaining > 0:
-            self._delayed_visible_after[marker] = remaining - 1
-            return None
-        return self.find_issue_by_marker(marker)
 
     def list_labels(self) -> list[str]:
         return sorted(self.labels)
