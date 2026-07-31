@@ -55,7 +55,8 @@ def _wire(cfg):
     conn = db.connect(cfg.state_db)
     db.migrate(conn)
     gh = GhCli(cfg)
-    worktree = PublishWorktree(cfg.repo_root, cfg.publish_worktree)
+    worktree = PublishWorktree(cfg.repo_root, cfg.publish_worktree,
+                              gh_token=cfg.gh_token, repo_slug=cfg.repo_slug)
     return conn, gh, worktree
 
 

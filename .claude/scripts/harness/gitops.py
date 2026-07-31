@@ -14,6 +14,10 @@ from .config import GIT
 TRAILER_KEY = "HARNESS-OP"
 TRAILER = f"{TRAILER_KEY}:"
 MAX_PUSH_RETRY = 3
+# 无人值守（systemd 定时器）下没有 ssh-agent 可解锁密钥，SSH remote 会永远
+# push 失败；PAT 走 HTTPS 是本就为此设计的凭据形式。host 固定为 github.com，
+# 因为 GH_TOKEN 是 GitHub PAT，与 SSH remote 的目标服务一致。
+GITHUB_HOST = "github.com"
 # 固定身份：commit 与 cherry-pick 都必须用它。否则重放后的 committer 会变成仓库
 # 本地配置里的人类身份（本机实测为 Pu Xu <puxu@microsoft.com>），
 # 「哪些提交是 harness 做的」就不再可查。
@@ -58,14 +62,39 @@ class InvalidProposalPath(Exception):
 
 class PublishWorktree:
     def __init__(self, repo_root: Path, worktree_path: Path,
-                 remote: str = "origin", branch: str = "main"):
+                 remote: str = "origin", branch: str = "main",
+                 gh_token: str = "", repo_slug: str = ""):
         self.repo_root = Path(repo_root)
         self.path = Path(worktree_path)
         self.remote = remote
         self.branch = branch
+        # 无人值守场景下的凭据：显式注入，不在本模块内读环境/配置文件，
+        # 保持凭据来源单一、本类可测（spec 要求 4）。二者都非空时才启用
+        # HTTPS+PAT 路径；否则回退到 `remote`（本地/测试场景，例如
+        # `file://`、路径式 bare repo）。
+        self.gh_token = gh_token
+        self.repo_slug = repo_slug
         # 本轮 operation 绑定的提案卡提交；重放只允许动它
         self.operation_sha: str | None = None
         self.operation_path: str | None = None
+
+    # ------------------------------------------------------------- 凭据/URL
+
+    def _use_https_auth(self) -> bool:
+        return bool(self.gh_token and self.repo_slug)
+
+    def _https_url(self) -> str:
+        return (f"https://x-access-token:{self.gh_token}@"
+                f"{GITHUB_HOST}/{self.repo_slug}.git")
+
+    def _redact(self, text: str) -> str:
+        """把 token 明文从任何将要落进异常/日志的文本里去掉。
+
+        token 一旦出现在 `RuntimeError` 里，会随异常冒到日志和 Issue 评论中——
+        等同于把 PAT 写进公开仓库（spec 要求 3）。"""
+        if self.gh_token:
+            return text.replace(self.gh_token, "<REDACTED>")
+        return text
 
     # ---------------------------------------------------------------- 路径校验
 
@@ -117,8 +146,34 @@ class PublishWorktree:
         proc = subprocess.run([GIT, *args], cwd=cwd or self.path,
                               capture_output=True, text=True)
         if proc.returncode != 0:
-            raise RuntimeError(f"git {' '.join(args)}: {proc.stderr.strip()}")
+            # args 本身可能含 HTTPS token URL（fetch 走 HTTPS 路径时）；
+            # stderr 与 argv 拼接前都必须脱敏，否则 token 会随异常冒到日志
+            # 和 Issue 评论里（spec 要求 3）。
+            raise RuntimeError(self._redact(
+                f"git {' '.join(args)}: {proc.stderr.strip()}"))
         return proc.stdout.strip()
+
+    def _fetch(self) -> None:
+        """fetch `self.branch`，确保 `refs/remotes/{remote}/{branch}` 被更新。
+
+        配置了 token 时直接用 HTTPS URL 拉取——无人值守场景下没有 ssh-agent，
+        SSH remote 永远失败（spec 要求 5）。此时 git 不会像按已配置 remote
+        名字 fetch 那样自动写 tracking ref，需要显式 refspec 补上；未配置
+        token（本地测试场景）时保留原有的按 remote 名 fetch，不改变既有
+        20 条 gitops 测试的行为（spec 要求 6）。
+        """
+        if self._use_https_auth():
+            self._git("-c", "credential.helper=", "fetch", self._https_url(),
+                      f"+{self.branch}:refs/remotes/{self.remote}/{self.branch}",
+                      cwd=self.repo_root)
+        else:
+            self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
+
+    def _push_argv(self) -> list[str]:
+        if self._use_https_auth():
+            return [GIT, "-c", "credential.helper=", "push",
+                    self._https_url(), f"HEAD:{self.branch}"]
+        return [GIT, "push", self.remote, f"HEAD:{self.branch}"]
 
     def ensure(self, allow_reset: bool = True) -> None:
         """allow_reset=False 时只保证工作区存在，**绝不 reset**（评审 C-04）。
@@ -127,7 +182,7 @@ class PublishWorktree:
         会先把待恢复的提交删掉，再去发现有未决 operation——
         §5.0 的 proposal-committed-local 恢复态在真实 round 里将永远到不了。
         """
-        self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
+        self._fetch()
         target = self._git("rev-parse", f"{self.remote}/{self.branch}",
                            cwd=self.repo_root)
         # 崩溃或人工清理会删掉目录却留下 worktree 注册；不 prune 会导致
@@ -228,7 +283,7 @@ class PublishWorktree:
         只验证「历史里有个含 marker 的 commit」不足以证明「那个 commit 改过
         那个 path」——评审 Important #3 要求同时核验改动路径。
         """
-        self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
+        self._fetch()
         matches = [sha for sha, value in self._trailer_log(
             f"{self.remote}/{self.branch}", cwd=self.repo_root)
             if value == operation_id]
@@ -258,7 +313,7 @@ class PublishWorktree:
         此时的拒绝只能是 branch protection / pre-receive hook 等策略拒绝，
         重放没有收益且会掩盖原始错误。
         """
-        self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
+        self._fetch()
         proc = subprocess.run(
             [GIT, "merge-base", "--is-ancestor", f"{self.remote}/{self.branch}", "HEAD"],
             cwd=self.path, capture_output=True, text=True)
@@ -270,12 +325,11 @@ class PublishWorktree:
     def push(self) -> None:
         last_stderr = ""
         for attempt in range(1, MAX_PUSH_RETRY + 1):
-            proc = subprocess.run(
-                [GIT, "push", self.remote, f"HEAD:{self.branch}"],
-                cwd=self.path, capture_output=True, text=True)
+            proc = subprocess.run(self._push_argv(), cwd=self.path,
+                                  capture_output=True, text=True)
             if proc.returncode == 0:
                 return
-            last_stderr = proc.stderr.strip()
+            last_stderr = self._redact(proc.stderr.strip())
             if not self._looks_like_ref_rejection(last_stderr):
                 raise RuntimeError(f"git push: {last_stderr}")
             if not self._is_real_race():
@@ -304,7 +358,7 @@ class PublishWorktree:
         if self.operation_sha is None:
             raise ReplayConflict("未绑定 operation commit SHA，拒绝重放")
         self._assert_single_path(self.operation_sha)
-        self._git("fetch", self.remote, self.branch, cwd=self.repo_root)
+        self._fetch()
         target = self._git("rev-parse", f"{self.remote}/{self.branch}",
                            cwd=self.repo_root)
         self._git("reset", "--hard", target)

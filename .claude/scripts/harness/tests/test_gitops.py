@@ -167,6 +167,116 @@ class TestPublishWorktree(unittest.TestCase):
         self.assertEqual(list(outside_dir.iterdir()), [],
                          "symlink 逃逸也不得在工作区外产生文件")
 
+    # -------------------------------------------------------- HTTPS+PAT push/fetch
+
+    def test_fetch_uses_https_url_and_explicit_refspec_when_token_configured(self):
+        """配置了 token 后，_fetch() 必须走 HTTPS URL 并显式写 tracking ref
+        （按 remote 名字 fetch 不会自动更新它，见 push 修复设计笔记）。"""
+        wt = PublishWorktree(self.local, self.local / ".worktree/_authed",
+                             gh_token="ghp_SECRETTOKEN123", repo_slug="acme/widgets")
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch("harness.gitops.subprocess.run", side_effect=fake_run):
+            wt._fetch()
+
+        self.assertEqual(calls, [[
+            GIT, "-c", "credential.helper=", "fetch",
+            "https://x-access-token:ghp_SECRETTOKEN123@github.com/acme/widgets.git",
+            "+main:refs/remotes/origin/main",
+        ]])
+
+    def test_push_argv_uses_https_url_when_token_configured(self):
+        wt = PublishWorktree(self.local, self.local / ".worktree/_authed",
+                             gh_token="ghp_SECRETTOKEN123", repo_slug="acme/widgets")
+        self.assertEqual(wt._push_argv(), [
+            GIT, "-c", "credential.helper=", "push",
+            "https://x-access-token:ghp_SECRETTOKEN123@github.com/acme/widgets.git",
+            "HEAD:main",
+        ])
+
+    def test_push_calls_https_argv_end_to_end_when_token_configured(self):
+        """push() 本体（非仅 _push_argv）在配置 token 时确实传出 HTTPS 参数。"""
+        wt = PublishWorktree(self.local, self.local / ".worktree/_authed",
+                             gh_token="ghp_SECRETTOKEN123", repo_slug="acme/widgets")
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch("harness.gitops.subprocess.run", side_effect=fake_run):
+            wt.push()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], [
+            GIT, "-c", "credential.helper=", "push",
+            "https://x-access-token:ghp_SECRETTOKEN123@github.com/acme/widgets.git",
+            "HEAD:main",
+        ])
+
+    def test_fetch_and_push_fall_back_to_remote_name_without_token(self):
+        """无 token（本地测试场景的默认构造）时必须回退到原有按 remote 名字的
+        行为，不得意外触发 HTTPS 分支——这是既有 20 条 gitops 测试成立的前提。"""
+        self.assertEqual(self.wt._push_argv(),
+                         [GIT, "push", "origin", "HEAD:main"])
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch("harness.gitops.subprocess.run", side_effect=fake_run):
+            self.wt._fetch()
+        self.assertEqual(calls, [[GIT, "fetch", "origin", "main"]])
+
+    def test_push_error_message_redacts_token(self):
+        """token 泄漏是本次修复最关键的一条：push 失败时异常消息里绝不能出现
+        token 明文。"""
+        token = "ghp_SUPERSECRETTOKENVALUE"
+        wt = PublishWorktree(self.local, self.local / ".worktree/_authed",
+                             gh_token=token, repo_slug="acme/widgets")
+        # 模拟一次会把 URL（含 token）原样回显进 stderr 的失败——即便实测中
+        # git 本身通常不会这样做，也要防御性地保证脱敏对这种最坏情况生效。
+        leaking_stderr = (
+            f"fatal: unable to access "
+            f"'https://x-access-token:{token}@github.com/acme/widgets.git/': "
+            f"Could not resolve host")
+
+        def fake_run(cmd, *a, **kw):
+            return subprocess.CompletedProcess(cmd, 1, stdout="",
+                                               stderr=leaking_stderr)
+
+        with mock.patch("harness.gitops.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as ctx:
+                wt.push()
+
+        message = str(ctx.exception)
+        self.assertNotIn(token, message, "异常消息不得包含 token 明文")
+        self.assertIn("<REDACTED>", message)
+
+    def test_git_helper_error_message_redacts_token_in_argv(self):
+        """`_git()` 抛出的 RuntimeError 里，即便 token 出现在 argv 本身
+        （fetch 走 HTTPS 时），也必须被脱敏。"""
+        token = "ghp_ANOTHERSECRETTOKEN"
+        wt = PublishWorktree(self.local, self.local / ".worktree/_authed",
+                             gh_token=token, repo_slug="acme/widgets")
+
+        def fake_run(cmd, *a, **kw):
+            return subprocess.CompletedProcess(cmd, 1, stdout="",
+                                               stderr="fatal: Could not resolve host")
+
+        with mock.patch("harness.gitops.subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as ctx:
+                wt._fetch()
+
+        message = str(ctx.exception)
+        self.assertNotIn(token, message, "异常消息不得包含 token 明文")
+        self.assertIn("<REDACTED>", message)
+
     def test_write_proposal_accepts_legal_path(self):
         self.wt.ensure()
         self.wt.write_proposal("docs/proposals/1-demo.md", "# demo\n")
