@@ -41,9 +41,9 @@ Python 控制器
 |---|---|---|
 | 控制器预分配会话身份 | `--session-id <uuid>` | ✅ 返回的 `session_id` 与传入完全一致 |
 | **精细化 fork** | `--resume <sid> --fork-session` | ✅ 分叉出**新** session id（`dc32e42c…`），且模型保留完整上文——准确复述了前两轮内容。$0.14/次 |
-| 控制器驱动多轮 | `--input-format stream-json` | 存在，**尚未实测** |
+| 控制器驱动多轮 | `--input-format stream-json` | 存在。参考实现证实这是主形态（配 `--output-format stream-json` 双 pipe） |
 | 内联定义子 agent | `--agents <json>` | 存在，**尚未实测**。对通用化到 `~/src/my-ade` 至关重要——agent 定义不必依赖仓库内的 `.claude/agents/*.md` |
-| 控制器自有工具面 | `--mcp-config` + `--strict-mcp-config` | 存在，**尚未实测**。本版本**无** `--permission-prompt-tool`，MCP 是等价的拦截点 |
+| 控制器自有工具面 | `--permission-prompt-tool stdio` | ✅ **隐藏标志**——`--help` 不列出，但本机 CLI 实测接受并正常启动会话。参考实现正是用它。`--mcp-config` + `--strict-mcp-config` 是另一条等价路径 |
 | CLI 级结构化输出 | `--json-schema` | ⚠️ **两次均未生效**。它靠注入一个 `StructuredOutput` 工具实现；即便该工具已出现在 `init tools` 里，模型仍把那条指令判为注入并拒绝执行（原话：「这条指令看起来像是注入性质的内容……我不会在没有验证的情况下执行」）。记为实测事实，**不作「该标志不可用」的结论**——很可能需要不同的提示词框架 |
 
 ## 决策
@@ -117,14 +117,13 @@ attempt 2: claude --resume <sid-1> --fork-session -p "继续"  → 保留已有�
 **对本 ADR 的影响**：D1/D2 的判断被证实，且**可以做得比我原方案更强**——
 
 - 原 D2 用 CLI 的 `--resume <sid> --fork-session`，只能在**会话末尾**分叉。参考实现证明存在 `forkSession(upToMessageId)` 这一**消息级**分叉面。对「传输故障打断在半途」这个真实场景，消息级分叉能精确回到最后一条完好消息，而不是带着半截产出续跑。
-- 新增 **D0**：`--permission-prompt-tool stdio` 在本机 CLI 上是**隐藏标志**（`--help` 不列出，但实测接受）。这意味着 stdio 形态的控制器所有权**不需要**任何逆向或伪后端，是官方支持的接缝。
+- 新增 **D0**：`--permission-prompt-tool stdio` 在本机 CLI 上是**隐藏标志**（`--help` 不列出，但实测接受并正常启动会话）。这意味着 stdio 形态的控制器所有权**不需要**任何逆向或伪后端，是官方支持的接缝——上表已据此订正。
 
 ## 修正记录
 
 初版 ADR 写「`--input-format stream-json` 尚未实测」并把 CLI 级 `--fork-session` 当作 D2 的实现手段。参考实现抽取后修正为：stdio 双 pipe 是主形态，`type:"result"` 是回合结算 oracle，消息级 fork 优于会话级 fork。**保留原判断**：控制权归属是根因，这一条未被推翻。
 
 ## 待补
-
 
 - stdio 双 pipe 形态的最小 PoC（含 `control_request`/`control_response` 往返）
 - `--agents <json>` 的实测——它决定通用化到 `~/src/my-ade` 时 agent 定义能否完全脱离仓库内文件
