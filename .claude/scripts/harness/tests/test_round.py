@@ -7,7 +7,7 @@ from harness.config import GIT
 from harness.gitops import PublishWorktree
 from harness.outbox import Outbox
 from harness.publish import Publisher
-from harness.queue import Queue, fingerprint
+from harness.queue import Queue, canonical_key, fingerprint
 from harness import round as round_module
 from harness.round import Deps, run_round
 from harness.tests.fakes import FakeGitHub
@@ -350,7 +350,12 @@ class TestRound(unittest.TestCase):
         dup_fp = None
 
         cand = dict(CANDIDATE_PAYLOAD["candidates"][0])
-        cand["canonical_key"] = "dup-canonical-key"
+        # 刻意给一个**错误**的 canonical_key：控制器必须自算、无视模型给的值。
+        # 模型可控的 key 是一条持久抑制通道——给一个精心挑选的值就能永久屏蔽
+        # 某个合法方向（评审 rmf-13）。
+        cand["canonical_key"] = "attacker-supplied-key"
+        expected = canonical_key(cand["goal"], cand["invariant"],
+                                 cand["primary_path"], cand["oracle"])
 
         def invoke_dup(**kw):
             return _clean_invocation(True, {"candidates": [cand]}, 0.01, 1)
@@ -359,7 +364,10 @@ class TestRound(unittest.TestCase):
         # 先让它发布一次，拿到 fingerprint
         first = run_round(self.cfg, deps)
         self.assertEqual(first["result"], "published")
-        self.assertEqual(deps.queue.known_canonical_keys(), ["dup-canonical-key"])
+        self.assertEqual(deps.queue.known_canonical_keys(), [expected])
+        self.assertNotIn("attacker-supplied-key",
+                         deps.queue.known_canonical_keys(),
+                         "控制器消费了模型给的 canonical_key——那是持久抑制通道")
 
         # 清掉记忆，模拟「修复前就已存在的提案」：proposals 有行，proposal_keys 没有
         deps.queue.conn.execute("DELETE FROM proposal_keys")
@@ -368,7 +376,7 @@ class TestRound(unittest.TestCase):
 
         second = run_round(self.cfg, deps)
         self.assertEqual(second["result"], "duplicate")
-        self.assertEqual(deps.queue.known_canonical_keys(), ["dup-canonical-key"],
+        self.assertEqual(deps.queue.known_canonical_keys(), [expected],
                          "被判重复的候选没有进去重集——下一轮还会重来，永久卡死")
 
     def test_remaining_time_budget_is_passed_to_invoke_as_timeout(self):

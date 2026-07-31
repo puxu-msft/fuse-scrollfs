@@ -15,18 +15,49 @@ import re
 import sqlite3
 import time
 
-_WS = re.compile(r"\s+")
-_HEX_SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")  # 40 位 SHA-1 或 64 位 SHA-256
-_POSITIVE_INT = re.compile(r"^[1-9][0-9]*$")
-_NONNEG_INT = re.compile(r"^(0|[1-9][0-9]*)$")
+# canonical key 的规范化必须与 `.claude/workflows/scrollz-propose.js` 的
+# `canonicalKey()` **逐字节一致**——key 由 Python 产出、由 JS 比对，两侧算不出同一
+# 个串，跨轮去重就静默失效（不报错、不告警，只是每轮重提同一候选）。
+#
+# JS 那边是 `x.trim().toLowerCase().replace(/\s+/g, ' ')`，这里逐步镜像它。
+# 两处**不能**用 Python 的自带语义（跨语言测试各抓出一次真实漂移）：
+#   1. 不能用 `re` 的 `\s`：它匹配 `\x1c`–`\x1f`，ECMAScript 的 `\s` 不匹配。
+#      而 `\x1f` 恰恰是本模块拼接四个字段用的分隔符本身。
+#   2. 不能用 `str.strip()`：JS 的 `trim()` 去掉 `\ufeff`（BOM），Python 的
+#      `strip()` 不认它，于是 `"BOM\ufeff"` 两侧分别得到 `bom ` 与 `bom`。
+#
+# 已知残余差异（记录而非修复）：`toLowerCase()` 与 `str.lower()` 对少数字符不同
+# （如 `ß`、土耳其语 `İ`）。出现在这四个字段里的概率极低，且真出现时跨语言测试
+# 会抓到——加样本即可，不必现在引入完整的 Unicode 大小写映射。
+_JS_SPACE = ("\u0020\t\n\r\f\v\u00a0\u1680\u2000-\u200a"
+             "\u2028\u2029\u202f\u205f\u3000\ufeff")
+_WS = re.compile(f"[{_JS_SPACE}]+")
+_WS_EDGE = re.compile(f"^[{_JS_SPACE}]+|[{_JS_SPACE}]+$")
 
 
 def _norm(text: str) -> str:
-    return _WS.sub(" ", text.strip().lower())
+    return _WS.sub(" ", _WS_EDGE.sub("", text).lower())
+
+
+def canonical_key(goal: str, invariant: str, primary_path: str,
+                  oracle: str) -> str:
+    """候选的规范化原文 key —— 就是 `fingerprint()` 做 sha256 **之前**的那个 blob。
+
+    控制器**自己算**，绝不消费模型返回的 `canonical_key` 字段（评审 rmf-13）：
+    那个字段是 Workflow 附加、再穿过外层模型一次"原样回显"才到达控制器的，
+    `validate_candidate()` 对它零校验，而 `remember_canonical_key` 遇空值静默返回。
+    三者叠加 = 模型少抄一个字段，跨轮去重就永久失效，且无日志、无计数、无测试
+    能发现。更糟的是它可被构造：模型给一个精心挑选的 key，就能**永久抑制**某个
+    合法方向。这与"labels 一律由控制器确定性派生"是同一条原则。
+
+    四个入参都在 `_REQUIRED_CANDIDATE_FIELDS` 里，DTO 校验已保证是非空字符串，
+    所以"记不住"在结构上不可能发生。
+    """
+    return "\x1f".join(_norm(x) for x in (goal, invariant, primary_path, oracle))
 
 
 def fingerprint(goal: str, invariant: str, primary_path: str, oracle: str) -> str:
-    blob = "\x1f".join(_norm(x) for x in (goal, invariant, primary_path, oracle))
+    blob = canonical_key(goal, invariant, primary_path, oracle)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
 

@@ -15,7 +15,7 @@ from .claude_runner import (InvocationResult, DEFAULT_AGENT_MODEL,
                             STAGE1_ALLOWED_TOOLS)
 from .precheck import PrecheckFailed, assert_all_ok, run_prechecks
 from .publish import Publisher
-from .queue import Queue, fingerprint
+from .queue import Queue, canonical_key, fingerprint
 
 # 单一真相源：允许的工具集只在 claude_runner 里定义一次。这里曾经是第二份硬编码
 # 字符串，加 TaskOutput 时两边立刻漂移——被 build_argv 的入口强制拦下（真机实测
@@ -430,8 +430,11 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
         # 五节，fingerprint 又不可逆）会每轮被重新提出、每轮在这里被丢弃、每轮
         # 都不被记住，形成永久卡死：每 2 小时烧掉一整轮的钱且仓库零产出。
         # 只在这里记不影响正确性：能走到这里说明它确实已在 proposals 里在册。
-        deps.queue.remember_canonical_key(candidate["fingerprint"],
-                                          candidate.get("canonical_key"))
+        # 这里的四个字段已过 DTO 校验（`_REQUIRED_CANDIDATE_FIELDS`），必然存在。
+        deps.queue.remember_canonical_key(
+            candidate["fingerprint"],
+            canonical_key(candidate["goal"], candidate["invariant"],
+                          candidate["primary_path"], candidate["oracle"]))
         budget.settle(round_id, day, invocation.cost_usd)
         budget.record_outcome(round_id, mode="scan", result="duplicate",
                               turns=invocation.turns, denials=invocation.denials,
@@ -442,10 +445,9 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     candidate["labels"] = _derive_labels(candidate)
 
     publisher = Publisher(deps.outbox, deps.gh, deps.worktree, deps.queue, round_id)
+    # canonical key 的记忆已移进 Publisher.publish()，与 queue.record() 挨着写
+    # ——分开写必然存在「Issue 已建、提案已在册、key 还没记」的崩溃窗口。
     published = publisher.publish(candidate)
-    # 发布成功后才记 canonical key：没发出去的候选不该占用去重名额。
-    deps.queue.remember_canonical_key(candidate["fingerprint"],
-                                      candidate.get("canonical_key"))
     budget.settle(round_id, day, invocation.cost_usd)
     budget.record_outcome(round_id, mode="scan", result="published",
                           turns=invocation.turns, denials=invocation.denials,

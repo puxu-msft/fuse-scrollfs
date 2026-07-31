@@ -12,7 +12,7 @@ from . import lifecycle
 from .gitops import PublishWorktree
 from .lifecycle import Facts, State
 from .outbox import Outbox
-from .queue import Queue
+from .queue import canonical_key, Queue
 
 RECEIPT_MARKER = "HARNESS-RECEIPT"
 OP_MARKER = "HARNESS-OP:"
@@ -92,6 +92,17 @@ class Publisher:
         rel_path = f"docs/proposals/{number}-{candidate['slug']}.md"
         self.queue.record(candidate["fingerprint"], candidate["lane"],
                           candidate["title"], "proposed", issue_number=number)
+        # 与 record() 挨着写：两者是同一个提案的两半，分开写就一定存在中间态
+        # ——Issue 已建、提案已在册，而 key 还没记（评审 rmf-13 第二问）。
+        # key 由控制器自算，不看模型给的字段。
+        # 正常路径上这四个字段由 DTO 校验保证存在；缺失时**降级跳过**而不是抛
+        # ——少一条去重记忆是退化，把一次本该成功的发布变成异常则是事故。
+        # 真丢了也能自愈：下次同候选再来时会在 round 的 duplicate 分支补记。
+        key_parts = [candidate.get(f) for f in
+                     ("goal", "invariant", "primary_path", "oracle")]
+        if all(isinstance(x, str) and x for x in key_parts):
+            self.queue.remember_canonical_key(candidate["fingerprint"],
+                                              canonical_key(*key_parts))
         if stop_after == "issue":
             return {"issue": number, "state": State.ISSUE_CREATED}
 
