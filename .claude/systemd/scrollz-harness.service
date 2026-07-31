@@ -1,0 +1,28 @@
+# scrollz 自主改进 harness —— 单轮执行单元
+#
+# 安装：.claude/systemd/install.sh（只安装，不启用）
+# 启用：systemctl --user enable --now scrollz-harness.timer
+#
+# 超时分层（顺序不能颠倒）：
+#   harness 自身 ROUND_DEADLINE_S = 1200s（20 min）先到，走正常清理路径；
+#   systemd TimeoutStartSec = 1500s（25 min）是兜底硬杀，只在 harness 自身卡死时生效。
+#   若把 systemd 的值调到小于 harness 的，每轮都会被硬杀在清理之前——outbox 能恢复，
+#   但那会把「例外」变成「常态」。实测轮次壁钟已达 16 min，逼近 20 min 截止线。
+[Unit]
+Description=scrollz 自主改进 harness（一轮）
+After=default.target
+
+[Service]
+Type=oneshot
+Restart=no
+WorkingDirectory=/home/xp/src/zipfs/.claude/scripts
+# systemd 的 user PATH 不含 linuxbrew / ~/.local/bin，必须显式给全
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/home/xp/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GIT_TERMINAL_PROMPT=0
+EnvironmentFile=%h/.config/scrollz-harness/env
+TimeoutStartSec=1500
+# flock -n：上一轮还没跑完就直接放弃本轮，绝不并发跑两轮
+ExecStart=/home/linuxbrew/.linuxbrew/bin/flock -n /home/xp/src/zipfs/.claude/state/harness.lock \
+    /home/linuxbrew/.linuxbrew/bin/python3 -m harness.cli round
+StandardOutput=append:%h/.local/state/scrollz-harness/round.log
+StandardError=append:%h/.local/state/scrollz-harness/round.log

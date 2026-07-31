@@ -1,0 +1,15 @@
+# 节拍：Stage 1a 用 2 小时低频。
+# 提到 30 分钟的前置条件见 docs/harness/plan-stage1b.md B8——1b 的队列对账、拒绝
+# 记忆、机器红线 gate、熔断告警全部落地之前不得提速，否则退化无人察觉。
+# 另见 HANDOVER 的预算观察期：单轮实测 $5.45，2h 节拍外推约 $65/日。
+[Unit]
+Description=每 2 小时起一轮 scrollz harness（1a 低频；1b 完成后方可提到 30 分钟）
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
