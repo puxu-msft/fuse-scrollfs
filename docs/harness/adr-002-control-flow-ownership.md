@@ -1,6 +1,8 @@
 # ADR-002：控制器必须拥有对话循环，而不是请求模型配合
 
-> 状态：**提案**（待用户裁决）· 日期：2026-07-31
+> 状态：**已采纳**（用户 2026-07-31 裁决）· 日期：2026-07-31
+> 用户裁决两条：(1) **先在 zipfs 把新形态跑通，再由同伴搬进 `~/src/my-ade`**——理由是要有可跑的参照物，而不是纸面设计；(2) **2 小时定时器在重写完成前不启用**，避免用即将退役的形态往公开仓库堆 Issue。
+> 因此 `.claude/systemd/` 的单元保持已安装、`disabled`/`inactive`。
 > 触发：用户裁定「多 agent workflow 一起就被 kill 不能用 `CLAUDE_CODE_ENABLE_TASKS=0` 解决，我们的主要控制流设计的是否不当，例如应该用更低层的方式接管对话，甚至可以实现精细化 fork or retry」，并点名 `/home/xp/src/neighbors/claude-remote-3rd` 作为参考。
 > 关联：[spec.md](./spec.md) §四（三层信任模型）· [HANDOVER.md](./HANDOVER.md)（真机缺陷清单）· [ref-claude-remote-3rd.md](./ref-claude-remote-3rd.md)（参考实现机制抽取）
 
