@@ -99,8 +99,34 @@ attempt 2: claude --resume <sid-1> --fork-session -p "继续"  → 保留已有�
 | outbox / 预算 / 队列 / 发布 / 生命周期五个模块**不受影响** | 它们在扇出下游，接口是「一个候选」，与扇出如何产生无关 |
 | 通用化到 `~/src/my-ade` | D1+D2 反而**更**容易通用：不依赖仓库内的 `.claude/agents`、`.claude/workflows`、skill，全部可由调用方以 `--agents <json>` 传入 |
 
+## 参考实现的机制抽取结论（`claude-remote-3rd`，已核实到文件行号）
+
+| 问题 | 结论 | 强度 |
+|---|---|---|
+| 它在哪一层接管 | **不用 Agent SDK，也不靠 stdin 双向喂**。`ccr-ingress` spawn 真 `claude`，传 `--print --sdk-url … --session-id … --input-format stream-json --output-format stream-json --replay-user-messages`，stdin 设 `ignore`；下行 SSE、上行 HTTP POST/PUT（路径含 `/ws/` 但**不是** WebSocket） | confirmed |
+| 「一个回合结束」的确定信号 | worker 上行 stream-json 的 **`type:"result"`**，**不是**推理 SSE 的 `message_stop`——两者是不同层 | confirmed |
+| 工具能否拦截 | **能**。worker 上行 `control_request{subtype:"can_use_tool"}`，控制器回 `control_response`，可 `deny` / `allow` / 用 `updatedInput` **替换参数**。更强形态：把控制器伪装成 sdk-type MCP server（`mcp_message tools/call` → `mcp_response`） | confirmed |
+| 有无 fork / retry | `ccr-ingress` **没有**（单回合示范器）。但同仓库 `acp-adapter` 的本地 Agent SDK backend 有完整能力：`resume` 恢复整份 transcript、`resumeSessionAt(<assistant UUID>)` 原地回退、**`forkSession(sessionId, {upToMessageId})` 从任意第 N 条消息分叉** | confirmed |
+| 最小可复用面 | 不要复刻伪后端。取 `managed-agents-api/cloud-driver` 的 **stdio 形态**：spawn `claude --print --verbose --input-format stream-json --output-format stream-json --permission-prompt-tool stdio`，stdin/stdout 双 pipe；按 JSONL 读 stdout，见 `type:"result"` 结算回合；见 `control_request` 由控制器决策后写 `control_response`。扇出 = 每子任务一个独立 session + Python 侧持有 task→session 映射/超时/重试 | likely |
+
+**两条必须带走的坑**：
+
+1. **本地分类器自动放行的"安全命令"不产生 `can_use_tool`**——工具拦截**不是完整闸门**，不能把它当作唯一的权限边界。我们现有的 `--tools` allowlist + `permissions.allow` 仍是主防线，MITM 是增强而非替代。
+2. **`message_stop` 与 `type:"result"` 是不同层**。我此前正是在这类层次混淆上栽过（把「Workflow 返回 run ID」当成「编排开始」，把「模型说会等待」当成「模型会等待」）。
+
+**对本 ADR 的影响**：D1/D2 的判断被证实，且**可以做得比我原方案更强**——
+
+- 原 D2 用 CLI 的 `--resume <sid> --fork-session`，只能在**会话末尾**分叉。参考实现证明存在 `forkSession(upToMessageId)` 这一**消息级**分叉面。对「传输故障打断在半途」这个真实场景，消息级分叉能精确回到最后一条完好消息，而不是带着半截产出续跑。
+- 新增 **D0**：`--permission-prompt-tool stdio` 在本机 CLI 上是**隐藏标志**（`--help` 不列出，但实测接受）。这意味着 stdio 形态的控制器所有权**不需要**任何逆向或伪后端，是官方支持的接缝。
+
+## 修正记录
+
+初版 ADR 写「`--input-format stream-json` 尚未实测」并把 CLI 级 `--fork-session` 当作 D2 的实现手段。参考实现抽取后修正为：stdio 双 pipe 是主形态，`type:"result"` 是回合结算 oracle，消息级 fork 优于会话级 fork。**保留原判断**：控制权归属是根因，这一条未被推翻。
+
 ## 待补
 
-- `ref-claude-remote-3rd.md` 的六问结论（正在抽取）——决定 D3 是否采用
-- `--input-format stream-json`、`--agents <json>`、MCP 注入三项的实测
+
+- stdio 双 pipe 形态的最小 PoC（含 `control_request`/`control_response` 往返）
+- `--agents <json>` 的实测——它决定通用化到 `~/src/my-ade` 时 agent 定义能否完全脱离仓库内文件
+- Python 侧消息级 fork 的可用面：本机只有 TypeScript Agent SDK 绑定，Python 侧需按当前 SDK 文档核对 `can_use_tool`/resume/fork 的实际名称
 - `--json-schema` 失效的复现与规避（当前靠提示词约定 + `_extract_payload` 剥壳，已能工作）
