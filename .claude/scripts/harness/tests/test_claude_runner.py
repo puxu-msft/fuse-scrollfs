@@ -4,7 +4,7 @@ import subprocess
 import unittest
 
 from harness.claude_runner import (
-    DEFAULT_AGENT_MODEL, _HARNESS_OWNED_CLAUDE_ENV,
+    DEFAULT_AGENT_MODEL, _HARNESS_OWNED_CLAUDE_ENV, _INHERITED_AUTH_ENV,
     STAGE1_ALLOWED_TOOLS,
     UnsafeInvocationError,
     build_argv,
@@ -465,6 +465,8 @@ class TestInvoke(unittest.TestCase):
             "CLAUDE_EFFORT": "high",
             "CLAUDE_PID": "6538",
             "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90",
+            "ANTHROPIC_AUTH_TOKEN": "sk-secret",
+            "ANTHROPIC_BASE_URL": "https://api.example",
         }
         invoke(prompt="/x", tools=VALID_TOOLS, grant_usd=0.5, max_turns=5,
               settings_path="s.json", cwd="/tmp", timeout_s=5.0,
@@ -472,11 +474,15 @@ class TestInvoke(unittest.TestCase):
         passed = runner.calls[0]["env"]
         leaked = [k for k in passed
                   if (k.startswith(("ANTHROPIC_", "CLAUDE_"))
-                      and k not in _HARNESS_OWNED_CLAUDE_ENV)]
+                      and k not in _HARNESS_OWNED_CLAUDE_ENV
+                      and k not in _INHERITED_AUTH_ENV)]
         self.assertEqual(leaked, [],
                          f"父会话控制变量泄漏到 headless 子进程: {leaked}")
         self.assertEqual(passed["HOME"], "/home/x")
         self.assertEqual(passed["PATH"], "/usr/bin:/bin")
+        # 认证通道必须保留，否则子进程 Not logged in、轮次根本跑不起来
+        self.assertEqual(passed["ANTHROPIC_AUTH_TOKEN"], "sk-secret")
+        self.assertEqual(passed["ANTHROPIC_BASE_URL"], "https://api.example")
 
     def test_model_is_pinned_to_a_canonical_id_not_an_alias(self):
         """别名会被 ANTHROPIC_MODEL 影响，必须传规范 ID。"""

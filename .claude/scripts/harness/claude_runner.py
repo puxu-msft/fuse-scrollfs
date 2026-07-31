@@ -44,6 +44,23 @@ _HARNESS_OWNED_CLAUDE_ENV = frozenset({
     "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
 })
 
+# 模型 API 认证通道：deny-by-default 会把它们一并清掉，子进程随即报
+# `Not logged in · Please run /login`（实测 2026-07-31，apiKeySource=none、
+# 成本 0、零副作用——fail closed 正确，但轮次跑不起来）。因此必须**显式**放行。
+# 写成白名单而不是"少删一点"，是为了让「headless agent 的认证从哪来」这件事
+# 在代码里可见：生产环境由 systemd unit 的 EnvironmentFile 提供，而不是碰巧
+# 从某个交互式 shell 继承。
+#
+# 注意 ANTHROPIC_BASE_URL 同时也是一条重定向通道——放行它意味着启动者能改变
+# agent 的流量去向。Stage 1 接受这一点（agent 本来就以该身份运行），前提是
+# 启动环境受控；若将来要跑在不受控启动环境下，这一条要改成硬编码常量。
+_INHERITED_AUTH_ENV = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
 STAGE1_ALLOWED_TOOLS = frozenset({"Read", "Grep", "Glob", "Skill", "Workflow"})
 
 
@@ -320,7 +337,8 @@ def _sanitize_env(env: dict) -> dict:
     # 拿到什么模型、有什么运行时能力，不能取决于「谁启动了它」。
     for key in list(safe_env):
         if (key.startswith(("ANTHROPIC_", "CLAUDE_"))
-                and key not in _HARNESS_OWNED_CLAUDE_ENV):
+                and key not in _HARNESS_OWNED_CLAUDE_ENV
+                and key not in _INHERITED_AUTH_ENV):
             safe_env.pop(key, None)
     safe_env["GIT_TERMINAL_PROMPT"] = "0"
     # 真机实测（2026-07-31 首轮）：workflow 起 4 个并行 finder 时，Workflow
