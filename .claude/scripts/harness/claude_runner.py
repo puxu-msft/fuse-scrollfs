@@ -14,7 +14,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import pathlib
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -362,11 +364,36 @@ def _sanitize_env(env: dict) -> dict:
     return safe_env
 
 
+def _persist_stream(stream_log, stdout: str, stderr: str) -> None:
+    """把完整 stream 落盘供事后判因。
+
+    真机实测（2026-07-31）：一轮 $10 的 round 报 `invocation-failed`，而进程只
+    保留了 5 行 `raw_tail`——无从判断是 payload 提取失败、协议异常还是预算耗尽。
+    钱花了，诊断依据没有。`raw_tail` 是给告警看的摘要，不能当作事后取证的全部。
+
+    落盘失败**不得**影响本轮结论：诊断信息缺失是遗憾，把一轮本来成功的调用变成
+    异常则是事故。因此这里吞掉 IO 错误，但写进 stderr 让它可见，而不是静默。
+    """
+    if stream_log is None:
+        return
+    try:
+        path = pathlib.Path(stream_log)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(stdout or "")
+            if stderr:
+                fh.write("\n===== stderr =====\n")
+                fh.write(stderr)
+    except OSError as exc:
+        print(f"harness: 无法写入 stream 日志 {stream_log}: {exc}",
+              file=sys.stderr)
+
+
 def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,
            settings_path: str, cwd: str, timeout_s: float,
            env: dict | None = None, model: str | None = None,
-           runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
-           ) -> InvocationResult:
+           runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+           stream_log=None) -> InvocationResult:
     argv = build_argv(prompt, tools, grant_usd, max_turns, settings_path,
                       model=model)
     # 从完整环境出发再删凭据：只给 GIT_TERMINAL_PROMPT 会丢掉 HOME/PATH 等
@@ -376,8 +403,18 @@ def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,
         proc = runner(argv, cwd=cwd, capture_output=True, text=True,
                      timeout=timeout_s, env=safe_env)
     except subprocess.TimeoutExpired as exc:
+        # 超时是最需要事后判因的情形，不能反而什么都不留：把 claude 已经吐出的
+        # 部分 stream 一并落盘。
+        partial_out = exc.output or ""
+        partial_err = exc.stderr or ""
+        if isinstance(partial_out, bytes):
+            partial_out = partial_out.decode("utf-8", "replace")
+        if isinstance(partial_err, bytes):
+            partial_err = partial_err.decode("utf-8", "replace")
+        _persist_stream(stream_log, partial_out, partial_err)
         return InvocationResult(False, None, 0.0, 0, exit_code=124,
                                 raw_tail=str(exc)[-500:])
+    _persist_stream(stream_log, proc.stdout, proc.stderr)
     result = parse_stream_json(proc.stdout.splitlines())
     result.exit_code = proc.returncode
     if proc.returncode != 0:

@@ -338,7 +338,10 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     invocation = deps.invoke(
         model=DEFAULT_AGENT_MODEL, prompt=prompt, tools=STAGE1_TOOLS, grant_usd=grant,
         max_turns=cfg.max_turns, settings_path=SETTINGS_PATH,
-        cwd=str(cfg.repo_root), timeout_s=timeout_s)
+        cwd=str(cfg.repo_root), timeout_s=timeout_s,
+        # 每轮留一份完整 stream 供事后判因。目录随 .claude/state/ 一起被
+        # gitignore，不会污染仓库。
+        stream_log=cfg.state_db.parent / "rounds" / f"{round_id}.jsonl")
     # 从这里开始，若后续任何步骤（发布、账本写入之外的路径）抛出未预期
     # 异常，finalize 边界至少能按本次调用的真实 turns/denials/exit_code
     # 与已知成本结算，而不是完全空白（评审 Critical C）。

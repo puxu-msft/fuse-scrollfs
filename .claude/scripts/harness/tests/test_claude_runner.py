@@ -1,4 +1,5 @@
 import json
+import pathlib
 import math
 import subprocess
 import unittest
@@ -493,6 +494,48 @@ class TestInvoke(unittest.TestCase):
         self.assertNotIn("[", picked, "不得使用带上下文变体后缀的模型名")
         self.assertTrue(picked.startswith("claude-"),
                         f"必须是规范模型 ID，实际 {picked!r}")
+
+    def test_full_stream_is_persisted_for_post_mortem(self):
+        """失败轮必须留下完整 stream，否则事后无法判因。
+
+        真机实测（2026-07-31）：一轮 $10 的 round 报 invocation-failed，而进程
+        只保留了 5 行 raw_tail，无法判断到底是 payload 提取失败、协议异常还是
+        预算耗尽——花了钱却拿不到诊断依据。
+        """
+        import tempfile
+        stdout = self._valid_stdout()
+        runner = FakeRunner(result=subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stdout=stdout, stderr="some warning"))
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "nested" / "r1.jsonl"
+            invoke(prompt="/x", tools=VALID_TOOLS, grant_usd=0.5, max_turns=5,
+                  settings_path="s.json", cwd="/tmp", timeout_s=5.0,
+                  env={"HOME": "/home/x", "PATH": "/bin"}, runner=runner,
+                  stream_log=log)
+            self.assertTrue(log.exists(), "父目录不存在时也必须落盘")
+            written = log.read_text(encoding="utf-8")
+            self.assertIn(stdout.strip().splitlines()[0], written)
+            self.assertEqual(written.count("\n") >= stdout.count("\n"), True,
+                             "必须是完整 stream，不是尾部片段")
+            self.assertIn("some warning", written, "stderr 也要留")
+
+    def test_stream_is_persisted_even_when_the_call_times_out(self):
+        """超时是最需要事后判因的情形，不能反而什么都不留。"""
+        import tempfile
+
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=5.0,
+                                            output="partial line\n",
+                                            stderr="killed")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "r2.jsonl"
+            res = invoke(prompt="/x", tools=VALID_TOOLS, grant_usd=0.5,
+                        max_turns=5, settings_path="s.json", cwd="/tmp",
+                        timeout_s=5.0, env={"HOME": "/h", "PATH": "/bin"},
+                        runner=boom, stream_log=log)
+            self.assertEqual(res.exit_code, 124)
+            self.assertTrue(log.exists())
+            self.assertIn("partial line", log.read_text(encoding="utf-8"))
 
     def test_cwd_is_passed_through_correctly(self):
         runner = FakeRunner(result=subprocess.CompletedProcess(

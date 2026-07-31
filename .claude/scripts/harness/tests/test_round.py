@@ -47,6 +47,10 @@ def _clean_invocation(ok, payload, cost, turns, **kw):
 class Cfg:
     def __init__(self, root):
         self.repo_root = root
+        # 与真实 Config 一致：state_db 决定 stream 日志落在哪。测试假件漏掉真实
+        # 配置字段时，接缝缺陷只会在真机才暴露——这里就是一次（新增 stream_log
+        # 落盘后 24 个测试同时 AttributeError）。
+        self.state_db = Path(root) / ".claude/state/harness.db"
         self.gh_token = "tok"
         self.round_budget_usd = 1.0
         self.daily_budget_usd = 5.0
