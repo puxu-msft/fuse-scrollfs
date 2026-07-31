@@ -6,6 +6,7 @@
       "Glob",
       "Skill",
       "Workflow",
+      "TaskOutput",
       "TodoWrite"
     ],
     "deny": [

@@ -10,11 +10,21 @@ description: scrollz 自主改进 harness 的一轮入口。由控制器以 head
 ## 你必须做的
 
 1. 调用 `Workflow` 工具，`workflow` 参数为 `scrollz-propose`，`args` 取自控制器通过提示词传入的 JSON（含 `known_canonical_keys`、`blocked_lanes`、`inflight_paths`）。`known_canonical_keys` 是 Workflow 内 `canonicalKey()` 规范化后的候选原文 key 集合（四字段拼接、转小写、折叠空白），**不是** sha256 摘要，去重时按原文比对，而非按指纹比对。
-2. **等待 workflow 真正完成，拿到它的返回值再继续。**
+2. **立刻用 `TaskOutput` 阻塞等待，不要靠"等通知"。**
 
-   `Workflow` 工具在编排规模较大时会走「后台启动」路径、**立刻返回一个 run ID 而不是结果**。这时**绝不能结束本轮**——真机实测过一次：外层宣布「等完成后我会输出」然后结束了回合，会话一退后台任务立即被 kill，整轮报 `invocation-failed` 且白烧预算。
+   `Workflow` 工具**总是**立刻返回一个 run/task ID 而不是结果——它的编排在后台跑。
+   而你运行在 headless 的 `claude -p` 会话里：**你一旦结束回合，会话就退出，后台任务立即被杀。**
+   真机实测三次都栽在这里——外层如实宣布「我会等待完成通知后再取结果，不会在此之前结束本轮」，然后回合结束、任务被 stopped、整轮报 `invocation-failed` 且白烧预算。
+   **你没有「跨回合等待」这个动作**，所以"打算等"是做不到的事。
 
-   正确做法：收到 run ID 后继续等待该 workflow 的完成通知；通知到达后读取其返回值。**在拿到实际返回值之前，不要产出最终消息。**
+   唯一可行的等待方式是**在同一个回合内再发一次工具调用**：拿到 ID 后**紧接着**调用
+
+   ```
+   TaskOutput(task_id=<通知里的 task_id>, block=true, timeout=600000)
+   ```
+
+   它会阻塞到任务结束并把输出交给你。若返回时任务仍未完成，就**再调一次**，直到拿到结果或超过三次为止。
+   **在拿到实际返回值之前，绝不产出最终消息、绝不结束回合。**
 3. 把 workflow 的返回值**原样**作为最后一条消息输出，格式为单个 JSON 代码块，不加任何解释。
 
 ## labels 分工

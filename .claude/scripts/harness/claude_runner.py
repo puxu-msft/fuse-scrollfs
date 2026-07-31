@@ -61,7 +61,16 @@ _INHERITED_AUTH_ENV = (
     "CLAUDE_CODE_OAUTH_TOKEN",
 )
 
-STAGE1_ALLOWED_TOOLS = frozenset({"Read", "Grep", "Glob", "Skill", "Workflow"})
+# TaskOutput 是打通 `claude -p` + Workflow 的关键：Workflow 工具**总是**立刻返回
+# 一个 run/task ID 并转入后台（工具文档原文："Workflows run in the background —
+# this tool returns immediately"）。而 headless 会话在模型结束回合后即退出，后台
+# 任务随即被 stopped。真机实测两次（2026-07-31）：模型如实宣布"我会等待完成通知
+# 后再取结果"，随后 stop_reason=end_turn，任务被杀。这不是提示词能修的——模型在
+# -p 模式下没有"跨回合等待"这个动作。
+# TaskOutput(block=True) 让等待变成**同一回合内的一次工具调用**，模型不必结束回合。
+# 它是只读工具（只取已有任务的输出），不扩大写能力边界。
+STAGE1_ALLOWED_TOOLS = frozenset({"Read", "Grep", "Glob", "Skill", "Workflow",
+                                  "TaskOutput"})
 
 
 class UnsafeInvocationError(ValueError):
