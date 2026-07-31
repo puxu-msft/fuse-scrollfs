@@ -34,6 +34,10 @@ _JS_SPACE = ("\u0020\t\n\r\f\v\u00a0\u1680\u2000-\u200a"
 _WS = re.compile(f"[{_JS_SPACE}]+")
 _WS_EDGE = re.compile(f"^[{_JS_SPACE}]+|[{_JS_SPACE}]+$")
 
+_HEX_SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")  # 40 位 SHA-1 或 64 位 SHA-256
+_POSITIVE_INT = re.compile(r"^[1-9][0-9]*$")
+_NONNEG_INT = re.compile(r"^(0|[1-9][0-9]*)$")
+
 
 def _norm(text: str) -> str:
     return _WS.sub(" ", _WS_EDGE.sub("", text).lower())
