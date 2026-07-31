@@ -13,9 +13,15 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import claude_runner
 from .config import CLAUDE, FLOCK, GH, GIT, PYTHON
 
 DEFAULT_TOOLS = (PYTHON, CLAUDE, GH, GIT, FLOCK)
+
+# 真正构成凭据的变量。刻意**不含** ANTHROPIC_BASE_URL——它只指定端点，光有端点
+# 没有凭据同样跑不起来，把它算作"有认证"会让本检查漏掉真实的失败态。
+AUTH_CREDENTIAL_ENV = tuple(
+    k for k in claude_runner._INHERITED_AUTH_ENV if k != "ANTHROPIC_BASE_URL")
 PAUSED_LABEL = "harness:paused"
 
 
@@ -48,6 +54,22 @@ def _inspect_preconditions(cfg, gh, tools: tuple[str, ...]) -> list[CheckResult]
     token_ok = bool(getattr(cfg, "gh_token", ""))
     results.append(CheckResult("gh_token", token_ok,
                                "GH_TOKEN 为空" if not token_ok else "ok"))
+
+    # 模型 API 认证。必须在这里查、且必须查 `os.environ`——`invoke()` 实际读的
+    # 就是它（经 `_sanitize_env` 的白名单透传）。查配置文件是**另一件事**：文件
+    # 里有而没进本进程环境，子进程照样 `Not logged in`。
+    #
+    # 为什么这是 fail-closed 的而不是"跑起来再说"（评审 rmf-01）：认证缺失时
+    # 失败路径按**预留满额**计费，12 轮/日 × $6 = 每日约 $72 的虚构花费写进
+    # budget_days（真实模型花费 $0），且正好不触发「单日 > $80」的观察终点——
+    # 于是预算观察期唯一的 oracle 被污染，而没有任何人会察觉。
+    # 本检查在第一层，因此在 `budget.reserve()` 之前返回，不产生虚构占用。
+    present = [k for k in AUTH_CREDENTIAL_ENV if os.environ.get(k)]
+    results.append(CheckResult(
+        "model_auth", bool(present),
+        "ok" if present else
+        "环境中无任何模型 API 凭据（需其一：" + "、".join(AUTH_CREDENTIAL_ENV) +
+        "）。systemd 起的轮次靠 EnvironmentFile 提供，不要指望从交互式 shell 继承"))
 
     try:
         perm = gh.viewer_permission()

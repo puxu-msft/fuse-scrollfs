@@ -1,6 +1,8 @@
+import os
 import subprocess, tempfile, unittest
+from unittest import mock
 from pathlib import Path
-from harness import db
+from harness import claude_runner, db, precheck
 from harness.config import GIT
 from harness.gitops import PublishWorktree
 from harness.outbox import Outbox, TerminalOperationError
@@ -53,6 +55,14 @@ class RaisingOutbox:
 
 class Cfg:
     gh_token = "tok"
+
+
+class _StubGh:
+    def viewer_permission(self):
+        return "ADMIN"
+
+    def list_open_issues_with_label(self, label):
+        return []
 
 
 class TestPrecheck(unittest.TestCase):
@@ -383,6 +393,54 @@ class TestPrecheckRealWorktreeIntegration(unittest.TestCase):
         self.assertEqual(untracked.read_text(), "please keep me\n")
         self.assertEqual(tracked.read_text(), "locally modified, do not discard\n",
                          "已跟踪文件的本地修改不得被 reset --hard 丢弃")
+
+
+
+class TestModelAuthPrecheck(unittest.TestCase):
+    """认证缺失必须在 reserve() 之前 fail closed。
+
+    评审 rmf-01：systemd 起的轮次环境里一个认证变量都没有，子进程报
+    `Not logged in`，而失败路径按预留满额计费。12 轮/日 × $6 = 每日约 $72 的
+    **虚构**花费写进 budget_days（真实模型花费 $0），且正好不触发「单日 > $80」
+    的观察终点——于是 2026-08-07 那次预算复核读到的是一串虚构数字，而它本该是
+    观察期唯一的 oracle。
+
+    oracle 必须与断言一致：`invoke()` 实际读的是 `os.environ`（经
+    `_sanitize_env` 透传白名单），所以这里就查 `os.environ`，不查配置文件——
+    配置文件存在不等于变量进了本进程环境。
+    """
+
+    def _run(self, env):
+        with mock.patch.dict(os.environ, env, clear=True):
+            results = precheck._inspect_preconditions(
+                Cfg(), _StubGh(), tools=())
+        return {r.name: r for r in results}
+
+    def test_missing_all_auth_channels_fails_closed(self):
+        by_name = self._run({})
+        self.assertIn("model_auth", by_name)
+        self.assertFalse(by_name["model_auth"].ok)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", by_name["model_auth"].detail)
+
+    def test_any_single_auth_channel_is_enough(self):
+        for key in claude_runner._INHERITED_AUTH_ENV:
+            if key == "ANTHROPIC_BASE_URL":
+                continue  # 仅有 base_url 不构成凭据
+            with self.subTest(key=key):
+                by_name = self._run({key: "x"})
+                self.assertTrue(by_name["model_auth"].ok,
+                                f"{key} 已设置却仍判失败")
+
+    def test_base_url_alone_is_not_a_credential(self):
+        """只有端点没有凭据同样跑不起来，不得放行。"""
+        by_name = self._run({"ANTHROPIC_BASE_URL": "https://api.example"})
+        self.assertFalse(by_name["model_auth"].ok)
+
+    def test_auth_check_is_pure_read(self):
+        """预检第一层必须无副作用：不得写入或修改环境。"""
+        before = dict(os.environ)
+        self._run({"ANTHROPIC_AUTH_TOKEN": "x"})
+        self.assertEqual(dict(os.environ), before)
 
 
 if __name__ == "__main__":
