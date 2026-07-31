@@ -1,0 +1,5 @@
+# 逐轮 wire 证据（stdin/stdout 原始字节）。体积大且随每次重跑变化，结论已固化在
+# CONCLUSIONS.md 里并附了脱敏片段，因此不入库；需要复现时按文档重跑即可。
+artifacts/
+__pycache__/
+rewrite-effective.txt
