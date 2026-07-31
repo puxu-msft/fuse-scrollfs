@@ -247,3 +247,55 @@ class TestOutbox(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReconcileFeedsObservationWindow(unittest.TestCase):
+    """reconcile 路径也必须喂观察窗，否则闸门会被整条路径绕过。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        db.migrate(self.conn)
+        self.ob = Outbox(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _make_uncertain(self):
+        op = self.ob.prepare("r1", "publish_proposal", "nk", {"title": "x"})
+        with self.assertRaises(ResponseLost):
+            self.ob.execute(op, call=lambda: (_ for _ in ()).throw(
+                ResponseLost("boom")), probe=lambda: None)
+        return op
+
+    def test_reconcile_accumulates_observations_and_finally_goes_terminal(self):
+        op = self._make_uncertain()
+        blind = {"publish_proposal": lambda o: None}
+        for _ in range(self.ob.UNCERTAIN_WINDOW + 2):
+            self.ob.reconcile(blind)
+        row = self.conn.execute(
+            "SELECT phase FROM operations WHERE operation_id=?",
+            (op.operation_id,)).fetchone()
+        self.assertEqual(row["phase"], "failed_terminal",
+                         "只经 reconcile 重访的 operation 必须最终撞到窗口上限")
+        self.assertEqual(len(self.ob.unresolved()), 1,
+                         "转 terminal 后必须能阻断后续轮次")
+
+    def test_reconcile_adopting_positive_read_clears_uncertainty(self):
+        op = self._make_uncertain()
+        self.ob.reconcile({"publish_proposal": lambda o: None})
+        self.ob.reconcile({"publish_proposal": lambda o: {"number": 7}})
+        self.assertEqual(self.ob.get("publish_proposal", "nk").result,
+                         {"number": 7})
+        self.assertEqual(self.ob.unresolved(), [])
+
+    def test_prepared_ops_are_not_counted_as_uncertain(self):
+        """从未 ResponseLost 过的 prepared operation 只是还没执行，不算不确定。"""
+        self.ob.prepare("r1", "publish_proposal", "nk2", {"title": "y"})
+        for _ in range(self.ob.UNCERTAIN_WINDOW + 2):
+            self.ob.reconcile({"publish_proposal": lambda o: None})
+        row = self.conn.execute(
+            "SELECT phase FROM operations WHERE natural_key='nk2'").fetchone()
+        self.assertEqual(row["phase"], "prepared")
+        self.assertEqual(self.ob.unresolved(), [])

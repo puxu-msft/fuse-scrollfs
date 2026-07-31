@@ -228,8 +228,18 @@ class Outbox:
             observed = probe(op)
             if observed is not None:
                 self._mark(op, "observed", observed)
-            else:
-                still_open.append(op)
+                continue
+            if op.phase == "failed_retryable":
+                # 与 `execute()` 同一策略：结果曾经不确定、这次探测又是阴性，
+                # 只累计观察次数。**这条分支不能少**——若 reconcile 只是把 op
+                # 放回 still_open 而不喂观察计数，一个始终经 reconcile 而从不
+                # 经 execute 被重访的 operation 会永远开着、撞不到窗口上限，
+                # 于是"窗口耗尽转人工"这道闸门被整条路径绕过。
+                updated = self.record_uncertain_observation(op)
+                if updated.uncertain_observations >= self.UNCERTAIN_WINDOW:
+                    self._mark(op, "failed_terminal", None)
+                    continue
+            still_open.append(op)
         return still_open
 
     def open_operations(self) -> list[Operation]:
