@@ -18,6 +18,11 @@ from .precheck import inspect_facts
 from .queue import Queue
 from .round import SETTINGS_PATH, STAGE1_TOOLS, Deps, run_round
 
+
+
+# 真机实测标定（2026-07-31）：contract probe 单次 $0.2433 / 3 turns
+PROBE_BUDGET_USD = 0.60
+PROBE_MAX_TURNS = 8
 # `invoke()` 统一走 `claude_runner._extract_payload()`：只接受形如
 # `{"candidates": [...]}` 的对象，且要求「单个 JSON 代码块，不加任何解释」
 # （评审 Critical B）。probe 若仍要求模型「回复 OK，不要调用任何工具」，
@@ -87,8 +92,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "probe":
+        # 预算与 turn 上限按**实测**标定，不是估值（spec §十六：这类数值
+        # 先给保守硬上限、实测后只调优）。2026-07-31 真机实测：contract
+        # probe 会起一个 sonnet agent，单次成本 $0.2433、需要 3 个 turn
+        # （调 Skill → 调 Workflow → 输出结果）。原先写的 $0.10 / 2 turns
+        # 是凭空估的，必然触发 error_max_budget_usd。
+        # 这里留 ~2.5x 余量吸收模型侧波动；余量再大就失去了"探针也是预算
+        # 闸门的一次实弹演练"的意义。
         res = invoke(prompt=PROBE_PROMPT, tools=STAGE1_TOOLS,
-                     grant_usd=0.10, max_turns=2, settings_path=SETTINGS_PATH,
+                     grant_usd=PROBE_BUDGET_USD, max_turns=PROBE_MAX_TURNS,
+                     settings_path=SETTINGS_PATH,
                      cwd=str(cfg.repo_root), timeout_s=180, env=dict(os.environ))
         print(json.dumps({
             "exit_code": res.exit_code, "init_seen": res.init_seen,
