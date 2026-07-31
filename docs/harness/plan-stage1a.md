@@ -4089,15 +4089,30 @@ git commit -m "docs(harness): 提案卡目录说明、文档索引接线、Round
 | 2 | 生命周期派生函数 | **done** | `test_lifecycle` 7/7 绿（含 256 组合穷举、八状态全可达） | 实现取自已验证的 PoC |
 | 3 | outbox | **done** | `test_outbox` 14/14 绿；关键两条：probe-before-call 认出既有 artifact、artifact 齐全但 root 未 settled 仍算待恢复 | 比计划多 4 条测试（父指针断言、root_of、open_roots、unpushed_commits） |
 | 4 | GitHub 层 + Fake | **done** | 45d0196 实施 → 评审 ❌ → f858b2c 修复 → **复审 ✅ Approved**；33 用例（含 24 条 adapter contract） | 评审五条全闭合：分页 --slurp 展平、Issue DTO 规范化 labels→list[str]、写/读错误分型 + timeout、GitHubClient(Protocol) + 可注入执行器、Fake 写方法全经故障注入。残余 2 Minor 不阻塞 |
-| 5 | 发布工作区 | 修复中 | 6c81d2b 实施 7/7 → 评审 ❌ | **Critical：路径逃逸**（评审复现 `write_proposal('../../../x')` 写到工作区外）；另 push 失败分类过宽、allow_reset=False 仍 abort、grep 模糊匹配、缺 3 条异常路径测试、ResourceWarning |
-| 6 | 预算 | 修复中 | 591a48b 实施 5/5 → 评审 ❌ | **Critical：同 round 重复 reserve 留永久幽灵预留**（评审复现）；另 overrun 静默截断、崩溃测试没重开连接、record_invocation 非幂等 |
-| 7 | 队列治理 | 修复中 | 591a48b 实施 7/7 → 评审 ❌ | typed 谓词只验前缀不验参数（评审复现 `main_sha_changed:not-a-sha` → True）；possible_duplicate 不可达；INSERT OR REPLACE 抹历史 |
-| 8 | 发布编排 + 崩溃矩阵 | 待开工 | | 依赖 4/5/6/7 修完 |
-| 9 | 预检 | 修复中 | 600769c 实施 7/7 → 评审 ❌ | **实施者错误「校正」引入死锁**（open_operations 阻断 → 恢复路径永不可达），协调者已改回 unresolved 并加不变量测试，评审确认改回正确；另判 dirty 检查假绿（先 clean 再宣布 clean）、paused 时仍改工作区 |
-| 10 | Claude 侧资产 | 修复中 | aba911b 实施 14 文件 → 评审 ❌ | **Critical：两个 workflow 未以 export const meta 开头 + 契约探针未跑**；另 finder 数组/对象契约矛盾、labels 缺失、参数名漂移、缺 additionalProperties:false、judge schema 不一致、**红线路径大半写错**（MAGIC 实在 archive/mod.rs、提交顺序在 updater.rs）、自修改红线漏 agents/rules/redlines 自身 |
-| 11 | claude -p 调用层 | 修复中 | 076911c 实施 8/8 → 评审 ❌ | **Critical：硬权限契约只活在测试输入里**（`build_argv(tools="default")` 照样生成带写能力 argv）；另多 result/多 init 静默覆盖、非法行忽略、cost 异常、init_seen 不强制、env 漏 GH_CONFIG_DIR/GIT_CONFIG_*、invoke() 零测试 |
-| 12 | 轮次编排 + CLI | pending | | |
-| 13 | systemd + 真机验收 | pending | | 含授权门，逐步执行 |
+| 5 | 发布工作区 | **done** | 评审 ❌ → 修复 → 复审 ✅ | 路径逃逸已修（严格模式 `docs/proposals/<issue>-<slug>.md` + resolve 边界校验，评审的 `write_proposal('../../../x')` 反例已不可复现）；push 失败分类收窄；dirty 检查先于任何 reset |
+| 6 | 预算 | **done** | 评审 ❌ → 修复 → 复审 ✅ | 幽灵预留已修（`round_id` 作幂等键）；overrun 不再静默截断；崩溃测试重开连接 |
+| 7 | 队列治理 | **done** | 评审 ❌ → 修复 → 复审 ✅ | typed 谓词改为验参数（`main_sha_changed:not-a-sha` 现判非法）；`possible_duplicate` 仍不可达，**已冻结为 Stage 1b B2 范围**，非静默省略 |
+| 8 | 发布编排 + 崩溃矩阵 | **done** | 12 相 crash matrix 由 `OPERATION_KINDS × FAULT_PHASES` 派生穷举 | probe 现场核验 git 对象，不再只信 SQLite 缓存的 SHA |
+| 9 | 预检 | **done** | 评审 ❌ → 修复 → 复审 ✅ | 实施者误引入的死锁已改回 `unresolved()` 并加不变量测试 `test_pending_operations_do_not_block_the_round` |
+| 10 | Claude 侧资产 | **done** | 契约探针真机跑通（$0.202，工具集恰为五个、无 MCP/插件、零外部写入） | 两个 workflow 均以 `export const meta` 首字节开头；红线路径 19 条逐条核实存在 |
+| 11 | claude -p 调用层 | **done** | 评审 ❌ → 修复 → 复审 ✅ | 硬权限契约移进 `build_argv()` 入口强制；**真机又补三处**：env 前缀级 deny-by-default、规范模型 ID、`TaskOutput` 进 allowlist |
+| 12 | 轮次编排 + CLI | **done** | 285 测试全绿、`-W error::ResourceWarning` 干净 | finalize 边界实测兜住过一次 `unhandled-exception`（工具集漂移），预留正确释放 |
+| 13 | systemd + 真机验收 | **进行中** | 见下表 | 逐步执行，不连跑 |
+
+### Task 13 真机验收逐步状态
+
+| 步骤 | 状态 | 证据 |
+|---|---|---|
+| 0. 推送代码到 origin/main | ✅ | `9b498e9`；改走 HTTPS + PAT（SSH agent 无密钥会打死无人值守 push，真机才暴露） |
+| 1. doctor 纯只读 | ✅ | 全绿退出 0，零状态变化，`viewerPermission=ADMIN` |
+| 2. probe 只花钱零写入 | ✅ | 退出 0，$0.202，隔离项逐条核对 |
+| 3. bootstrap 18 个 label | ✅ | name+color+description 逐项回读一致；幂等复跑 0 新建；9 个既有 label 未被动 |
+| 4. 首轮真实 round | ✅ | **Issue #1** + 提案卡 `d2ca47e`；四个 operation 全 `settled`，末态 `publication-receipt-complete`；成本 $5.45 |
+| 5. 定点故障注入恢复验收 | 进行中 | 首次尝试在扫描阶段撞 $6 上限、注入未触发，已把轮上限提到 $10，并把后续注入点挪到 **resume 轮**（不跑扫描，成本接近零，测的是同一批发布接缝） |
+| 6. 安装 systemd 单元但不启用 | 待做 | |
+| 7. 启用 2h 定时器并观察一周期 | 待做 | |
+
+**真机暴露而 285 个离线测试 + 四轮合并态评审全部漏掉的五个缺陷**，见 `HANDOVER.md` 顶部表格。可推广的判据：**「由谁启动我」「我活多久」「上游抖动时编排怎么办」这三类问题，离线测试系统性地看不见。**
 
 **2. 占位符扫描**：无 TBD/TODO；每个代码步骤均给出完整可运行代码；每个测试步骤均给出完整断言。
 
