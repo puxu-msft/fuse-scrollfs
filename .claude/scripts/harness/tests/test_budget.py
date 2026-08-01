@@ -111,17 +111,25 @@ class TestBudget(unittest.TestCase):
         self.assertTrue(self.b.breached("r1"))
 
     def test_normal_business_outcome_does_not_erase_budget_breach(self):
-        """预留 X、实花 X+δ 后正常发布：业务结果与超支事实必须同时可读。"""
+        """预留 X、实花 X+δ 后正常发布：业务结果与超支事实必须同时可读，
+        且 settle 不得暂借业务 result 字段承载 breach。"""
         self.b.reserve("r1", DAY)
         self.b.settle("r1", DAY, 1.2)
-        self.b.record_outcome("r1", result="published")
-
-        row = self.conn.execute(
+        settled = self.conn.execute(
             "SELECT result, reserved_usd, settled_usd FROM rounds WHERE round_id=?",
             ("r1",),
         ).fetchone()
-        self.assertEqual(row["result"], "published")
-        self.assertGreater(row["settled_usd"], row["reserved_usd"])
+        self.assertIsNone(settled["result"])
+        self.assertGreater(settled["settled_usd"], settled["reserved_usd"])
+        self.assertTrue(self.b.breached("r1"))
+
+        self.b.record_outcome("r1", result="published")
+        recorded = self.conn.execute(
+            "SELECT result, reserved_usd, settled_usd FROM rounds WHERE round_id=?",
+            ("r1",),
+        ).fetchone()
+        self.assertEqual(recorded["result"], "published")
+        self.assertGreater(recorded["settled_usd"], recorded["reserved_usd"])
         self.assertTrue(self.b.breached("r1"))
 
     def test_non_breach_remains_distinguishable_from_breach(self):
