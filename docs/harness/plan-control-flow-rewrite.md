@@ -1,7 +1,7 @@
 # scrollz harness · 控制流重写实施计划（ADR-002 D0/D1/D2 落地）
 
-> 状态：**草稿 v3，已处置两轮跨模型对抗评审（cfr-01–19、cfr2-01–10），撰写中，尚未提交第三轮审查**。
-> 撰写日期 2026-07-31，v3 修订日期 2026-08-02。回答「怎么做」；「做什么/为什么」见 [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md)、PoC 结论见 [exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md)、现行不变量见 [spec.md](./spec.md)、真机现状见 [HANDOVER.md](./HANDOVER.md)、最近一轮评审见 [code-review-realmachine-fixes.md](./code-review-realmachine-fixes.md)、第一轮评审见 [plan-control-flow-rewrite-review.md](./plan-control-flow-rewrite-review.md)、第二轮评审见 [plan-control-flow-rewrite-review-2.md](./plan-control-flow-rewrite-review-2.md)。
+> 状态：**草稿 v4，已处置三轮跨模型对抗评审（cfr-01–19、cfr2-01–10、cfr3-01–03），撰写中，尚未提交第四轮审查**。
+> 撰写日期 2026-07-31，v3 修订日期 2026-08-02，v4 修订日期 2026-08-02。回答「怎么做」；「做什么/为什么」见 [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md)、PoC 结论见 [exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md)、现行不变量见 [spec.md](./spec.md)、真机现状见 [HANDOVER.md](./HANDOVER.md)、最近一轮评审见 [code-review-realmachine-fixes.md](./code-review-realmachine-fixes.md)、第一轮评审见 [plan-control-flow-rewrite-review.md](./plan-control-flow-rewrite-review.md)、第二轮评审见 [plan-control-flow-rewrite-review-2.md](./plan-control-flow-rewrite-review-2.md)、第三轮评审见 [plan-control-flow-rewrite-review-3.md](./plan-control-flow-rewrite-review-3.md)。
 > 关联但**冻结不动**：[plan-stage1a.md](./plan-stage1a.md)（Task 1–12 已完成，是本计划的起点代码）、[plan-stage1b.md](./plan-stage1b.md)（治理范围，不受本次重写影响，仍在其冻结范围内）。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans` 逐任务实施。任务用 checkbox（`- [ ] `）追踪。
@@ -113,6 +113,22 @@
 
 ---
 
+## 评审处置台账（第三轮，`cfr3-01`–`cfr3-03`，`docs/harness/plan-control-flow-rewrite-review-3.md`）
+
+> 第三轮评审明确判定 v3（第二轮修订）"形态不是 wrong-shape"——契约化降级方向正确，八项核心设计要求中七项完整保留（`WaveResult` 全部 attempts、`BudgetTracker` 允许负余额、状态词三处统一、judge 传 `expected_tools`、`retryable`/`resumable` 分离、能力漂移不可降级、动态 `timeout_s`），新引入缺陷数从上一轮的 4 降为 0。仅剩三个阻塞项，均属"因降级丢失细节"或"三轮未真正关闭"，本表记录 v4 修订的处置。
+
+| 编号 | 严重级别 | 处置 | 落点（v4 修订后的章节） |
+|---|---|---|---|
+| cfr3-01 | Critical | **采纳**：契约此前未定义生产请求的 `cwd`/`settings_path`/`model`/per-attempt `stream_log` 从哪里取得并验证——Phase 6 测试只验证 adapter 展开了哪些键，不验证值是否正确；judge task identity 虽要求贯穿 session/ledger/路由，但测试只比较了 session ID，未验证 `attempt_key`/`stream_log` 是否同样由同一 task identity 派生。修正：新增 `RequestContext`（Task 2.3）与 `build_stream_log_path`（与账本 `attempt_key` 共用拼接模板），Task 5.5 新增两个候选的联合测试（逐项断言 session ID/attempt key/stream path 均由同一含 fingerprint 的 task identity 派生），Task 6.1 新增 `_build_request_context(cfg)` 作为生产值的唯一构造点并断言其产出值确为生产真值 | Phase 2 Task 2.3（`RequestContext`/`build_stream_log_path` 定义）、Phase 5 Task 5.5（联合测试+消费）、Phase 6 Task 6.1（生产值唯一构造点） |
+| cfr3-02 | Critical | **采纳**：`retryable` 字段自 cfr2-07 引入以来，赋值规则始终是"`failed_transport` 恒真、`capability_drift` 恒假"——三轮评审反复指出这只是把旧的"全部重试"策略换了个字段名字，没有做终态分类本身；`error_max_budget_usd`（预算耗尽）与确定性协议异常（重复 init/result 事件）不应被无差别当作可重试的传输故障。修正：Task 2.1 让 `InvocationResult` 暴露 `subtype` 字段（透传终态事件原始值），Task 5.3 新增可测试的终态分类表（区分预算耗尽/确定性协议异常"不可重试" vs 真实传输抖动/schema 校验失败"可重试"），`_classify_retryable` 函数体现分类表全部行，不是"看 status 字面量做二元判断" | Phase 2 Task 2.1（`subtype` 透传）、Phase 5 Task 5.3（终态分类表 + `_classify_retryable`） |
+| cfr3-03 | Important | **采纳**：开放发现处置表宣称三项修复（rmf-04 的 `protocol_errors` 进 `detail`、`record_degraded` 双写 `agentType`、rmf-17 显式设规范 `model`），但对应任务的不变量与测试清单从未真正覆盖这三点——处置表记的是作者相信会做的事，不是任务清单里真正执行的断言。修正：三项全部补进**实际任务**的不变量与测试清单：`record_degraded` 双写测试补进 Task 5.2；`protocol_errors` 聚合测试补进 Task 5.6；`_format_detail` 消费聚合结果与 `model=DEFAULT_AGENT_MODEL` 显式传入的测试补进 Task 6.1 | Phase 5 Task 5.2（`agentType` 双写测试）、Task 5.6（`protocol_errors` 聚合测试）、Phase 6 Task 6.1（`_format_detail`/`model` 显式传入测试） |
+
+**非阻塞但需明确处置的一项（rmf-08）**：第三轮评审明确指出"本计划把每轮日志从 1 份扩大到多份，属于直接放大，不是无关任务"——不能再简单写"与本次改动无关"。已处置：Phase 2 Task 2.1 把 stream 落盘权限从系统默认收紧为显式 `0o600`（成本最低、无需额外设计决策，随手做掉）；脱敏与轮转/保留策略仍明确延后（需要新的设计决策，非本计划范围），但已量化说明暴露面放大 7 倍（原 1 个文件→最多 7 个），供用户择期裁决，不再是模糊的"无关"表述。
+
+**未被反驳的条目**：本轮 3 条经复核**全部成立，无一条被驳回**。cfr3-01/cfr3-03 是"因降级丢失"的细节缺口（第二轮修订在把代码草图收窄为契约时，一并收窄掉了原本存在于详尽代码里的交叉验证），cfr3-02 是三轮评审持续指出、直到本轮才真正给出可测试终态分类表的设计缺陷——三者均非评审误判，予以全部采纳。
+
+---
+
 ## 开放发现处置表（cfr-16：`code-review-realmachine-fixes.md` 中仍开放且落在本次改动模块上的条目）
 
 > 退役 JS/`TaskOutput`/`Skill`/`Workflow` 只能关闭这些发现里"由外层会话/Workflow 编排导致"的那部分触发路径，**不会自动关闭**与 `claude_runner.invoke()`/`round.py` 本身相关的部分。以下逐条核查：本次改动是否让该发现的根因消失、还是仍需在新代码里显式处理。
@@ -122,7 +138,7 @@
 | rmf-04 | `invocation-failed`/`capability-drift` 分支只带 `raw_tail`（末 5 行），`protocol_errors` 结论被丢弃 | **仍开放，且扇出后影响面扩大**——每轮最多 7 次独立子调用，每次失败都可能需要这条判因链路，而不是过去"一次顶层调用" | **新增处置**：Phase 5 的 `AttemptRecord`（见 Task 5.3）已含字段 `protocol_errors: list[str]`，直接透传 `InvocationResult.protocol_errors`；Phase 6 的 `FanoutSettlement` 聚合时保留每个失败角色的 `protocol_errors`，写入 `round.py` 返回的 `detail` 字段（沿用 rmf-04 建议的 `"; ".join(protocol_errors) or raw_tail` 拼接方式）。落点：Phase 5 Task 5.3/5.6、Phase 6 Task 6.1 |
 | rmf-05 | 成本已知时仍按预留满额计费 | **已被 `round.py` 现状代码修复**（`_settle_failed()` 按 `cost_known` 分支），本次改动不改这段逻辑，且 Phase 5/6 的新增 `_BudgetTracker`（cfr-05 修复）与其正交——`_BudgetTracker` 管"本轮扇出内部的并发预留"，`_settle_failed`/`budget.settle`/`budget.abandon` 管"整轮对 `budget_days` 的最终结算"，两层不冲突 | 无需处置，确认不回归 |
 | rmf-06 | env "deny-by-default" 是前缀级黑名单而非白名单，`CLAUDECODE` 等变量穿透 | **不在本次改动范围**——`_sanitize_env()` 完全不因扇出重写而改变，七个子调用复用同一份 `_sanitize_env()` 逻辑（每次调用各自构造 argv 与 env，但函数本身不变） | **仍开放，理由是**：修复 `_sanitize_env` 的白名单化是独立的安全加固任务，与"扇出架构从 JS 迁到 Python"无逻辑依赖，混在本计划里会扩大变更面而不利于审查。**不落 backlog 编号**（第二轮评审 cfr2-09 指出此前登记的"backlog 项 5"并不存在于下方「通用化接缝」章节的 backlog 列表里，是自填的假引用）——如需正式排期，应在本计划提交合入后由主会话另开一个独立 issue/backlog 条目登记，本计划只如实记录"仍开放、未处置、原因如上"这个状态，不预先编造一个不存在的追踪编号 |
-| rmf-08 | stream 落盘默认权限 0644、无脱敏、无轮转、无限增长 | **本次改动扩大暴露面**：原来一轮一个 stream 文件，扇出后一轮最多 7 个（每个子调用一个，Phase 2 Task 2.3 的 `RoleInvocationRequest.stream_log` 字段承载 per-call 路径，解决 cfr-01 关联的可观测性缺口） | **部分处置**：Phase 6 接线时构造的 `stream_log` 路径构造复用 `claude_runner._persist_stream()` 现有函数（不改其权限/脱敏行为，因为那是独立缺口），但**新增**一条测试断言"扇出一轮后 `.claude/state/rounds/` 目录下有 N 个文件而非 1 个"，确保可观测性至少不因为"从 1 个文件变多个文件"而意外丢失信息。**0644 权限/脱敏/轮转本身仍开放，理由同 rmf-06**——独立安全加固任务，非本计划引入也非本计划解决，不落 backlog 编号（同一处 cfr2-09 反例，见上） |
+| rmf-08 | stream 落盘默认权限 0644、无脱敏、无轮转、无限增长 | **本次改动扩大暴露面**：原来一轮一个 stream 文件，扇出后一轮最多 7 个（每个子调用一个，Phase 2 Task 2.3 的 `RoleInvocationRequest.stream_log` 字段承载 per-call 路径，解决 cfr-01 关联的可观测性缺口）——暴露面**放大 7 倍**（4 finder + 3 judge），第三轮评审明确指出"这是直接放大，不是无关任务"，不能一概推给独立加固 | **权限部分已处置**：Phase 2 Task 2.1 已把 `_persist_stream()` 落盘权限从系统默认（通常 0644）收紧为显式 `0o600`，并有测试断言权限位（第三轮评审 cfr3 附带处置，成本最低、可在本计划内直接完成）。**脱敏与轮转/保留策略仍明确延后，非"与本次改动无关"**：这两项需要新的设计决策（脱敏规则、保留窗口长度），不是本计划可以顺手做的一行修改；已量化说明放大倍数（7 倍）供用户择期裁决是否值得单独立项，不越权替用户决定优先级，不落 backlog 编号（同一处 cfr2-09 反例，见上） |
 | rmf-14 | `TaskOutput` 是官方标记 `[Deprecated]` 的工具，CLI 无版本钉死 | **本次改动直接消灭该发现的触发对象**——`TaskOutput` 随 Phase 6/7 完全退出 `STAGE1_ALLOWED_TOOLS` 与 `harness-settings.json`，新架构不再依赖任何后台任务通知机制 | **确认关闭（部分）**：`TaskOutput` 依赖本身随本计划核心设计目标消灭（ADR D1 就是为了消灭对 `TaskOutput`/`Workflow` 的依赖）。**CLI 版本钉死这条建议仍开放，理由是**：与本次架构重写无直接关联，是通用的可用性加固（`precheck` 里加 `claude --version` 断言），**不落 backlog 编号**（同上 cfr2-09 反例，此前的"backlog 项 6"同样是不存在的假引用） |
 | rmf-16 | `.claude/systemd/` 需调整三处（`flock -E`、日志轮转、`OnFailure`） | **不在本次改动范围**——systemd 单元文件本身不受扇出架构影响，`round.py` 对外的 CLI 接口（`python3 -m harness.cli round`）签名不变 | 无需处置，非本次改动触及的文件；`.claude/systemd/` 不在本计划「文件结构」清单内 |
 | rmf-17 | 内层 13 个 agent 用别名 `'sonnet'` 而非规范模型 ID | **本次改动直接消灭该发现的触发对象**——旧架构的"内层 agent" 概念本身消失（不再有 Workflow 内部的 `agent(prompt, {model:'sonnet'})` 调用），新架构里每个 finder/judge 都是顶层 `invoke()` 调用，Phase 2 的 `RoleInvocationRequest.model` 字段要求显式传入 | **确认关闭并加固**：Phase 6 `round.py` 接线时为每个角色的 `RoleInvocationRequest` 显式设置 `model=DEFAULT_AGENT_MODEL`（复用 `claude_runner.DEFAULT_AGENT_MODEL` 规范 ID 常量，与 rmf-17 建议一致），新增测试断言"七个角色的调用请求 `model` 字段均等于 `DEFAULT_AGENT_MODEL`"。落点：Phase 6 Task 6.1 |
@@ -378,7 +394,11 @@ git commit -m "feat(harness): agent_attempts 谱系账本（纯追加表，状�
 
 **为什么工具集收窄是本阶段而非 Phase 5 才做**：`_validate_tools` 是 `build_argv` 内部的强制校验（`UnsafeInvocationError`），一旦改了 `STAGE1_ALLOWED_TOOLS` 常量，`round.py` 现有引用它的 `STAGE1_TOOLS = ",".join(sorted(STAGE1_ALLOWED_TOOLS))` 会立即联动变化，因此收窄工具集与新增会话参数是同一处代码的同一次编辑，放在一个任务里做，避免中间态。**但实际收窄动作挪至 Phase 6 执行**（见 Task 2.4 说明），本阶段只新增能力，不改变既有行为。
 
-### Task 2.1：`build_argv`/`invoke` 新增会话身份参数
+### Task 2.1（含 rmf-08 权限收紧）：`build_argv`/`invoke` 新增会话身份参数（含 cfr3-02 所需的 `subtype` 暴露）
+
+**rmf-08 补充（第三轮评审明确指出"延后理由站不住"，本任务落实其中可低成本处理的一项）**：本计划把每轮 stream 落盘从 1 份扩大到最多 7 份（Phase 2 Task 2.3 的 `RoleInvocationRequest.stream_log`，Phase 6 接线时每个子调用各自一个文件），这是**直接放大**暴露面，不是无关任务，不能一概推给"独立安全加固、非本计划引入"。本任务借 Task 2.1 已经在改 `claude_runner.py` 的机会，把 `_persist_stream()` 落盘时的文件权限从当前系统 umask 决定的默认值（通常 0644，全用户可读）收紧为 0600（仅所有者可读写）——这是成本最低、风险最小的一项（不改变落盘逻辑、不改变调用方接口，只是 `os.chmod` 一次），可以在不引入新设计决策的前提下立即处理，不需要用户额外裁决。
+
+**脱敏与轮转/保留策略明确仍延后，量化说明放大倍数（rmf-08 不能再模糊处置的部分）**：脱敏（落盘前对 prompt/输出做敏感信息过滤）与轮转/保留（防止 `.claude/state/rounds/` 无限增长）需要新的设计决策（脱敏规则、保留窗口长度），不是本计划可以顺手做的一行修改，继续登记为**明确的延后项，而非"与本次改动无关"**：暴露面从"每轮 1 个文件"变为"每轮最多 7 个文件"，**放大倍数为 7 倍**（4 finder + 3 judge，redline reject 时降为最多 5 个）；磁盘增长速度同比例放大 7 倍。这两条需要用户在本计划实施前后择期裁决是否值得单独立项，本计划只负责把"权限"这一项在低成本范围内做掉、把"脱敏/轮转"的延后决策讲清楚量化后果，不越权替用户决定优先级。
 
 **接口契约**：
 
@@ -394,6 +414,8 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
 - `fork_session=True` 时必须提供 `resume`（fork 语义依附于续接一个已有会话），否则拒绝。
 - `session_id`/`resume` 若提供，必须是合法 UUID 格式字符串，否则拒绝（`UnsafeInvocationError`，与既有 `_validate_tools` 等校验同一层级、同一异常类型）。
 - `invoke()` 同步新增三个透传参数；`InvocationResult` 新增字段 `session_id: str | None = None`，取自 stream 的 `init`/`result` 事件里的 `session_id` 字段（若存在）。
+- **`InvocationResult` 同时新增字段 `subtype: str | None = None`**（第三轮评审 cfr3-02 要求：`_parse_terminal_result` 内部已经读取了终态 `result` 事件的 `subtype` 字段用于判断是否 `success`，但此前这个值读完即弃，`AttemptRecord`/Phase 5 的重试判定完全看不到它，只能靠"`ok` 是否为真"这一个粗粒度信号）。`subtype` 取值直接透传终态事件的原始字符串（`"success"`/`"error_max_turns"`/`"error_max_budget_usd"`/`"error_during_execution"` 等，不做枚举校验——本层只负责如实传递，分类判断是 Phase 5 Task 5.3 的职责）；超时（未见任何终态事件）时 `subtype` 为 `None`。
+- **`_persist_stream()` 落盘后立即 `os.chmod(path, 0o600)`**（rmf-08）：不改变函数签名、不改变调用方式，落盘失败时的容错语义（吞 `OSError`、写 stderr）不变，`chmod` 失败同样吞掉并写 stderr（不能让一次权限收紧失败反而让本来成功的调用变成异常）。
 
 **测试清单**：
 1. 提供 `session_id` 时 argv 含 `--session-id <值>`。
@@ -402,17 +424,20 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
 4. `fork_session=True` 但无 `resume` 抛 `UnsafeInvocationError`。
 5. `session_id`/`resume` 格式非法 UUID 抛 `UnsafeInvocationError`。
 6. `invoke()` 的返回值 `InvocationResult.session_id` 能正确带出 stream 里 `init` 事件的 `session_id`（复用文件内既有的 fake stream 构造 fixture 模式）。
+7. **cfr3-02 新增**：终态事件 `subtype="error_max_budget_usd"` 时，`InvocationResult.subtype == "error_max_budget_usd"`（`ok` 仍为 `False`，与现有行为一致，只是新增字段可读）。
+8. **cfr3-02 新增**：超时场景（`subprocess.TimeoutExpired`，无终态事件）时，`InvocationResult.subtype is None`。
+9. **rmf-08 新增**：调用 `invoke(..., stream_log=<临时文件路径>)` 后，该文件的权限位恰为 `0o600`（用 `stat.S_IMODE(path.stat().st_mode)` 断言，不依赖测试环境的 umask）。
 
-- [ ] **Step 1**：按测试清单写测试（追加到 `test_claude_runner.py`），跑至因 `build_argv`/`invoke` 不接受这些参数而红。
-- [ ] **Step 2**：实现改动（`build_argv` 新增参数与校验；`invoke()` 透传；`InvocationResult` 新增 `session_id` 字段；`parse_stream_json` 解析 `init`/`result` 事件时带出该字段）。
+- [ ] **Step 1**：按测试清单写测试（追加到 `test_claude_runner.py`），跑至因 `build_argv`/`invoke` 不接受这些参数、或落盘权限不是 `0o600` 而红。
+- [ ] **Step 2**：实现改动（`build_argv` 新增参数与校验；`invoke()` 透传；`InvocationResult` 新增 `session_id`/`subtype` 字段；`parse_stream_json`/`_parse_terminal_result` 解析 `init`/`result` 事件时带出这两个字段——`subtype` 只是把已经读到的值透传出去，不新增解析逻辑；`_persist_stream()` 落盘成功后追加 `path.chmod(0o600)`，用 `try/except OSError` 包裹，失败仅写 stderr）。
 - [ ] **Step 3**：跑通，重跑既有全部用例确认无回归。
-- [ ] **Step 4（正控）**：临时删除互斥校验，确认对应用例变红；恢复。
+- [ ] **Step 4（正控）**：临时删除互斥校验，确认对应用例变红；恢复。另临时删除 `_persist_stream()` 里新增的 `chmod` 调用，跑用例 9，确认变红；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/claude_runner.py .claude/scripts/harness/tests/test_claude_runner.py
-git commit -m "feat(harness): claude_runner 支持 session_id/resume/fork_session" -- .claude/scripts/harness/claude_runner.py .claude/scripts/harness/tests/test_claude_runner.py
+git commit -m "feat(harness): claude_runner 支持 session_id/resume/fork_session，InvocationResult 暴露 subtype（cfr3-02 前置），stream 落盘收紧为 0600（rmf-08 部分处置）" -- .claude/scripts/harness/claude_runner.py .claude/scripts/harness/tests/test_claude_runner.py
 ```
 
 ### Task 2.2（处置 cfr-01）：`invoke()` 接受可注入的 payload parser
@@ -454,13 +479,35 @@ git add .claude/scripts/harness/claude_runner.py .claude/scripts/harness/tests/t
 git commit -m "feat(harness): claude_runner 支持可注入 payload_parser，修复 judge 输出被强制要求 candidates 字段（cfr-01）" -- .claude/scripts/harness/claude_runner.py .claude/scripts/harness/tests/test_claude_runner.py
 ```
 
-### Task 2.3（处置 cfr-02/cfr2-01）：`RoleInvocationRequest`——扇出调用的唯一契约
+### Task 2.3（处置 cfr-02/cfr2-01/cfr3-01）：`RoleInvocationRequest` + `RequestContext`——扇出调用的唯一契约
 
 **背景（评审 cfr-02，已独立复现，Critical；第二轮 cfr2-01 指出仍未闭合）**：v1 草图用宽松 `**kwargs` 调 `invoke_fn`，缺 `cwd`/`timeout_s` 等必需参数、未传 `model`/`stream_log`。v2 定义了 `RoleInvocationRequest` 与 `to_invoke_kwargs()`，但**第二轮评审发现生产接线（Phase 6）仍在直接执行 `deps.invoke(request)`**——把整个 `RoleInvocationRequest` 对象当成 `invoke()` 的第一个位置参数传入，而不是先用 `to_invoke_kwargs()` 展开成关键字参数。**本任务的契约必须在 Phase 6 被真正使用，不能定义了却不接线**——Phase 6 Task 6.1 的实现步骤需要显式包含 `deps.invoke(**to_invoke_kwargs(request))` 这一调用形式，且 `Deps.invoke` 字段的类型标注需要相应更新为接受 `RoleInvocationRequest` 或者是一个包装了 `to_invoke_kwargs` 展开的适配函数——两种选择都可以，但必须明确写死一种，不能两边"看起来都行"地留白。
+
+**cfr3-01（Critical，因降级丢失，第三轮评审指出）**：`RoleInvocationRequest` 定义了 `cwd`/`settings_path`/`model`/`stream_log` 四个字段，但契约里**从未明确这四个值在生产路径上从哪里取得**——此前的测试清单只用 `_make_request` 局部测试替身里的占位值（`cwd="/tmp"`、`settings_path=""`、`model=None`）验证过字段"存在"，Phase 6 的测试清单也只验证了 adapter **展开了哪些键**（键集合是 `invoke()` 参数名的子集），从未验证这些键对应的**值是不是生产环境该有的值**（例如 `cwd` 应该等于 `cfg.repo_root`，不是测试替身里随手写的 `/tmp`）。同时 Task 5.5 的不变量 2 要求 judge task identity（含 fingerprint）贯穿 session ID、账本 `attempt_key`、`AttemptRecord.role` 三处，但测试清单第 6 条**只比较了两次调用的 `request.session_id` 是否不同**——没有验证 `attempt_key`（账本主键）与 `stream_log` 路径是否**同样**由这个 task identity 派生、且与 session ID 用的是同一个源字符串（三者各自独立拼接出"看起来都对但可能不一致"的字符串，是完全可能发生的实现错误，例如 `attempt_key` 不小心用了 `role` 原始值而 `session_id` 用了 `task_role`）。
+
+**修复：新增显式 `RequestContext` 契约**，把"生产环境下这些值应该等于什么"从"分散在 Phase 5/6 各处的口头约定"收敛为一个可传递、可测试的数据对象，同时补齐 task identity 四处统一的联合测试。
 
 **接口契约**：
 
 ```python
+@dataclass(frozen=True)
+class RequestContext:
+    """扇出调用的生产环境上下文——把 cwd/settings_path/model/stream_log_dir
+    这四个"应该等于什么"的问题收敛到一处，供 run_finders/judge_candidate
+    的 _make_request 工厂消费，不再让这四个值在 Phase 5/6 之间只靠口头约定
+    传递（cfr3-01 修复）。
+    """
+    cwd: str               # 生产值：str(cfg.repo_root)，不是测试替身的 "/tmp"
+    settings_path: str     # 生产值：round.SETTINGS_PATH（现有常量，".claude/harness-settings.json"）
+    model: str             # 生产值：claude_runner.DEFAULT_AGENT_MODEL，不是 None
+    stream_log_dir: str    # 生产值：str(cfg.state_db.parent / "rounds")，per-attempt 文件名由调用方按 task identity 拼接
+
+def build_stream_log_path(stream_log_dir: str, round_id: str, task_role: str,
+                          attempt: int) -> str: ...
+    # 返回 f"{stream_log_dir}/{round_id}:{task_role}:{attempt}.jsonl"（与
+    # attempt_key 用同一个 f-string 模板拼接，两者除文件后缀外逐字相同，
+    # 供测试机械比对字符串前缀一致）
+
 @dataclass(frozen=True)
 class RoleInvocationRequest:
     role: str
@@ -487,23 +534,27 @@ def for_judge(**kwargs) -> RoleInvocationRequest: ...  # payload_parser 默认�
 - `role` 字段是路由信息，不出现在 `to_invoke_kwargs()` 的返回值里（不传给 `invoke()`）。
 - **生产代码必须调用 `invoke(**to_invoke_kwargs(request))` 或等价的完整展开**，不允许把 `RoleInvocationRequest` 对象整体当位置/关键字参数传给 `invoke()`（那样只会填满第一个形参 `prompt`，其余必需参数全部缺失，`TypeError`）——这条不变量在 Phase 6 Task 6.1 的实现里必须体现，本任务只定义类型，接线正确性由 Phase 6 负责，但**两处必须交叉核对一致**。
 - `for_judge()` 的默认 `payload_parser` 是 `_extract_json_object`，其余字段与基类构造方式相同。
+- **`RequestContext` 的四个字段值必须是生产真值，不是占位符**（cfr3-01）：`cwd` 非空且不等于测试常用的占位值（如硬编码的 `/tmp`，除非该值恰好就是被测环境的真实 `repo_root`）；`model` 非 `None`；`settings_path` 等于 `round.SETTINGS_PATH` 常量本身（不是重新拼接的字符串字面量，避免两处"看起来一样"实则不同步）。
+- **`build_stream_log_path` 与账本 `attempt_key` 共用同一个 task identity 拼接模板**（cfr3-01）：两者除文件后缀外的字符串前缀逐字相同——`Task 1.2` 的 `attempt_key = f"{round_id}:{role}:{attempt}"`，`build_stream_log_path` 返回 `f"{stream_log_dir}/{round_id}:{task_role}:{attempt}.jsonl"`，`round_id:task_role:attempt` 这一段必须逐字等于 `attempt_key`——测试用字符串前缀比对机械核对，不凭肉眼判断"看起来像"。
 
 **测试清单**：
 1. 缺任一必需字段（如只传 `role`）时 `TypeError`（dataclass 天然行为）。
 2. `to_invoke_kwargs()` 的返回值键集合是 `invoke()` 真实参数名的子集（`inspect.signature` 核对），且不含 `role`。
 3. 默认（非 `for_judge`）构造的 `payload_parser` 是 `_extract_payload`。
 4. `for_judge()` 构造的 `payload_parser` 是 `_extract_json_object`。
+5. **cfr3-01 核心之一**：`build_stream_log_path(stream_log_dir, round_id, task_role, attempt)` 返回值的 `round_id:task_role:attempt` 段，与 `ledger` 模块用同样三个入参拼出的 `attempt_key` 逐字相等（字符串前缀比对）。
+6. **cfr3-01 核心之二**：`RequestContext` 的 `model` 字段类型标注为 `str`（非 `str | None`）——dataclass 层面就不允许构造出 `model=None` 的 `RequestContext`，把"必须显式设置"从运行时断言提升为类型系统能表达的约束（不完全依赖测试兜底）。
 
 - [ ] **Step 1**：按测试清单写测试（新建 `test_role_invocation.py`），跑至因模块不存在而红。
-- [ ] **Step 2**：按接口契约实现 `.claude/scripts/harness/role_invocation.py`。
+- [ ] **Step 2**：按接口契约实现 `.claude/scripts/harness/role_invocation.py`（含 `RequestContext`/`build_stream_log_path`）。
 - [ ] **Step 3**：跑通全部用例。
-- [ ] **Step 4（正控）**：临时在 `claude_runner.invoke()` 里改名一个参数（模拟签名漂移），确认 `to_invoke_kwargs` 一致性测试变红；恢复。
+- [ ] **Step 4（正控）**：临时在 `claude_runner.invoke()` 里改名一个参数（模拟签名漂移），确认 `to_invoke_kwargs` 一致性测试变红；恢复。另临时把 `build_stream_log_path` 的拼接模板改成不含 `task_role`（只用 `round_id:attempt`），跑用例 5，确认变红（复现"stream path 与 attempt_key 各自拼接、可能不一致"这个 cfr3-01 指出的缺口）；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/role_invocation.py .claude/scripts/harness/tests/test_role_invocation.py
-git commit -m "feat(harness): RoleInvocationRequest —— 扇出调用的唯一契约，机械核对与 invoke() 签名一致（cfr-02）" -- .claude/scripts/harness/role_invocation.py .claude/scripts/harness/tests/test_role_invocation.py
+git commit -m "feat(harness): RoleInvocationRequest + RequestContext —— 扇出调用的唯一契约，生产值来源显式化，stream path 与账本 attempt_key 共用拼接模板（cfr-02, cfr3-01）" -- .claude/scripts/harness/role_invocation.py .claude/scripts/harness/tests/test_role_invocation.py
 ```
 
 ### Task 2.4（原挪至 Phase 6 执行，此处只登记设计，不在本阶段实施）
@@ -760,7 +811,9 @@ git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fan
 git commit -m "feat(harness): fanout —— 候选去重与排序（复用 Python 侧 canonical_key，不再需要 JS 实现）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
-### Task 5.2：错误规范化折叠（`normalize_error`/`record_degraded`，含 rmf-10 修复）
+### Task 5.2（cfr3-03 补充：`agentType` 双写不变量与测试）：错误规范化折叠（`normalize_error`/`record_degraded`，含 rmf-10 修复）
+
+**cfr3-03 背景（第三轮评审指出，承接 cfr2-09/cfr-16）**：开放发现处置表（本文档「评审 cfr-16 指出的具体反例复核」一节）宣称 `record_degraded()` 会同时写 `role` 与 `agentType` 两个字段，但本任务此前的测试清单与实现代码**只写了 `role`**——处置表记的是作者相信会做的事，不是任务清单里真正要求执行的断言，第三轮评审明确指出这个缺口必须补进**实际任务**，不能只留在处置表里。本任务补上缺失的测试与实现要求。
 
 - [ ] **Step 1: 写失败测试**（追加到 `test_fanout.py`）
 
@@ -811,9 +864,21 @@ class TestRecordDegraded(unittest.TestCase):
         record_degraded(degraded, role="finder:roadmap", error="e1", attempts=3)
         record_degraded(degraded, role="judge:redline", error="e1", attempts=3)
         self.assertEqual(len(degraded), 2)
+
+    def test_writes_agent_type_alias_for_round_describe_degraded(self):
+        # cfr3-03 新增：round.py 现有 _describe_degraded() 读的是
+        # d.get('agentType')，不是 d.get('role')——处置表宣称的"双写"必须
+        # 有一条测试真正断言这件事，否则字段名漂移会在 Phase 6 才被发现
+        # （届时 round.py 的日志会显示 "?×N" 而不报错，属于静默的可观测性
+        # 回归，不会被任何测试自然捕获）。
+        from harness.fanout import record_degraded
+        degraded = []
+        record_degraded(degraded, role="finder:roadmap", error="e1", attempts=3)
+        self.assertEqual(degraded[0]["agentType"], "finder:roadmap")
+        self.assertEqual(degraded[0]["agentType"], degraded[0]["role"])
 ```
 
-- [ ] **Step 2**：跑测试，确认因函数不存在而红。
+- [ ] **Step 2**：跑测试，确认因函数不存在、或 `agentType` 键缺失而红。
 - [ ] **Step 3**：在 `fanout.py` 追加：
 
 ```python
@@ -851,32 +916,52 @@ def normalize_error(err: object) -> str:
 
 def record_degraded(degraded: list[dict], *, role: str, error: str,
                     attempts: int) -> None:
+    """折叠同 role + 同规范化错误的降级记录。
+
+    `agentType` 字段（cfr3-03 修复）：与 `role` 值完全相同，纯粹是为了让
+    `round.py` 现有 `_describe_degraded()`（读 `d.get('agentType') or
+    d.get('label')`）不改代码即可正确读取——处置表此前只是"宣称"这个双写，
+    本任务把它变成真正执行且被测试断言的行为（第三轮评审 cfr3-03）。
+    """
     for d in degraded:
         if d["role"] == role and d["error"] == error:
             d["occurrences"] += 1
             d["attempts"] += attempts
             return
-    degraded.append({"role": role, "error": error, "occurrences": 1,
-                     "attempts": attempts})
+    degraded.append({"role": role, "agentType": role, "error": error,
+                     "occurrences": 1, "attempts": attempts})
 ```
 
+
 - [ ] **Step 4**：跑通全部用例（绿）；重跑 `test_fanout.py` 全部（Task 5.1 用例应不受影响）。
-- [ ] **Step 5（正控）**：临时把 `_ID_PATTERNS` 里的 UUID 正则移到裸 hex 正则**之后**，跑 `test_folds_uuid_trace_id`，确认失败（复现 rmf-10 指出的顺序敏感问题）；恢复到 UUID 在前。
+- [ ] **Step 5（正控）**：临时把 `_ID_PATTERNS` 里的 UUID 正则移到裸 hex 正则**之后**，跑 `test_folds_uuid_trace_id`，确认失败（复现 rmf-10 指出的顺序敏感问题）；恢复到 UUID 在前。另临时把 `record_degraded` 的 `degraded.append(...)` 里 `"agentType": role` 这一项删掉（复现 cfr3-03 指出的"处置表宣称但代码未做"缺口），跑 `test_writes_agent_type_alias_for_round_describe_degraded`，确认失败（`agentType` 键缺失）；恢复。
 - [ ] **Step 6**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
-git commit -m "feat(harness): fanout —— 错误规范化折叠（修复 rmf-10 的 UUID/尾部差异漏检）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
+git commit -m "feat(harness): fanout —— 错误规范化折叠（修复 rmf-10 的 UUID/尾部差异漏检；record_degraded 真正双写 agentType，cfr3-03）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
-### Task 5.3（处置 cfr-02/cfr-03/cfr-06/cfr-12/cfr2-07）：单次尝试原语 `run_one_attempt`（不含重试循环、不含并发、不含账本 IO）
+### Task 5.3（处置 cfr-02/cfr-03/cfr-06/cfr-12/cfr2-07/cfr3-02）：单次尝试原语 `run_one_attempt`（不含重试循环、不含并发、不含账本 IO）
 
-**v3 重写说明**：v1 草图的 `run_role_with_retry` 把"单次调用"与"最多 3 次重试循环"揉在一个函数里，且直接用宽松 `**kwargs` 调 `invoke_fn`、直接访问 `conn` 写账本。cfr-12 指出重试循环应提升到跨角色的"波次"层（Task 5.4），本任务因此只保留一个不做重试、不做并发、不碰账本的最小原语——它只负责"用给定的 `RoleInvocationRequest` 发起一次调用，判定结果"。
+**v4 重写说明**：v1 草图的 `run_role_with_retry` 把"单次调用"与"最多 3 次重试循环"揉在一个函数里，且直接用宽松 `**kwargs` 调 `invoke_fn`、直接访问 `conn` 写账本。cfr-12 指出重试循环应提升到跨角色的"波次"层（Task 5.4），本任务因此只保留一个不做重试、不做并发、不碰账本的最小原语——它只负责"用给定的 `RoleInvocationRequest` 发起一次调用，判定结果"。
 
-**cfr2-07（Critical，本轮修复引入）**：`AttemptRecord` 新增两个显式布尔位 `retryable`/`resumable`，把"值得再试一次"与"能不能 fork 续接"拆成两个独立问题：
-- `retryable`：`failed_transport` 恒为 `True`（传输故障值得再试）；`capability_drift` 恒为 `False`（配置信号，重试大概率复现同样问题）；`success` 恒为 `False`（已成功，不需要重试）。
-- `resumable`：`True` **当且仅当** `session_id` 取自 `InvocationResult.session_id`（即 CLI 通过 `init`/`result` 事件真正报告过的值）；超时、进程在 `init` 之前被杀等场景下 `InvocationResult.session_id` 为 `None`，此时即便 `request.session_id`（预分配的派生值）存在，也不得据此判定 `resumable=True`——那个值从未被 CLI 确认使用过，`--resume` 它大概率失败或续接到错误上下文。`resumable` 与 `retryable` 是正交的两个位：`retryable=True, resumable=False` 时（Task 5.4）必须发起**全新**尝试而非 fork。
+**cfr2-07（Critical，本轮修复引入）**：`AttemptRecord` 新增两个显式布尔位 `retryable`/`resumable`，把"值得再试一次"与"能不能 fork 续接"拆成两个独立问题。
+
+**cfr3-02（Critical，三轮未关闭，本轮必须真正关闭）**：第二轮修订新增了 `retryable` 字段，但字段值的**赋值规则**仍是"`failed_transport` 恒 `True`、`capability_drift` 恒 `False`"——这只是把"全部重试"这个旧策略换了个字段名字，没有做终态分类本身。第三轮评审明确指出：`error_max_budget_usd`（预算耗尽，重试只会立刻再次撞预算，属于确定性失败）、`UnsafeInvocationError` 之类的参数错误（配置问题，重试不会变好）、以及"协议异常但明确是确定性的"（如同一份 stream 出现重复 `init`/重复 `result`，这不是随机噪声而是调用侧构造错误）都不应该被无差别归入"传输故障，值得重试"。**本任务因此把 `status="failed_transport"` 拆分为更细的终态分类**，用 `AttemptRecord.subtype`（Task 2.1 已在 `InvocationResult` 上新增此字段，本任务原样透传）与 `protocol_errors` 的具体内容共同决定 `retryable`，不再是"只要不是 capability_drift 就重试"的粗粒度判断。
+
+**可测试的终态分类表**（本任务的核心交付物，取代此前"全部归为 failed_transport 可重试"的粗粒度规则）：
+
+| 终态特征 | `status` | `retryable` | 理由 |
+|---|---|---|---|
+| `invocation.ok=True`，`validate()` 无错误 | `success` | `False` | 已成功 |
+| 能力漂移（`init_tools` 等与 `expected_tools` 不符） | `capability_drift` | `False` | 配置信号，重试大概率复现同样问题（cfr-06 既有结论） |
+| `invocation.subtype` 为 `None`（超时/进程被杀，无终态事件）或明确的传输层信号（`raw_tail` 匹配现有 `normalize_error` 判定的传输故障样式，如 `"API Error: Server error"`） | `failed_transport` | `True` | 真正的传输抖动，值得重试 |
+| `invocation.subtype == "error_max_budget_usd"` | `failed_transport` | **`False`** | 预算耗尽是确定性结果——同一 `grant_usd` 重试大概率再次撞线，不是随机噪声（cfr3-02 核心修复点） |
+| `validate(payload)` 返回非空错误列表（schema 校验失败，`invocation.ok=True`） | `failed_transport` | `True` | schema 校验失败在真机场景下多为模型输出随机波动，重试可能恢复（沿用 rmf-07 既有结论，不改） |
+| `invocation.protocol_errors` 含 `"duplicate init events"` 或 `"duplicate terminal result events"`（同一次调用内部出现结构性重复，不是网络层面的随机噪声，而是这次调用本身的 stream 已经确定性地损坏） | `failed_transport` | **`False`** | 确定性协议异常——损坏的是这次调用产生的 stream 结构本身，重试大概率产生同样结构的 stream（与预算耗尽同理：问题不在"这次网络抖了一下"，而在"这次调用的产出形状本身有问题"） |
+| `UnsafeInvocationError`（或任何编程/配置类异常）从 `invoke_fn` 抛出 | 不产生 `AttemptRecord`，异常穿透 | 不适用 | 配置错误不重试、不降级（既有规则，本任务不改） |
 
 **接口契约**：
 
@@ -895,9 +980,14 @@ class AttemptRecord:
     protocol_errors: list = field(default_factory=list)
     payload: dict | None = None
     last_error: str | None = None
-    retryable: bool = False   # cfr2-07 新增
+    retryable: bool = False   # cfr2-07 新增，cfr3-02 修正赋值规则（见上方分类表）
     resumable: bool = False   # cfr2-07 新增
+    subtype: str | None = None  # cfr3-02 新增：原样透传 InvocationResult.subtype，供分类表判断依据可审计
 
+def _classify_retryable(invocation: InvocationResult, status: str,
+                        validation_errors: list[str]) -> bool: ...
+    # 按上方终态分类表实现；status="success" 恒 False；status="capability_drift" 恒 False；
+    # status="failed_transport" 时再细分 subtype/protocol_errors，见分类表
 def _check_capability_drift(invocation: InvocationResult, expected_tools: frozenset[str]) -> list[str]: ...
 def run_one_attempt(*, role: str, attempt: int, request: RoleInvocationRequest,
                     invoke_fn, validate,
@@ -908,16 +998,17 @@ def build_continuation_request(previous: RoleInvocationRequest, resume_session_i
 **不变量**：
 1. `invoke_fn` 必须接受**唯一一个位置参数** `RoleInvocationRequest`（cfr-02）——不用宽松 `**kwargs`，测试替身与生产代码共用同一个类型。
 2. `AttemptRecord` 是纯数据（`dataclasses.asdict()` 递归取值不含任何 `Connection`/`Lock` 类型实例），可安全跨线程通过 `future.result()` 传回主线程（cfr-03 的前提）。
-3. `expected_tools` 非空且 `invocation.init_seen` 为真时才做能力漂移检查（cfr-06）；命中漂移 → `status="capability_drift"`，`retryable=False`，`resumable` 按上述规则从 `invocation.session_id` 是否非空决定（漂移场景通常 `init` 已发生，`resumable` 多为 `True`，但仍需按同一规则计算，不得硬编码）。
-4. 校验失败（`validate(payload)` 返回非空错误列表）与调用本身失败（`invocation.ok` 为假）都归为 `status="failed_transport"`，`retryable=True`——schema 校验失败是随机的，本原语把它当可重试处理，是否真的重试由波次调度器（Task 5.4）决定。
+3. `expected_tools` 非空且 `invocation.init_seen` 为真时才做能力漂移检查（cfr-06）；命中漂移 → `status="capability_drift"`，`retryable=False`（分类表第 2 行），`resumable` 按下方规则从 `invocation.session_id` 是否非空决定。
+4. **`retryable` 的赋值必须调用 `_classify_retryable`（分类表），不得用"是否等于 `capability_drift`"这种二元判断代替**（cfr3-02 核心：三轮评审反复指出的问题正是"新增字段只是给旧策略换了名字"，本任务要求赋值逻辑本身体现分类表的全部行，而不只是把原有的 if/elif 换个字段名输出）。
 5. `resumable` 的计算**只看** `invocation.session_id`（`InvocationResult` 字段），不回退到 `request.session_id`/`request.resume`——`session_id`（`AttemptRecord` 字段，供审计与下一波构造 `parent_session_id` 用）允许在 `invocation.session_id` 为空时回退到 `request.session_id or request.resume`（这是"记录我们认为这次尝试用的是哪个身份"，与"能否安全 fork"是两件事，`resumable` 只回答后者）。
 6. 编程/配置类异常（如 `UnsafeInvocationError`）不被本函数捕获，原样穿透——不属于"传输故障"，不重试、不降级。
 7. `build_continuation_request`：`resume`+`fork_session=True`，`session_id` 置空（与原有互斥校验一致），`prompt` 换成续接指令（不是重发原始任务）。
+8. `AttemptRecord.subtype` 原样保留 `InvocationResult.subtype`（不做转换），供下游（账本、故障排查）审计"这次判定 `retryable` 的依据具体是什么"，不是只留一个布尔结论看不出理由。
 
 **测试清单**（断言点，不是完整测试源码）：
 1. 成功调用 → `status="success"`，`session_id` 取自 `InvocationResult.session_id`，`payload` 原样带出，`retryable=False`。
-2. 传输失败（`invocation.ok=False`）→ `status="failed_transport"`，`retryable=True`，`last_error` 非空。
-3. schema 校验失败（`invocation.ok=True` 但 `validate()` 返回错误）→ `status="failed_transport"`，`retryable=True`（不是致命错误）。
+2. 传输失败（`invocation.ok=False`，`subtype=None`，模拟超时）→ `status="failed_transport"`，`retryable=True`，`last_error` 非空。
+3. schema 校验失败（`invocation.ok=True` 但 `validate()` 返回错误）→ `status="failed_transport"`，`retryable=True`（不是致命错误，沿用 rmf-07 结论）。
 4. `UnsafeInvocationError` 从 `invoke_fn` 抛出 → 原样穿透，不被本函数捕获或转换。
 5. 能力漂移（`init_tools` 多出未预期工具）→ `status="capability_drift"`，`retryable=False`，`last_error` 含多出的工具名。
 6. 工具集与期望一致 → 不触发漂移分支，走正常成功/失败判定。
@@ -925,17 +1016,20 @@ def build_continuation_request(previous: RoleInvocationRequest, resume_session_i
 8. **cfr2-07 核心之一**：`InvocationResult(session_id=None, ...)`（模拟超时/进程未及 `init` 即被杀）+ 调用本身失败 → `AttemptRecord.resumable == False`，即便 `request.session_id` 非空。
 9. **cfr2-07 核心之二**：`InvocationResult(session_id="real-sid", ...)`（CLI 真实报告过）→ `AttemptRecord.resumable == True`。
 10. `build_continuation_request` 产出的请求 `resume == 传入的 session_id`、`fork_session is True`、`session_id is None`、`prompt` 与原始 prompt 不同。
+11. **cfr3-02 核心之一（不可重试）**：`InvocationResult(ok=False, subtype="error_max_budget_usd", ...)` → `status="failed_transport"` 但 `retryable=False`（区别于用例 2 的普通传输故障）。
+12. **cfr3-02 核心之二（不可重试）**：`InvocationResult(ok=False, protocol_errors=["duplicate terminal result events: 2"], ...)` → `status="failed_transport"` 但 `retryable=False`（确定性协议异常，不是随机传输抖动）。
+13. **cfr3-02 核心之三（可重试，对照组）**：`InvocationResult(ok=False, subtype="error_during_execution", raw_tail="API Error: Server error mid-response", ...)`（无 `protocol_errors`，非预算耗尽）→ `status="failed_transport"` 且 `retryable=True`（真正的传输抖动分支仍然可重试，不能因为新增分类而误伤这条既有路径）。
 
-- [ ] **Step 1**：按测试清单写测试（追加到 `test_fanout.py`），跑至因 `AttemptRecord.retryable`/`resumable` 字段或 `run_one_attempt` 不存在而红。
-- [ ] **Step 2**：按接口契约实现（`fanout.py` 追加 `AttemptRecord`/`_check_capability_drift`/`run_one_attempt`/`build_continuation_request`）。
+- [ ] **Step 1**：按测试清单写测试（追加到 `test_fanout.py`），跑至因 `AttemptRecord.retryable`/`resumable`/`subtype` 字段或 `run_one_attempt`/`_classify_retryable` 不存在而红。
+- [ ] **Step 2**：按接口契约实现（`fanout.py` 追加 `AttemptRecord`/`_classify_retryable`/`_check_capability_drift`/`run_one_attempt`/`build_continuation_request`）。
 - [ ] **Step 3**：跑通全部用例；重跑既有 `test_fanout.py`（Task 5.1/5.2）确认无回归。
-- [ ] **Step 4（正控）**：临时把 `resumable` 的计算改为直接读 `bool(session_id)`（即回退到 `request.session_id` 也算数），跑用例 8，确认变红（复现 cfr2-07 指出的"用预分配值冒充真实 ID"）；恢复。另临时把能力漂移分支的 `retryable=False` 改成 `True`，跑用例 5 附加断言（若测试清单包含"漂移不可重试"的显式检查），确认变红；恢复。
+- [ ] **Step 4（正控）**：临时把 `resumable` 的计算改为直接读 `bool(session_id)`（即回退到 `request.session_id` 也算数），跑用例 8，确认变红（复现 cfr2-07 指出的"用预分配值冒充真实 ID"）；恢复。另临时把 `_classify_retryable` 简化回"`status != 'capability_drift'` 就返回 `True`"（复现三轮未关闭的 cfr-12/cfr3-02 缺陷），跑用例 11/12，确认变红（预算耗尽与确定性协议异常被误判为可重试）；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
-git commit -m "feat(harness): fanout —— run_one_attempt 单次尝试原语，AttemptRecord 新增 retryable/resumable 位（cfr-02/03/06/12, cfr2-07）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
+git commit -m "feat(harness): fanout —— run_one_attempt 单次尝试原语，retryable 分类表区分预算耗尽/确定性协议异常与真实传输故障（cfr-02/03/06/12, cfr2-07, cfr3-02）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
 
@@ -1015,12 +1109,13 @@ git commit -m "feat(harness): fanout —— BudgetTracker 允许变负结算 + �
 ```
 
 
-### Task 5.5（处置 cfr-06/cfr-07/cfr-14/cfr2-02/cfr2-04）：finder 并发扇出 + judge 短路裁决（组合编排，消费 `WaveResult`）
+### Task 5.5（处置 cfr-06/cfr-07/cfr-14/cfr2-02/cfr2-04/cfr3-01）：finder 并发扇出 + judge 短路裁决（组合编排，消费 `WaveResult`）
 
-**v3 重写说明**：本任务把 `run_finders`/`judge_candidate` 改为调用 Task 5.4 产出的 `run_wave_scheduled`（返回 `WaveResult`，而非 v2 的裸 `dict[str, AttemptRecord]`），并在 v2 已修复的三处（`skipped_judges` cfr-14、judge 降级同步顶层 `degraded` cfr-07、`expected_tools` 透传 cfr-06）之上，补齐两处第二轮评审指出的新设计缺陷：
+**v4 重写说明**：本任务把 `run_finders`/`judge_candidate` 改为调用 Task 5.4 产出的 `run_wave_scheduled`（返回 `WaveResult`，而非 v2 的裸 `dict[str, AttemptRecord]`），并在 v2 已修复的三处（`skipped_judges` cfr-14、judge 降级同步顶层 `degraded` cfr-07、`expected_tools` 透传 cfr-06）之上，补齐三处评审指出的设计缺陷：
 
 - **cfr2-02（Critical，已核实）**：`judge_candidate` 每次调用都必须为该候选构造**携带 fingerprint 的 task identity**（Task 1.1 的新设计），不能再对 `judge:redline` 这类静态角色字符串重复派生 session_id——否则同一轮内两个候选依次裁决时，第二个候选的账本写入会与第一个候选撞主键，且实际发出的是第一个候选的会话。本任务的 `_make_request` 必须先算出 `task_role = f"{role}:{queue.fingerprint(candidate['goal'], candidate['invariant'], candidate['primary_path'], candidate['oracle'])}"`，把 `task_role`（而不是裸的 `judge:redline`）传给 `session_identity.derive_session_id`、`run_wave_scheduled` 的 `roles=`、以及 `AttemptRecord.role`/`all_records`/`degraded` 里记录的 `role` 字段——四处统一（Task 1.1 已定的不变量），`_JUDGE_ROLE_TO_TYPE` 等按类型分派的查表逻辑改为对 `task_role` 做前缀匹配（`task_role.split(":", 2)[:2]` 取出 `("judge", "redline")` 这一级用于查表），不能整串相等匹配。
 - **cfr2-04（Critical，已核实）**：`judge_candidate` 的三次 `run_wave_scheduled` 调用（redline 一次、`completed`+`oracle` 一次）此前均未传 `expected_tools`，Bash/MCP 等能力漂移在 judge 侧完全不会被发现。修正：`judge_candidate` 与 `run_finders` 一样，把 `_STAGE1_EXPECTED_TOOLS` 透传给每一次 `run_wave_scheduled` 调用。
+- **cfr3-01（Critical，因降级丢失，第三轮评审指出）**：此前的测试清单第 6 条只断言"两个候选调用的 `request.session_id` 不相等"，**没有验证 `attempt_key`（账本主键）与 `stream_log` 路径是否同样由这个含 fingerprint 的 task identity 派生、且三者共用同一个源字符串**——`session_id` 算对了，`attempt_key`/`stream_log` 完全可能各自独立拼接、在某处不小心漏加 fingerprint 而不被任何测试发现（因为它们分别在 `ledger.py`/`role_invocation.build_stream_log_path` 里各自实现，没有交叉核对）。本任务补上跨三处的联合测试，并要求 `_make_request` 显式使用 `role_invocation.build_stream_log_path`（Task 2.3 新增）而不是自行拼接 stream 路径字符串；`cwd`/`settings_path`/`model` 三个字段的值改为从调用方传入的 `RequestContext`（Task 2.3 新增）读取，不再是本函数内部硬编码的占位字符串。
 
 **接口契约**：
 
@@ -1030,6 +1125,7 @@ _STAGE1_EXPECTED_TOOLS: frozenset[str]  # {"Read", "Grep", "Glob"}，finder/judg
 def run_finders(*, round_id: str, invoke_fn, budget: BudgetTracker,
                 deadline_monotonic: float, blocked_lanes: list[str],
                 known_canonical_keys: set[str],
+                context: "role_invocation.RequestContext",
                 agents: dict[str, AgentDef] | None = None,
                 conn=None, all_records: list[AttemptRecord] | None = None
                 ) -> tuple[list[dict], list[dict]]: ...  # (ranked_candidates, degraded)
@@ -1037,6 +1133,7 @@ def run_finders(*, round_id: str, invoke_fn, budget: BudgetTracker,
 def judge_candidate(*, round_id: str, candidate: dict, invoke_fn,
                     budget: BudgetTracker, deadline_monotonic: float,
                     inflight_paths: list[str],
+                    context: "role_invocation.RequestContext",
                     agents: dict[str, AgentDef] | None = None,
                     conn=None, all_records: list[AttemptRecord] | None = None
                     ) -> tuple[list[dict], list[dict]]: ...  # (verdicts, degraded)
@@ -1044,12 +1141,14 @@ def judge_candidate(*, round_id: str, candidate: dict, invoke_fn,
 
 **不变量**：
 1. `run_finders`/`judge_candidate` 都从 `run_wave_scheduled` 返回的 `WaveResult.final` 读取每角色最终结果（供路由/裁决），并把 `WaveResult.all_attempts` 的全部记录追加进调用方传入的 `all_records`（而不是像 v2 那样只追加 `final` 里的每角色一条）——这是 Task 5.4 的 `WaveResult` 存在的直接原因：Task 5.6 的结算聚合需要看到全部尝试的真实花费，不止最后一次。
-2. `judge_candidate` 每次构造请求前，先算出携带 fingerprint 的 `task_role`（cfr2-02），并在**全部**下游标识（`derive_session_id` 的 `role` 参数、`run_wave_scheduled` 的 `roles=`、`AttemptRecord.role`、账本 `attempt_key`）里统一使用它；不同候选（不同 `fingerprint`）算出的 `task_role` 必须不同。
+2. `judge_candidate` 每次构造请求前，先算出携带 fingerprint 的 `task_role`（cfr2-02），并在**全部**下游标识（`derive_session_id` 的 `role` 参数、`run_wave_scheduled` 的 `roles=`、`AttemptRecord.role`、账本 `attempt_key`、`role_invocation.build_stream_log_path` 的 `task_role` 参数）里统一使用它；不同候选（不同 `fingerprint`）算出的 `task_role` 必须不同（cfr2-02/cfr3-01）。
 3. `judge_candidate` 的每一次 `run_wave_scheduled` 调用都传 `expected_tools=_STAGE1_EXPECTED_TOOLS`（cfr2-04）；`run_finders` 同理（沿用 v2）。
 4. redline judge 返回 `reject`（或降级/失败后按"降级即拒绝"规则解析出 `reject`）→ 短路，不调用另外两个 judge；此时 `verdicts` 只含 redline 一条，`skipped_judges` 字段列出被跳过的另外两个 judge 类型（`harness-judge-completed`、`harness-judge-oracle`）。
 5. redline 通过 → 继续裁决另外两个 judge，三条 verdict 的 `skipped_judges` 均为空列表。
 6. 任一 judge 降级（耗尽重试仍失败）→ 该 judge 的局部 verdict 是 `{"judge": ..., "verdict": "reject", "reason": "judge-unavailable", <该 judge 专有字段>: None, "degraded": True, "skipped_judges": [...]}`（rmf-12 占位字段 + cfr-14 skipped_judges），**同时**该 judge 被 `record_degraded` 记入本函数返回的顶层 `degraded` 列表（cfr-07：不能只在局部 verdict 体现，顶层数组必须同步非空，否则 round.py 侧会把这种场景误判为干净的 no-candidate，精确复发 rmf-03）。
 7. `run_finders` 里任一 finder 非成功 → 记入 `degraded`（`record_degraded` 折叠），不产出候选；`known_canonical_keys`/`blocked_lanes` 的过滤逻辑复用 Task 5.1 的 `dedupe_and_rank`，不重复实现。
+8. **`_make_request` 的 `cwd`/`settings_path`/`model` 三个字段值取自入参 `context: RequestContext`**（cfr3-01），不是函数内部硬编码的字面量——生产路径（Phase 6 接线）传入携带真实值的 `RequestContext`，测试路径传入携带测试替身值的 `RequestContext`，两条路径共用同一个"从哪里取值"的结构，不会出现"生产该传什么值"只停留在文档说明、代码里各自硬编码一份的情况。
+9. **`_make_request` 的 `stream_log` 字段通过 `role_invocation.build_stream_log_path(context.stream_log_dir, round_id, task_role, attempt)` 构造**（cfr3-01），不自行拼接路径字符串——`task_role` 与传给 `derive_session_id`/账本的值完全相同（同一个变量，不重新计算）。
 
 **测试清单**（断言点，不是完整测试源码）：
 
@@ -1063,23 +1162,27 @@ def judge_candidate(*, round_id: str, candidate: dict, invoke_fn,
 5. 全部 judge 持续失败降级 → redline 局部 verdict 的 `verdict/reason/degraded/skipped_judges` 字段符合 6 号不变量；**顶层 `degraded` 长度为 1 且 `role` 字段等于该次调用实际使用的 `task_role`**（不是裸 `judge:redline`）。
 6. **cfr2-02 核心**：对两个不同 `candidate`（不同 fingerprint）分别调用 `judge_candidate`，断言两次调用中传给 `invoke_fn` 的 `request.session_id` 不相等（验证 task identity 确实携带了 fingerprint，不会在同一轮内撞车）。
 7. **cfr2-04 核心**：任一 judge 调用返回能力漂移（`init_tools` 含未预期工具）→ 该 judge 的 `AttemptRecord.status == "capability_drift"` 被正确传导（通过 mock/monkeypatch 断言传给 `run_wave_scheduled` 的 `expected_tools` 参数非 `None`，或直接构造漂移场景断言最终 verdict 走"judge-unavailable"降级分支而非误判为成功）。
+8. **cfr3-01 核心（联合测试，第三轮评审明确要求）**：对**两个不同候选**分别调用 `judge_candidate`，对每个候选各自捕获传给 `invoke_fn` 的 `request.session_id`、写入账本的 `attempt_key`（通过传入的假 `conn`/`ledger` 替身捕获实际写入的主键值）、`request.stream_log` 路径——断言：(a) 同一候选内，`request.session_id`、`attempt_key` 的 `round_id:task_role:attempt` 段、`stream_log` 路径里的 `round_id:task_role:attempt` 段三者**逐字一致**（不是"看起来差不多"，是字符串相等比较）；(b) 两个候选之间，这三组值**分别互不相同**（不会出现"session_id 变了但 stream_log 路径没变"这种部分更新的漂移）。
+9. **cfr3-01 核心（生产值验证）**：传入一个 `RequestContext(cwd="/real/repo", settings_path=".claude/harness-settings.json", model="claude-sonnet-5", stream_log_dir="/real/repo/.claude/state/rounds")` → 断言传给 `invoke_fn` 的**全部**请求（4 finder + 最多 3 judge）的 `cwd`/`settings_path`/`model` 字段都等于这个 `RequestContext` 里的值，不是函数内部残留的硬编码占位符（如 `"/tmp"`、`""`、`None`）。
 
 - [ ] **Step 1**：按测试清单写测试（追加到 `test_fanout.py`），跑至因签名/字段不匹配而红。
-- [ ] **Step 2**：按接口契约与不变量实现 `run_finders`/`judge_candidate`（复用 Task 1.1 的 `session_identity.derive_session_id`、Task 5.4 的 `run_wave_scheduled`/`WaveResult`）。
+- [ ] **Step 2**：按接口契约与不变量实现 `run_finders`/`judge_candidate`（复用 Task 1.1 的 `session_identity.derive_session_id`、Task 2.3 的 `role_invocation.RequestContext`/`build_stream_log_path`、Task 5.4 的 `run_wave_scheduled`/`WaveResult`）。
 - [ ] **Step 3**：跑通全部用例；重跑既有 `test_fanout.py`（Task 5.1–5.4）确认无回归。
-- [ ] **Step 4（正控）**：临时把短路判断注释掉（改成永不短路），跑用例 3，确认失败（`invoke_fn` 对其余 judge 分支的 `AssertionError` 被触发）；恢复。另临时删除"降级同步顶层 `degraded`"这一步，跑用例 5，确认失败（顶层 `degraded` 为空，复现 cfr-07）；恢复。再临时把 `judge_candidate` 的 `task_role` 构造改回裸角色字符串（去掉 fingerprint 拼接），跑用例 6，确认失败（两次调用 session_id 相同，复现 cfr2-02）；恢复。
+- [ ] **Step 4（正控）**：临时把短路判断注释掉（改成永不短路），跑用例 3，确认失败（`invoke_fn` 对其余 judge 分支的 `AssertionError` 被触发）；恢复。另临时删除"降级同步顶层 `degraded`"这一步，跑用例 5，确认失败（顶层 `degraded` 为空，复现 cfr-07）；恢复。再临时把 `judge_candidate` 的 `task_role` 构造改回裸角色字符串（去掉 fingerprint 拼接），跑用例 6，确认失败（两次调用 session_id 相同，复现 cfr2-02）；恢复。最后临时让 `stream_log` 构造改用裸 `role` 而不是 `task_role`（模拟"session_id 对了但 stream path 漏加 fingerprint"这种局部更新遗漏），跑用例 8，确认失败（两个候选的 `stream_log` 路径里的 task identity 段相同，复现 cfr3-01 指出的联合一致性缺口）；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
-git commit -m "feat(harness): fanout —— finder/judge 组合编排消费 WaveResult，judge task identity 携带 fingerprint，expected_tools 透传（cfr-06/07/14, cfr2-02/04）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
+git commit -m "feat(harness): fanout —— finder/judge 组合编排消费 WaveResult 与 RequestContext，judge task identity 携带 fingerprint 且贯穿 session/ledger/stream 三处一致，expected_tools 透传（cfr-06/07/14, cfr2-02/04, cfr3-01）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
 
-### Task 5.6（处置 cfr-04/cfr-06/cfr2-03）：顶层 `run_fanout()`——组合入口，聚合结算基于全部尝试
+### Task 5.6（处置 cfr-04/cfr-06/cfr2-03/cfr3-03）：顶层 `run_fanout()`——组合入口，聚合结算基于全部尝试
 
-**v3 重写说明**：本任务的 `_aggregate_settlement` 现在消费 Task 5.4/5.5 传出的 `all_records`——它已包含**每一波、每次实际发起的调用**（不止每角色最后一条，cfr2-03 修复的直接消费点），因此 `FanoutSettlement` 的总成本/turns/denials 现在真实反映本轮全部尝试的花费，包括失败重试所消耗的部分。
+**v4 重写说明**：本任务的 `_aggregate_settlement` 现在消费 Task 5.4/5.5 传出的 `all_records`——它已包含**每一波、每次实际发起的调用**（不止每角色最后一条，cfr2-03 修复的直接消费点），因此 `FanoutSettlement` 的总成本/turns/denials 现在真实反映本轮全部尝试的花费，包括失败重试所消耗的部分。
+
+**cfr3-03 补充（第三轮评审指出，承接 rmf-04）**：开放发现处置表宣称 `AttemptRecord.protocol_errors` 会被 `FanoutSettlement` 聚合、供 Phase 6 写入 `round.py` 返回的 `detail` 字段（rmf-04 的判因链路修复），但本任务此前的测试清单没有一条**真正断言** `FanoutSettlement.protocol_errors` 聚合了多个角色/多次尝试的具体错误内容——`FanoutSettlement` 字段契约里虽然列了 `protocol_errors: list`，测试清单却完全没有覆盖它的聚合行为，只覆盖了 `capability_drift`/`cost_known`。本任务补上这条测试。
 
 **接口契约**：
 
@@ -1112,6 +1215,7 @@ def run_fanout(*, round_id: str, invoke_fn, budget: BudgetTracker,
 4. 任一记录 `status="capability_drift"` → 该记录被计入 `capability_drift` 列表；`run_fanout` 本身不对此做"整轮失败"的判断——那是调用方（Phase 6 的 `round.py` 接线）的职责，`run_fanout` 只负责如实透传 `settlement.capability_drift` 是否非空（cfr-06：检查点在 Phase 6，`fanout.py` 只产出可供检查的信号）。
 5. `degraded` 是 `run_finders` 与每次 `judge_candidate` 调用返回的 `degraded` 列表的合并（cfr-07 沿用），顶层 `degraded` 非空是"finder 有候选但 judge 全部降级"这个场景与"真正无候选"场景的唯一区分信号。
 6. `selected`（顶层 `candidates`）取自 `ranked` 列表中第一个全部 judge 通过（无 `reject`）的候选；一旦选中即停止裁决后续候选（不为已选中候选之外的候选继续花钱）。
+7. **`_aggregate_settlement` 对 `all_records` 里每条记录非空的 `protocol_errors` 做拼接**（cfr3-03/rmf-04）：格式为 `f"{record.role}:{record.attempt}: {e}"`（角色+attempt 编号作为前缀，区分是哪次尝试产生的协议错误），汇总进 `FanoutSettlement.protocol_errors` 列表——这条聚合逻辑此前只在 Task 5.3 的 `AttemptRecord.protocol_errors` 字段注释与本任务的接口契约里提及，但从未被测试清单真正断言过，第三轮评审指出这是"处置表宣称、任务清单遗漏"的典型缺口，本任务补齐。
 
 **测试清单**（断言点，不是完整测试源码）：
 1. 全部 finder 返回空候选 → `candidates=[]`，`rejected=[]`，返回值含 `degraded` 键（即便为空）。
@@ -1120,17 +1224,18 @@ def run_fanout(*, round_id: str, invoke_fn, budget: BudgetTracker,
 4. **cfr2-03 核心**：构造一个角色首波失败（产生成本）、次波成功的场景 → `settlement.total_cost_usd` 等于首波成本+次波成本之和，**不等于**仅次波成本（验证聚合基于全部 attempts，不是只取最终记录）。
 5. 任一子调用 `cost_known=False` → `settlement.cost_known` 为 `False`（即便其余子调用成本均已知）。
 6. 任一子调用检测到能力漂移 → `settlement.capability_drift` 非空。
+7. **cfr3-03 核心（rmf-04 端到端）**：构造两个不同角色，各自的 `InvocationResult.protocol_errors` 含不同的协议错误文本（如 `["duplicate init events: 2"]` 与 `["unparseable stream line: ..."]`）→ `settlement.protocol_errors` 长度为 2，且每条都能通过角色名前缀区分来自哪个角色（不是把两条错误文本合并成一条丢失来源信息）。
 
 - [ ] **Step 1**：按测试清单写测试（追加到 `test_fanout.py`），跑至因 `FanoutSettlement`/`run_fanout` 签名或聚合逻辑不匹配而红。
 - [ ] **Step 2**：按接口契约与不变量实现 `FanoutSettlement`/`_aggregate_settlement`/`run_fanout`。
 - [ ] **Step 3**：跑通全部用例；跑整个 `test_fanout.py` 确认无回归；跑全量测试套件确认其余模块未受影响。
-- [ ] **Step 4（正控）**：临时把 `_aggregate_settlement` 改回只遍历"每角色最后一条记录"（模拟 v2 的缺陷），跑用例 4，确认失败（聚合成本漏掉了失败重试的花费，复现 cfr2-03）；恢复。另临时删除 `degraded.extend(judge_degraded)` 这一步，跑用例 3，确认失败（顶层 `degraded` 为空，复现 cfr-07）；恢复。
+- [ ] **Step 4（正控）**：临时把 `_aggregate_settlement` 改回只遍历"每角色最后一条记录"（模拟 v2 的缺陷），跑用例 4，确认失败（聚合成本漏掉了失败重试的花费，复现 cfr2-03）；恢复。另临时删除 `degraded.extend(judge_degraded)` 这一步，跑用例 3，确认失败（顶层 `degraded` 为空，复现 cfr-07）；恢复。再临时把 `protocol_errors` 聚合逻辑删掉（`_aggregate_settlement` 里跳过该字段拼接），跑用例 7，确认失败（`settlement.protocol_errors` 为空，复现 cfr3-03 指出的"宣称但未测试"缺口）；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
-git commit -m "feat(harness): fanout —— run_fanout 组合入口，FanoutSettlement 基于全部 attempts 聚合（cfr-04/cfr-06, cfr2-03）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
+git commit -m "feat(harness): fanout —— run_fanout 组合入口，FanoutSettlement 基于全部 attempts 聚合含 protocol_errors 判因链路（cfr-04/cfr-06, cfr2-03, cfr3-03/rmf-04）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
 **Phase 5 收尾检查**：跑全量测试套件，确认 Phase 0–4 基线 + 本阶段新增用例全部绿，且既有测试无一因本阶段改动而回归。若 Task 3.1 末尾提到的"长度上限"补充尚未做，此时是最后合适时机。**另需核对**：`session_identity`/`ledger`/`role_invocation`/`prompts`/`fanout_schema`/`queue` 六个模块在 `fanout.py` 顶部的 import 语句齐全（Task 5.1–5.6 分散追加的 import 需要在此阶段汇总核对一次，避免遗漏；`queue.fingerprint` 是 Task 5.5 cfr2-02 修复新增的依赖，需确认已加入 import 列表）。
@@ -1156,9 +1261,13 @@ git commit -m "feat(harness): fanout —— run_fanout 组合入口，FanoutSett
 - **`record_invocation` 生产路径缺口顺手补上**：`budget.py` 现有 `record_invocation()` 已写好且有测试，但从未在生产路径被调用（`code-review-realmachine-fixes.md` 已指出）。本阶段在每次子调用真正返回后调用它——这与 `BudgetTracker` 是两回事：`BudgetTracker` 管本轮扇出内部的并发原子预留（进程内存），`budget.record_invocation` 管持久化到 SQLite 的跨轮次审计记录。
 - **截止时间切分**：`deadline_monotonic = started + ROUND_DEADLINE_S - CLEANUP_RESERVE_S`（绝对时刻，供 `fanout.run_wave_scheduled` 在每一波开始前自行计算剩余时间与动态 `timeout_s`）。
 
-### Task 6.1（处置 cfr-02/cfr-04/cfr-06/cfr-08/cfr-09/cfr-15，cfr2-01）：`round.py` 原子切换 + `STAGE1_ALLOWED_TOOLS` 收窄 + 结算分支迁移 + `cli.py` 调用适配
+### Task 6.1（处置 cfr-02/cfr-04/cfr-06/cfr-08/cfr-09/cfr-15，cfr2-01，cfr3-01/cfr3-03）：`round.py` 原子切换 + `STAGE1_ALLOWED_TOOLS` 收窄 + 结算分支迁移 + `cli.py` 调用适配
 
 **范围说明**：本任务同时触及 Task 2.4 登记的工具收窄、`round.py` 结算分支从"读单一 `invocation`"迁移为"读 `FanoutSettlement`"（cfr-04）、能力漂移检查从"整轮判定"迁移为"聚合后判定，不可降级"（cfr-06）、`round.py` 本身的调用段替换、以及 `cli.py` 的调用适配闭包（cfr-02/cfr2-01）。五者耦合在一起，必须同一次提交生效（不留过渡态）。
+
+**cfr3-03 补充（第三轮评审指出，承接 rmf-04/rmf-17）**：开放发现处置表宣称本任务会"把 `settlement.protocol_errors` 写入 `round.py` 返回的 `detail` 字段"（rmf-04）与"为每个角色的 `RoleInvocationRequest` 显式设置 `model=DEFAULT_AGENT_MODEL`"（rmf-17），但此前的不变量列表与测试清单都没有覆盖这两点——本任务补上。
+
+**cfr3-01 补充（第三轮评审指出）**：本任务是 `RequestContext`（Task 2.3 新增）唯一的生产值构造点——`_run_round_body` 必须显式构造 `RequestContext(cwd=str(cfg.repo_root), settings_path=SETTINGS_PATH, model=claude_runner.DEFAULT_AGENT_MODEL, stream_log_dir=str(cfg.state_db.parent / "rounds"))` 并传给 `fanout.run_finders`/`fanout.judge_candidate` 的 `context=` 参数——这是"生产环境下这四个值应该等于什么"这个问题在整个计划里**唯一**的真值来源，Task 5.5 的 `_make_request` 只负责消费它，不允许在 Phase 5/6 之间出现第二份重复定义。
 
 **接口契约**：
 
@@ -1179,8 +1288,13 @@ class Deps:
 def _settle_failed(budget: Budget, round_id: str, day: str, *,
                    cost_known: bool, cost_usd: float) -> None: ...
 def _capability_drift_problems(settlement: "fanout.FanoutSettlement") -> list[str]: ...
+def _format_detail(settlement: "fanout.FanoutSettlement", fallback: str) -> str: ...
+    # cfr3-03/rmf-04：settlement.protocol_errors 非空时 "; ".join(...)，
+    # 否则回退到 fallback（既有场景下的默认 detail 文案，如 "no eligible candidate"）
 
 def _load_agents(repo_root) -> dict[str, "prompts.AgentDef"]: ...
+def _build_request_context(cfg: "Config") -> "role_invocation.RequestContext": ...
+    # cfr3-01：唯一的生产值构造点，见上方补充说明
 
 # cli.py
 def _build_invoke_adapter() -> Callable[[RoleInvocationRequest], InvocationResult]: ...
@@ -1192,10 +1306,13 @@ def _build_invoke_adapter() -> Callable[[RoleInvocationRequest], InvocationResul
 2. `_settle_failed` 不再接受 `InvocationResult` 对象，改为直接接受 `cost_known`/`cost_usd` 两个具名参数——调用方（无论逻辑上源自单次 invocation 还是 `FanoutSettlement`）各自取出这两个字段传入，函数内部逻辑（`cost_known` 为真走 `budget.settle`，否则走 `budget.abandon`）不变（沿用 rmf-05 已修复的语义）。
 3. `_capability_drift_problems` 不再接受 `InvocationResult` 并重新判断，直接接受 `FanoutSettlement` 并透传其 `capability_drift` 列表——漂移判定逻辑已下沉到 `fanout._check_capability_drift`（每次子调用各自判断，Task 5.3 cfr-06），本函数只做"结论非空即失败"的既有格式化，不重复判定。
 4. `_describe_degraded` **不改动**——`record_degraded`（Task 5.2）已同时写 `role` 与 `agentType` 两个字段，继续读 `d.get('agentType')` 即可正确工作。
-5. `_run_round_body` 内，原有的"外层会话唯一职责是调 Workflow 再原样回显"这段旧代码整体替换为：构造 `agents = _load_agents(cfg.repo_root)` → 构造 `deadline_monotonic`/`call_budget: BudgetTracker(total_usd=grant)` → 定义 `_invoke_and_record(request)`（内部调用 `deps.invoke(request)` 并紧接着调用 `budget.record_invocation(...)`）→ 调用 `fanout.run_fanout(..., invoke_fn=_invoke_and_record, budget=call_budget, deadline_monotonic=deadline_monotonic, agents=agents, conn=deps.conn)` → 从返回的 `fanout_result["settlement"]` 取出 `total_turns`/`total_denials`/`exit_code`/`cost_known`/`total_cost_usd` 填入 `progress` 字典。
+5. `_run_round_body` 内，原有的"外层会话唯一职责是调 Workflow 再原样回显"这段旧代码整体替换为：构造 `agents = _load_agents(cfg.repo_root)` → 构造 `context = _build_request_context(cfg)`（cfr3-01）→ 构造 `deadline_monotonic`/`call_budget: BudgetTracker(total_usd=grant)` → 定义 `_invoke_and_record(request)`（内部调用 `deps.invoke(request)` 并紧接着调用 `budget.record_invocation(...)`）→ 调用 `fanout.run_fanout(..., invoke_fn=_invoke_and_record, budget=call_budget, deadline_monotonic=deadline_monotonic, agents=agents, context=context, conn=deps.conn)` → 从返回的 `fanout_result["settlement"]` 取出 `total_turns`/`total_denials`/`exit_code`/`cost_known`/`total_cost_usd` 填入 `progress` 字典。
 6. 能力漂移分支：`drift_problems = _capability_drift_problems(settlement)`，非空则整轮判定为 `capability-drift`（调用 `_settle_failed`+`budget.record_outcome` 后原样返回），**不得**因为漂移角色本身恰好返回了看似合法的 payload 而继续使用其 candidates。
 7. 后续 `eligible`/`candidate = dict(...)`/DTO 校验/`classify`/`publish` 等既有代码逐字保留不改——`fanout_result["candidates"]` 的形状与旧 `invocation.payload.get("candidates", [])` 完全一致。**核对点（cfr-04 要求逐一核对，不能遗漏）**：`round.py` 全文对 `invocation.cost_usd`/`invocation.turns`/`invocation.denials`/`invocation.exit_code` 的引用，必须全部替换为 `settlement.total_cost_usd`/`settlement.total_turns`/`settlement.total_denials`/`settlement.exit_code`；`_invoke_and_record` 函数体内部的局部变量 `invocation`（单次调用的返回值）允许保留，那不是聚合值引用。
 8. `.claude/harness-settings.json` 的 `permissions.allow` 收窄为 `["Read", "Grep", "Glob"]`（删除 `Skill`/`Workflow`/`TaskOutput`/`TodoWrite`）。
+9. **判因链路（cfr3-03/rmf-04）**：`invocation-failed`/`capability-drift` 等结果分支构造 `detail` 字段时，调用 `_format_detail(settlement, fallback=<既有默认文案>)`——`settlement.protocol_errors` 非空时优先使用它（拼接后的判因结论），为空时回退到既有的默认文案，不得让本次改动之后判因结论反而比旧架构更模糊。
+10. **每个角色的模型固定为规范 ID（cfr3-03/rmf-17）**：`_load_agents` 装配出的每个角色对应的 `RoleInvocationRequest`（在 `run_finders`/`judge_candidate` 内部构造，Phase 5 Task 5.5）在 Phase 6 接线时必须显式传入 `model=claude_runner.DEFAULT_AGENT_MODEL`——本任务负责在 `round.py` 传给 `fanout.run_finders`/`fanout.judge_candidate` 的入参或它们内部的 `_make_request` 工厂里确保这一点被设置，不依赖 `RoleInvocationRequest.model` 的默认值 `None`（`None` 会让 `build_argv` 不传 `--model`，退回 CLI 自身默认值，不是"规范 ID 已显式设置"）。
+11. **`RequestContext` 的生产值全部来自 `Config`/既有常量，不重新硬编码**（cfr3-01）：`_build_request_context(cfg)` 的四个字段——`cwd=str(cfg.repo_root)`、`settings_path=SETTINGS_PATH`（`round.py` 现有常量，不重新拼字符串字面量）、`model=claude_runner.DEFAULT_AGENT_MODEL`、`stream_log_dir=str(cfg.state_db.parent / "rounds")`（与旧架构原有的单一 stream_log 路径的父目录一致，只是现在每个子调用各自一个文件）——这个函数是整个计划里"生产环境这些值该等于什么"的唯一实现，`fanout.py` 侧的 `_make_request` 不允许再有第二份重复定义或硬编码占位符。
 
 **测试清单**（断言点，不是完整测试源码）：
 1. `round.STAGE1_TOOLS == "Glob,Grep,Read"`（工具集收窄端到端验证）。
@@ -1206,12 +1323,15 @@ def _build_invoke_adapter() -> Callable[[RoleInvocationRequest], InvocationResul
 6. 某子调用 `cost_known=False` → 本轮按 `_settle_failed` 现有语义走 `budget.abandon()`（预留满额）。
 7. **cfr-02/cfr2-01 核心**：构造一个"忠实"的 `deps.invoke` 适配闭包（真正执行 `to_invoke_kwargs` 展开），断言它能正确调用一个记录实际收到的关键字参数集合的假 `claude_runner.invoke` 替身，且该集合覆盖全部必需参数（`cwd`/`timeout_s` 等）——验证生产接线确实按契约展开，不是把整个对象塞进第一个形参。
 8. `.claude/harness-settings.json` 的 `permissions.allow` 恰好是 `["Read","Grep","Glob"]`（或等价断言，`test_precheck.py`/`test_cli.py` 同步改写）。
+9. **cfr3-03 核心之一（rmf-04 端到端）**：构造一个某角色返回 `protocol_errors=["duplicate init events: 2"]` 的场景（该角色最终判定失败）→ 本轮返回的 `detail` 字段包含这条协议错误文本（不是只有 `raw_tail` 摘要或空字符串）。
+10. **cfr3-03 核心之二（rmf-17 端到端）**：构造一次完整扇出（全部 finder/judge 成功），断言传给 `deps.invoke` 的**全部**（4 个 finder + 3 个 judge，共 7 次）请求的 `model` 字段均等于 `claude_runner.DEFAULT_AGENT_MODEL`，且不是 `None`。
+11. **cfr3-01 核心（端到端生产值验证）**：`_build_request_context(cfg)` 返回的 `RequestContext` 的 `cwd` 等于 `str(cfg.repo_root)`（不是任何测试替身占位符）、`settings_path` 等于 `round.SETTINGS_PATH`、`model` 等于 `claude_runner.DEFAULT_AGENT_MODEL`；进一步跑一次完整扇出（真实 `_build_request_context` 产出的 context，传给 `fanout.run_finders`），断言传给 `deps.invoke` 的请求的 `cwd`/`settings_path` 字段确实等于这些生产值，不是 Phase 5 测试替身里遗留的 `/tmp`/`""`。
 
-- [ ] **Step 1**：按测试清单写测试（改写 `test_round.py` 的 fixture：`_deps(invocation)` 改为 `_deps(invoke_fn)`，新增 `_multi_role_invoke(role_results: dict)` 按 `request.role` 路由；新增/改写上述 8 类断言），跑至因签名/字段不匹配、`fanout`/`role_invocation` 未接入而大面积红——这是预期的中间态。
-- [ ] **Step 2**：按接口契约与不变量顺序实现：先落地 `_settle_failed`/`_capability_drift_problems` 的新签名（结算分支迁移，cfr-04），再落地 `_run_round_body` 的调用段替换（工具收窄 + `fanout.run_fanout` 接入），最后在 `cli.py` 构造真正执行 `to_invoke_kwargs` 展开的适配闭包并传给 `Deps(invoke=...)`（cfr-02/cfr2-01）。
+- [ ] **Step 1**：按测试清单写测试（改写 `test_round.py` 的 fixture：`_deps(invocation)` 改为 `_deps(invoke_fn)`，新增 `_multi_role_invoke(role_results: dict)` 按 `request.role` 路由；新增/改写上述 11 类断言），跑至因签名/字段不匹配、`fanout`/`role_invocation` 未接入而大面积红——这是预期的中间态。
+- [ ] **Step 2**：按接口契约与不变量顺序实现：先落地 `_settle_failed`/`_capability_drift_problems`/`_format_detail` 的新签名（结算分支迁移，cfr-04/cfr3-03），再落地 `_build_request_context` 与 `_run_round_body` 的调用段替换（工具收窄 + `fanout.run_fanout` 接入 + `context=` 传入 + 各角色 `model=DEFAULT_AGENT_MODEL` 显式传入），最后在 `cli.py` 构造真正执行 `to_invoke_kwargs` 展开的适配闭包并传给 `Deps(invoke=...)`（cfr-02/cfr2-01）。
 - [ ] **Step 3**：跑通全部新用例；重跑既有 `test_round.py` 全部用例——**预计有大量既有用例因 fixture 形状变化需要同步改写**（凡是构造单个 `InvocationResult` 直接传给 `_deps()` 的既有用例，改成 `_multi_role_invoke({...七个角色...})` 形式），逐条改写但不得删除既有用例覆盖的场景。同步修正 `test_precheck.py`/`test_cli.py` 中断言旧工具集的既有用例。
 - [ ] **Step 4**：跑通全量测试套件，全绿。
-- [ ] **Step 5（正控，cfr-15 已订正的方向）**：临时把 `fanout.py` 的 `judge_candidate` 短路判断禁用，重跑 **`test_fanout.py`**（不是 `test_round.py`）里 Task 5.5 已写好的 `test_redline_reject_short_circuits_other_judges`，确认它变红；恢复后重跑 `test_round.py`+`test_fanout.py` 全部用例确认恢复绿色。另外，临时把 `cli.py` 的适配闭包改回"直接把 `request` 整体传给 `claude_runner.invoke`"（复现 cfr-02/cfr2-01 指出的错误接线），跑测试清单第 7 条，确认变红；恢复。
+- [ ] **Step 5（正控，cfr-15 已订正的方向）**：临时把 `fanout.py` 的 `judge_candidate` 短路判断禁用，重跑 **`test_fanout.py`**（不是 `test_round.py`）里 Task 5.5 已写好的 `test_redline_reject_short_circuits_other_judges`，确认它变红；恢复后重跑 `test_round.py`+`test_fanout.py` 全部用例确认恢复绿色。另外，临时把 `cli.py` 的适配闭包改回"直接把 `request` 整体传给 `claude_runner.invoke`"（复现 cfr-02/cfr2-01 指出的错误接线），跑测试清单第 7 条，确认变红；恢复。再临时把 `_format_detail` 改回恒定返回 `fallback`（忽略 `settlement.protocol_errors`），跑用例 9，确认变红（复现 cfr3-03 指出的"宣称但未接线"缺口）；恢复。再临时删除 `model=DEFAULT_AGENT_MODEL` 的显式传入，跑用例 10，确认变红；恢复。最后临时把 `_build_request_context` 的 `cwd` 改回硬编码 `"/tmp"`（模拟"忘记接生产值"），跑用例 11，确认变红（复现 cfr3-01 指出的"生产值来源未验证"缺口）；恢复。
 - [ ] **Step 6**：提交（**cfr-08 要求：涵盖全部实际修改的文件**——包括 `round.py`、`cli.py`、`.claude/harness-settings.json`、相关测试文件；若 Phase 5 遗留但尚未提交的文件因实施顺序被合并到本次一起做，必须在提交文件列表里如实列出，不能只提交 `round.py` 而遗漏实际改过的 `cli.py`/`fanout.py`）。
 
 ```bash
@@ -1221,7 +1341,7 @@ git add .claude/scripts/harness/round.py .claude/scripts/harness/cli.py \
         .claude/scripts/harness/tests/test_round.py \
         .claude/scripts/harness/tests/test_precheck.py \
         .claude/scripts/harness/tests/test_cli.py
-git commit -m "refactor(harness): round.py 接入控制器驱动扇出，cli.py 落实 to_invoke_kwargs 展开接线，消费 FanoutSettlement 聚合结算（ADR-002 D1/D2 落地，cfr-02/04/06/09, cfr2-01）" -- \
+git commit -m "refactor(harness): round.py 接入控制器驱动扇出，cli.py 落实 to_invoke_kwargs 展开接线，消费 FanoutSettlement 聚合结算含判因链路，各角色显式设规范 model，RequestContext 生产值唯一来源（ADR-002 D1/D2 落地，cfr-02/04/06/09, cfr2-01, cfr3-01/03）" -- \
         .claude/scripts/harness/round.py .claude/scripts/harness/cli.py \
         .claude/harness-settings.json \
         .claude/scripts/harness/tests/test_round.py \
@@ -1508,7 +1628,7 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 
 ## 自审
 
-> 本节随 v3 修订（第二轮跨模型对抗评审 cfr2-01–cfr2-10 处置后）同步更新。v3 相对 v2 的核心变化：(a) 全篇代码块降级为「接口契约+不变量+测试清单」（cfr2-05）；(b) `AttemptRecord` 新增 `retryable`/`resumable` 两个布尔位（cfr2-07）；(c) judge task identity 携带 candidate fingerprint（cfr2-02）；(d) `WaveResult` 携带全部 attempts 供 `FanoutSettlement` 正确聚合（cfr2-03）；(e) `BudgetTracker.settle()` 允许变负（cfr2-03）；(f) judge 调用补传 `expected_tools`（cfr2-04）；(g) Task 8.4 探针改用专用 parser（cfr2-06）；(h) 开放发现处置表删除自填的假 backlog 编号（cfr2-09）；(i) Phase 7 Task 7.5 验收 oracle 改为定点检查（cfr2-10）。
+> 本节随 v4 修订（第三轮跨模型对抗评审 cfr3-01–cfr3-03 处置后）同步更新。v4 相对 v3 的核心变化：(a) 新增 `RequestContext`/`build_stream_log_path` 契约，把生产环境 `cwd`/`settings_path`/`model`/`stream_log` 的取值收敛到 Phase 6 Task 6.1 单一构造点，并补齐 judge task identity 贯穿 session/ledger/stream 三处一致性的联合测试（cfr3-01）；(b) `InvocationResult` 新增 `subtype` 字段透传终态事件原始值，`AttemptRecord.retryable` 的赋值从"二元判断"改为可测试的终态分类表，区分预算耗尽/确定性协议异常（不可重试）与真实传输抖动/schema 校验失败（可重试）（cfr3-02）；(c) 把开放发现处置表宣称但从未被任务清单断言的三项（`protocol_errors` 进 detail、`record_degraded` 双写 `agentType`、显式设规范 `model`）补进 Task 5.2/5.6/6.1 的实际不变量与测试清单（cfr3-03）；(d) rmf-08 的 stream 权限收紧为 0600（Task 2.1 顺手处置），脱敏/轮转仍延后但量化说明放大 7 倍。v3 相对 v2 的变化（cfr2 系列）保留在下方历史记录：(e) 全篇代码块降级为「接口契约+不变量+测试清单」（cfr2-05）；(f) `AttemptRecord` 新增 `retryable`/`resumable` 两个布尔位（cfr2-07）；(g) judge task identity 携带 candidate fingerprint（cfr2-02）；(h) `WaveResult` 携带全部 attempts 供 `FanoutSettlement` 正确聚合（cfr2-03）；(i) `BudgetTracker.settle()` 允许变负（cfr2-03）；(j) judge 调用补传 `expected_tools`（cfr2-04）；(k) Task 8.4 探针改用专用 parser（cfr2-06）；(l) 开放发现处置表删除自填的假 backlog 编号（cfr2-09）；(m) Phase 7 Task 7.5 验收 oracle 改为定点检查（cfr2-10）。
 
 ### ADR-002 D0/D1/D2 覆盖检查
 
@@ -1572,7 +1692,7 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 
 ## 执行状态（逐任务同步，跨会话据此判断进度）
 
-> v3 修订（第二轮跨模型对抗评审 cfr2-01–cfr2-10 处置后）：任务编号相对 v2 不变（Phase 5 仍是 6 个任务，Phase 6/7/8 任务编号不变），但多个任务的**内部设计**有实质性修正——Task 1.1（judge task identity 携带 fingerprint，cfr2-02）、Task 1.2（状态词去掉 `degraded`，cfr2-04）、Task 5.3（`AttemptRecord` 新增 `retryable`/`resumable`，cfr2-07）、Task 5.4（`WaveResult`/`BudgetTracker` 允许变负，cfr2-03）、Task 5.5（judge 补传 `expected_tools`，cfr2-04；task identity 携带 fingerprint，cfr2-02）、Task 5.6（结算基于全部 attempts，cfr2-03）、Task 6.1（`cli.py` 落实 `to_invoke_kwargs` 展开，cfr2-01）、Task 8.4（探针专用 parser，cfr2-06）、Task 7.5（验收 oracle 改为定点检查，cfr2-10）。全篇代码块格式改为「接口契约+不变量+测试清单」（cfr2-05）。若此前有会话已按 v2 的完整代码草图开始实施，**请对照本次修订的具体设计变化重新核对已写代码**，不要假设 v2 的函数体可以原样照抄。
+> v4 修订（第三轮跨模型对抗评审 cfr3-01–cfr3-03 处置后）：任务编号相对 v3 不变，但多个任务补充了新的不变量与测试清单条目——Task 2.1（`InvocationResult` 新增 `subtype` 字段 + stream 落盘权限收紧 0600，cfr3-02/rmf-08）、Task 2.3（新增 `RequestContext`/`build_stream_log_path` 契约，cfr3-01）、Task 5.2（`record_degraded` 双写 `agentType` 补测试，cfr3-03）、Task 5.3（新增可测试的终态分类表，`_classify_retryable` 取代二元判断，cfr3-02）、Task 5.5（新增 `context: RequestContext` 参数 + 三处 task identity 一致性联合测试，cfr3-01）、Task 5.6（`protocol_errors` 聚合补测试，cfr3-03）、Task 6.1（新增 `_build_request_context`/`_format_detail`，补 rmf-04/rmf-17/cfr3-01 端到端测试）。若此前有会话已按 v3 的契约开始实施，**请对照本次修订的具体测试清单新增项补齐**，尤其是 Task 5.3 的终态分类表与 Task 5.5 的联合测试，不要假设 v3 版本已经足够。
 
 | # | 任务 | 状态 | 验证证据 | 偏差 |
 |---|---|---|---|---|
@@ -1580,19 +1700,19 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 | 0.2 | 只读工具是否触发 can_use_tool（cfr-15 订正：须带 stdio 权限开关） | 待开始 | | |
 | 1.1 | session_identity.py（judge task identity 携带 fingerprint，cfr2-02） | 待开始 | | |
 | 1.2 | agent_attempts 表 + ledger.py（状态词统一，cfr2-04） | 待开始 | | |
-| 2.1 | claude_runner 会话参数扩展 | 待开始 | | |
+| 2.1 | claude_runner 会话参数扩展（`subtype` 暴露 cfr3-02 前置；stream 落盘 0600，rmf-08） | 待开始 | | |
 | 2.2 | claude_runner 可注入 payload_parser（cfr-01） | 待开始 | | |
-| 2.3 | RoleInvocationRequest 唯一调用契约（cfr-02） | 待开始 | | |
+| 2.3 | RoleInvocationRequest + RequestContext 唯一调用契约（cfr-02, cfr3-01） | 待开始 | | |
 | 2.4 | STAGE1_ALLOWED_TOOLS 收窄（挪至 Phase 6 Task 6.1 执行） | 待开始 | | |
 | 3.1 | fanout_schema.py（含 cfr-13 类型前置检查） | 待开始 | | |
 | 4.1 | prompts.py | 待开始 | | |
 | 5.1 | dedupe_and_rank | 待开始 | | |
-| 5.2 | normalize_error/record_degraded | 待开始 | | |
-| 5.3 | run_one_attempt 单次尝试原语（cfr-02/03/06/12, cfr2-07 新增 retryable/resumable） | 待开始 | | |
+| 5.2 | normalize_error/record_degraded（双写 agentType 补测试，cfr3-03/rmf-04 反例） | 待开始 | | |
+| 5.3 | run_one_attempt 单次尝试原语（cfr-02/03/06/12, cfr2-07 新增 retryable/resumable, cfr3-02 终态分类表） | 待开始 | | |
 | 5.4 | BudgetTracker + run_wave_scheduled 波次调度（cfr-03/05/09/12, cfr2-03 允许变负+全部attempts, cfr2-07 fork判定） | 待开始 | | |
-| 5.5 | run_finders/judge_candidate 基于波次重写（cfr-06/07/14, cfr2-02 fingerprint task identity, cfr2-04 expected_tools） | 待开始 | | |
-| 5.6 | run_fanout + FanoutSettlement 聚合（cfr-04/06, cfr2-03 基于全部attempts） | 待开始 | | |
-| 6.1 | round.py 接线 + 工具收窄 + 结算分支迁移 + cli.py 适配闭包（cfr-02/04/06/08/09/15, cfr2-01） | 待开始 | | |
+| 5.5 | run_finders/judge_candidate 基于波次重写（cfr-06/07/14, cfr2-02 fingerprint task identity, cfr2-04 expected_tools, cfr3-01 RequestContext+联合测试） | 待开始 | | |
+| 5.6 | run_fanout + FanoutSettlement 聚合（cfr-04/06, cfr2-03 基于全部attempts, cfr3-03 protocol_errors 补测试） | 待开始 | | |
+| 6.1 | round.py 接线 + 工具收窄 + 结算分支迁移 + cli.py 适配闭包（cfr-02/04/06/08/09/15, cfr2-01, cfr3-01 RequestContext 构造点, cfr3-03 detail/model 补测试） | 待开始 | | |
 | 7.2 | 写继任测试（提前执行，冻结 canonical key 真值，cfr-18） | 待开始 | | |
 | 7.1 | 删除 JS workflow/skill + 旧跨语言测试（同一提交，cfr-18） | 待开始 | | |
 | 7.3 | 删除 degraded-dedup.test.mjs | 待开始 | | |
