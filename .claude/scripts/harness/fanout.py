@@ -10,6 +10,7 @@ import re
 import sys
 import threading
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
@@ -62,6 +63,19 @@ _JUDGE_ORDER = ("redline", "completed", "oracle")
 _JUDGE_TYPES = tuple(_JUDGE_AGENT_NAMES[kind] for kind in _JUDGE_ORDER)
 _DEFAULT_MAX_TURNS = 10
 _DEFAULT_REQUEST_TIMEOUT_S = 60.0
+_MICRO_USD_PER_USD = 1_000_000
+
+
+def _to_micro_usd(amount: float) -> int:
+    return int(
+        (Decimal(str(amount)) * _MICRO_USD_PER_USD).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+
+
+def _from_micro_usd(amount: int) -> float:
+    return amount / _MICRO_USD_PER_USD
 
 # 顺序敏感：UUID 必须先于裸 hex，否则第一段会被提前替换。
 _ID_PATTERNS = (
@@ -319,27 +333,30 @@ class BudgetTracker:
     def __init__(self, total_usd: float) -> None:
         if total_usd < 0:
             raise ValueError("total_usd must be non-negative")
-        self._remaining = float(total_usd)
+        self._remaining_micro_usd = _to_micro_usd(total_usd)
         self._lock = threading.Lock()
 
     def try_reserve(self, amount: float) -> bool:
-        if amount <= 0:
+        amount_micro_usd = _to_micro_usd(amount)
+        if amount_micro_usd <= 0:
             raise ValueError("reservation amount must be positive")
         with self._lock:
-            if self._remaining < amount:
+            if self._remaining_micro_usd < amount_micro_usd:
                 return False
-            self._remaining -= amount
+            self._remaining_micro_usd -= amount_micro_usd
             return True
 
     def settle(self, *, reserved: float, actual: float, cost_known: bool) -> None:
         if not cost_known:
             return
         with self._lock:
-            self._remaining += reserved - actual
+            self._remaining_micro_usd += (
+                _to_micro_usd(reserved) - _to_micro_usd(actual)
+            )
 
     def remaining(self) -> float:
         with self._lock:
-            return self._remaining
+            return _from_micro_usd(self._remaining_micro_usd)
 
 
 def _unscheduled_record(
@@ -441,7 +458,11 @@ def run_wave_scheduled(
                     role, attempt, "deadline-exhausted"
                 )
                 continue
-            request = replace(base_request, timeout_s=dynamic_timeout)
+            request = replace(
+                base_request,
+                timeout_s=dynamic_timeout,
+                grant_usd=single_call_cap_usd,
+            )
             if role in resumable_sessions:
                 request = build_continuation_request(
                     request, resumable_sessions[role]
@@ -535,6 +556,7 @@ def run_finders(
     blocked_lanes: list[str],
     known_canonical_keys: set[str],
     context: RequestContext,
+    single_call_cap_usd: float = _DEFAULT_SINGLE_CALL_CAP_USD,
     agents: dict[str, AgentDef] | None = None,
     conn=None,
     all_records: list[AttemptRecord] | None = None,
@@ -566,6 +588,7 @@ def run_finders(
         validate=validate_finder_output,
         budget=budget,
         deadline_monotonic=deadline_monotonic,
+        single_call_cap_usd=single_call_cap_usd,
         expected_tools=_STAGE1_EXPECTED_TOOLS,
         conn=conn,
         round_id=round_id,
@@ -645,6 +668,7 @@ def judge_candidate(
     deadline_monotonic: float,
     inflight_paths: list[str],
     context: RequestContext,
+    single_call_cap_usd: float = _DEFAULT_SINGLE_CALL_CAP_USD,
     agents: dict[str, AgentDef] | None = None,
     conn=None,
     all_records: list[AttemptRecord] | None = None,
@@ -695,6 +719,7 @@ def judge_candidate(
             validate=validate,
             budget=budget,
             deadline_monotonic=deadline_monotonic,
+            single_call_cap_usd=single_call_cap_usd,
             expected_tools=_STAGE1_EXPECTED_TOOLS,
             conn=conn,
             round_id=round_id,
@@ -796,6 +821,7 @@ def run_fanout(
     known_canonical_keys: set[str],
     inflight_paths: list[str],
     context: RequestContext,
+    single_call_cap_usd: float = _DEFAULT_SINGLE_CALL_CAP_USD,
     agents: dict[str, AgentDef] | None = None,
     conn=None,
 ) -> dict:
@@ -808,6 +834,7 @@ def run_fanout(
         blocked_lanes=blocked_lanes,
         known_canonical_keys=known_canonical_keys,
         context=context,
+        single_call_cap_usd=single_call_cap_usd,
         agents=agents,
         conn=conn,
         all_records=all_records,
@@ -824,6 +851,7 @@ def run_fanout(
             deadline_monotonic=deadline_monotonic,
             inflight_paths=inflight_paths,
             context=context,
+            single_call_cap_usd=single_call_cap_usd,
             agents=agents,
             conn=conn,
             all_records=all_records,

@@ -504,6 +504,22 @@ class TestBudgetTracker(unittest.TestCase):
         self.assertLess(budget.remaining(), 0.0)
         self.assertFalse(budget.try_reserve(0.01))
 
+    def test_four_exact_quarter_reservations_exhaust_budget(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(1.2)
+        accepted = [budget.try_reserve(0.3) for _ in range(4)]
+        self.assertEqual(accepted, [True, True, True, True])
+        self.assertEqual(budget.remaining(), 0.0)
+
+    def test_three_exact_third_reservations_exhaust_budget(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(0.6)
+        accepted = [budget.try_reserve(0.2) for _ in range(3)]
+        self.assertEqual(accepted, [True, True, True])
+        self.assertEqual(budget.remaining(), 0.0)
+
 
 class TestRunWaveScheduled(unittest.TestCase):
     _ROLE = "finder:roadmap"
@@ -541,7 +557,8 @@ class TestRunWaveScheduled(unittest.TestCase):
         )
 
     def _run(self, invoke_fn, *, roles=None, budget=None, deadline=None,
-             make_request=None, conn=None, expected_tools=None):
+             make_request=None, conn=None, expected_tools=None,
+             single_call_cap_usd=0.3):
         import time
         from harness.fanout import BudgetTracker, run_wave_scheduled
 
@@ -552,7 +569,7 @@ class TestRunWaveScheduled(unittest.TestCase):
             validate=lambda payload: [],
             budget=budget or BudgetTracker(3.0),
             deadline_monotonic=deadline or time.monotonic() + 120.0,
-            single_call_cap_usd=0.3,
+            single_call_cap_usd=single_call_cap_usd,
             expected_tools=expected_tools,
             conn=conn,
             round_id="round-1",
@@ -575,6 +592,27 @@ class TestRunWaveScheduled(unittest.TestCase):
         self.assertTrue(all(r.status == "success" for r in result.final.values()))
         self.assertEqual(len(result.all_attempts), 2)
         self.assertEqual(seen_attempts, [(role, 1) for role in roles])
+
+    def test_reserved_cap_is_applied_to_every_scheduled_request(self):
+        seen = []
+        roles = ("finder:roadmap", "finder:code")
+
+        from harness.fanout import BudgetTracker
+
+        self._run(
+            lambda request: (
+                seen.append(request)
+                or self._invocation(session_id=request.session_id)
+            ),
+            roles=roles,
+            budget=BudgetTracker(0.2),
+            make_request=lambda role, attempt: self._request(
+                role, attempt, grant_usd=0.3
+            ),
+            single_call_cap_usd=0.1,
+        )
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(request.grant_usd == 0.1 for request in seen))
 
     def test_retryable_resumable_failure_forks_from_reported_session(self):
         seen = []
@@ -1101,6 +1139,34 @@ class TestRunFanout(unittest.TestCase):
         self.assertEqual(result["rejected"], [])
         self.assertIn("degraded", result)
         self.assertEqual(result["degraded"], [])
+
+    def test_single_call_cap_reaches_finders_and_judges(self):
+        candidate = self._candidate()
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            if request.role.startswith("finder:"):
+                finder_candidate = {
+                    k: v for k, v in candidate.items() if k != "lane"
+                }
+                payload = (
+                    {"candidates": [finder_candidate]}
+                    if request.role == "finder:code"
+                    else {"candidates": []}
+                )
+            else:
+                kind = request.role.split(":", 2)[1]
+                payload = {
+                    "redline": {"verdict": "pass", "reason": "safe", "invariant_at_risk": "none"},
+                    "completed": {"verdict": "pass", "reason": "new", "evidence": "none"},
+                    "oracle": {"verdict": "pass", "reason": "strong", "suggested_oracle": "none"},
+                }[kind]
+            return self._invocation(payload, request=request)
+
+        self._run(invoke, single_call_cap_usd=0.1)
+        self.assertEqual(len(seen), 7)
+        self.assertTrue(all(request.grant_usd == 0.1 for request in seen))
 
     def test_first_candidate_passing_all_judges_is_selected(self):
         candidate = self._candidate()
