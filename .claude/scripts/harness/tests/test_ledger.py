@@ -105,3 +105,40 @@ class TestLedger(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStatusVocabularyIsPinned(unittest.TestCase):
+    """`ATTEMPT_STATUSES` 与建表 CHECK 必须始终一致（评审 cfr2-04）。
+
+    这是同一语义的第二份真相：Python 侧的集合与 SQL 侧的 CHECK 分开写，
+    改一处忘另一处不会有任何报错——直到某个真实状态写不进去才炸，而那时
+    表现是 `sqlite3.IntegrityError`，看起来像数据问题而不是配置漂移。
+
+    本项目已经栽过同一形态一次（`STAGE1_TOOLS` 与 `STAGE1_ALLOWED_TOOLS`
+    两份硬编码，加 `TaskOutput` 时立刻漂移）。那次靠入口强制拦下了，但正确的
+    做法是让漂移**无法发生**——这条测试把两者钉在一起。
+    """
+
+    def test_python_set_matches_sql_check_constraint(self):
+        import re as _re
+
+        from harness import db as _db
+        from harness.ledger import ATTEMPT_STATUSES
+
+        schema = _db.SCHEMA if hasattr(_db, "SCHEMA") else None
+        if schema is None:
+            src = Path(_db.__file__).read_text(encoding="utf-8")
+        else:
+            src = schema
+        block = _re.search(
+            r"CREATE TABLE IF NOT EXISTS agent_attempts\b.*?\);",
+            src, _re.S)
+        self.assertIsNotNone(block, "未找到 agent_attempts 建表语句")
+        check = _re.search(r"status\s+TEXT NOT NULL CHECK\s*\(\s*status IN\s*\((.*?)\)\s*\)",
+                           block.group(0), _re.S)
+        self.assertIsNotNone(check, "未找到 status 的 CHECK 约束")
+        sql_statuses = set(_re.findall(r"'([a-z_]+)'", check.group(1)))
+        self.assertEqual(
+            sql_statuses, set(ATTEMPT_STATUSES),
+            "ledger.ATTEMPT_STATUSES 与建表 CHECK 漂移了——"
+            "改一处必须同步另一处，否则合法状态会在写入时抛 IntegrityError")

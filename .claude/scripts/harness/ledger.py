@@ -1,3 +1,26 @@
+"""`agent_attempts` 谱系账本：记录每个角色每次尝试的会话身份与终态。
+
+本模块刻意做成**纯数据层**——它按调用方给的值写表，不推断、不派生。语义约束
+由 Phase 5 的调用方保证，但两条最容易搞错的记在这里，因为读代码的人先看到的是这里：
+
+1. **`session_id` 的含义随 `attempt` 变化**（评审 cfr2-07）：
+   - `attempt == 1` → 存 `session_identity.derive_session_id()` 的**预派生**值
+   - `attempt >= 2` → 必须存 **CLI 实际返回的**新 session id，**不是**预派生值
+
+   为什么：fork 重试走 `--resume <sid> --fork-session`，而 CLI 会分配一个**新**
+   session id。若拿预分配 ID 冒充「实际 ID」，下一次 fork 会去 resume 一个**从未被
+   CLI 创建过的会话**。评审原话：这等于把 Phase 8 测试里的 fake 挪进了生产重试路径。
+   同理 `parent_session_id` 必须指向上一次的**真实** id。
+
+2. **`ATTEMPT_STATUSES` 与建表 CHECK 是同一语义的两份真相**，必须逐字一致。
+   `test_ledger.TestStatusVocabularyIsPinned` 把两者钉在一起——改一处忘另一处会被
+   它拦下，而不是等到某个合法状态写不进去时抛 `sqlite3.IntegrityError`（那时的表现
+   像数据问题，不像配置漂移）。
+
+   注意状态词里**没有 `degraded`**：「降级」是编排层对「重试耗尽」的结论，不是单次
+   attempt 的状态。单次 attempt 只有成功 / 传输失败 / 能力漂移三种终态。
+"""
+
 from __future__ import annotations
 
 import sqlite3
