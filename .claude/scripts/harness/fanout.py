@@ -6,12 +6,27 @@
 
 from __future__ import annotations
 
+import re
+
 from .queue import canonical_key
 
 
 _PRIORITY_ORDER = {"T0": 0, "T1": 1, "T2": 2, "T3": 3, "T4": 4}
 _SIZE_ORDER = {"S": 0, "M": 1, "L": 2}
 _MAX_RANKED_CANDIDATES = 3
+
+# 顺序敏感：UUID 必须先于裸 hex，否则第一段会被提前替换。
+_ID_PATTERNS = (
+    re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        re.I,
+    ),
+    re.compile(r"\b[0-9A-HJKMNP-TV-Z]{26}\b"),
+    re.compile(r"req_\S+"),
+    re.compile(r"trace[-_]?id[=: ]\S+", re.I),
+    re.compile(r"\d{10,}"),
+    re.compile(r"[0-9a-f]{8,}", re.I),
+)
 
 
 def dedupe_and_rank(
@@ -46,3 +61,34 @@ def dedupe_and_rank(
         )
     )
     return deduped[:_MAX_RANKED_CANDIDATES]
+
+
+def normalize_error(err: object) -> str:
+    """折叠传输错误中的动态 ID，同时保留错误首尾的语义差异。"""
+    text = str(getattr(err, "message", None) or err)
+    for pattern in _ID_PATTERNS:
+        text = pattern.sub("<id>", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 300:
+        text = text[:200] + "…" + text[-100:]
+    return text
+
+
+def record_degraded(
+    degraded: list[dict], *, role: str, error: str, attempts: int
+) -> None:
+    """按 role 与规范化错误折叠降级记录。"""
+    for record in degraded:
+        if record["role"] == role and record["error"] == error:
+            record["occurrences"] += 1
+            record["attempts"] += attempts
+            return
+    degraded.append(
+        {
+            "role": role,
+            "agentType": role,
+            "error": error,
+            "occurrences": 1,
+            "attempts": attempts,
+        }
+    )

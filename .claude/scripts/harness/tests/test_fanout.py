@@ -70,5 +70,88 @@ class TestDedupeAndRank(unittest.TestCase):
         self.assertEqual(len(result), 1)
 
 
+class TestNormalizeError(unittest.TestCase):
+    def test_folds_hex_request_id(self):
+        from harness.fanout import normalize_error
+
+        first = normalize_error(
+            "API Error: Server error mid-response. req_9f3a2b7c1d"
+        )
+        second = normalize_error(
+            "API Error: Server error mid-response. req_11ee44aa99"
+        )
+        self.assertEqual(first, second)
+
+    def test_folds_uuid_trace_id(self):
+        from harness.fanout import normalize_error
+
+        first = normalize_error(
+            "...(trace 9f3a2b7c-1d4e-4f8a-9b2c-1234567890ab)"
+        )
+        second = normalize_error(
+            "...(trace 0c8d51ea-7b62-4a19-8e30-0987654321fe)"
+        )
+        self.assertEqual(first, second)
+
+    def test_does_not_fold_different_error_kinds(self):
+        from harness.fanout import normalize_error
+
+        schema_error = normalize_error("schema validation failed: candidates")
+        transport_error = normalize_error(
+            "API Error: Server error mid-response. req_9f3a2b7c1d"
+        )
+        self.assertNotEqual(schema_error, transport_error)
+
+    def test_preserves_tail_difference_after_shared_prefix(self):
+        from harness.fanout import normalize_error
+
+        shared_prefix = "x" * 250
+        body_error = normalize_error(
+            shared_prefix + " MISSING body_md on candidate 1"
+        )
+        slug_error = normalize_error(
+            shared_prefix + " MISSING slug on candidate 2"
+        )
+        self.assertNotEqual(body_error, slug_error)
+
+
+class TestRecordDegraded(unittest.TestCase):
+    def test_folds_same_role_same_error(self):
+        from harness.fanout import record_degraded
+
+        degraded = []
+        record_degraded(
+            degraded, role="finder:roadmap", error="e1", attempts=3
+        )
+        record_degraded(
+            degraded, role="finder:roadmap", error="e1", attempts=3
+        )
+        self.assertEqual(len(degraded), 1)
+        self.assertEqual(degraded[0]["occurrences"], 2)
+        self.assertEqual(degraded[0]["attempts"], 6)
+
+    def test_does_not_fold_different_roles(self):
+        from harness.fanout import record_degraded
+
+        degraded = []
+        record_degraded(
+            degraded, role="finder:roadmap", error="e1", attempts=3
+        )
+        record_degraded(
+            degraded, role="judge:redline", error="e1", attempts=3
+        )
+        self.assertEqual(len(degraded), 2)
+
+    def test_writes_agent_type_alias_for_round_describe_degraded(self):
+        from harness.fanout import record_degraded
+
+        degraded = []
+        record_degraded(
+            degraded, role="finder:roadmap", error="e1", attempts=3
+        )
+        self.assertEqual(degraded[0]["agentType"], "finder:roadmap")
+        self.assertEqual(degraded[0]["agentType"], degraded[0]["role"])
+
+
 if __name__ == "__main__":
     unittest.main()

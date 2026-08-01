@@ -1747,7 +1747,7 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 | 3.1 | fanout_schema.py（含 cfr-13 类型前置检查） | 已完成 | `python3 -m unittest harness.tests.test_fanout_schema`：14 tests OK；全量：354 tests + 13 tests OK；正控禁用 finder 顶层未知字段检测后额外字段测试失败，删除 `_check_enum` 类型前置检查后 size/priority/verdict 的 list/dict 用例以未捕获 `TypeError` 失败；每次正控均先清理 `__pycache__` | 无 |
 | 4.1 | prompts.py | 已完成 | `python3 -m unittest harness.tests.test_prompts`：6 tests OK；全量：361 tests + 13 tests OK；正控将 frontmatter 正则临时改为永不匹配后，样例解析与全部 7 个真实 agent 定义集成测试共 8 个 error，恢复并清理 `__pycache__` 后 6 tests OK | 无；agent 定义来源由 `parse_agent_file(path)` 参数注入，未硬编码项目路径；未使用 `--agents` 或 `Task` |
 | 5.1 | dedupe_and_rank | 已完成 | `python3 -m unittest harness.tests.test_fanout`：5 tests OK；全量：371 tests + 13 tests OK；正控将排序 key 临时改为恒定值后 priority 排序测试失败，恢复前清理 `__pycache__` | 无 |
-| 5.2 | normalize_error/record_degraded（双写 agentType 补测试，cfr3-03/rmf-04 反例） | 待开始 | | |
+| 5.2 | normalize_error/record_degraded（双写 agentType 补测试，cfr3-03/rmf-04 反例） | 已完成 | `python3 -m unittest harness.tests.test_fanout`：12 tests OK；全量：378 tests + 13 tests OK；正控将 UUID 正则移到裸 hex 后 UUID 折叠测试失败，删除 `agentType` 双写后别名测试以 `KeyError` 失败；每次恢复前清理 `__pycache__` | 无 |
 | 5.3 | run_one_attempt 单次尝试原语（cfr-02/03/06/12, cfr2-07 新增 retryable/resumable, cfr3-02 终态分类表, cfr4-02 补齐 parser 层与 CLI 启动失败分支） | 待开始 | | |
 | 5.4 | BudgetTracker + run_wave_scheduled 波次调度（cfr-03/05/09/12, cfr2-03 允许变负+全部attempts, cfr2-07 fork判定, cfr4-01 make_request 携带 attempt+stream_log 不覆盖） | 待开始 | | |
 | 5.5 | run_finders/judge_candidate 基于波次重写（cfr-06/07/14, cfr2-02 fingerprint task identity, cfr2-04 expected_tools, cfr3-01 RequestContext+联合测试, cfr4-01 oracle 订正为同源比对） | 待开始 | | |
