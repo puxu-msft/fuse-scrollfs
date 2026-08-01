@@ -15,20 +15,18 @@ import re
 import sqlite3
 import time
 
-# canonical key 的规范化必须与 `.claude/workflows/scrollz-propose.js` 的
-# `canonicalKey()` **逐字节一致**——key 由 Python 产出、由 JS 比对，两侧算不出同一
-# 个串，跨轮去重就静默失效（不报错、不告警，只是每轮重提同一候选）。
+# ADR-002 控制流重写后，本轮内去重与跨轮去重都调用本模块的
+# `canonical_key()`；原 JavaScript `canonicalKey()` 已退役，不再有两份跨语言实现。
+# `_norm()` / `canonical_key()` 是唯一规范化真值，其边界行为由
+# `test_canonical_key_normalization.py` 冻结。
 #
-# JS 那边是 `x.trim().toLowerCase().replace(/\s+/g, ' ')`，这里逐步镜像它。
-# 两处**不能**用 Python 的自带语义（跨语言测试各抓出一次真实漂移）：
-#   1. 不能用 `re` 的 `\s`：它匹配 `\x1c`–`\x1f`，ECMAScript 的 `\s` 不匹配。
-#      而 `\x1f` 恰恰是本模块拼接四个字段用的分隔符本身。
-#   2. 不能用 `str.strip()`：JS 的 `trim()` 去掉 `\ufeff`（BOM），Python 的
-#      `strip()` 不认它，于是 `"BOM\ufeff"` 两侧分别得到 `bom ` 与 `bom`。
+# 仍不能直接改用 Python 的内建空白语义，否则会改变既有 canonical key：
+#   1. 不能用 `re` 的 `\s`：它匹配 `\x1c`–`\x1f`，而当前规范化不匹配。
+#      `\x1f` 恰恰是本模块拼接四个字段用的分隔符本身。
+#   2. 不能用 `str.strip()`：它不去掉 `\ufeff`（BOM），而当前规范化会去掉。
+# 当前 `_WS_EDGE` 明确包含 BOM 字符（见下一行常量）。
 #
-# 已知残余差异（记录而非修复）：`toLowerCase()` 与 `str.lower()` 对少数字符不同
-# （如 `ß`、土耳其语 `İ`）。出现在这四个字段里的概率极低，且真出现时跨语言测试
-# 会抓到——加样本即可，不必现在引入完整的 Unicode 大小写映射。
+# 大小写与空白规则同样属于已冻结行为；若需调整，必须迁移既有 key 并更新测试。
 _JS_SPACE = ("\u0020\t\n\r\f\v\u00a0\u1680\u2000-\u200a"
              "\u2028\u2029\u202f\u205f\u3000\ufeff")
 _WS = re.compile(f"[{_JS_SPACE}]+")

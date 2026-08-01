@@ -48,4 +48,4 @@ rules:
       - .claude/agents/
       - .claude/rules/
       - docs/harness/redlines.yaml
-    reason: 禁止 harness 无人值守地重写自身控制逻辑（含 finder/judge 提示词、不可信输入纪律、红线清单本身）；此类改动只能走独立 PR
+    reason: 禁止 harness 无人值守地重写自身控制逻辑（含 finder/judge 提示词、不可信输入纪律、红线清单本身）；此类改动只能走独立 PR。2026-07-31 起 harness 扇出改为控制器驱动，两目录不再含 harness 编排代码，但仍属禁止无人值守自修改的范围

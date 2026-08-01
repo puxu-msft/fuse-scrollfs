@@ -1424,7 +1424,7 @@ cd /tmp/phase6-verify/.claude/scripts
 
 **但删除不能是净减覆盖**：原测试隐含校验了 `canonical_key`/`_norm` 对若干边界输入（`\x1f` 分隔符、全角空格、BOM、大小写）的处理是**确定性且符合当前实现**的（虽然此前是通过「与 JS 比对」这个侧面手段验证，但断言的真正内容是「Python 侧的规范化函数对这些输入产出这个确定的结果」）。因此替换测试直接对 `queue.canonical_key`/`_norm` 断言这些边界输入的**实测**具体输出，不再需要 node 子进程，也不再假设"应该"折叠成什么。
 
-- [ ] **Step 1: 写测试** —— 新建 `.claude/scripts/harness/tests/test_canonical_key_normalization.py`。**此时 `scrollz-propose.js` 与旧的 `test_canonical_key_cross_language.py` 均原样保留，尚未触碰**——新旧两条测试此刻应同时为绿（旧测试测的是"Python 与 JS 一致"，新测试测的是"Python 自身行为符合已冻结真值"，两者互不依赖对方是否存在，因此可以共存验证）：
+- [x] **Step 1: 写测试** —— 新建 `.claude/scripts/harness/tests/test_canonical_key_normalization.py`。**此时 `scrollz-propose.js` 与旧的 `test_canonical_key_cross_language.py` 均原样保留，尚未触碰**——新旧两条测试此刻应同时为绿（旧测试测的是"Python 与 JS 一致"，新测试测的是"Python 自身行为符合已冻结真值"，两者互不依赖对方是否存在，因此可以共存验证）：
 
 ```python
 """canonical key 规范化的边界行为（原 test_canonical_key_cross_language.py
@@ -1491,17 +1491,17 @@ class TestCanonicalKeyNormalization(unittest.TestCase):
         self.assertEqual(a, b)
 ```
 
-- [ ] **Step 2**：跑新测试文件，确认全绿（此时 `queue.py` 未改动，`scrollz-propose.js` 与旧跨语言测试均未触碰）。同时跑一次旧的 `test_canonical_key_cross_language.py`，确认它也仍然是绿的——**这一步是本次订正的核心验证点**：证明新旧测试在 JS 尚存在时确实可以共存，而不是像 v1 草图错误声称的那样只在"理论上"共存。
-- [ ] **Step 3（正控）**：临时把 `_norm()` 里的 `_WS_EDGE.sub("", text)` 那部分改成不做任何处理（直接 `text.lower()`），跑 `test_bom_stripped_at_edge`，确认失败（因为 BOM 不会被剥离）；恢复。**另加一条反向正控**：临时把 `_norm()` 改成"把 `\x1f` 也当空白折叠"（例如在 `_WS` 正则字符类里加入 `\x1f`），跑 `test_control_character_separator_is_preserved_not_folded`，确认失败——这一步验证的是"如果有人静默改变了规范化语义，这条测试会挡住"，是这条测试存在的核心价值；恢复。
+- [x] **Step 2**：跑新测试文件，确认全绿（此时 `queue.py` 未改动，`scrollz-propose.js` 与旧跨语言测试均未触碰）。同时跑一次旧的 `test_canonical_key_cross_language.py`，确认它也仍然是绿的——**这一步是本次订正的核心验证点**：证明新旧测试在 JS 尚存在时确实可以共存，而不是像 v1 草图错误声称的那样只在"理论上"共存。
+- [x] **Step 3（正控）**：临时把 `_norm()` 里的 `_WS_EDGE.sub("", text)` 那部分改成不做任何处理（直接 `text.lower()`），跑 `test_bom_is_stripped_at_edge`，确认失败（因为 BOM 不会被剥离）；恢复。**另加一条反向正控**：临时把 `_norm()` 改成"把 `\x1f` 也当空白折叠"（例如在 `_WS` 正则字符类里加入 `\x1f`），跑 `test_control_characters_are_preserved_not_folded`，确认失败——这一步验证的是"如果有人静默改变了规范化语义，这条测试会挡住"，是这条测试存在的核心价值；恢复。
 
 **本任务到此为止，不提交**——继续到 Task 7.1 的删除步骤后一并提交（下方 Task 7.1 已改为在同一个提交里包含本任务新增的测试文件与删除的旧资产）。
 
 ### Task 7.1：删除 `.claude/workflows/scrollz-propose.js`、`.claude/skills/scrollz-round/`、旧跨语言测试（同一原子提交）
 
-- [ ] **Step 1**：确认零引用——`rg -n "scrollz-propose|scrollz-round" --type-not=md .claude/scripts/` 应无命中（`docs/harness/*.md` 里提及历史背景的引用不算，那是文档，不影响本检查）。
-- [ ] **Step 2**：`git rm .claude/workflows/scrollz-propose.js .claude/skills/scrollz-round/SKILL.md .claude/scripts/harness/tests/test_canonical_key_cross_language.py`（若 `.claude/skills/scrollz-round/` 目录下还有其它文件一并 `git rm -r`）。
-- [ ] **Step 3**：跑全量测试套件，确认无回归——此时 `test_canonical_key_normalization.py`（Task 7.2 新增，已 `git add` 但尚未提交）与其余全部测试应为绿；旧跨语言测试已被删除，不会再因为找不到 JS 文件而报红。
-- [ ] **Step 4**：提交（**这一次提交同时包含 Task 7.2 新增的测试文件与 Task 7.1 删除的三个旧文件**，是同一个原子提交，不拆成两次）。
+- [x] **Step 1**：确认不存在活跃引用。原「全文件零命中」oracle 经实施核对发现不成立：合法的取代说明、旧 DTO shape 来源说明与 `build_argv` 任意 prompt 夹具仍会命中。改为全仓 `rg --hidden` 后逐条分类，允许「历史叙述且删除后仍为真」「测试夹具字符串」「历史档案」三类；确认不存在任何活跃 import、工具调用或文件读取指向已删除对象。`queue.py` 中原先要求与已删除 JS 实现逐字节一致的现行断言已改为 Python 唯一实现说明。
+- [x] **Step 2**：`git rm .claude/workflows/scrollz-propose.js .claude/skills/scrollz-round/SKILL.md .claude/scripts/harness/tests/test_canonical_key_cross_language.py`（若 `.claude/skills/scrollz-round/` 目录下还有其它文件一并 `git rm -r`）。
+- [x] **Step 3**：跑全量测试套件，确认无回归——此时 `test_canonical_key_normalization.py`（Task 7.2 新增，已 `git add` 但尚未提交）与其余全部测试应为绿；旧跨语言测试已被删除，不会再因为找不到 JS 文件而报红。
+- [x] **Step 4**：提交（**这一次提交同时包含 Task 7.2 新增的测试文件与 Task 7.1 删除的三个旧文件**，是同一个原子提交，不拆成两次）。
 
 ```bash
 cd /home/xp/src/zipfs
@@ -1518,14 +1518,14 @@ git commit -m "chore(harness): 退役 scrollz-propose workflow/scrollz-round ski
 
 **背景**：该测试是 `normalizeError`/`recordDegraded` 两个 JS 纯函数的复制式测试（`code-review-realmachine-fixes.md` rmf-11 已指出这类复制式测试的漂移风险——测试复制的 `safeAgent` 因缺 `MAX_AGENT_ATTEMPTS` 常量而实际跑不起来，只是从未被调用所以未暴露）。Phase 5 Task 5.2 的 `test_fanout.py::TestNormalizeError`/`TestRecordDegraded` 已经是这两个函数 Python 版本的等价测试（且修复了 rmf-10 的两个真实漏检），是**净增强**而非平移。
 
-- [ ] **Step 1**：确认 `test_fanout.py` 里 `TestNormalizeError`/`TestRecordDegraded` 已覆盖 `degraded-dedup.test.mjs` 断言过的全部场景——逐条核对：
+- [x] **Step 1**：确认 `test_fanout.py` 里 `TestNormalizeError`/`TestRecordDegraded` 已覆盖 `degraded-dedup.test.mjs` 断言过的全部场景——逐条核对：
   - `.mjs` 断言「3 条同类传输故障折叠为 1 条，occurrences=3，attempts=9」→ 对应 `test_folds_hex_request_id`（折叠断言）+ `test_record_degraded` 系列（计数断言）。
   - `.mjs` 断言「1 条不同错误不折叠」→ 对应 `test_does_not_fold_different_error_kinds`。
   - `.mjs` 断言「不同 agent 的同错误不折叠」→ 对应 `test_does_not_fold_different_roles`。
   全部三项均已在 Task 5.2 覆盖，无缺口。
-- [ ] **Step 2**：`git rm -r .claude/workflows/tests/`（该目录下若还有其它 `.mjs` 文件，先确认无其它内容依赖）。
-- [ ] **Step 3**：跑全量测试套件（Python 侧不受影响；若 CI/其它脚本曾经调用 `node .claude/workflows/tests/degraded-dedup.test.mjs`，检查 `.claude/systemd/`、`Makefile` 或任何 shell 脚本是否引用它——`rg -n "degraded-dedup" --type-not=md .` 确认零命中）。
-- [ ] **Step 4**：提交。
+- [x] **Step 2**：`git rm -r .claude/workflows/tests/`（该目录下若还有其它 `.mjs` 文件，先确认无其它内容依赖）。
+- [x] **Step 3**：跑全量测试套件（Python 侧不受影响；若 CI/其它脚本曾经调用 `node .claude/workflows/tests/degraded-dedup.test.mjs`，检查 `.claude/systemd/`、`Makefile` 或任何 shell 脚本是否引用它——`rg -n "degraded-dedup" --type-not=md .` 确认零命中）。
+- [x] **Step 4**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
@@ -1535,8 +1535,8 @@ git commit -m "chore(harness): 退役 degraded-dedup.test.mjs（Python 侧 test_
 
 ### Task 7.4：`docs/harness/redlines.yaml` 说明性更新（不改判定逻辑）
 
-- [ ] `harness-self-modification` 红线条目的 `paths` 列表里 `.claude/workflows/` 与 `.claude/skills/` **保留不删**——即便当前这两个目录下已无 harness 专属文件，红线的意图是「防止未来任何 agent 无人值守地在这两个目录下重新创建编排逻辑」，路径本身不因为目录暂时为空而失去意义。仅在 `reason` 字段追加一句说明：「2026-07-31 起 harness 扇出改为控制器驱动，两目录不再含 harness 编排代码，但仍属禁止无人值守自修改的范围」。
-- [ ] 提交（该文件是纯文档性质的说明补充，不涉及测试）。
+- [x] `harness-self-modification` 红线条目的 `paths` 列表里 `.claude/workflows/` 与 `.claude/skills/` **保留不删**——即便当前这两个目录下已无 harness 专属文件，红线的意图是「防止未来任何 agent 无人值守地在这两个目录下重新创建编排逻辑」，路径本身不因为目录暂时为空而失去意义。仅在 `reason` 字段追加一句说明：「2026-07-31 起 harness 扇出改为控制器驱动，两目录不再含 harness 编排代码，但仍属禁止无人值守自修改的范围」。
+- [x] 提交（该文件是纯文档性质的说明补充，不涉及测试）。
 
 ```bash
 cd /home/xp/src/zipfs
@@ -1550,20 +1550,20 @@ git commit -m "docs(harness): redlines.yaml 补充说明——workflows/skills �
 
 **功能范围不削减的边界**：本任务只修订"用什么实现接缝达成"的描述与"用什么具体对象做验收判据"，**不改变** B1–B8 任一条目的目标范围。特别是 B2 的核心功能（远端队列对账、拒绝记忆、`possible_duplicate` 复核、统一指纹协议）**全部原样保留**，只是"统一指纹协议"这一条的实现对象从"JS `canonicalKey` vs Python `queue.fingerprint`，需要跨语言测试"改为"Python 侧 `fanout.dedupe_and_rank` 与 `queue.fingerprint`/`queue.canonical_key` 本就是同一份实现，跨语言一致性问题已因架构改变而不复存在，Stage 1b 的验收方式相应简化为对 `queue.canonical_key`/`_norm` 的单元测试覆盖（Phase 7 Task 7.2 的 `test_canonical_key_normalization.py` 已经是这份覆盖的一部分）"——**功能保留、实现手段与验收 oracle 更新**。
 
-- [ ] **Step 1**：修订 `docs/harness/spec.md` 相关段落。具体改动点（只读改动即可核实定位，属文档编辑，不涉及代码）：
+- [x] **Step 1**：修订 `docs/harness/spec.md` 相关段落。具体改动点（只读改动即可核实定位，属文档编辑，不涉及代码）：
   - §二"已裁定决策"表的"编排载体"一行，原文「内置 `Workflow` 工具（已核实存在；skill 指令调用它属合法 opt-in 路径）」，追加脚注：「**2026-07-31 起由 ADR-002 取代**：控制器直接驱动扇出，不再经由 `Workflow` 工具或 skill 间接编排，见 [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md) 与 [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md)」。
   - §七 Phase B 流程图（"段 1 Workflow scrollz-propose"那一段）追加同样的脚注，说明该流程图描述的是**重写前**的架构，当前实现见控制流重写计划。**不删除原图**——它仍有历史参考价值（后续维护者理解"为什么曾经这样设计、又为什么改掉"需要这段上下文），只标注其时效性。
   - §十五评审处置台账追加一行：「ADR-002（控制流重写）| 采纳，废弃 Workflow 编排载体、改为控制器驱动扇出 | Stage 1a 完成后」。
-- [ ] **Step 2**：修订 `docs/harness/plan-stage1b.md` B2 小节。原文「统一指纹协议：JS 侧 `canonicalKey` 与 Python 侧 `queue.fingerprint` 必须对同一候选产出一致的规范化串，加一条跨语言一致性测试（Python 生成样本 → Node 计算 → 比对）」，改为：「统一指纹协议：**该问题已因 ADR-002 控制流重写而结构性消失**——本轮内去重（原由 `scrollz-propose.js` 的 JS `canonicalKey()` 实现）与跨轮去重现在共用同一个 Python 函数 `queue.canonical_key`/`fingerprint`（见 `fanout.dedupe_and_rank`），不存在"两份独立实现需要保持一致"这件事。Stage 1b 实施时无需再写跨语言测试，`.claude/scripts/harness/tests/test_canonical_key_normalization.py`（控制流重写 Phase 7 产出）已经是这份规范化行为的单元测试覆盖，Stage 1b 若需要为 `possible_duplicate` 的相似度判定新增测试，直接扩展该文件或新增同类单元测试即可」。
-- [ ] **Step 3**：`plan-stage1b.md` 文首状态行追加一句：「2026-07-31 起，B2 的实现接缝已按 [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md) Task 7.5 同步修订；B1/B3–B8 的目标范围不受影响」。
-- [ ] **Step 4（cfr2-10 订正：验收 oracle 不能是"全文件零/少匹配"）**：Step 1 明确要求"不删除原图"——`spec.md`/`plan-stage1b.md` 中保留了大量描述**重写前**架构的历史 Workflow 段落，这些命中是**预期且刻意保留**的，`rg -n "Workflow" docs/harness/spec.md` 必然产生远多于"两处脚注"的匹配，用这条命令的匹配数量做验收判据必然失败，不能作为本任务的验收 oracle（第二轮评审 cfr2-10 已指出这一具体缺陷）。**改为对明确断言做定点检查**，而不是对全文件做无差别扫描：
+- [x] **Step 2**：修订 `docs/harness/plan-stage1b.md` B2 小节。原文「统一指纹协议：JS 侧 `canonicalKey` 与 Python 侧 `queue.fingerprint` 必须对同一候选产出一致的规范化串，加一条跨语言一致性测试（Python 生成样本 → Node 计算 → 比对）」，改为：「统一指纹协议：**该问题已因 ADR-002 控制流重写而结构性消失**——本轮内去重（原由 `scrollz-propose.js` 的 JS `canonicalKey()` 实现）与跨轮去重现在共用同一个 Python 函数 `queue.canonical_key`/`fingerprint`（见 `fanout.dedupe_and_rank`），不存在"两份独立实现需要保持一致"这件事。Stage 1b 实施时无需再写跨语言测试，`.claude/scripts/harness/tests/test_canonical_key_normalization.py`（控制流重写 Phase 7 产出）已经是这份规范化行为的单元测试覆盖，Stage 1b 若需要为 `possible_duplicate` 的相似度判定新增测试，直接扩展该文件或新增同类单元测试即可」。
+- [x] **Step 3**：`plan-stage1b.md` 文首状态行追加一句：「2026-07-31 起，B2 的实现接缝已按 [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md) Task 7.5 同步修订；B1/B3–B8 的目标范围不受影响」。
+- [x] **Step 4（cfr2-10 订正：验收 oracle 不能是"全文件零/少匹配"）**：Step 1 明确要求"不删除原图"——`spec.md`/`plan-stage1b.md` 中保留了大量描述**重写前**架构的历史 Workflow 段落，这些命中是**预期且刻意保留**的，`rg -n "Workflow" docs/harness/spec.md` 必然产生远多于"两处脚注"的匹配，用这条命令的匹配数量做验收判据必然失败，不能作为本任务的验收 oracle（第二轮评审 cfr2-10 已指出这一具体缺陷）。**改为对明确断言做定点检查**，而不是对全文件做无差别扫描：
   1. 核对 §二"已裁定决策"表"编排载体"一行**确实包含** Step 1 要求追加的脚注文本（用 `rg -n "2026-07-31 起由 ADR-002 取代" docs/harness/spec.md` 命中且仅命中 1 处，作为"脚注已加"的定点验证，不是"Workflow 只出现一次"的验证）。
   2. 同理核对 §七 Phase B 流程图段落包含该脚注（`rg -n -A2 "段 1 Workflow scrollz-propose" docs/harness/spec.md` 人工核对紧随其后是否有脚注文字，不是自动化断言，属人工可复现的检查）。
   3. 核对 §十五评审处置台账新增了"ADR-002（控制流重写）"一行（`rg -n "ADR-002（控制流重写）" docs/harness/spec.md` 命中 1 处）。
   4. 核对 `plan-stage1b.md` B2 小节的"统一指纹协议"描述**确实**替换为 Step 2 给出的新文本（`rg -n "该问题已因 ADR-002 控制流重写而结构性消失" docs/harness/plan-stage1b.md` 命中 1 处），且原文里"JS 侧 `canonicalKey`"与"跨语言一致性测试（Python 生成样本 → Node 计算 → 比对）"这两处**具体指代已删除对象的措辞**在 B2 小节内**不再出现**（`rg -n "canonicalKey|Node 计算" docs/harness/plan-stage1b.md` 命中数为 0——这条窄范围检查是合理的，因为这两个措辞是本任务明确要删除的具体对象引用，不是"Workflow"这种允许历史保留的宽泛词）。
   5. 核对 `plan-stage1b.md` 文首状态行含 Step 3 要求的那句话。
   这五条都是对**本任务实际写下的文字**做定点存在性检查，不是对整个文件的宽泛扫描，因此不会被"历史段落刻意保留"产生的噪音污染。
-- [ ] **Step 5**：提交。
+- [x] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
@@ -1757,11 +1757,11 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 | 5.5 | run_finders/judge_candidate 基于波次重写（cfr-06/07/14, cfr2-02 fingerprint task identity, cfr2-04 expected_tools, cfr3-01 RequestContext+联合测试, cfr4-01 oracle 订正为同源比对） | 已完成 | `python3 -m unittest harness.tests.test_fanout`：56 tests OK；全量：422 tests + 13 tests OK；正控禁用 redline 短路后目标测试触发非 redline 调用失败，删除 judge 顶层 degraded 汇入后降级测试失败，移除 fingerprint identity 后 2 个 identity 测试失败，固定 stream attempt=1 后重试日志测试失败；恢复并清理 `__pycache__` 后全绿 | 无 |
 | 5.6 | run_fanout + FanoutSettlement 聚合（cfr-04/06, cfr2-03 基于全部attempts, cfr3-03 protocol_errors 补测试） | 已完成 | `python3 -m unittest harness.tests.test_fanout`：63 tests OK；全量：429 tests + 13 tests OK；正控改为只聚合每角色最终 attempt 后成本测试失败，删除 judge degraded 顶层汇入后端到端降级测试失败，删除 protocol_errors 聚合后来源测试失败；恢复并清理 `__pycache__` 后全绿 | 无 |
 | 6.1 | round.py 接线 + 工具收窄 + 结算分支迁移 + cli.py 适配闭包（cfr-02/04/06/08/09/15, cfr2-01, cfr3-01 RequestContext 构造点, cfr3-03 detail/model 补测试） | 已完成 | `python3 -m unittest discover -s harness/tests -t .`：440 tests + 13 tests OK；真实 sqlite3 integration 证实 worker 线程只调用 invoke、主线程写 7 条 `invocations` 与 7 条 `agent_attempts`；正控分别破坏 redline 短路、CLI kwargs 展开、protocol detail、RequestContext cwd、显式 model 与 attempts 暴露后，目标测试均红，逐项恢复并清理 `__pycache__` 后全绿 | 实施中发现订正后的计划要求主线程遍历全部 attempts，但 Phase 5 顶层返回未暴露它们；经用户授权，仅在 `fanout.py` 返回 dict 增加 `attempts` 键并补保留被重试覆盖失败记录的测试，未改其它 fanout 行为 |
-| 7.2 | 写继任测试（提前执行，冻结 canonical key 真值，cfr-18） | 待开始 | | |
-| 7.1 | 删除 JS workflow/skill + 旧跨语言测试（同一提交，cfr-18） | 待开始 | | |
-| 7.3 | 删除 degraded-dedup.test.mjs | 待开始 | | |
-| 7.4 | redlines.yaml 说明更新 | 待开始 | | |
-| 7.5 | spec.md/plan-stage1b.md 实现接缝同步修订（cfr-17，验收 oracle 改为定点检查 cfr2-10） | 待开始 | | |
+| 7.2 | 写继任测试（提前执行，冻结 canonical key 真值，cfr-18） | 已完成 | `test_canonical_key_normalization` 8 tests OK；旧跨语言测试在 JS 尚存在时 1 test OK；BOM 与 `\x1f` 双正控分别按预期失败 | 无 |
+| 7.1 | 删除 JS workflow/skill + 旧跨语言测试（同一提交，cfr-18） | 已完成 | 删除后活跃引用定点 sweep 无消费者；历史说明与任意 prompt 夹具分类保留 | 原零命中 oracle 不成立，已按主会话裁决改为逐条分类 |
+| 7.3 | 删除 degraded-dedup.test.mjs | 已完成 | `TestNormalizeError`/`TestRecordDegraded` 覆盖折叠、计数、错误类型与角色隔离 | 无 |
+| 7.4 | redlines.yaml 说明更新 | 已完成 | `paths` 原样保留，只追加控制器驱动后的适用范围说明 | 无 |
+| 7.5 | spec.md/plan-stage1b.md 实现接缝同步修订（cfr-17，验收 oracle 改为定点检查 cfr2-10） | 已完成 | ADR-002 脚注、历史流程注释、处置台账与 B2 Python 唯一实现定点检查通过；B1–B8 保留 | 无 |
 | 8.1 | probe 真机复核 | 待开始 | | |
 | 8.2 | 单角色真机冒烟 | 待开始 | | |
 | 8.3 | 完整扇出真机跑通 | 待开始 | | |

@@ -35,7 +35,7 @@ Stage 1 先上线的理由不变：协议复杂度低一个量级，却能立刻
 |---|---|---|
 | 驱动方式 | **无人值守循环** | 非手动起轮 |
 | 循环载体 | **headless 每轮一个新进程**（systemd user timer + `claude -p`） | 从根上消除上下文累积 |
-| 编排载体 | **内置 `Workflow` 工具**（已核实存在；skill 指令调用它属合法 opt-in 路径） | 承载模型侧编排 |
+| 编排载体 | **内置 `Workflow` 工具**（已核实存在；skill 指令调用它属合法 opt-in 路径）。**2026-07-31 起由 ADR-002 取代**：控制器直接驱动扇出，不再经由 `Workflow` 工具或 skill 间接编排，见 [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md) 与 [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md) | 承载模型侧编排（重写前） |
 | 控制面 | **确定性可信控制器**独占全部副作用与状态迁移 | Workflow 降权为「只产出结构化结果」 |
 | 队列真值源 | **GitHub 事实**（Issue/PR/branch/commit 联合派生），label 只作索引 | 网页/手机可见 |
 | 提案文档落点 | **新建 `docs/proposals/`**；中大型再升级 `docs/plan/<topic>.md` | 不冲淡现有 plan/ |
@@ -227,6 +227,7 @@ v2 的致命矛盾：既要求「agent 第一个可编译提交即 push」保证
 段 1  Workflow scrollz-propose
         扫描（4 lens 并行 finder）→ JS 去重 → 3 judge 对抗裁决（可跨模型 agentType）→ 排序选一
         ↓ 返回结构化候选，不产生任何外部副作用
+        注：本段描述重写前架构；2026-07-31 起由 ADR-002 的控制器直接驱动扇出取代，当前实现见 plan-control-flow-rewrite.md。
 控制器  建 Issue（natural key 幂等，label 随建一次提交）→ 冻结 attempt_id
         → 写提案卡 docs/proposals/<issue>-<slug>.md（commit trailer 绑定 operation）
         → push main（non-fast-forward 时 fetch/merge 后重放同一 operation）
@@ -472,6 +473,7 @@ Stage 1 没有「实际开发选择」，按开发选择计算的软配额在此
 | R3 上下文续接契约 | 采纳，fresh invocation + durable checkpoint（§七 B.1） | Stage 2 |
 | R3 `--settings` 伪协议 | 采纳，给出精确启动组合并已核实 flag 语义（§9.1） | Stage 1 |
 | R3 `reconsider_when` 需 typed | 采纳（§12.3） | Stage 1 |
+| ADR-002（控制流重写） | 采纳，废弃 Workflow 编排载体、改为控制器驱动扇出 | Stage 1a 完成后 |
 
 ## 十六、开放项（实施期确认，不阻塞本 spec）
 

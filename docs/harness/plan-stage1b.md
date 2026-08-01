@@ -1,6 +1,6 @@
 # scrollz 自主改进 harness · Stage 1b 实施计划（治理与可观测）
 
-> 状态：**范围已冻结，实施待 1a 稳定运行后开始**。用户 2026-07-30 裁定把 Stage 1 拆为 1a/1b。
+> 状态：**范围已冻结，实施待 1a 稳定运行后开始**。用户 2026-07-30 裁定把 Stage 1 拆为 1a/1b。2026-07-31 起，B2 的实现接缝已按 [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md) Task 7.5 同步修订；B1/B3–B8 的目标范围不受影响。
 > 前置：[plan-stage1a.md](./plan-stage1a.md) 全部任务完成并已真实运行若干轮。
 > 规格来源：[spec.md](./spec.md) §12.1、§13.1、§十、§6.1。
 
@@ -23,8 +23,8 @@
 
 - `Queue.classify` 真正返回 `possible_duplicate`（当前实现从不返回，属自审假覆盖）：精确指纹命中 → `exact_duplicate`；规范化目标高度相似但指纹不同 → `possible_duplicate`，交 judge 复核后再定。
 - 用户关闭 Issue / 关闭 PR 的原因文本入库，作为 finder 与 judge 的负反馈上下文。
-- `known_keys` 从本地 DB + 远端对账结果联合产出，传给 Workflow（1a 传空数组）。
-- 统一指纹协议：JS 侧 `canonicalKey` 与 Python 侧 `queue.fingerprint` 必须对同一候选产出一致的规范化串，加一条跨语言一致性测试（Python 生成样本 → Node 计算 → 比对）。
+- `known_keys` 从本地 DB + 远端对账结果联合产出，传给控制器驱动的 finder/judge 扇出（1a 传空数组）。
+- 统一指纹协议：**该问题已因 ADR-002 控制流重写而结构性消失**——本轮内去重（原由 JavaScript workflow 实现）与跨轮去重现在共用同一个 Python 函数 `queue.canonical_key`/`fingerprint`（见 `fanout.dedupe_and_rank`），不存在两份独立实现需要保持一致。Stage 1b 实施时无需再写跨语言测试；`.claude/scripts/harness/tests/test_canonical_key_normalization.py` 已覆盖规范化行为，`possible_duplicate` 的相似度判定测试可直接扩展该文件或新增同类单元测试。
 
 ### B3 · 机器红线 gate
 
@@ -68,5 +68,5 @@
 2. 用户关闭一个 Issue 后，同一提案不再被重提，除非 `reconsider_when` 谓词成立。
 3. 塞一个触及 `redlines.yaml` 路径的候选，控制器 gate 独立拦下（不依赖 judge）。
 4. 人为制造连续 N 次同类失败，harness 自动 paused 并留下哨兵 Issue。
-5. 跨语言指纹一致性测试通过。
+5. Python 唯一实现的 canonical key 规范化与指纹单元测试通过。
 6. 提节拍后连续运行 24 小时，成本与指标在阈值内。
