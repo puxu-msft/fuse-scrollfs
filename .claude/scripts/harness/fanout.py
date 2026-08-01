@@ -77,6 +77,17 @@ def _to_micro_usd(amount: float) -> int:
 def _from_micro_usd(amount: int) -> float:
     return amount / _MICRO_USD_PER_USD
 
+
+def split_budget_cap(total_usd: float, parts: int) -> float:
+    """把总池向下切成等额微美元上限，保证全部份额之和不超过总池。"""
+    if parts <= 0:
+        raise ValueError("parts must be positive")
+    total_micro_usd = _to_micro_usd(total_usd)
+    if total_micro_usd < 0:
+        raise ValueError("total_usd must be non-negative")
+    return _from_micro_usd(total_micro_usd // parts)
+
+
 # 顺序敏感：UUID 必须先于裸 hex，否则第一段会被提前替换。
 _ID_PATTERNS = (
     re.compile(

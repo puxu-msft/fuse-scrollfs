@@ -372,7 +372,7 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     agents = _load_agents(cfg.repo_root)
     context = _build_request_context(cfg)
     call_budget = fanout.BudgetTracker(total_usd=grant)
-    single_call_cap_usd = cfg.round_budget_usd / 7
+    single_call_cap_usd = fanout.split_budget_cap(grant, 7)
 
     def _invoke(request: RoleInvocationRequest) -> InvocationResult:
         # 此闭包在 worker 线程运行。这里只允许模型调用；SQLite 写入统一在

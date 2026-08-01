@@ -1,4 +1,5 @@
 import shutil, subprocess, tempfile, unittest
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from unittest import mock
 from harness import db
@@ -234,12 +235,45 @@ class TestRound(unittest.TestCase):
         run_round(self.cfg, self._deps(invoke))
 
         self.assertEqual(len(seen), 7)
-        expected_grant = self.cfg.round_budget_usd / 7
+        expected_grant = round_module.fanout.split_budget_cap(
+            self.cfg.round_budget_usd, 7
+        )
         for request in seen:
             self.assertEqual(request.model, DEFAULT_AGENT_MODEL)
             self.assertEqual(request.cwd, str(self.cfg.repo_root))
             self.assertEqual(request.settings_path, round_module.SETTINGS_PATH)
             self.assertAlmostEqual(request.grant_usd, expected_grant)
+
+    def test_seven_call_grants_never_exceed_one_dollar_fifty_pool(self):
+        """具体反例：$1.50 / 7 若逐项四舍五入到微美元会成为 214286，
+        七份合计 1,500,002 微美元，最后一个 judge 会被错误拒绝调度。"""
+        self.cfg.round_budget_usd = 1.50
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            return _multi_role_invoke(
+                candidate=CANDIDATE_PAYLOAD["candidates"][0]
+            )(request)
+
+        result = run_round(self.cfg, self._deps(invoke))
+
+        self.assertEqual(result["result"], "published")
+        self.assertEqual(len(seen), 7)
+        pool_micro_usd = int(
+            (Decimal("1.50") * 1_000_000).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        grant_micro_usd = [
+            int(
+                (Decimal(str(request.grant_usd)) * 1_000_000).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
+            for request in seen
+        ]
+        self.assertLessEqual(sum(grant_micro_usd), pool_micro_usd)
 
     def test_protocol_errors_are_exposed_in_round_detail(self):
         def invoke(request):
