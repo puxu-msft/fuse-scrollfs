@@ -294,25 +294,11 @@ def derive_session_id(round_id: str, role: str, attempt: int) -> str:
 - **与幂等键的关系**：`derive_session_id` 的输出**只用作 `claude --session-id` 参数**，不是 outbox 的 natural key。outbox 幂等键的定义（`round.py` 现有的 `fingerprint()` / `Outbox` 的 `(kind, natural_key)` 唯一索引）完全不变——candidate 一旦产出，走的还是现有的 `publish_proposal`/`commit_proposal`/`push_main`/`publication_receipt` 四个 operation，与本次扇出改动无关。session_id 解决的是**同一个逻辑角色在同一轮内的会话身份稳定性**（用于 attempt 1 失败后 attempt 2 能 `--resume` 到正确的会话），是编排层内部状态，不进 outbox。
 - 为什么用 `uuid5` 而非哈希截断字符串：`--session-id` 要求合法 UUID 格式（PoC 已用 `str(uuid.uuid4())` 验证格式接受），`uuid5(namespace, name)` 天然产出合法 UUID 且确定性——同一 `(round_id, role, attempt)` 任何时候调用都得到同一 ID，无需持久化「本轮用过哪些 ID」这件事本身（虽然仍会持久化到账本用于审计，见下）。
 
-**设计回答（问题 3：fork 重试谱系记录）**——**新增一张纯追加表**，不改任何既有表（延续本库「只追加表」不变量，与 `proposal_keys` 表先例一致）：
+**设计回答（问题 3：fork 重试谱系记录）**——**新增一张纯追加表**，不改任何既有表（延续本库「只追加表」不变量，与 `proposal_keys` 表先例一致）。
 
-```sql
-CREATE TABLE IF NOT EXISTS agent_attempts (
-    attempt_key   TEXT PRIMARY KEY,   -- f"{round_id}:{role}:{attempt}"
-    round_id      TEXT NOT NULL,
-    role          TEXT NOT NULL,      -- 'finder:roadmap' 等七种之一
-    attempt       INTEGER NOT NULL,   -- 1 起
-    session_id    TEXT NOT NULL,      -- derive_session_id 的输出
-    parent_session_id TEXT,           -- attempt>1 时指向上一次的 session_id（fork 源）；attempt=1 为 NULL
-    status        TEXT NOT NULL CHECK (status IN
-                    ('running','success','degraded','failed_transport')),
-    cost_usd      REAL,
-    turns         INTEGER,
-    created_at    REAL NOT NULL,
-    ended_at      REAL
-);
-CREATE INDEX IF NOT EXISTS idx_agent_attempts_round ON agent_attempts(round_id);
-```
+> **schema 的权威定义在 Task 1.2，不在这里。** 本节此前重复了一份 `CREATE TABLE` 全文，v2→v3 修正状态词（cfr2-04）时只改了 Task 1.2 那份，这里留下了含 `'degraded'`、缺 `'capability_drift'` 的旧版——**照旧版实现出的 CHECK 会让能力漂移在写账本时抛 `sqlite3.IntegrityError`，正是 cfr2-04 要修的那个缺陷**。这是本项目反复出现的「第二份硬编码真相」形态（`STAGE1_TOOLS` 同源），故本节改为只描述**意图**、不再复制 DDL，实施时以 Task 1.2 为准。
+>
+> 意图：以 `attempt_key = f"{round_id}:{role}:{attempt}"` 为主键；记录 `session_id`（`derive_session_id` 输出）与 `parent_session_id`（`attempt>1` 时指向 fork 源，`attempt=1` 为 `NULL`），使「第 N 次尝试」这条谱系可审计；带 `status`/`cost_usd`/`turns`/`created_at`/`ended_at` 供结算与判因；按 `round_id` 建索引。状态词枚举见 Task 1.2 的「状态词统一」小节。
 
 `ledger.py` 提供三个函数：`record_attempt_started(conn, round_id, role, attempt, session_id, parent_session_id)`、`record_attempt_finished(conn, attempt_key, status, cost_usd, turns)`、`attempts_for_round(conn, round_id) -> list[dict]`（供审计/`status` CLI 命令未来展示谱系用；本计划不新增 CLI 命令，只留查询函数，CLI 展示留 backlog）。这张表是**纯审计**，不是崩溃恢复的判定依据——`fanout.py`（Phase 5）的重试判定只依赖内存中本轮的执行状态，账本写失败不得阻断本轮（与 `_persist_stream` 的「落盘失败不影响结论」纪律一致）。
 
