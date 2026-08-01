@@ -748,3 +748,101 @@ def judge_candidate(
             )
         )
     return verdicts, degraded_records
+
+
+@dataclass(frozen=True)
+class FanoutSettlement:
+    total_cost_usd: float = 0.0
+    cost_known: bool = True
+    total_turns: int = 0
+    total_denials: int = 0
+    protocol_errors: list = field(default_factory=list)
+    capability_drift: list = field(default_factory=list)
+    exit_code: int = 0
+
+
+def _aggregate_settlement(
+    records: list[AttemptRecord],
+) -> FanoutSettlement:
+    protocol_errors: list[str] = []
+    capability_drift: list[str] = []
+    for record in records:
+        protocol_errors.extend(
+            f"{record.role}:{record.attempt}: {error}"
+            for error in record.protocol_errors
+        )
+        if record.status == "capability_drift":
+            capability_drift.append(
+                f"{record.role}:{record.attempt}: "
+                f"{record.last_error or 'capability drift'}"
+            )
+    return FanoutSettlement(
+        total_cost_usd=sum(record.cost_usd for record in records),
+        cost_known=all(record.cost_known for record in records),
+        total_turns=sum(record.turns for record in records),
+        total_denials=sum(record.denials for record in records),
+        protocol_errors=protocol_errors,
+        capability_drift=capability_drift,
+    )
+
+
+def run_fanout(
+    *,
+    round_id: str,
+    invoke_fn,
+    budget: BudgetTracker,
+    deadline_monotonic: float,
+    blocked_lanes: list[str],
+    known_canonical_keys: set[str],
+    inflight_paths: list[str],
+    context: RequestContext,
+    agents: dict[str, AgentDef] | None = None,
+    conn=None,
+) -> dict:
+    all_records: list[AttemptRecord] = []
+    ranked, degraded = run_finders(
+        round_id=round_id,
+        invoke_fn=invoke_fn,
+        budget=budget,
+        deadline_monotonic=deadline_monotonic,
+        blocked_lanes=blocked_lanes,
+        known_canonical_keys=known_canonical_keys,
+        context=context,
+        agents=agents,
+        conn=conn,
+        all_records=all_records,
+    )
+
+    selected: list[dict] = []
+    rejected: list[dict] = []
+    for candidate in ranked:
+        verdicts, judge_degraded = judge_candidate(
+            round_id=round_id,
+            candidate=candidate,
+            invoke_fn=invoke_fn,
+            budget=budget,
+            deadline_monotonic=deadline_monotonic,
+            inflight_paths=inflight_paths,
+            context=context,
+            agents=agents,
+            conn=conn,
+            all_records=all_records,
+        )
+        degraded.extend(judge_degraded)
+        if any(verdict["verdict"] == "reject" for verdict in verdicts):
+            rejected.append({"title": candidate["title"], "verdicts": verdicts})
+            continue
+        needs_decision = candidate.get("needs_decision", False) or any(
+            verdict["verdict"] == "needs_decision" for verdict in verdicts
+        )
+        selected.append(
+            dict(candidate, needs_decision=needs_decision, verdicts=verdicts)
+        )
+        break
+
+    return {
+        "candidates": selected,
+        "rejected": rejected,
+        "degraded": degraded,
+        "settlement": _aggregate_settlement(all_records),
+    }

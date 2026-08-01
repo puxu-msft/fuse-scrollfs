@@ -1057,5 +1057,221 @@ class TestFanoutComposition(unittest.TestCase):
         self.assertNotEqual(seen[0].stream_log, seen[1].stream_log)
 
 
+class TestRunFanout(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        TestFanoutComposition.setUpClass()
+        cls.composition = TestFanoutComposition
+        cls._CONTEXT = cls.composition._CONTEXT
+        cls._AGENTS = cls.composition._AGENTS
+
+    def _run(self, invoke_fn, **overrides):
+        import time
+        from harness.fanout import BudgetTracker, run_fanout
+
+        values = {
+            "round_id": "round-1",
+            "invoke_fn": invoke_fn,
+            "budget": BudgetTracker(5.0),
+            "deadline_monotonic": time.monotonic() + 120.0,
+            "blocked_lanes": [],
+            "known_canonical_keys": set(),
+            "inflight_paths": [],
+            "context": self._CONTEXT,
+            "agents": self._AGENTS,
+        }
+        values.update(overrides)
+        return run_fanout(**values)
+
+    def _candidate(self, **overrides):
+        return self.composition._candidate(**overrides)
+
+    def _invocation(self, payload, *, request, **overrides):
+        return self.composition._invocation(
+            payload, request=request, **overrides
+        )
+
+    def test_empty_finders_preserve_legacy_top_level_shape(self):
+        result = self._run(
+            lambda request: self._invocation(
+                {"candidates": []}, request=request
+            )
+        )
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["rejected"], [])
+        self.assertIn("degraded", result)
+        self.assertEqual(result["degraded"], [])
+
+    def test_first_candidate_passing_all_judges_is_selected(self):
+        candidate = self._candidate()
+
+        def invoke(request):
+            if request.role.startswith("finder:"):
+                finder_candidate = {
+                    k: v for k, v in candidate.items() if k != "lane"
+                }
+                payload = (
+                    {"candidates": [finder_candidate]}
+                    if request.role == "finder:code"
+                    else {"candidates": []}
+                )
+            else:
+                kind = request.role.split(":", 2)[1]
+                payload = {
+                    "redline": {"verdict": "pass", "reason": "safe", "invariant_at_risk": "none"},
+                    "completed": {"verdict": "pass", "reason": "new", "evidence": "none"},
+                    "oracle": {"verdict": "pass", "reason": "strong", "suggested_oracle": "none"},
+                }[kind]
+            return self._invocation(payload, request=request)
+
+        result = self._run(invoke)
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(len(result["candidates"][0]["verdicts"]), 3)
+        self.assertEqual(result["rejected"], [])
+
+    def test_degraded_redline_reaches_top_level(self):
+        candidate = self._candidate()
+
+        def invoke(request):
+            if request.role.startswith("finder:"):
+                finder_candidate = {
+                    k: v for k, v in candidate.items() if k != "lane"
+                }
+                payload = (
+                    {"candidates": [finder_candidate]}
+                    if request.role == "finder:code"
+                    else {"candidates": []}
+                )
+                return self._invocation(payload, request=request)
+            return self._invocation(
+                None,
+                request=request,
+                ok=False,
+                session_id="real-redline",
+                raw_tail="transient",
+            )
+
+        result = self._run(invoke)
+        self.assertEqual(result["candidates"], [])
+        self.assertTrue(
+            any(d["role"].startswith("judge:redline:") for d in result["degraded"])
+        )
+
+    def test_settlement_counts_failed_and_successful_attempt_costs(self):
+        candidate = self._candidate()
+        roadmap_calls = 0
+
+        def invoke(request):
+            nonlocal roadmap_calls
+            if request.role == "finder:roadmap":
+                roadmap_calls += 1
+                if roadmap_calls == 1:
+                    return InvocationResult(
+                        ok=False,
+                        payload=None,
+                        cost_usd=0.2,
+                        turns=1,
+                        cost_known=True,
+                        session_id="real-roadmap",
+                        subtype="error_during_execution",
+                        init_seen=True,
+                        init_tools=["Glob", "Grep", "Read"],
+                        raw_tail="transient",
+                    )
+            if request.role.startswith("finder:"):
+                finder_candidate = {
+                    k: v for k, v in candidate.items() if k != "lane"
+                }
+                payload = (
+                    {"candidates": [finder_candidate]}
+                    if request.role == "finder:code"
+                    else {"candidates": []}
+                )
+            else:
+                payload = {
+                    "verdict": "reject",
+                    "reason": "redline",
+                    "invariant_at_risk": "risk",
+                }
+            return InvocationResult(
+                ok=True,
+                payload=payload,
+                cost_usd=0.2,
+                turns=1,
+                cost_known=True,
+                session_id=request.session_id,
+                subtype="success",
+                init_seen=True,
+                init_tools=["Glob", "Grep", "Read"],
+            )
+
+        result = self._run(invoke)
+        self.assertEqual(roadmap_calls, 2)
+        self.assertAlmostEqual(result["settlement"].total_cost_usd, 1.2)
+        self.assertNotAlmostEqual(result["settlement"].total_cost_usd, 1.0)
+
+    def test_unknown_attempt_cost_makes_settlement_unknown(self):
+        calls = 0
+
+        def invoke(request):
+            nonlocal calls
+            calls += 1
+            return InvocationResult(
+                ok=True,
+                payload={"candidates": []},
+                cost_usd=0.01,
+                turns=1,
+                cost_known=calls != 1,
+                session_id=request.session_id,
+                subtype="success",
+                init_seen=True,
+                init_tools=["Glob", "Grep", "Read"],
+            )
+
+        result = self._run(invoke)
+        self.assertFalse(result["settlement"].cost_known)
+
+    def test_capability_drift_is_aggregated_for_caller(self):
+        calls = 0
+
+        def invoke(request):
+            nonlocal calls
+            calls += 1
+            return self._invocation(
+                {"candidates": []},
+                request=request,
+                init_tools=(
+                    ["Bash", "Glob", "Grep", "Read"]
+                    if calls == 1
+                    else ["Glob", "Grep", "Read"]
+                ),
+            )
+
+        result = self._run(invoke)
+        self.assertEqual(len(result["settlement"].capability_drift), 1)
+
+    def test_protocol_errors_keep_role_and_attempt_sources(self):
+        from harness.fanout import AttemptRecord, _aggregate_settlement
+
+        records = [
+            AttemptRecord(
+                role="finder:roadmap",
+                attempt=1,
+                status="failed_transport",
+                protocol_errors=["duplicate init events: 2"],
+            ),
+            AttemptRecord(
+                role="finder:code",
+                attempt=2,
+                status="failed_transport",
+                protocol_errors=["unparseable stream line: bad"],
+            ),
+        ]
+        settlement = _aggregate_settlement(records)
+        self.assertEqual(len(settlement.protocol_errors), 2)
+        self.assertTrue(settlement.protocol_errors[0].startswith("finder:roadmap:1:"))
+        self.assertTrue(settlement.protocol_errors[1].startswith("finder:code:2:"))
+
+
 if __name__ == "__main__":
     unittest.main()
