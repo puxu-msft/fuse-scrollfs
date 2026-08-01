@@ -44,6 +44,14 @@ class TestArgv(unittest.TestCase):
     def test_stage1_allowlist_is_read_only_controller_surface(self):
         self.assertEqual(STAGE1_ALLOWED_TOOLS, frozenset({"Read", "Grep", "Glob"}))
 
+    def test_settings_allowlist_matches_stage1_tool_source_of_truth(self):
+        settings_path = pathlib.Path(__file__).resolve().parents[3] / "harness-settings.json"
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(settings["permissions"]["allow"]),
+            set(STAGE1_ALLOWED_TOOLS),
+        )
+
     def test_argv_pins_the_exact_isolation_combination(self):
         argv = build_argv(prompt="/scrollz-round", tools=VALID_TOOLS,
                           grant_usd=0.75, max_turns=40,

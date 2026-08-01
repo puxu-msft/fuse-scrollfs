@@ -3,11 +3,7 @@
     "allow": [
       "Read",
       "Grep",
-      "Glob",
-      "Skill",
-      "Workflow",
-      "TaskOutput",
-      "TodoWrite"
+      "Glob"
     ],
     "deny": [
       "Bash",
