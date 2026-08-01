@@ -1740,10 +1740,10 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 | 0.2 | 只读工具是否触发 can_use_tool（cfr-15 订正：须带 stdio 权限开关） | 待开始 | | |
 | 1.1 | session_identity.py（judge task identity 携带 fingerprint，cfr2-02） | 已完成 | `python3 -m unittest harness.tests.test_session_identity`：7 tests OK；正控将 `uuid5` 临时替换为 `uuid4` 后，确定性测试按预期失败 | 无 |
 | 1.2 | agent_attempts 表 + ledger.py（状态词统一，cfr2-04） | 已完成 | `python3 -m unittest harness.tests.test_ledger harness.tests.test_db`：9 tests OK；删除表定义后 6 tests 因 `no such table` 报错；删除 Python 状态校验后非法状态在 SQL CHECK 处报错 | 无 |
-| 2.1 | claude_runner 会话参数扩展（`subtype` 暴露 cfr3-02 前置；stream 落盘 0600，rmf-08） | 待开始 | | |
-| 2.2 | claude_runner 可注入 payload_parser（cfr-01） | 待开始 | | |
-| 2.3 | RoleInvocationRequest + RequestContext 唯一调用契约（cfr-02, cfr3-01） | 待开始 | | |
-| 2.4 | STAGE1_ALLOWED_TOOLS 收窄（挪至 Phase 6 Task 6.1 执行） | 待开始 | | |
+| 2.1 | claude_runner 会话参数扩展（`subtype` 暴露 cfr3-02 前置；stream 落盘 0600，rmf-08） | 已完成 | `python3 -m unittest harness.tests.test_claude_runner`：55 tests OK；全量：328 tests + 13 tests OK；正控删除 session_id/resume 互斥校验后目标测试失败，改回默认权限创建后权限位与源码创建方式测试失败 | 无；保留现有 6 工具 allowlist，未提前执行 Phase 6 收窄 |
+| 2.2 | claude_runner 可注入 payload_parser（cfr-01） | 已完成 | `python3 -m unittest harness.tests.test_claude_runner`：60 tests OK；全量：333 tests + 13 tests OK；正控放宽 `_extract_json_object` 允许 list 后拒绝非 dict 测试失败 | 无 |
+| 2.3 | RoleInvocationRequest + RequestContext 唯一调用契约（cfr-02, cfr3-01） | 已完成 | `python3 -m unittest harness.tests.test_role_invocation`：7 tests OK；全量：340 tests + 13 tests OK；正控将 `invoke.session_id` 改名后签名一致性测试失败，将 stream path 去掉 task_role 后 identity 测试失败 | 无 |
+| 2.4 | STAGE1_ALLOWED_TOOLS 收窄（挪至 Phase 6 Task 6.1 执行） | 延后至 6.1 | 未修改 `STAGE1_ALLOWED_TOOLS`；全量测试 init 工具集仍为 `Glob,Grep,Read,Skill,TaskOutput,Workflow` | 按本节明确要求，本阶段只新增能力、不改变生产调用路径 |
 | 3.1 | fanout_schema.py（含 cfr-13 类型前置检查） | 待开始 | | |
 | 4.1 | prompts.py | 待开始 | | |
 | 5.1 | dedupe_and_rank | 待开始 | | |
