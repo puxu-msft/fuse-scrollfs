@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-import json
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
+from . import fanout, prompts
 from .budget import Budget, BudgetError
-from .claude_runner import (InvocationResult, DEFAULT_AGENT_MODEL,
-                            STAGE1_ALLOWED_TOOLS)
+from .claude_runner import InvocationResult, STAGE1_ALLOWED_TOOLS
 from .precheck import PrecheckFailed, assert_all_ok, run_prechecks
 from .publish import Publisher
 from .queue import Queue, canonical_key, fingerprint
+from .role_invocation import (RoleInvocationRequest, build_request_context)
 
 # 单一真相源：允许的工具集只在 claude_runner 里定义一次。这里曾经是第二份硬编码
 # 字符串，加 TaskOutput 时两边立刻漂移——被 build_argv 的入口强制拦下（真机实测
@@ -64,7 +64,7 @@ class Deps:
     worktree: object
     outbox: object
     queue: Queue
-    invoke: Callable[..., InvocationResult]
+    invoke: Callable[[RoleInvocationRequest], InvocationResult]
     tools: tuple = field(default_factory=tuple)
 
 
@@ -181,24 +181,11 @@ def _derive_labels(candidate: dict) -> list[str]:
             f"size:{candidate['size']}", f"lane:{candidate['lane']}"]
 
 
-def _capability_drift_problems(invocation: InvocationResult) -> list[str]:
-    """能力漂移校验（评审 Important #4）：Round 0 的 probe 通过不保证以后
-    每次 invocation 都没有配置漂移——必须把实际解析到的能力集纳入**每次**
-    invocation 的成功谓词。
-    """
-    problems: list[str] = []
-    expected = frozenset(STAGE1_TOOLS.split(","))
-    actual = frozenset(invocation.init_tools)
-    if actual != expected:
-        problems.append(f"工具集不等：多={sorted(actual - expected)} "
-                        f"少={sorted(expected - actual)}")
-    if invocation.init_mcp_servers:
-        problems.append(f"MCP 未清空：{invocation.init_mcp_servers}")
-    if invocation.init_plugins:
-        problems.append(f"插件未清空：{invocation.init_plugins}")
-    if invocation.init_errors:
-        problems.append(f"加载报错：{invocation.init_errors}")
-    return problems
+def _capability_drift_problems(
+    settlement: fanout.FanoutSettlement,
+) -> list[str]:
+    """返回扇出层逐次检查并聚合出的能力漂移。"""
+    return list(settlement.capability_drift)
 
 
 def _describe_degraded(degraded: list) -> str:
@@ -219,13 +206,40 @@ def _describe_degraded(degraded: list) -> str:
     return "降级 agent：" + "、".join(parts) if parts else ""
 
 
-def _settle_failed(budget: Budget, round_id: str, day: str,
-                   invocation: InvocationResult) -> None:
+def _settle_failed(budget: Budget, round_id: str, day: str, *,
+                   cost_known: bool, cost_usd: float) -> None:
     """失败轮的结算：成本已知按实测，未知才按预留满额（评审 rmf-05）。"""
-    if invocation.cost_known:
-        budget.settle(round_id, day, invocation.cost_usd)
+    if cost_known:
+        budget.settle(round_id, day, cost_usd)
     else:
         budget.abandon(round_id, day)
+
+
+def _format_detail(settlement: fanout.FanoutSettlement, fallback: str) -> str:
+    if settlement.protocol_errors:
+        return "; ".join(settlement.protocol_errors)
+    return fallback
+
+
+def _build_request_context(cfg):
+    return build_request_context(cfg)
+
+
+def _load_agents(repo_root) -> dict[str, prompts.AgentDef]:
+    agent_dir = repo_root / ".claude" / "agents"
+    names = (
+        "harness-finder-roadmap",
+        "harness-finder-code",
+        "harness-finder-bench",
+        "harness-finder-hygiene",
+        "harness-judge-redline",
+        "harness-judge-completed",
+        "harness-judge-oracle",
+    )
+    return {
+        name: prompts.parse_agent_file(agent_dir / f"{name}.md")
+        for name in names
+    }
 
 
 def run_round(cfg, deps: Deps) -> dict:
@@ -346,77 +360,98 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     if deps.queue.total_full(cfg.proposed_cap):
         blocked_lanes = ["roadmap", "defect", "perf", "hygiene"]
 
-    # 单调截止已耗尽（或不足以覆盖结算窗口）时，绝不能用 `max(x, 60)` 之类
-    # 的下限把剩余时间反向放大——那会让子进程超时超过整轮剩余时间（评审
-    # Important #7）。剩余不足以覆盖 `CLEANUP_RESERVE_S` 时直接不起模型。
-    remaining = ROUND_DEADLINE_S - (time.monotonic() - started)
-    if remaining <= CLEANUP_RESERVE_S:
+    deadline_monotonic = started + ROUND_DEADLINE_S - CLEANUP_RESERVE_S
+    if time.monotonic() >= deadline_monotonic:
+        remaining = deadline_monotonic - time.monotonic()
         budget.abandon(round_id, day)
         budget.record_outcome(round_id, result="deadline-exhausted")
         return {"round_id": round_id, "mode": "scan", "result": "deadline-exhausted",
-                "detail": f"剩余 {remaining:.1f}s 不足以覆盖结算窗口"
-                          f" {CLEANUP_RESERVE_S:.0f}s"}
-    timeout_s = remaining - CLEANUP_RESERVE_S
+                "detail": f"调用截止时间已耗尽（剩余 {remaining:.1f}s）"}
 
-    # 跨轮去重的记忆（评审 rmf-02）：这里曾经硬编码 `[]`，而它是 workflow 里
-    # `seen` 集合的唯一外部来源——传空等于把跨轮去重整个关掉，于是每轮都可能
-    # 花掉一整轮的钱重新提出同一个候选，最后在最后一步被判 duplicate 丢弃。
-    known_keys = deps.queue.known_canonical_keys()
+    known_keys = set(deps.queue.known_canonical_keys())
+    agents = _load_agents(cfg.repo_root)
+    context = _build_request_context(cfg)
+    call_budget = fanout.BudgetTracker(total_usd=grant)
+    single_call_cap_usd = cfg.round_budget_usd / 7
 
-    # 用 json.dumps 而不是 `repr()` 再把 ' 换成 "：canonical key 是四个自由文本
-    # 字段拼出来的，里面完全可能含撇号、双引号或 \x1f 分隔符，repr 加字符替换
-    # 会产出非法 JSON，而这个 prompt 正是要被下游当 JSON 解析的。
-    prompt = "/scrollz-round\n" + json.dumps(
-        {"blocked_lanes": blocked_lanes,
-         "known_canonical_keys": known_keys,
-         "inflight_paths": []},
-        ensure_ascii=False)
+    def _invoke(request: RoleInvocationRequest) -> InvocationResult:
+        # 此闭包在 worker 线程运行。这里只允许模型调用；SQLite 写入统一在
+        # run_fanout 返回后由当前主线程执行。
+        return deps.invoke(request)
 
-    # 外层会话的唯一职责是调 Workflow 再原样回显 JSON，不需要 opus。
-    # 真机实测：首轮外层用 opus-5 花了 $0.6466，占该轮总成本 $0.87 的 74%。
-    invocation = deps.invoke(
-        model=DEFAULT_AGENT_MODEL, prompt=prompt, tools=STAGE1_TOOLS, grant_usd=grant,
-        max_turns=cfg.max_turns, settings_path=SETTINGS_PATH,
-        cwd=str(cfg.repo_root), timeout_s=timeout_s,
-        # 每轮留一份完整 stream 供事后判因。目录随 .claude/state/ 一起被
-        # gitignore，不会污染仓库。
-        stream_log=cfg.state_db.parent / "rounds" / f"{round_id}.jsonl")
-    # 从这里开始，若后续任何步骤（发布、账本写入之外的路径）抛出未预期
-    # 异常，finalize 边界至少能按本次调用的真实 turns/denials/exit_code
-    # 与已知成本结算，而不是完全空白（评审 Critical C）。
-    progress["turns"] = invocation.turns
-    progress["denials"] = invocation.denials
-    progress["exit_code"] = invocation.exit_code
-    progress["cost_known"] = True
-    progress["cost"] = invocation.cost_usd
+    fanout_result = fanout.run_fanout(
+        round_id=round_id,
+        invoke_fn=_invoke,
+        budget=call_budget,
+        deadline_monotonic=deadline_monotonic,
+        blocked_lanes=blocked_lanes,
+        known_canonical_keys=known_keys,
+        inflight_paths=[],
+        context=context,
+        single_call_cap_usd=single_call_cap_usd,
+        agents=agents,
+        conn=deps.conn,
+    )
+    settlement = fanout_result["settlement"]
+    attempts = fanout_result["attempts"]
+    for record in attempts:
+        invocation_id = f"{round_id}:{record.role}:{record.attempt}"
+        budget.record_invocation(round_id, invocation_id, record.cost_usd)
 
-    if not invocation.ok or invocation.payload is None:
-        # 成本已知就按实测结算——`abandon()` 的「按预留满额计费」语义只适用于
-        # 成本**真的**未知（超时、进程被杀、终态事件没解析到）。失败轮的成本
-        # 往往是已知的：cost/turns 的解析独立于 subtype。
-        # 为什么不能将就：预算观察期的判据是「复核 budget_days 实际花费」，而
-        # 满额回填的偏置方向恰好是「看起来花得比实际多」，会让日上限定得过高
-        # ——正是这次观察想避免的方向（评审 rmf-05）。
-        _settle_failed(budget, round_id, day, invocation)
-        budget.record_outcome(round_id, mode="scan", result="invocation-failed",
-                              turns=invocation.turns, denials=invocation.denials,
-                              exit_code=invocation.exit_code)
-        return {"round_id": round_id, "mode": "scan",
-                "result": "invocation-failed", "detail": invocation.raw_tail}
+    if not attempts:
+        _settle_failed(
+            budget,
+            round_id,
+            day,
+            cost_known=settlement.cost_known,
+            cost_usd=settlement.total_cost_usd,
+        )
+        budget.record_outcome(
+            round_id,
+            mode="scan",
+            result="invocation-failed",
+            turns=settlement.total_turns,
+            denials=settlement.total_denials,
+            exit_code=settlement.exit_code,
+        )
+        return {
+            "round_id": round_id,
+            "mode": "scan",
+            "result": "invocation-failed",
+            "detail": _format_detail(settlement, "no invocation was scheduled"),
+        }
 
-    # 能力漂移 fail-closed（评审 Important #4）：`invocation.ok` 只表示 stream
-    # 协议干净，不保证本次真实解析到的 tools/MCP/plugins/加载错误仍等于
-    # Stage 1 集合。漂移即判失败并按最坏值记账，不得继续使用其 candidates。
-    drift_problems = _capability_drift_problems(invocation)
+    progress["turns"] = settlement.total_turns
+    progress["denials"] = settlement.total_denials
+    progress["exit_code"] = settlement.exit_code
+    progress["cost_known"] = settlement.cost_known
+    progress["cost"] = settlement.total_cost_usd
+
+    drift_problems = _capability_drift_problems(settlement)
     if drift_problems:
-        _settle_failed(budget, round_id, day, invocation)
-        budget.record_outcome(round_id, mode="scan", result="capability-drift",
-                              turns=invocation.turns, denials=invocation.denials,
-                              exit_code=invocation.exit_code)
-        return {"round_id": round_id, "mode": "scan", "result": "capability-drift",
-                "detail": "；".join(drift_problems)}
+        _settle_failed(
+            budget,
+            round_id,
+            day,
+            cost_known=settlement.cost_known,
+            cost_usd=settlement.total_cost_usd,
+        )
+        budget.record_outcome(
+            round_id,
+            mode="scan",
+            result="capability-drift",
+            turns=settlement.total_turns,
+            denials=settlement.total_denials,
+            exit_code=settlement.exit_code,
+        )
+        return {
+            "round_id": round_id,
+            "mode": "scan",
+            "result": "capability-drift",
+            "detail": _format_detail(settlement, "；".join(drift_problems)),
+        }
 
-    candidates = invocation.payload.get("candidates", [])
+    candidates = fanout_result["candidates"]
     # 结构校验必须先于任何解引用（评审 Critical A）：`candidates` 顶层非
     # 列表，或列表内混入非对象元素时，下面 `c.get("lane")` 会直接
     # `AttributeError` 崩溃——那样 round 会永久悬挂在
@@ -424,17 +459,23 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     # 判定为结构化的 `invalid-candidate` 结算路径，写完整账本、释放预留。
     shape_error = _candidates_shape_error(candidates)
     if shape_error is not None:
-        budget.settle(round_id, day, invocation.cost_usd)
+        _settle_failed(
+            budget,
+            round_id,
+            day,
+            cost_known=settlement.cost_known,
+            cost_usd=settlement.total_cost_usd,
+        )
         budget.record_outcome(round_id, mode="scan", result="invalid-candidate",
-                              turns=invocation.turns, denials=invocation.denials,
-                              exit_code=invocation.exit_code)
+                              turns=settlement.total_turns, denials=settlement.total_denials,
+                              exit_code=settlement.exit_code)
         return {"round_id": round_id, "mode": "scan", "result": "invalid-candidate",
-                "detail": shape_error}
+                "detail": _format_detail(settlement, shape_error)}
 
     # 降级证据（某个 finder/judge 反复失败后被跳过）。它必须被读出来并进账本
     # ——否则一轮花了真金白银、只是裁决通道挂了，对外表现却与「仓库确实没东西
     # 可提」完全不可区分（评审 rmf-03）。
-    degraded = invocation.payload.get("degraded") or []
+    degraded = fanout_result["degraded"]
     degraded_detail = _describe_degraded(degraded)
 
     eligible = [c for c in candidates if c.get("lane") not in blocked_lanes]
@@ -442,13 +483,20 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
         # 有降级 = 不是干净的空轮。用不同的 result 值让它在账本与退出码上都可见；
         # 没有降级时保持 `no-candidate`，不把静默换成噪声。
         result = "no-candidate-degraded" if degraded else "no-candidate"
-        budget.settle(round_id, day, invocation.cost_usd)
+        _settle_failed(
+            budget,
+            round_id,
+            day,
+            cost_known=settlement.cost_known,
+            cost_usd=settlement.total_cost_usd,
+        )
         budget.record_outcome(round_id, mode="scan", result=result,
-                              turns=invocation.turns, denials=invocation.denials,
-                              exit_code=invocation.exit_code)
+                              turns=settlement.total_turns, denials=settlement.total_denials,
+                              exit_code=settlement.exit_code)
         out = {"round_id": round_id, "mode": "scan", "result": result}
-        if degraded:
-            out["detail"] = degraded_detail
+        detail = _format_detail(settlement, degraded_detail)
+        if detail:
+            out["detail"] = detail
         return out
 
     candidate = dict(eligible[0])
@@ -460,12 +508,18 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     # 且该 Issue 已被 observed，之后每次 resume 都重遇同一非法 slug。
     dto_errors = validate_candidate(candidate)
     if dto_errors:
-        budget.settle(round_id, day, invocation.cost_usd)
+        _settle_failed(
+            budget,
+            round_id,
+            day,
+            cost_known=settlement.cost_known,
+            cost_usd=settlement.total_cost_usd,
+        )
         budget.record_outcome(round_id, mode="scan", result="invalid-candidate",
-                              turns=invocation.turns, denials=invocation.denials,
-                              exit_code=invocation.exit_code)
+                              turns=settlement.total_turns, denials=settlement.total_denials,
+                              exit_code=settlement.exit_code)
         return {"round_id": round_id, "mode": "scan", "result": "invalid-candidate",
-                "detail": "; ".join(dto_errors)}
+                "detail": _format_detail(settlement, "; ".join(dto_errors))}
 
     candidate["fingerprint"] = fingerprint(
         candidate["goal"], candidate["invariant"],
@@ -481,11 +535,21 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
             candidate["fingerprint"],
             canonical_key(candidate["goal"], candidate["invariant"],
                           candidate["primary_path"], candidate["oracle"]))
-        budget.settle(round_id, day, invocation.cost_usd)
+        _settle_failed(
+            budget,
+            round_id,
+            day,
+            cost_known=settlement.cost_known,
+            cost_usd=settlement.total_cost_usd,
+        )
         budget.record_outcome(round_id, mode="scan", result="duplicate",
-                              turns=invocation.turns, denials=invocation.denials,
-                              exit_code=invocation.exit_code)
-        return {"round_id": round_id, "mode": "scan", "result": "duplicate"}
+                              turns=settlement.total_turns, denials=settlement.total_denials,
+                              exit_code=settlement.exit_code)
+        out = {"round_id": round_id, "mode": "scan", "result": "duplicate"}
+        detail = _format_detail(settlement, "")
+        if detail:
+            out["detail"] = detail
+        return out
 
     # 控制器忽略任何输入 labels，确定性派生（评审 Important #3）。
     candidate["labels"] = _derive_labels(candidate)
@@ -494,11 +558,21 @@ def _run_round_body(cfg, deps: Deps, round_id: str, started: float,
     # canonical key 的记忆已移进 Publisher.publish()，与 queue.record() 挨着写
     # ——分开写必然存在「Issue 已建、提案已在册、key 还没记」的崩溃窗口。
     published = publisher.publish(candidate)
-    budget.settle(round_id, day, invocation.cost_usd)
+    _settle_failed(
+        budget,
+        round_id,
+        day,
+        cost_known=settlement.cost_known,
+        cost_usd=settlement.total_cost_usd,
+    )
     budget.record_outcome(round_id, mode="scan", result="published",
-                          turns=invocation.turns, denials=invocation.denials,
-                          exit_code=invocation.exit_code)
+                          turns=settlement.total_turns, denials=settlement.total_denials,
+                          exit_code=settlement.exit_code)
     out_extra = {"degraded_detail": degraded_detail} if degraded else {}
-    return {**out_extra,
-            "round_id": round_id, "mode": "scan", "result": "published",
-            "issue": published["issue"], "state": published["state"]}
+    out = {**out_extra,
+           "round_id": round_id, "mode": "scan", "result": "published",
+           "issue": published["issue"], "state": published["state"]}
+    detail = _format_detail(settlement, "")
+    if detail:
+        out["detail"] = detail
+    return out

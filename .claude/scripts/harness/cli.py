@@ -9,6 +9,7 @@ import sys
 
 from . import db
 from .claude_runner import invoke
+from .role_invocation import RoleInvocationRequest, to_invoke_kwargs
 from .config import load_config
 from .ghclient import GhCli
 from .gitops import PublishWorktree
@@ -54,6 +55,13 @@ def _publish_or_resume_succeeded(result: dict) -> bool:
     误报为成功。
     """
     return result.get("state") == State.RECEIPT_COMPLETE
+
+
+def _build_invoke_adapter():
+    def adapter(request: RoleInvocationRequest):
+        return invoke(**to_invoke_kwargs(request))
+
+    return adapter
 
 
 def _wire(cfg):
@@ -141,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     deps = Deps(conn=conn, gh=gh, worktree=worktree, outbox=Outbox(conn),
-                queue=Queue(conn), invoke=invoke)
+                queue=Queue(conn), invoke=_build_invoke_adapter())
     result = run_round(cfg, deps)
     print(json.dumps(result, ensure_ascii=False))
     # `no-candidate-degraded` **刻意**不在这里：它表示本轮有 agent 反复失败后

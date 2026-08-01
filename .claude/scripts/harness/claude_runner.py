@@ -28,7 +28,7 @@ from .config import CLAUDE
 # 外层结束，截出半个对象（实测反例：body_md="example } ``` remainder"）。
 # 改为按首尾边界剥壳，再对中间全文做一次 json.loads。
 
-# Stage 1 允许的工具集：只读探测 + Skill/Workflow 调用，不含任何写能力。
+# Stage 1 允许的工具集：控制器直接扇出后，子角色只需只读探测工具。
 # build_argv() 强制 tools 解析后恰好等于这个集合——多一个、少一个、换成
 # "default" 都会被拒绝，而不是原样传给 claude 子进程。
 # 后台 workflow 等待上限（毫秒）：需大于单次 invocation 的 timeout_s
@@ -64,16 +64,7 @@ _INHERITED_AUTH_ENV = (
     "CLAUDE_CODE_OAUTH_TOKEN",
 )
 
-# TaskOutput 是打通 `claude -p` + Workflow 的关键：Workflow 工具**总是**立刻返回
-# 一个 run/task ID 并转入后台（工具文档原文："Workflows run in the background —
-# this tool returns immediately"）。而 headless 会话在模型结束回合后即退出，后台
-# 任务随即被 stopped。真机实测两次（2026-07-31）：模型如实宣布"我会等待完成通知
-# 后再取结果"，随后 stop_reason=end_turn，任务被杀。这不是提示词能修的——模型在
-# -p 模式下没有"跨回合等待"这个动作。
-# TaskOutput(block=True) 让等待变成**同一回合内的一次工具调用**，模型不必结束回合。
-# 它是只读工具（只取已有任务的输出），不扩大写能力边界。
-STAGE1_ALLOWED_TOOLS = frozenset({"Read", "Grep", "Glob", "Skill", "Workflow",
-                                  "TaskOutput"})
+STAGE1_ALLOWED_TOOLS = frozenset({"Read", "Grep", "Glob"})
 
 
 class UnsafeInvocationError(ValueError):

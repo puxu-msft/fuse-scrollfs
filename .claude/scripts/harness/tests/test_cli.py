@@ -12,6 +12,7 @@ from unittest import mock
 
 from harness import cli, db
 from harness.claude_runner import InvocationResult
+from harness.role_invocation import RoleInvocationRequest, to_invoke_kwargs
 from harness.lifecycle import State
 from harness.outbox import Outbox
 from harness.publish import Publisher
@@ -89,6 +90,37 @@ class TestCliRoundExitCode(unittest.TestCase):
     def test_budget_exhausted_exits_nonzero(self):
         result = {"round_id": "r1", "mode": "scan", "result": "budget-exhausted"}
         self.assertEqual(self._run_with_result(result), 1)
+
+
+class TestCliInvokeAdapter(unittest.TestCase):
+    def test_adapter_expands_every_required_invoke_keyword(self):
+        request = RoleInvocationRequest(
+            role="finder:code",
+            prompt="find",
+            tools="Glob,Grep,Read",
+            grant_usd=0.2,
+            max_turns=9,
+            settings_path="settings.json",
+            cwd="/repo",
+            timeout_s=42.0,
+            model="claude-sonnet-5",
+            stream_log="stream.jsonl",
+            session_id="11111111-1111-4111-8111-111111111111",
+        )
+        seen = {}
+
+        def fake_invoke(**kwargs):
+            seen.update(kwargs)
+            return "sentinel"
+
+        with mock.patch.object(cli, "invoke", side_effect=fake_invoke):
+            result = cli._build_invoke_adapter()(request)
+
+        self.assertEqual(result, "sentinel")
+        self.assertEqual(seen, to_invoke_kwargs(request))
+        self.assertNotIn("role", seen)
+        self.assertEqual(seen["cwd"], "/repo")
+        self.assertEqual(seen["timeout_s"], 42.0)
 
 
 class TestCliProbePromptParserSeam(unittest.TestCase):

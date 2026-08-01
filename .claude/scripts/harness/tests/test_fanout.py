@@ -1223,6 +1223,53 @@ class TestRunFanout(unittest.TestCase):
             any(d["role"].startswith("judge:redline:") for d in result["degraded"])
         )
 
+    def test_returns_every_attempt_including_a_failure_superseded_by_retry(self):
+        candidate = self._candidate()
+        roadmap_calls = 0
+
+        def invoke(request):
+            nonlocal roadmap_calls
+            if request.role == "finder:roadmap":
+                roadmap_calls += 1
+                if roadmap_calls == 1:
+                    return self._invocation(
+                        None,
+                        request=request,
+                        ok=False,
+                        session_id="real-roadmap",
+                        raw_tail="transient",
+                    )
+            if request.role.startswith("finder:"):
+                finder_candidate = {
+                    key: value for key, value in candidate.items() if key != "lane"
+                }
+                payload = (
+                    {"candidates": [finder_candidate]}
+                    if request.role == "finder:code"
+                    else {"candidates": []}
+                )
+            else:
+                payload = {
+                    "verdict": "reject",
+                    "reason": "redline",
+                    "invariant_at_risk": "risk",
+                }
+            return self._invocation(payload, request=request)
+
+        result = self._run(invoke)
+
+        self.assertEqual(roadmap_calls, 2)
+        self.assertEqual(len(result["attempts"]), 6)
+        roadmap_attempts = [
+            record for record in result["attempts"]
+            if record.role == "finder:roadmap"
+        ]
+        self.assertEqual([record.attempt for record in roadmap_attempts], [1, 2])
+        self.assertEqual(
+            [record.status for record in roadmap_attempts],
+            ["failed_transport", "success"],
+        )
+
     def test_settlement_counts_failed_and_successful_attempt_costs(self):
         candidate = self._candidate()
         roadmap_calls = 0

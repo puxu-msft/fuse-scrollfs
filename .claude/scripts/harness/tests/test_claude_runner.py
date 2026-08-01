@@ -41,6 +41,9 @@ def _error_line(cost=0.1, turns=1, subtype="error_max_turns"):
 
 
 class TestArgv(unittest.TestCase):
+    def test_stage1_allowlist_is_read_only_controller_surface(self):
+        self.assertEqual(STAGE1_ALLOWED_TOOLS, frozenset({"Read", "Grep", "Glob"}))
+
     def test_argv_pins_the_exact_isolation_combination(self):
         argv = build_argv(prompt="/scrollz-round", tools=VALID_TOOLS,
                           grant_usd=0.75, max_turns=40,
@@ -85,9 +88,9 @@ class TestArgv(unittest.TestCase):
                       max_turns=10, settings_path="s.json")
 
     def test_build_argv_rejects_subset_of_allowlist(self):
-        """少一个工具（例如漏了 Workflow）也必须拒绝——不是"只要不多就行"。"""
+        """少一个只读工具也必须拒绝——不是"只要不多就行"。"""
         with self.assertRaises(UnsafeInvocationError):
-            build_argv(prompt="p", tools="Read,Grep,Glob,Skill",
+            build_argv(prompt="p", tools="Read,Grep",
                       grant_usd=0.5, max_turns=10, settings_path="s.json")
 
     def test_build_argv_rejects_unknown_extra_tool(self):

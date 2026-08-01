@@ -1,8 +1,8 @@
-import subprocess, tempfile, unittest
+import shutil, subprocess, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 from harness import db
-from harness.claude_runner import InvocationResult
+from harness.claude_runner import DEFAULT_AGENT_MODEL, InvocationResult
 from harness.config import GIT
 from harness.gitops import PublishWorktree
 from harness.outbox import Outbox
@@ -25,6 +25,7 @@ CANDIDATE_PAYLOAD = {
         "oracle": "翻转一个字节后读取必须 fail-closed",
         "slug": "tail-journal-crc", "size": "M", "priority": "T1",
         "needs_decision": False, "body_md": "## 意图\n补 CRC\n",
+        "evidence": "archive.rs", "touched_paths": ["crates/scrollz/src/archive.rs"],
     }]
 }
 
@@ -33,6 +34,99 @@ CANDIDATE_PAYLOAD = {
 # `_capability_drift_problems()` 会正确判定漂移——这里显式传入干净能力集，
 # 代表「本次调用没有配置漂移」的正常场景。
 _CLEAN_INIT_TOOLS = sorted(round_module.STAGE1_TOOLS.split(","))
+_FINDER_ROLES = (
+    "finder:roadmap",
+    "finder:code",
+    "finder:bench",
+    "finder:hygiene",
+)
+
+
+def _finder_candidate(candidate: dict) -> dict:
+    return {
+        key: value
+        for key, value in candidate.items()
+        if key not in {"lane", "labels", "canonical_key", "verdicts"}
+    }
+
+
+def _default_judge_payload(request) -> dict:
+    kind = request.role.split(":", 2)[1]
+    return {
+        "redline": {
+            "verdict": "pass",
+            "reason": "safe",
+            "invariant_at_risk": "none",
+        },
+        "completed": {
+            "verdict": "pass",
+            "reason": "new",
+            "evidence": "none",
+        },
+        "oracle": {
+            "verdict": "pass",
+            "reason": "strong",
+            "suggested_oracle": "none",
+        },
+    }[kind]
+
+
+def _multi_role_invoke(
+    *,
+    candidate: dict | None = None,
+    empty_payload: dict | None = None,
+    role_results: dict | None = None,
+    judge_payload_fn=None,
+):
+    role_results = role_results or {}
+
+    def invoke(request):
+        configured = role_results.get(request.role)
+        if configured is not None:
+            return configured(request) if callable(configured) else configured
+        if request.role.startswith("finder:"):
+            if empty_payload is not None:
+                return _clean_invocation(True, empty_payload, 0.01, 1,
+                                         session_id=request.session_id)
+            payload = (
+                {"candidates": [_finder_candidate(candidate)]}
+                if candidate is not None and request.role == "finder:code"
+                else {"candidates": []}
+            )
+        else:
+            payload = (
+                judge_payload_fn(request)
+                if judge_payload_fn is not None
+                else _default_judge_payload(request)
+            )
+        return _clean_invocation(True, payload, 0.01, 1,
+                                 session_id=request.session_id)
+
+    return invoke
+
+
+def _fanout_result(candidates, *, cost=0.1, turns=3, degraded=None):
+    from harness.fanout import AttemptRecord, FanoutSettlement
+
+    attempt = AttemptRecord(
+        role="finder:code",
+        attempt=1,
+        status="success",
+        cost_usd=cost,
+        cost_known=True,
+        turns=turns,
+    )
+    return {
+        "candidates": candidates,
+        "rejected": [],
+        "degraded": degraded or [],
+        "settlement": FanoutSettlement(
+            total_cost_usd=cost,
+            cost_known=True,
+            total_turns=turns,
+        ),
+        "attempts": [attempt],
+    }
 
 
 def _clean_invocation(ok, payload, cost, turns, **kw):
@@ -91,43 +185,118 @@ class TestRound(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.gh = FakeGitHub("WRITE")
         self.cfg = Cfg(self.local)
+        source_agents = Path(__file__).resolve().parents[3] / "agents"
+        shutil.copytree(source_agents, self.local / ".claude/agents")
         self.wt = PublishWorktree(self.local, self.local / ".worktree/_publish")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _deps(self, invocation):
+    def _deps(self, invoke_fn=None):
         return Deps(conn=self.conn, gh=self.gh, worktree=self.wt,
                     outbox=Outbox(self.conn), queue=Queue(self.conn),
-                    invoke=lambda **kw: invocation, tools=("/usr/bin/git",))
+                    invoke=invoke_fn or _multi_role_invoke(empty_payload={"candidates": []}),
+                    tools=("/usr/bin/git",))
+
+    def test_real_sqlite_connection_is_only_written_from_main_thread(self):
+        main_thread = __import__("threading").get_ident()
+        worker_threads = []
+
+        def invoke(request):
+            worker_threads.append(__import__("threading").get_ident())
+            return _multi_role_invoke(
+                candidate=CANDIDATE_PAYLOAD["candidates"][0]
+            )(request)
+
+        result = run_round(self.cfg, self._deps(invoke))
+
+        self.assertEqual(result["result"], "published")
+        self.assertTrue(worker_threads)
+        self.assertTrue(all(thread != main_thread for thread in worker_threads))
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM invocations").fetchone()["n"],
+            7,
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM agent_attempts").fetchone()["n"],
+            7,
+        )
+
+    def test_all_role_requests_use_model_context_and_single_call_grant(self):
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            return _multi_role_invoke(
+                candidate=CANDIDATE_PAYLOAD["candidates"][0]
+            )(request)
+
+        run_round(self.cfg, self._deps(invoke))
+
+        self.assertEqual(len(seen), 7)
+        expected_grant = self.cfg.round_budget_usd / 7
+        for request in seen:
+            self.assertEqual(request.model, DEFAULT_AGENT_MODEL)
+            self.assertEqual(request.cwd, str(self.cfg.repo_root))
+            self.assertEqual(request.settings_path, round_module.SETTINGS_PATH)
+            self.assertAlmostEqual(request.grant_usd, expected_grant)
+
+    def test_protocol_errors_are_exposed_in_round_detail(self):
+        def invoke(request):
+            if request.role == "finder:roadmap":
+                return _clean_invocation(
+                    False,
+                    None,
+                    0.01,
+                    1,
+                    protocol_errors=["duplicate init events: 2"],
+                    session_id=request.session_id,
+                )
+            return _clean_invocation(True, {"candidates": []}, 0.01, 1,
+                                     session_id=request.session_id)
+
+        result = run_round(self.cfg, self._deps(invoke))
+
+        self.assertEqual(result["result"], "no-candidate-degraded")
+        self.assertIn("duplicate init events: 2", result["detail"])
+
+    def test_request_context_uses_production_sources(self):
+        context = round_module._build_request_context(self.cfg)
+        self.assertEqual(context.cwd, str(self.cfg.repo_root))
+        self.assertEqual(context.settings_path, round_module.SETTINGS_PATH)
+        self.assertEqual(context.model, DEFAULT_AGENT_MODEL)
+        self.assertEqual(
+            context.stream_log_dir,
+            str(self.cfg.state_db.parent / "rounds"),
+        )
 
     def test_successful_round_publishes_and_settles_budget(self):
-        inv = _clean_invocation(True, CANDIDATE_PAYLOAD, 0.30, 8)
-        result = run_round(self.cfg, self._deps(inv))
+        result = run_round(
+            self.cfg,
+            self._deps(_multi_role_invoke(candidate=CANDIDATE_PAYLOAD["candidates"][0])),
+        )
         self.assertEqual(result["result"], "published")
         self.assertEqual(len(self.gh.issues), 1)
         row = self.conn.execute("SELECT settled_usd FROM rounds").fetchone()
-        self.assertAlmostEqual(row["settled_usd"], 0.30)
+        self.assertAlmostEqual(row["settled_usd"], 0.07)
 
     def test_empty_candidates_is_a_clean_noop_round(self):
         inv = _clean_invocation(True, {"candidates": []}, 0.05, 3)
-        result = run_round(self.cfg, self._deps(inv))
+        result = run_round(self.cfg, self._deps(lambda request: inv))
         self.assertEqual(result["result"], "no-candidate")
         self.assertEqual(len(self.gh.issues), 0)
 
-    def test_failed_invocation_charges_full_reservation(self):
+    def test_all_finders_failed_is_degraded_and_charges_full_reservation(self):
         inv = InvocationResult(False, None, 0.0, 0, exit_code=1)
-        result = run_round(self.cfg, self._deps(inv))
-        self.assertEqual(result["result"], "invocation-failed")
+        result = run_round(self.cfg, self._deps(lambda request: inv))
+        self.assertEqual(result["result"], "no-candidate-degraded")
         day_row = self.conn.execute("SELECT settled_usd FROM budget_days").fetchone()
         self.assertAlmostEqual(day_row["settled_usd"], 1.0,
                                msg="结果未知必须按最坏上限计费")
 
     def test_needs_decision_candidate_gets_that_label_not_proposed(self):
-        payload = {"candidates": [dict(CANDIDATE_PAYLOAD["candidates"][0],
-                                       needs_decision=True)]}
-        inv = _clean_invocation(True, payload, 0.2, 5)
-        run_round(self.cfg, self._deps(inv))
+        candidate = dict(CANDIDATE_PAYLOAD["candidates"][0], needs_decision=True)
+        run_round(self.cfg, self._deps(_multi_role_invoke(candidate=candidate)))
         number = next(iter(self.gh.issues))
         labels = self.gh.get_issue_labels(number)
         self.assertIn("harness:needs-decision", labels)
@@ -144,8 +313,7 @@ class TestRound(unittest.TestCase):
         """
         candidate = dict(CANDIDATE_PAYLOAD["candidates"][0],
                          labels=["harness:paused", "bogus-label"])
-        inv = _clean_invocation(True, {"candidates": [candidate]}, 0.2, 5)
-        run_round(self.cfg, self._deps(inv))
+        run_round(self.cfg, self._deps(_multi_role_invoke(candidate=candidate)))
         number = next(iter(self.gh.issues))
         labels = self.gh.get_issue_labels(number)
         expected = {"harness", "harness:proposed", "T1", "size:M", "lane:defect"}
@@ -155,8 +323,8 @@ class TestRound(unittest.TestCase):
         q = Queue(self.conn)
         for i in range(6):
             q.record(f"fp{i}", "defect", f"t{i}", "proposed")
-        inv = _clean_invocation(True, CANDIDATE_PAYLOAD, 0.1, 3)
-        deps = self._deps(inv)
+        deps = self._deps(_multi_role_invoke(
+            candidate=CANDIDATE_PAYLOAD["candidates"][0]))
         result = run_round(self.cfg, deps)
         self.assertEqual(result["result"], "no-candidate")
         self.assertEqual(len(self.gh.issues), 0, "lane 已满不得再发布该 lane")
@@ -212,7 +380,7 @@ class TestRound(unittest.TestCase):
     def test_precheck_failure_aborts_before_spending(self):
         self.gh.permission = "READ"
         inv = _clean_invocation(True, CANDIDATE_PAYLOAD, 0.3, 8)
-        result = run_round(self.cfg, self._deps(inv))
+        result = run_round(self.cfg, self._deps(lambda request: inv))
         self.assertEqual(result["result"], "precheck-failed")
         rows = self.conn.execute("SELECT COUNT(*) AS n FROM budget_days").fetchone()
         self.assertEqual(rows["n"], 0, "预检失败不得预留预算")
@@ -231,7 +399,7 @@ class TestRound(unittest.TestCase):
             init_tools=list(round_module.STAGE1_TOOLS.split(",")) + ["Bash"],
             init_mcp_servers=[{"name": "shell"}],
             init_plugins=[], init_errors=[])
-        result = run_round(self.cfg, self._deps(inv))
+        result = run_round(self.cfg, self._deps(lambda request: inv))
         self.assertEqual(result["result"], "capability-drift")
         self.assertEqual(len(self.gh.issues), 0,
                          "能力漂移时绝不能继续发布")
@@ -283,31 +451,22 @@ class TestRound(unittest.TestCase):
         self.assertAlmostEqual(row["settled_usd"], 0.0,
                                msg="恢复轮不应产生新的模型花费")
 
-    def test_prompt_uses_known_canonical_keys_not_known_fingerprints(self):
-        """控制器 prompt 传给 Workflow 的字段名必须是 `known_canonical_keys`
-        （评审 Minor #8）：skill/Workflow 读的是 `known_canonical_keys`，若
-        控制器仍传旧的 `known_fingerprints`，1a 阶段传空数组时无外部行为
-        差异，但 1b 接入已知 key 后会静默失效——这里做一条字面契约测试，
-        直接断言 prompt JSON 里含有正确的键名、不含旧键名。
-        """
-        import json as _json
-
+    def test_finder_prompts_use_known_canonical_keys_not_known_fingerprints(self):
+        """每个 finder prompt 必须接收跨轮 canonical key，而非旧字段名。"""
         seen_prompts = []
 
-        def capturing_invoke(**kw):
-            seen_prompts.append(kw.get("prompt"))
-            return _clean_invocation(True, {"candidates": []}, 0.01, 1)
+        def capturing_invoke(request):
+            seen_prompts.append(request.prompt)
+            return _clean_invocation(True, {"candidates": []}, 0.01, 1,
+                                     session_id=request.session_id)
 
-        deps = self._deps(None)
-        deps.invoke = capturing_invoke
-        run_round(self.cfg, deps)
+        run_round(self.cfg, self._deps(capturing_invoke))
 
-        self.assertEqual(len(seen_prompts), 1)
-        prompt = seen_prompts[0]
-        _, _, json_blob = prompt.partition("\n")
-        args = _json.loads(json_blob)
-        self.assertIn("known_canonical_keys", args)
-        self.assertNotIn("known_fingerprints", args)
+        self.assertEqual(len(seen_prompts), 4)
+        self.assertTrue(all('"known_canonical_keys"' in prompt
+                            for prompt in seen_prompts))
+        self.assertTrue(all('"known_fingerprints"' not in prompt
+                            for prompt in seen_prompts))
 
     def test_known_canonical_keys_are_actually_carried_into_the_prompt(self):
         """接线断言（评审 rmf-02）：在册提案的 key 必须真的进 prompt。
@@ -318,8 +477,6 @@ class TestRound(unittest.TestCase):
         key 里刻意放撇号、双引号与 \x1f 分隔符：prompt 曾用 `repr()` 再把 `'`
         换成 `"` 来拼 JSON，这类字符会直接产出非法 JSON，而下游是要当 JSON 解析的。
         """
-        import json as _json
-
         nasty = "goal's \"quoted\"\x1finv\x1fpath\x1foracle"
         self.deps_queue_seed = None
         deps = self._deps(None)
@@ -329,16 +486,16 @@ class TestRound(unittest.TestCase):
 
         seen = []
 
-        def capturing_invoke(**kw):
-            seen.append(kw.get("prompt"))
+        def capturing_invoke(request):
+            seen.append(request.prompt)
             return _clean_invocation(True, {"candidates": []}, 0.01, 1)
 
         deps.invoke = capturing_invoke
         run_round(self.cfg, deps)
 
-        _, _, blob = seen[0].partition("\n")
-        args = _json.loads(blob)   # 非法 JSON 会在这里炸
-        self.assertEqual(args["known_canonical_keys"], [nasty])
+        self.assertEqual(len(seen), 4)
+        self.assertTrue(all("goal's" in prompt and "quoted" in prompt
+                            for prompt in seen))
 
     def test_duplicate_candidate_still_teaches_the_dedup_memory(self):
         """被判重复的候选也必须进去重集，否则系统学不会（rmf-02 修复的自身缺口）。
@@ -362,10 +519,7 @@ class TestRound(unittest.TestCase):
         expected = canonical_key(cand["goal"], cand["invariant"],
                                  cand["primary_path"], cand["oracle"])
 
-        def invoke_dup(**kw):
-            return _clean_invocation(True, {"candidates": [cand]}, 0.01, 1)
-
-        deps.invoke = invoke_dup
+        deps.invoke = _multi_role_invoke(candidate=cand)
         # 先让它发布一次，拿到 fingerprint
         first = run_round(self.cfg, deps)
         self.assertEqual(first["result"], "published")
@@ -384,70 +538,65 @@ class TestRound(unittest.TestCase):
         self.assertEqual(deps.queue.known_canonical_keys(), [expected],
                          "被判重复的候选没有进去重集——下一轮还会重来，永久卡死")
 
-    def test_failed_invocation_settles_at_known_cost_not_full_reserve(self):
-        """成本已知时不得按预留满额计费（评审 rmf-05）。
+    def test_failed_finders_with_known_cost_settle_at_aggregate_cost(self):
+        """所有失败 attempt 的成本已知时，按聚合实测值结算。"""
+        def failing_invoke(request):
+            return _clean_invocation(False, None, 0.03, 1)
 
-        `abandon()` 的语义是「结果未知按最坏值计费」，在成本**真的**未知时正确。
-        但 `invocation-failed` 分支里成本往往是已知的——终态 result 事件的
-        cost/turns 解析独立于 subtype，代码自己前两行刚把它存进 progress。
-
-        为什么这条重要：预算观察期的判据是「复核 budget_days 实际花费，据此定
-        真实日上限」。真机今日 $41.07 里只有 $5.57 来自实测，其余约 86% 是
-        reserved_usd 的原样回填。**偏置方向恰好是「看起来花得比实际多」**——
-        它会让人把上限定得过高，正好是这次观察想避免的错误方向。
-        """
-        deps = self._deps(None)
-
-        def failing_invoke(**kw):
-            # ok=False 但成本已知：终态事件解析到了 cost 与 turns
-            return _clean_invocation(False, None, 0.37, 4)
-
-        deps.invoke = failing_invoke
-        out = run_round(self.cfg, deps)
-        self.assertEqual(out["result"], "invocation-failed")
-
+        out = run_round(self.cfg, self._deps(failing_invoke))
+        self.assertEqual(out["result"], "no-candidate-degraded")
         row = self.conn.execute(
             "SELECT reserved_usd, settled_usd FROM rounds WHERE round_id=?",
             (out["round_id"],)).fetchone()
-        self.assertAlmostEqual(row["settled_usd"], 0.37, places=6,
-                               msg="按预留满额计费，账本被虚构花费污染")
-        self.assertNotAlmostEqual(row["settled_usd"], row["reserved_usd"],
-                                  places=6)
+        self.assertAlmostEqual(row["settled_usd"], 0.36, places=6)
+        self.assertNotAlmostEqual(row["settled_usd"], row["reserved_usd"], places=6)
 
-    def test_failed_invocation_with_unknown_cost_still_charges_worst_case(self):
-        """成本**真的**未知时（超时、进程被杀）仍按最坏值——这是保守的正确行为。"""
-        deps = self._deps(None)
+    def test_failed_finder_with_unknown_cost_still_charges_worst_case(self):
+        """任一 attempt 成本未知时仍按整轮预留上限结算。"""
+        calls = 0
 
-        def timing_out(**kw):
-            return InvocationResult(False, None, 0.0, 0, exit_code=124,
-                                    raw_tail="timeout", init_seen=False)
+        def timing_out(request):
+            nonlocal calls
+            calls += 1
+            return InvocationResult(
+                False,
+                None,
+                0.0,
+                0,
+                exit_code=124,
+                raw_tail="timeout",
+                init_seen=False,
+                cost_known=calls != 1,
+            )
 
-        deps.invoke = timing_out
-        out = run_round(self.cfg, deps)
+        out = run_round(self.cfg, self._deps(timing_out))
         row = self.conn.execute(
             "SELECT reserved_usd, settled_usd FROM rounds WHERE round_id=?",
             (out["round_id"],)).fetchone()
         self.assertAlmostEqual(row["settled_usd"], row["reserved_usd"], places=6)
 
     def test_degraded_round_with_no_candidate_is_not_a_clean_noop(self):
-        """全降级轮不得与「仓库确实没东西可提」混为一谈（评审 rmf-03）。
+        """一个 finder 重试耗尽时，空轮必须保留降级证据。"""
+        calls = {}
 
-        修复传输故障隔离**之前**，一个 agent 挂掉会让整轮 aborted →
-        invocation-failed → exit 1，systemd 看得见。修复**之后**同样的故障变成
-        `candidates: []` → `no-candidate` → exit 0，systemd 记成功。
-        隔离是对的，但它把「响亮的失败」换成了「安静的成功」——2 小时节拍下
-        这可以持续一整天而无人察觉。
-        """
-        payload = {"candidates": [],
-                   "degraded": [{"agentType": "harness-judge-redline",
-                                 "label": "harness-judge-redline",
-                                 "error": "API Error: Server error mid-response",
-                                 "occurrences": 3, "attempts": 9}]}
-        deps = self._deps(_clean_invocation(True, payload, 0.42, 3))
-        out = run_round(self.cfg, deps)
+        def invoke(request):
+            calls[request.role] = calls.get(request.role, 0) + 1
+            if request.role == "finder:roadmap":
+                return _clean_invocation(
+                    False,
+                    None,
+                    0.01,
+                    1,
+                    raw_tail="API Error: Server error mid-response",
+                    session_id=request.session_id,
+                )
+            return _clean_invocation(True, {"candidates": []}, 0.01, 1,
+                                     session_id=request.session_id)
+
+        out = run_round(self.cfg, self._deps(invoke))
 
         self.assertEqual(out["result"], "no-candidate-degraded")
-        self.assertIn("harness-judge-redline", out["detail"])
+        self.assertIn("finder:roadmap", out["detail"])
         row = self.conn.execute(
             "SELECT result FROM rounds WHERE round_id=?",
             (out["round_id"],)).fetchone()
@@ -456,21 +605,23 @@ class TestRound(unittest.TestCase):
 
     def test_clean_no_candidate_round_stays_a_clean_noop(self):
         """没有降级时，空轮仍是干净的空轮——不得把静默换成噪声。"""
-        deps = self._deps(_clean_invocation(True, {"candidates": [],
-                                                   "degraded": []}, 0.05, 3))
+        deps = self._deps(lambda request: _clean_invocation(True, {"candidates": []}, 0.05, 3))
         out = run_round(self.cfg, deps)
         self.assertEqual(out["result"], "no-candidate")
 
     def test_published_round_still_surfaces_partial_degradation(self):
-        """部分降级但发布成功：仍算成功，但降级证据必须带出来。"""
-        payload = {"candidates": list(CANDIDATE_PAYLOAD["candidates"]),
-                   "degraded": [{"agentType": "harness-finder-bench",
-                                 "label": "perf", "error": "boom",
-                                 "occurrences": 1, "attempts": 3}]}
-        deps = self._deps(_clean_invocation(True, payload, 0.5, 4))
-        out = run_round(self.cfg, deps)
+        """部分 finder 降级但发布成功时，降级证据仍需带出。"""
+        candidate = CANDIDATE_PAYLOAD["candidates"][0]
+
+        def invoke(request):
+            if request.role == "finder:bench":
+                return _clean_invocation(False, None, 0.01, 1, raw_tail="boom",
+                                         session_id=request.session_id)
+            return _multi_role_invoke(candidate=candidate)(request)
+
+        out = run_round(self.cfg, self._deps(invoke))
         self.assertEqual(out["result"], "published")
-        self.assertIn("harness-finder-bench", out.get("degraded_detail", ""))
+        self.assertIn("finder:bench", out.get("degraded_detail", ""))
 
     def test_remaining_time_budget_is_passed_to_invoke_as_timeout(self):
         """单调截止：剩余时间被真实传给 invoke，且必须小于整轮截止。
@@ -483,8 +634,8 @@ class TestRound(unittest.TestCase):
         """
         seen_timeouts = []
 
-        def capturing_invoke(**kw):
-            seen_timeouts.append(kw.get("timeout_s"))
+        def capturing_invoke(request):
+            seen_timeouts.append(request.timeout_s)
             return _clean_invocation(True, {"candidates": []}, 0.01, 1)
 
         deps = self._deps(None)
@@ -503,8 +654,8 @@ class TestRound(unittest.TestCase):
                                side_effect=fake_monotonic):
             run_round(self.cfg, deps)
 
-        self.assertEqual(len(seen_timeouts), 1, "invoke 必须恰好被调用一次")
-        timeout_s = seen_timeouts[0]
+        self.assertEqual(len(seen_timeouts), 4, "四个 finder 必须各调用一次")
+        timeout_s = max(seen_timeouts)
         self.assertIsNotNone(
             timeout_s, "timeout_s 必须真的把 remaining_time 传给 invoke，"
                       "而不是被忽略或传 None")
@@ -513,12 +664,15 @@ class TestRound(unittest.TestCase):
         self.assertLess(
             timeout_s, round_module.ROUND_DEADLINE_S,
             "必须为 checkpoint/结算预留时间窗，不能把整轮时间全部给模型")
+        expected = min(
+            60.0,
+            round_module.ROUND_DEADLINE_S - elapsed
+            - round_module.CLEANUP_RESERVE_S - 1.0,
+        )
         self.assertAlmostEqual(
             timeout_s,
-            round_module.ROUND_DEADLINE_S - elapsed
-            - round_module.CLEANUP_RESERVE_S,
-            msg="timeout_s 必须等于 round_deadline 减去已流逝的单调时间、"
-               "再减去结算窗口，而不是任意常量")
+            expected,
+            msg="timeout_s 必须由 fanout 调度器按剩余窗口动态收缩")
 
     def test_deadline_exhausted_does_not_invoke_and_charges_full_reservation(self):
         """截止已耗尽（剩余不足以覆盖结算窗口）时必须显式判失败退出，绝不能
@@ -668,20 +822,27 @@ class TestRunRoundRejectsInvalidCandidate(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.gh = FakeGitHub("WRITE")
         self.cfg = Cfg(self.local)
+        source_agents = Path(__file__).resolve().parents[3] / "agents"
+        shutil.copytree(source_agents, self.local / ".claude/agents")
         self.wt = PublishWorktree(self.local, self.local / ".worktree/_publish")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _deps(self, invocation):
+    def _deps(self, invoke_fn=None):
         return Deps(conn=self.conn, gh=self.gh, worktree=self.wt,
                     outbox=Outbox(self.conn), queue=Queue(self.conn),
-                    invoke=lambda **kw: invocation, tools=("/usr/bin/git",))
+                    invoke=invoke_fn or _multi_role_invoke(empty_payload={"candidates": []}),
+                    tools=("/usr/bin/git",))
 
     def _assert_zero_side_effects(self, overrides: dict):
         candidate = _valid_candidate(**overrides)
-        inv = _clean_invocation(True, {"candidates": [candidate]}, 0.1, 3)
-        result = run_round(self.cfg, self._deps(inv))
+        with mock.patch.object(
+            round_module.fanout,
+            "run_fanout",
+            return_value=_fanout_result([candidate]),
+        ):
+            result = run_round(self.cfg, self._deps())
         self.assertEqual(result["result"], "invalid-candidate")
         self.assertEqual(len(self.gh.issues), 0, "非法 candidate 不得产生 Issue")
         self.assertEqual(len(Outbox(self.conn).open_operations()), 0,
@@ -698,8 +859,12 @@ class TestRunRoundRejectsInvalidCandidate(unittest.TestCase):
     def test_missing_field_produces_zero_side_effects(self):
         candidate = _valid_candidate()
         del candidate["invariant"]
-        inv = _clean_invocation(True, {"candidates": [candidate]}, 0.1, 3)
-        result = run_round(self.cfg, self._deps(inv))
+        with mock.patch.object(
+            round_module.fanout,
+            "run_fanout",
+            return_value=_fanout_result([candidate]),
+        ):
+            result = run_round(self.cfg, self._deps())
         self.assertEqual(result["result"], "invalid-candidate")
         self.assertEqual(len(self.gh.issues), 0)
 
@@ -726,8 +891,12 @@ class TestRunRoundRejectsInvalidCandidate(unittest.TestCase):
         `reserved_usd` 未释放。修复后必须走结构化 `invalid-candidate` 结算：
         零 Issue、零 operation、零 git 改动，且账本完整结算。
         """
-        inv = _clean_invocation(True, payload, 0.1, 3)
-        result = run_round(self.cfg, self._deps(inv))
+        with mock.patch.object(
+            round_module.fanout,
+            "run_fanout",
+            return_value=_fanout_result(payload.get("candidates")),
+        ):
+            result = run_round(self.cfg, self._deps())
         self.assertEqual(result["result"], "invalid-candidate")
         self.assertEqual(len(self.gh.issues), 0, "非法顶层形状不得产生 Issue")
         self.assertEqual(len(Outbox(self.conn).open_operations()), 0,
@@ -757,14 +926,17 @@ class TestRunRoundRejectsInvalidCandidate(unittest.TestCase):
     def test_candidates_element_none_produces_zero_side_effects(self):
         self._assert_zero_side_effects_for_payload({"candidates": [None]})
 
-    def test_charges_full_reservation_on_invalid_candidate(self):
-        """非法 candidate 仍然消耗了一次真实模型调用，必须按实际花费入账，
-        不能因为拒绝发布就悄悄免单。"""
+    def test_charges_aggregate_cost_on_invalid_candidate(self):
+        """非法 candidate 仍消耗了整轮扇出，必须按聚合实际花费入账。"""
         candidate = _valid_candidate(slug="../escape")
-        inv = _clean_invocation(True, {"candidates": [candidate]}, 0.42, 3)
-        run_round(self.cfg, self._deps(inv))
+        with mock.patch.object(round_module.fanout, "validate_finder_output",
+                               return_value=[]):
+            run_round(
+                self.cfg,
+                self._deps(_multi_role_invoke(candidate=candidate)),
+            )
         row = self.conn.execute("SELECT settled_usd FROM rounds").fetchone()
-        self.assertAlmostEqual(row["settled_usd"], 0.42)
+        self.assertAlmostEqual(row["settled_usd"], 0.07)
 
 
 class TestRoundLedgerFinalize(unittest.TestCase):
@@ -795,15 +967,18 @@ class TestRoundLedgerFinalize(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.gh = FakeGitHub("WRITE")
         self.cfg = Cfg(self.local)
+        source_agents = Path(__file__).resolve().parents[3] / "agents"
+        shutil.copytree(source_agents, self.local / ".claude/agents")
         self.wt = PublishWorktree(self.local, self.local / ".worktree/_publish")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _deps(self, invocation):
+    def _deps(self, invoke_fn=None):
         return Deps(conn=self.conn, gh=self.gh, worktree=self.wt,
                     outbox=Outbox(self.conn), queue=Queue(self.conn),
-                    invoke=lambda **kw: invocation, tools=("/usr/bin/git",))
+                    invoke=invoke_fn or _multi_role_invoke(empty_payload={"candidates": []}),
+                    tools=("/usr/bin/git",))
 
     def _round_row(self, round_id):
         return self.conn.execute(
@@ -811,23 +986,22 @@ class TestRoundLedgerFinalize(unittest.TestCase):
             " WHERE round_id=?", (round_id,)).fetchone()
 
     def test_successful_publish_round_is_fully_settled(self):
-        inv = InvocationResult(True, CANDIDATE_PAYLOAD, 0.30, 8,
-                               init_seen=True,
-                               init_tools=list(round_module.STAGE1_TOOLS.split(",")),
-                               init_mcp_servers=[], init_plugins=[],
-                               init_errors=[], denials=2, exit_code=0)
-        result = run_round(self.cfg, self._deps(inv))
+        result = run_round(
+            self.cfg,
+            self._deps(_multi_role_invoke(
+                candidate=CANDIDATE_PAYLOAD["candidates"][0])),
+        )
         row = self._round_row(result["round_id"])
         self.assertEqual(row["mode"], "scan")
         self.assertEqual(row["result"], "published")
-        self.assertEqual(row["turns"], 8)
-        self.assertEqual(row["denials"], 2)
+        self.assertEqual(row["turns"], 7)
+        self.assertEqual(row["denials"], 0)
         self.assertEqual(row["exit_code"], 0)
 
     def test_precheck_failed_round_is_fully_settled(self):
         self.gh.permission = "READ"
         inv = _clean_invocation(True, CANDIDATE_PAYLOAD, 0.3, 8)
-        result = run_round(self.cfg, self._deps(inv))
+        result = run_round(self.cfg, self._deps(lambda request: inv))
         row = self._round_row(result["round_id"])
         self.assertEqual(row["mode"], "scan")
         self.assertEqual(row["result"], "precheck-failed")
@@ -853,11 +1027,15 @@ class TestRoundLedgerFinalize(unittest.TestCase):
 
     def test_invalid_candidate_round_is_fully_settled(self):
         candidate = _valid_candidate(slug="../escape")
-        inv = _clean_invocation(True, {"candidates": [candidate]}, 0.1, 3)
-        result = run_round(self.cfg, self._deps(inv))
+        with mock.patch.object(round_module.fanout, "validate_finder_output",
+                               return_value=[]):
+            result = run_round(
+                self.cfg,
+                self._deps(_multi_role_invoke(candidate=candidate)),
+            )
         row = self._round_row(result["round_id"])
         self.assertEqual(row["result"], "invalid-candidate")
-        self.assertEqual(row["turns"], 3)
+        self.assertEqual(row["turns"], 7)
 
     def test_unexpected_exception_during_publish_is_still_fully_settled(self):
         """评审 Critical C 复现：`create_issue()` 抛一个普通 transport
@@ -871,8 +1049,8 @@ class TestRoundLedgerFinalize(unittest.TestCase):
         结算——`ended_at` 非空、预留已释放、`result="unhandled-exception"`、
         `turns`/`exit_code` 取自本次真实调用。
         """
-        inv = _clean_invocation(True, CANDIDATE_PAYLOAD, 0.25, 6, exit_code=0)
-        deps = self._deps(inv)
+        deps = self._deps(_multi_role_invoke(
+            candidate=CANDIDATE_PAYLOAD["candidates"][0]))
         with mock.patch.object(
                 self.gh, "create_issue",
                 side_effect=RuntimeError("transport 故障，非 outbox 已知异常")):
@@ -885,16 +1063,16 @@ class TestRoundLedgerFinalize(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["result"], "unhandled-exception")
         self.assertIsNotNone(row["ended_at"], "异常路径也必须完整结算账本")
-        self.assertAlmostEqual(row["settled_usd"], 0.25,
-                               msg="成本已知（invoke 已返回）必须记实际值")
-        self.assertEqual(row["turns"], 6)
+        self.assertAlmostEqual(row["settled_usd"], 0.07,
+                               msg="成本已知（fanout 已返回）必须记聚合实际值")
+        self.assertEqual(row["turns"], 7)
         self.assertEqual(row["exit_code"], 0)
 
         day_row = self.conn.execute(
             "SELECT reserved_usd, settled_usd FROM budget_days").fetchone()
         self.assertAlmostEqual(day_row["reserved_usd"], 0.0,
                                msg="异常路径也必须释放预留，不能永久占用日预算")
-        self.assertAlmostEqual(day_row["settled_usd"], 0.25)
+        self.assertAlmostEqual(day_row["settled_usd"], 0.07)
 
     def test_unexpected_exception_before_invoke_charges_worst_case(self):
         """成本未知（异常发生在 `invoke()` 返回之前，例如 prechecks 之后、

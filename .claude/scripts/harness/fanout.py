@@ -873,4 +873,5 @@ def run_fanout(
         "rejected": rejected,
         "degraded": degraded,
         "settlement": _aggregate_settlement(all_records),
+        "attempts": all_records,
     }
