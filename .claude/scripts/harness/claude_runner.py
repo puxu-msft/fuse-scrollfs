@@ -212,14 +212,8 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
     return argv
 
 
-def _extract_payload(text: str) -> dict | None:
-    """从 result.result 里剥出 JSON payload。
-
-    上游契约是「只输出单个 JSON 代码块，不加任何解释」：闭合 fence 之后如果
-    还有说明文字，说明模型违反了契约，必须判失败，而不是静默剥壳成功。
-    顶层必须是对象且含 `candidates: list`——数组或缺字段的对象都不再被
-    无条件包装/放行。
-    """
+def _strip_fence_and_parse(text: str) -> object | None:
+    """剥离可选 JSON fence，并拒绝 fence 后的额外文字。"""
     blob = (text or "").strip()
     if blob.startswith("```"):
         first_newline = blob.find("\n")
@@ -228,21 +222,31 @@ def _extract_payload(text: str) -> dict | None:
             return None
         trailing = blob[last_fence + 3:].strip()
         if trailing:
-            # 闭合 fence 之后还有内容：不是「单个代码块，不加解释」
             return None
         blob = blob[first_newline + 1:last_fence].strip()
     if not blob.startswith(("{", "[")):
         return None
     try:
-        data = json.loads(blob)
+        return json.loads(blob)
     except json.JSONDecodeError:
         return None
+
+
+def _extract_payload(text: str) -> dict | None:
+    """解析 finder payload；顶层须为含 `candidates: list` 的对象。"""
+    data = _strip_fence_and_parse(text)
     if not isinstance(data, dict):
         return None
     candidates = data.get("candidates")
     if not isinstance(candidates, list):
         return None
     return data
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """解析 judge payload；字段级约束由 fanout_schema 负责。"""
+    data = _strip_fence_and_parse(text)
+    return data if isinstance(data, dict) else None
 
 
 def _coerce_finite_nonneg_float(value, field_name: str,
@@ -277,8 +281,8 @@ def _coerce_nonneg_int(value, field_name: str,
     return parsed
 
 
-def _parse_terminal_result(event: dict,
-                           protocol_errors: list[str]
+def _parse_terminal_result(event: dict, protocol_errors: list[str],
+                           payload_parser: Callable[[str], dict | None]
                            ) -> tuple[float, int, bool, dict | None, bool, str | None]:
     """解析终态事件，返回 (cost, turns, ok, payload, cost_known, subtype)。
 
@@ -296,14 +300,16 @@ def _parse_terminal_result(event: dict,
         return 0.0, 0, False, None, False, subtype
     if subtype != "success":
         return cost, turns, False, None, True, subtype
-    payload = _extract_payload(event.get("result", ""))
+    payload = payload_parser(event.get("result", ""))
     if payload is None:
         protocol_errors.append("unparseable or malformed payload in success result")
         return cost, turns, False, None, True, subtype
     return cost, turns, True, payload, True, subtype
 
 
-def parse_stream_json(lines) -> InvocationResult:
+def parse_stream_json(lines, *,
+                      payload_parser: Callable[[str], dict | None] = _extract_payload
+                      ) -> InvocationResult:
     cost, turns = 0.0, 0
     payload: dict | None = None
     result_ok = False
@@ -350,7 +356,8 @@ def parse_stream_json(lines) -> InvocationResult:
             result_count += 1
             if result_count == 1:
                 cost, turns, result_ok, payload, cost_known, subtype = (
-                    _parse_terminal_result(event, protocol_errors))
+                    _parse_terminal_result(event, protocol_errors,
+                                           payload_parser))
                 if session_id is None:
                     session_id = event.get("session_id")
             # 第二个及以后的 terminal result：无论 success 还是 error，都不
@@ -440,7 +447,8 @@ def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,
            env: dict | None = None, model: str | None = None,
            runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
            stream_log=None, session_id: str | None = None,
-           resume: str | None = None, fork_session: bool = False
+           resume: str | None = None, fork_session: bool = False,
+           payload_parser: Callable[[str], dict | None] = _extract_payload
            ) -> InvocationResult:
     argv = build_argv(prompt, tools, grant_usd, max_turns, settings_path,
                       model=model, session_id=session_id, resume=resume,
@@ -464,7 +472,8 @@ def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,
         return InvocationResult(False, None, 0.0, 0, exit_code=124,
                                 raw_tail=str(exc)[-500:])
     _persist_stream(stream_log, proc.stdout, proc.stderr)
-    result = parse_stream_json(proc.stdout.splitlines())
+    result = parse_stream_json(proc.stdout.splitlines(),
+                               payload_parser=payload_parser)
     result.exit_code = proc.returncode
     if proc.returncode != 0:
         # 退出码非 0 时即便 stdout 里恰好有 success result 也不得判 ok

@@ -8,7 +8,7 @@ import unittest
 
 from harness.claude_runner import (
     DEFAULT_AGENT_MODEL, _HARNESS_OWNED_CLAUDE_ENV, _INHERITED_AUTH_ENV,
-    STAGE1_ALLOWED_TOOLS,
+    STAGE1_ALLOWED_TOOLS, _extract_json_object, _extract_payload,
     UnsafeInvocationError,
     build_argv,
     invoke,
@@ -286,6 +286,33 @@ class TestParse(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIsNone(res.payload)
 
+    def test_json_object_parser_accepts_judge_payload(self):
+        lines = [_init_line(),
+                 json.dumps({"type": "result", "subtype": "success",
+                            "total_cost_usd": 0.1, "num_turns": 1,
+                            "result": '{"verdict":"pass","reason":"r"}'})]
+        res = parse_stream_json(lines, payload_parser=_extract_json_object)
+        self.assertTrue(res.ok, res.protocol_errors)
+        self.assertEqual(res.payload, {"verdict": "pass", "reason": "r"})
+
+    def test_json_object_parser_rejects_non_dict_top_level(self):
+        self.assertIsNone(_extract_json_object('[{"verdict":"pass"}]'))
+        self.assertIsNone(_extract_json_object('"pass"'))
+
+    def test_json_object_parser_rejects_text_after_closing_fence(self):
+        self.assertIsNone(_extract_json_object(
+            '```json\n{"verdict":"pass"}\n```\nextra'))
+
+    def test_default_payload_parser_remains_finder_parser(self):
+        default = inspect.signature(parse_stream_json).parameters[
+            "payload_parser"].default
+        self.assertIs(default, _extract_payload)
+        lines = [_init_line(),
+                 json.dumps({"type": "result", "subtype": "success",
+                            "total_cost_usd": 0.1, "num_turns": 1,
+                            "result": '{"verdict":"pass"}'})]
+        self.assertFalse(parse_stream_json(lines).ok)
+
     # ---- 恰好一个 terminal result ----
 
     def test_success_then_error_is_not_ok(self):
@@ -514,6 +541,22 @@ class TestInvoke(unittest.TestCase):
                session_id=session_id)
         argv = runner.calls[0]["argv"]
         self.assertEqual(argv[argv.index("--session-id") + 1], session_id)
+
+    def test_invoke_uses_injected_payload_parser(self):
+        stdout = "\n".join([
+            _init_line(),
+            json.dumps({"type": "result", "subtype": "success",
+                        "total_cost_usd": 0.1, "num_turns": 1,
+                        "result": '{"verdict":"pass","reason":"r"}'})
+        ])
+        runner = FakeRunner(result=subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stdout=stdout, stderr=""))
+        res = invoke(prompt="/x", tools=VALID_TOOLS, grant_usd=0.5,
+                     max_turns=5, settings_path="s.json", cwd="/tmp",
+                     timeout_s=5.0, env={"HOME": "/home/x", "PATH": "/bin"},
+                     runner=runner, payload_parser=_extract_json_object)
+        self.assertTrue(res.ok, res.protocol_errors)
+        self.assertEqual(res.payload["verdict"], "pass")
 
     def test_parent_claude_control_vars_cannot_reach_the_child(self):
         """父进程的 CLAUDE_CODE_*/ANTHROPIC_* 控制变量必须被清除。
