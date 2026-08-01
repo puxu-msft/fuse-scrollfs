@@ -86,10 +86,10 @@ class Budget:
         配置改过之后用配置值会释放错数量。
 
         `actual_usd` 超过预留时**不截断**：全额记入 `settled_usd`（评审
-        Important #1），并把该 round 标记为 `budget_breach`，让账本能解释
-        「花得比预留多」而不是悄悄吞掉差额——差额会持续占用当日预算，后续
-        `reserve()` 会据此正确拒绝超支。未知 round 抛 `BudgetError`（评审
-        Minor #4），只有真正已结算过的 round 才 no-op。
+        Important #1）。超支事实由账本金额谓词 `settled_usd > reserved_usd`
+        独立承载，不与业务 `result` 争用同一字段；差额会持续占用当日预算，
+        后续 `reserve()` 会据此正确拒绝超支。未知 round 抛 `BudgetError`
+        （评审 Minor #4），只有真正已结算过的 round 才 no-op。
         """
         if not math.isfinite(actual_usd):
             raise BudgetError(f"actual_usd 必须是有限数值，收到 {actual_usd!r}")
@@ -107,20 +107,13 @@ class Budget:
                 return
             reserved = row["reserved_usd"]
             charged = actual_usd  # 足额入账，不按 reserved 截断
-            breach = actual_usd > reserved
             self.conn.execute(
                 "UPDATE budget_days SET reserved_usd = MAX(reserved_usd - ?, 0),"
                 " settled_usd = settled_usd + ? WHERE day=?",
                 (reserved, charged, day))
-            if breach:
-                self.conn.execute(
-                    "UPDATE rounds SET settled_usd=?, ended_at=?,"
-                    " result='budget_breach' WHERE round_id=?",
-                    (charged, time.time(), round_id))
-            else:
-                self.conn.execute(
-                    "UPDATE rounds SET settled_usd=?, ended_at=? WHERE round_id=?",
-                    (charged, time.time(), round_id))
+            self.conn.execute(
+                "UPDATE rounds SET settled_usd=?, ended_at=? WHERE round_id=?",
+                (charged, time.time(), round_id))
             self.conn.execute("COMMIT")
         except Exception:
             self.conn.execute("ROLLBACK")
@@ -165,6 +158,19 @@ class Budget:
             "SELECT COALESCE(SUM(cost_usd),0) AS spent FROM invocations"
             " WHERE round_id=?", (round_id,)).fetchone()["spent"]
         return max(row["reserved_usd"] - spent, 0.0)
+
+    def breached(self, round_id: str) -> bool:
+        """从独立金额字段判定本轮是否超支，不依赖业务结果写入顺序。"""
+        row = self.conn.execute(
+            "SELECT reserved_usd, settled_usd FROM rounds WHERE round_id=?",
+            (round_id,),
+        ).fetchone()
+        if row is None:
+            raise BudgetError(f"未知 round：{round_id}")
+        return (
+            row["settled_usd"] is not None
+            and row["settled_usd"] > row["reserved_usd"]
+        )
 
     def open_round_record(self, round_id: str, mode: str) -> None:
         """为不消耗新预算的 round（例如恢复轮、预检失败轮、预算耗尽轮）建立

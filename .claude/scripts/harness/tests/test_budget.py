@@ -99,15 +99,36 @@ class TestBudget(unittest.TestCase):
     def test_settle_overrun_is_not_silently_truncated(self):
         """实际花费超过预留时必须足额入账，不能截断到 reserved（评审
         Important #1）。这里预留 1.0、实花 5.0，spent_today 必须反映 5.0
-        而不是 1.0，round 要被标记为 budget_breach。"""
+        而不是 1.0；超支由独立于业务 result 的金额谓词承载。"""
         self.b.reserve("r1", DAY)
         self.b.settle("r1", DAY, 5.0)
         self.assertAlmostEqual(self.b.spent_today(DAY), 5.0)
         row = self.conn.execute(
-            "SELECT settled_usd, result FROM rounds WHERE round_id=?",
+            "SELECT reserved_usd, settled_usd FROM rounds WHERE round_id=?",
             ("r1",)).fetchone()
         self.assertAlmostEqual(row["settled_usd"], 5.0)
-        self.assertEqual(row["result"], "budget_breach")
+        self.assertGreater(row["settled_usd"], row["reserved_usd"])
+        self.assertTrue(self.b.breached("r1"))
+
+    def test_normal_business_outcome_does_not_erase_budget_breach(self):
+        """预留 X、实花 X+δ 后正常发布：业务结果与超支事实必须同时可读。"""
+        self.b.reserve("r1", DAY)
+        self.b.settle("r1", DAY, 1.2)
+        self.b.record_outcome("r1", result="published")
+
+        row = self.conn.execute(
+            "SELECT result, reserved_usd, settled_usd FROM rounds WHERE round_id=?",
+            ("r1",),
+        ).fetchone()
+        self.assertEqual(row["result"], "published")
+        self.assertGreater(row["settled_usd"], row["reserved_usd"])
+        self.assertTrue(self.b.breached("r1"))
+
+    def test_non_breach_remains_distinguishable_from_breach(self):
+        self.b.reserve("r1", DAY)
+        self.b.settle("r1", DAY, 0.8)
+        self.b.record_outcome("r1", result="published")
+        self.assertFalse(self.b.breached("r1"))
 
     def test_settle_negative_or_nonfinite_actual_usd_rejected(self):
         self.b.reserve("r1", DAY)
