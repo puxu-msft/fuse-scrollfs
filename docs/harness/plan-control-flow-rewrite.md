@@ -1738,8 +1738,8 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 |---|---|---|---|---|
 | 0.1 | 会话原语真机验证（session_id/resume/fork） | 待开始 | | |
 | 0.2 | 只读工具是否触发 can_use_tool（cfr-15 订正：须带 stdio 权限开关） | 待开始 | | |
-| 1.1 | session_identity.py（judge task identity 携带 fingerprint，cfr2-02） | 待开始 | | |
-| 1.2 | agent_attempts 表 + ledger.py（状态词统一，cfr2-04） | 待开始 | | |
+| 1.1 | session_identity.py（judge task identity 携带 fingerprint，cfr2-02） | 已完成 | `python3 -m unittest harness.tests.test_session_identity`：7 tests OK；正控将 `uuid5` 临时替换为 `uuid4` 后，确定性测试按预期失败 | 无 |
+| 1.2 | agent_attempts 表 + ledger.py（状态词统一，cfr2-04） | 已完成 | `python3 -m unittest harness.tests.test_ledger harness.tests.test_db`：9 tests OK；删除表定义后 6 tests 因 `no such table` 报错；删除 Python 状态校验后非法状态在 SQL CHECK 处报错 | 无 |
 | 2.1 | claude_runner 会话参数扩展（`subtype` 暴露 cfr3-02 前置；stream 落盘 0600，rmf-08） | 待开始 | | |
 | 2.2 | claude_runner 可注入 payload_parser（cfr-01） | 待开始 | | |
 | 2.3 | RoleInvocationRequest + RequestContext 唯一调用契约（cfr-02, cfr3-01） | 待开始 | | |
