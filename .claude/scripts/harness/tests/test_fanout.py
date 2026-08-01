@@ -442,5 +442,278 @@ class TestRunOneAttempt(unittest.TestCase):
         self.assertEqual(continued.stream_log, previous.stream_log)
 
 
+class TestBudgetTracker(unittest.TestCase):
+    def test_reserve_deducts_available_budget(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(1.0)
+        self.assertTrue(budget.try_reserve(0.3))
+        self.assertAlmostEqual(budget.remaining(), 0.7)
+
+    def test_failed_reserve_preserves_available_budget(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(0.2)
+        self.assertFalse(budget.try_reserve(0.3))
+        self.assertAlmostEqual(budget.remaining(), 0.2)
+
+    def test_concurrent_reservations_cannot_overspend(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(1.0)
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            accepted = list(pool.map(lambda _: budget.try_reserve(0.3), range(10)))
+        self.assertLessEqual(sum(accepted) * 0.3, 1.0)
+
+    def test_settle_returns_unused_reservation(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(1.0)
+        self.assertTrue(budget.try_reserve(0.3))
+        before = budget.remaining()
+        budget.settle(reserved=0.3, actual=0.1, cost_known=True)
+        self.assertAlmostEqual(budget.remaining() - before, 0.2)
+
+    def test_settle_charges_spend_above_reservation(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(1.0)
+        self.assertTrue(budget.try_reserve(0.3))
+        before = budget.remaining()
+        budget.settle(reserved=0.3, actual=0.5, cost_known=True)
+        self.assertAlmostEqual(budget.remaining() - before, -0.2)
+
+    def test_unknown_cost_keeps_full_reservation_charged(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(1.0)
+        self.assertTrue(budget.try_reserve(0.3))
+        before = budget.remaining()
+        budget.settle(reserved=0.3, actual=0.1, cost_known=False)
+        self.assertAlmostEqual(budget.remaining(), before)
+
+    def test_negative_balance_blocks_later_reservations(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(0.6)
+        self.assertTrue(budget.try_reserve(0.3))
+        self.assertTrue(budget.try_reserve(0.3))
+        for _ in range(2):
+            budget.settle(reserved=0.3, actual=0.5, cost_known=True)
+        self.assertLess(budget.remaining(), 0.0)
+        self.assertFalse(budget.try_reserve(0.01))
+
+
+class TestRunWaveScheduled(unittest.TestCase):
+    _ROLE = "finder:roadmap"
+
+    def _request(self, role, attempt, **overrides):
+        values = {
+            "role": role,
+            "prompt": "find candidates",
+            "tools": "Glob,Grep,Read",
+            "grant_usd": 0.3,
+            "max_turns": 10,
+            "settings_path": ".claude/harness-settings.json",
+            "cwd": "/repo",
+            "timeout_s": 60.0,
+            "session_id": f"session-{role}-{attempt}",
+            "stream_log": f"log-{role}-{attempt}.jsonl",
+        }
+        values.update(overrides)
+        return RoleInvocationRequest(**values)
+
+    @staticmethod
+    def _invocation(*, ok=True, session_id="reported-session", cost_usd=0.1,
+                    cost_known=True, init_tools=None, raw_tail=""):
+        return InvocationResult(
+            ok=ok,
+            payload={"candidates": []} if ok else None,
+            cost_usd=cost_usd,
+            turns=1,
+            cost_known=cost_known,
+            session_id=session_id,
+            subtype="success" if ok else "error_during_execution",
+            init_seen=True,
+            init_tools=init_tools or ["Glob", "Grep", "Read"],
+            raw_tail=raw_tail,
+        )
+
+    def _run(self, invoke_fn, *, roles=None, budget=None, deadline=None,
+             make_request=None, conn=None, expected_tools=None):
+        import time
+        from harness.fanout import BudgetTracker, run_wave_scheduled
+
+        return run_wave_scheduled(
+            roles=roles or (self._ROLE,),
+            make_request=make_request or self._request,
+            invoke_fn=invoke_fn,
+            validate=lambda payload: [],
+            budget=budget or BudgetTracker(3.0),
+            deadline_monotonic=deadline or time.monotonic() + 120.0,
+            single_call_cap_usd=0.3,
+            expected_tools=expected_tools,
+            conn=conn,
+            round_id="round-1",
+        )
+
+    def test_first_wave_success_records_every_role_and_attempt_number(self):
+        seen_attempts = []
+        roles = ("finder:roadmap", "finder:code")
+
+        def make_request(role, attempt):
+            seen_attempts.append((role, attempt))
+            return self._request(role, attempt)
+
+        result = self._run(
+            lambda request: self._invocation(session_id=request.session_id),
+            roles=roles,
+            make_request=make_request,
+        )
+        self.assertEqual(set(result.final), set(roles))
+        self.assertTrue(all(r.status == "success" for r in result.final.values()))
+        self.assertEqual(len(result.all_attempts), 2)
+        self.assertEqual(seen_attempts, [(role, 1) for role in roles])
+
+    def test_retryable_resumable_failure_forks_from_reported_session(self):
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            if len(seen) == 1:
+                return self._invocation(
+                    ok=False, session_id="real-parent", raw_tail="transient"
+                )
+            return self._invocation(session_id="real-child")
+
+        result = self._run(invoke)
+        self.assertEqual(result.final[self._ROLE].attempt, 2)
+        self.assertEqual(len(result.all_attempts), 2)
+        self.assertEqual(seen[1].resume, "real-parent")
+        self.assertTrue(seen[1].fork_session)
+
+    def test_retryable_nonresumable_failure_starts_fresh_attempt(self):
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            if len(seen) == 1:
+                return self._invocation(
+                    ok=False, session_id=None, raw_tail="timed out"
+                )
+            return self._invocation(session_id="real-second")
+
+        result = self._run(invoke)
+        self.assertEqual(result.final[self._ROLE].attempt, 2)
+        self.assertIsNone(seen[1].resume)
+        self.assertFalse(seen[1].fork_session)
+        self.assertEqual(seen[1].session_id, f"session-{self._ROLE}-2")
+        self.assertNotEqual(seen[0].session_id, seen[1].session_id)
+
+    def test_all_failed_attempts_charge_actual_cost_and_are_returned(self):
+        from harness.fanout import BudgetTracker
+
+        budget = BudgetTracker(1.0)
+        result = self._run(
+            lambda request: self._invocation(
+                ok=False,
+                session_id="real-parent",
+                cost_usd=0.5,
+                raw_tail="transient",
+            ),
+            budget=budget,
+        )
+        self.assertEqual(len(result.all_attempts), 2)
+        self.assertAlmostEqual(budget.remaining(), 0.0)
+
+    def test_exhausted_deadline_does_not_start_calls(self):
+        import time
+
+        calls = []
+        result = self._run(
+            lambda request: calls.append(request),
+            deadline=time.monotonic() - 1.0,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(result.all_attempts, [])
+        self.assertIn("deadline-exhausted", result.final[self._ROLE].last_error)
+
+    def test_budget_shortage_prevents_later_wave(self):
+        from harness.fanout import BudgetTracker
+
+        calls = []
+        budget = BudgetTracker(0.3)
+        result = self._run(
+            lambda request: (
+                calls.append(request)
+                or self._invocation(
+                    ok=False,
+                    session_id="real-parent",
+                    cost_known=False,
+                    raw_tail="transient",
+                )
+            ),
+            budget=budget,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(result.all_attempts), 1)
+        self.assertIn("budget-exhausted", result.final[self._ROLE].last_error)
+
+    def test_capability_drift_is_not_retried(self):
+        calls = []
+        result = self._run(
+            lambda request: (
+                calls.append(request)
+                or self._invocation(init_tools=["Bash", "Glob", "Grep", "Read"])
+            ),
+            expected_tools=frozenset({"Glob", "Grep", "Read"}),
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.final[self._ROLE].status, "capability_drift")
+
+    def test_timeout_shrinks_with_available_deadline(self):
+        import time
+
+        observed = []
+        for seconds in (90.0, 30.0):
+            self._run(
+                lambda request: (
+                    observed.append(request.timeout_s)
+                    or self._invocation(session_id=request.session_id)
+                ),
+                deadline=time.monotonic() + seconds,
+            )
+        self.assertNotEqual(observed[0], observed[1])
+        self.assertGreater(observed[0], observed[1])
+        self.assertTrue(all(0.0 < timeout <= 60.0 for timeout in observed))
+
+    def test_ledger_failures_are_visible_but_nonblocking(self):
+        class BrokenConnection:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("ledger unavailable")
+
+        result = self._run(
+            lambda request: self._invocation(session_id=request.session_id),
+            conn=BrokenConnection(),
+        )
+        self.assertEqual(result.final[self._ROLE].status, "success")
+
+    def test_fork_uses_new_attempt_stream_log(self):
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            if len(seen) == 1:
+                return self._invocation(
+                    ok=False, session_id="real-parent", raw_tail="transient"
+                )
+            return self._invocation(session_id="real-child")
+
+        self._run(invoke)
+        self.assertNotEqual(seen[0].stream_log, seen[1].stream_log)
+        self.assertTrue(str(seen[1].stream_log).endswith("-2.jsonl"))
+
+
 if __name__ == "__main__":
     unittest.main()

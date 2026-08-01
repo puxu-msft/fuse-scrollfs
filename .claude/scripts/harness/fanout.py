@@ -7,8 +7,13 @@
 from __future__ import annotations
 
 import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 
+from . import ledger
 from .claude_runner import InvocationResult
 from .queue import canonical_key
 from .role_invocation import RoleInvocationRequest
@@ -17,6 +22,10 @@ from .role_invocation import RoleInvocationRequest
 _PRIORITY_ORDER = {"T0": 0, "T1": 1, "T2": 2, "T3": 3, "T4": 4}
 _SIZE_ORDER = {"S": 0, "M": 1, "L": 2}
 _MAX_RANKED_CANDIDATES = 3
+_MAX_AGENT_ATTEMPTS = 3
+_DEFAULT_SINGLE_CALL_CAP_USD = 0.3
+_MIN_CALL_WINDOW_S = 5.0
+_CALL_TEARDOWN_MARGIN_S = 1.0
 
 # 顺序敏感：UUID 必须先于裸 hex，否则第一段会被提前替换。
 _ID_PATTERNS = (
@@ -260,3 +269,186 @@ def build_continuation_request(
         resume=resume_session_id,
         fork_session=True,
     )
+
+
+@dataclass(frozen=True)
+class WaveResult:
+    final: dict[str, AttemptRecord]
+    all_attempts: list[AttemptRecord]
+
+
+class BudgetTracker:
+    """线程安全的单轮调用预算预留器。"""
+
+    def __init__(self, total_usd: float) -> None:
+        if total_usd < 0:
+            raise ValueError("total_usd must be non-negative")
+        self._remaining = float(total_usd)
+        self._lock = threading.Lock()
+
+    def try_reserve(self, amount: float) -> bool:
+        if amount <= 0:
+            raise ValueError("reservation amount must be positive")
+        with self._lock:
+            if self._remaining < amount:
+                return False
+            self._remaining -= amount
+            return True
+
+    def settle(self, *, reserved: float, actual: float, cost_known: bool) -> None:
+        if not cost_known:
+            return
+        with self._lock:
+            self._remaining += reserved - actual
+
+    def remaining(self) -> float:
+        with self._lock:
+            return self._remaining
+
+
+def _unscheduled_record(
+    role: str, attempt: int, reason: str
+) -> AttemptRecord:
+    return AttemptRecord(
+        role=role,
+        attempt=attempt,
+        status="failed_transport",
+        last_error=reason,
+    )
+
+
+def _record_ledger_attempt(
+    conn,
+    *,
+    round_id: str,
+    record: AttemptRecord,
+) -> None:
+    if conn is None:
+        return
+    attempt_key = f"{round_id}:{record.role}:{record.attempt}"
+    try:
+        ledger.record_attempt_started(
+            conn,
+            round_id=round_id,
+            role=record.role,
+            attempt=record.attempt,
+            session_id=record.session_id or "",
+            parent_session_id=record.parent_session_id,
+        )
+        ledger.record_attempt_finished(
+            conn,
+            attempt_key=attempt_key,
+            status=record.status,
+            cost_usd=record.cost_usd,
+            turns=record.turns,
+        )
+    except Exception as exc:
+        print(
+            f"warning: agent attempt ledger write failed for {attempt_key}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def run_wave_scheduled(
+    *,
+    roles: tuple[str, ...],
+    make_request,
+    invoke_fn,
+    validate,
+    budget: BudgetTracker,
+    deadline_monotonic: float,
+    single_call_cap_usd: float = _DEFAULT_SINGLE_CALL_CAP_USD,
+    expected_tools: frozenset[str] | None = None,
+    conn=None,
+    round_id: str = "",
+) -> WaveResult:
+    """按波并发执行角色调用，并保留每一次实际尝试。"""
+    final: dict[str, AttemptRecord] = {}
+    all_attempts: list[AttemptRecord] = []
+    pending = list(roles)
+    resumable_sessions: dict[str, str] = {}
+
+    for attempt in range(1, _MAX_AGENT_ATTEMPTS + 1):
+        if not pending:
+            break
+
+        remaining_window = deadline_monotonic - time.monotonic()
+        if remaining_window < _MIN_CALL_WINDOW_S:
+            for role in pending:
+                final[role] = _unscheduled_record(
+                    role, attempt, "deadline-exhausted"
+                )
+            break
+
+        scheduled: list[tuple[str, RoleInvocationRequest]] = []
+        for role in pending:
+            if not budget.try_reserve(single_call_cap_usd):
+                final[role] = _unscheduled_record(
+                    role, attempt, "budget-exhausted"
+                )
+                continue
+
+            base_request = make_request(role, attempt)
+            dynamic_timeout = min(
+                base_request.timeout_s,
+                deadline_monotonic
+                - time.monotonic()
+                - _CALL_TEARDOWN_MARGIN_S,
+            )
+            if dynamic_timeout <= 0:
+                budget.settle(
+                    reserved=single_call_cap_usd,
+                    actual=0.0,
+                    cost_known=True,
+                )
+                final[role] = _unscheduled_record(
+                    role, attempt, "deadline-exhausted"
+                )
+                continue
+            request = replace(base_request, timeout_s=dynamic_timeout)
+            if role in resumable_sessions:
+                request = build_continuation_request(
+                    request, resumable_sessions[role]
+                )
+            scheduled.append((role, request))
+
+        if not scheduled:
+            break
+
+        def worker(item):
+            role, request = item
+            record = run_one_attempt(
+                role=role,
+                attempt=attempt,
+                request=request,
+                invoke_fn=invoke_fn,
+                validate=validate,
+                expected_tools=expected_tools,
+            )
+            return role, record
+
+        with ThreadPoolExecutor(max_workers=len(scheduled)) as pool:
+            completed = list(pool.map(worker, scheduled))
+
+        retry_roles: list[str] = []
+        for role, record in completed:
+            all_attempts.append(record)
+            final[role] = record
+            budget.settle(
+                reserved=single_call_cap_usd,
+                actual=record.cost_usd,
+                cost_known=record.cost_known,
+            )
+            _record_ledger_attempt(
+                conn, round_id=round_id, record=record
+            )
+            if record.retryable and attempt < _MAX_AGENT_ATTEMPTS:
+                retry_roles.append(role)
+                if record.resumable and record.session_id:
+                    resumable_sessions[role] = record.session_id
+                else:
+                    resumable_sessions.pop(role, None)
+
+        pending = retry_roles
+
+    return WaveResult(final=final, all_attempts=all_attempts)
