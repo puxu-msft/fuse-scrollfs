@@ -12,12 +12,12 @@
 - 现行规格：`docs/harness/spec.md`（§四三层信任模型、§六 outbox 事务协议、§七轮次流程仍然有效，本次不改，Phase 7 Task 7.5 会追加脚注说明 Workflow 段已被 ADR-002 取代）
 - 现状与真机缺陷史：`docs/harness/HANDOVER.md`
 - 最近一轮评审：`docs/harness/code-review-realmachine-fixes.md`（rmf-01/02/03/05/13 已修，其余仍开着；本计划顺手吸收 rmf-07/rmf-10/rmf-12/rmf-04/rmf-14/rmf-17 到新实现里，见「开放发现处置表」章节）
-- **本次实施计划**：`docs/harness/plan-control-flow-rewrite.md`（v4，经三轮跨模型对抗评审 `cfr-01`–`cfr-19`/`cfr2-01`–`cfr2-10`/`cfr3-01`–`cfr3-03` 处置后修订，9 个 Phase + 若干细分任务，回答怎么做；文首有三份「评审处置台账」（第一/二/三轮）与「开放发现处置表」，文末有执行状态表。**v3 起全篇代码块降级为「接口契约+不变量+测试清单」形式，不再提供完整可执行函数体**——实施者需要按 TDD 自行写出最小实现，不能从文档里复制代码；**第三轮评审确认这一降级方向正确**，新引入缺陷数从上一轮的 4 降为 0）
-- **评审报告**：`docs/harness/plan-control-flow-rewrite-review.md`（第一轮，10 Critical / 8 Important / 1 Minor）、`docs/harness/plan-control-flow-rewrite-review-2.md`（第二轮，关闭 9 条、新引入 4 类设计缺陷、指出处置表存在自填假声明）、`docs/harness/plan-control-flow-rewrite-review-3.md`（第三轮，关闭 7 条、因契约降级丢失 3 条细节、新引入缺陷归零）——全部已处置；实施时若发现计划与报告的处置描述有出入，以计划正文的最新版本为准，评审报告本身不再更新
+- **本次实施计划**：`docs/harness/plan-control-flow-rewrite.md`（v5，经四轮跨模型对抗评审 `cfr-01`–`cfr-19`/`cfr2-01`–`cfr2-10`/`cfr3-01`–`cfr3-03`/`cfr4-01`–`cfr4-02` 处置后修订，9 个 Phase + 若干细分任务，回答怎么做；文首有四份「评审处置台账」（第一/二/三/四轮）与「开放发现处置表」，文末有执行状态表。**v3 起全篇代码块降级为「接口契约+不变量+测试清单」形式，不再提供完整可执行函数体**——实施者需要按 TDD 自行写出最小实现，不能从文档里复制代码；第三轮评审确认这一降级方向正确；**第四轮是对第三轮三个阻塞项的定点核验**，发现"只改那三条"确实造成了两处接缝不一致，本轮改为贯通修复）
+- **评审报告**：`docs/harness/plan-control-flow-rewrite-review.md`（第一轮，10 Critical / 8 Important / 1 Minor）、`docs/harness/plan-control-flow-rewrite-review-2.md`（第二轮，关闭 9 条、新引入 4 类设计缺陷、指出处置表存在自填假声明）、`docs/harness/plan-control-flow-rewrite-review-3.md`（第三轮，关闭 7 条、因契约降级丢失 3 条细节、新引入缺陷归零）、`docs/harness/plan-control-flow-rewrite-review-4.md`（第四轮，定点核验第三轮三个阻塞项，1 条关闭、2 条仍开且要求贯通修复，另订正 rmf-08 的错误数字）——全部已处置；实施时若发现计划与报告的处置描述有出入，以计划正文的最新版本为准，评审报告本身不再更新
 
 **执行方式**：用 `superpowers:subagent-driven-development`，一个任务派一个全新 subagent，任务之间由主会话评审。每个任务严格按计划里的 TDD 步骤走：写失败测试 → 跑到确认失败 → 写最小实现 → 跑到通过 → **正控**（临时还原实现确认测试真会红——**方向必须是"变红"，不是"仍然通过"**，这是 v2 修订专门订正过的一处常见误区）→ 提交。
 
-**开工前必须知道的十五件事**（v4 相对 v3 新增三条，第 13/14/15 项）：
+**开工前必须知道的十七件事**（v5 相对 v4 新增两条，第 16/17 项）：
 
 1. **主工作树可能有他人未提交改动**。提交一律用 `git commit -m <msg> -- <本任务的路径>` 限定路径，绝不 `git add -A`。
 2. **零第三方依赖**。只用 Python 3 标准库（`unittest`/`sqlite3`/`subprocess`/`concurrent.futures`/`uuid`/`re`/`threading`/`dataclasses`），不建 venv、不装 pip 包。测试跑法：`cd /home/xp/src/zipfs/.claude/scripts && /home/linuxbrew/.linuxbrew/bin/python3 -m unittest discover -s harness/tests -t .`（当前基线 304 个测试全绿，任何时候都不得让它变红）。
@@ -34,12 +34,16 @@
 13. **`RequestContext` 是生产环境 `cwd`/`settings_path`/`model`/`stream_log` 取值的唯一来源**（第三轮评审 cfr3-01 指出的具体缺陷）：Phase 6 Task 6.1 的 `_build_request_context(cfg)` 是整个计划里"这些值生产环境该等于什么"的唯一构造点，`fanout.py` 的 `_make_request` 只消费它，不允许重新硬编码一份。judge task identity（含 fingerprint）必须同时贯穿 session ID、账本 `attempt_key`、`stream_log` 路径三处，且三者共用同一个拼接模板（`role_invocation.build_stream_log_path` 与 `ledger` 的 `attempt_key` 逐字一致）——只验证 session ID 不同是不够的，`attempt_key`/`stream_log` 完全可能因为各自独立实现而遗漏 fingerprint。
 14. **`AttemptRecord.retryable` 的赋值必须来自可测试的终态分类表，不是"是否等于 capability_drift"这种二元判断**（第三轮评审 cfr3-02 指出：三轮评审反复指出这个问题，直到本轮才要求真正的分类表）：`error_max_budget_usd`（预算耗尽）与确定性协议异常（同一次调用内出现重复 `init`/重复 `result` 事件）**不可重试**——前者重试大概率再次撞线，后者是这次调用产出的 stream 结构本身已经损坏，不是随机的网络抖动。只有真正的传输抖动（超时、`API Error: Server error` 一类）与 schema 校验随机失败才可重试。`InvocationResult.subtype`（Task 2.1 新增）是做这个判断的依据，务必透传到 `AttemptRecord`。
 15. **开放发现处置表宣称的修复必须真正体现在对应任务的不变量与测试清单里，不能只停留在处置表的文字描述**（第三轮评审 cfr3-03 指出的具体缺陷）：`record_degraded` 双写 `agentType`（Task 5.2）、`FanoutSettlement.protocol_errors` 聚合（Task 5.6）、`round.py` 消费 `_format_detail` 与显式设 `model=DEFAULT_AGENT_MODEL`（Task 6.1）——这三项此前都只在处置表里"宣称"，本轮已补齐对应任务的测试断言，实施时必须真正写出这些测试，不能假设处置表说过就等于任务已覆盖。
+16. **`make_request`/`_make_request` 工厂签名是 `(role, attempt) -> RoleInvocationRequest`，不是 `(role)`**（第四轮评审 cfr4-01 指出的具体缺陷）：fork 续跑（Task 5.4 的波次调度器）每一波都要用当前 attempt 编号重新调用这个工厂取得"骨架请求"，`stream_log` 字段必须由 `role_invocation.build_stream_log_path(..., attempt)` 按这个编号构造——**不能直接对上一次的请求对象调用 `dataclasses.replace()` 只覆盖 `prompt`/`session_id`/`resume`/`fork_session` 四个字段**，那样 `stream_log` 会原样保留自上一次请求，导致 fork 成功的 attempt 2 把日志写到与失败的 attempt 1 完全相同的路径，覆盖掉最需要判因的记录。Task 5.5 的联合测试专门验证这一点：同一角色不同 attempt 的 `stream_log` 路径必须不同。
+17. **Task 5.5 联合测试的 oracle 是"同源"不是"字面相等"**（第四轮评审 cfr4-01 指出的另一处具体缺陷）：`request.session_id` 是 `session_identity.derive_session_id()` 产出的 UUIDv5（一段哈希值），`attempt_key`/`stream_log` 里含的是 `round_id:task_role:attempt` 这种明文拼接段——**两者类型不同，永远不可能字面相等**。正确的验证方式是分别独立计算这三个值各自的预期结果（各自调用对应的构造函数），再断言被测函数产出的实际值分别等于各自的预期值，从而验证"三处用了同一个 `task_role`"，而不是要求三个不同类型的值互相相等。第四轮评审明确指出：v4 按字面实现这条测试必然一写出来就失败，是本轮必须订正的具体缺陷，不是可以照抄的既有代码。
 
-**开工前须知的一项非阻塞提醒**：`claude_runner._persist_stream()` 的 stream 落盘权限已在 Task 2.1 收紧为 `0o600`（rmf-08 部分处置），但脱敏与轮转/保留策略仍明确延后（暴露面因扇出改动放大 7 倍，已量化说明），不在本次实施范围内，不要顺手展开这两项设计。
+**终态分类表补充（第四轮评审 cfr4-02 指出，Task 5.3 已按此订正）**：`_classify_retryable` 必须能正确处理两个之前遗漏的组合——(a) `InvocationResult.ok=False` 但 `subtype="success"`（终态事件本身没报错，是模型输出的 payload 解不出 JSON，`protocol_errors` 含 `"unparseable or malformed payload"`）→ 视为可重试（与 schema 校验失败同源）；(b) `subtype=None` 且 `protocol_errors` 含 `"missing init event"`（CLI 进程退出但从未产生任何 init 事件，是启动失败/认证失败/参数错误的特征）→ 视为**不可重试**，与"真正的执行中超时"（同样 `subtype=None` 但 `protocol_errors` 为空）明确区分——不能把"没有终态事件"这一个粗粒度信号当作唯一判据。
+
+**开工前须知的一项非阻塞提醒**：`claude_runner._persist_stream()` 已在 Task 2.1 改为创建时直接以 `0o600` 模式打开（不是落盘后 `chmod`，消除中间权限窗口，第四轮评审订正），但脱敏与轮转/保留策略仍明确延后（暴露面因扇出改动**最坏情形放大 39 倍**——第四轮评审订正了此前算错的"7 倍"，已量化说明），不在本次实施范围内，不要顺手展开这两项设计。
 
 **完成的标志**：Phase 8 全部走完，`agent_attempts`/`invocations` 表在真机验证轮次里有对应记录，probe 负向验证工具集恰为三项，至少一次完整扇出真机跑通并正确判定结果，fork 重试路径至少一次真机复现（基于真实创建的 session）。systemd timer **仍保持 disabled**（是否启用是用户裁决范围外的下一步，本计划不做）。
 
-**每完成一个任务**：更新 `plan-control-flow-rewrite.md` 文末执行状态表的该行（状态 + 验证证据 + 偏差），与代码一起提交。**注意 v4 的任务编号相对 v3 不变，但 Task 2.1/2.3/5.2/5.3/5.5/5.6/6.1 补充了新的不变量与测试清单条目**（见执行状态表开头说明与「评审处置台账（第三轮）」），实施前请先读一遍执行状态表的开头说明与三份评审处置台账，确认理解每个任务具体改了什么，不要假设 v3 的契约（更不用说 v2 的完整代码草图）已经足够或可以原样照抄。
+**每完成一个任务**：更新 `plan-control-flow-rewrite.md` 文末执行状态表的该行（状态 + 验证证据 + 偏差），与代码一起提交。**注意 v5 的任务编号相对 v4 不变，但 Task 5.3/5.4/5.5 有实质性修正**（终态分类表补齐、`make_request` 签名改为 `(role, attempt)`、联合测试 oracle 订正为同源比对，见执行状态表开头说明与「评审处置台账（第四轮）」），实施前请先读一遍执行状态表的开头说明与四份评审处置台账，确认理解每个任务具体改了什么，不要假设 v4 的契约（更不用说更早版本的完整代码草图）已经足够或可以原样照抄——尤其是 Task 5.5 的联合测试，v4 版本的写法一定跑不过。
 
 **遇到分叉停下来问，而非自行决定的情形**：
 - Phase 0 的两个待决项实测结果与推荐方案不符。

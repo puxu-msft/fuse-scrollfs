@@ -1,7 +1,7 @@
 # scrollz harness · 控制流重写实施计划（ADR-002 D0/D1/D2 落地）
 
-> 状态：**草稿 v4，已处置三轮跨模型对抗评审（cfr-01–19、cfr2-01–10、cfr3-01–03），撰写中，尚未提交第四轮审查**。
-> 撰写日期 2026-07-31，v3 修订日期 2026-08-02，v4 修订日期 2026-08-02。回答「怎么做」；「做什么/为什么」见 [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md)、PoC 结论见 [exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md)、现行不变量见 [spec.md](./spec.md)、真机现状见 [HANDOVER.md](./HANDOVER.md)、最近一轮评审见 [code-review-realmachine-fixes.md](./code-review-realmachine-fixes.md)、第一轮评审见 [plan-control-flow-rewrite-review.md](./plan-control-flow-rewrite-review.md)、第二轮评审见 [plan-control-flow-rewrite-review-2.md](./plan-control-flow-rewrite-review-2.md)、第三轮评审见 [plan-control-flow-rewrite-review-3.md](./plan-control-flow-rewrite-review-3.md)。
+> 状态：**草稿 v5，已处置四轮跨模型对抗评审（cfr-01–19、cfr2-01–10、cfr3-01–03、cfr4-01–02），撰写中，尚未提交第五轮审查**。
+> 撰写日期 2026-07-31，v3 修订日期 2026-08-02，v4 修订日期 2026-08-02，v5 修订日期 2026-08-02。回答「怎么做」；「做什么/为什么」见 [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md)、PoC 结论见 [exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md)、现行不变量见 [spec.md](./spec.md)、真机现状见 [HANDOVER.md](./HANDOVER.md)、最近一轮评审见 [code-review-realmachine-fixes.md](./code-review-realmachine-fixes.md)、第一轮评审见 [plan-control-flow-rewrite-review.md](./plan-control-flow-rewrite-review.md)、第二轮评审见 [plan-control-flow-rewrite-review-2.md](./plan-control-flow-rewrite-review-2.md)、第三轮评审见 [plan-control-flow-rewrite-review-3.md](./plan-control-flow-rewrite-review-3.md)、第四轮评审见 [plan-control-flow-rewrite-review-4.md](./plan-control-flow-rewrite-review-4.md)。
 > 关联但**冻结不动**：[plan-stage1a.md](./plan-stage1a.md)（Task 1–12 已完成，是本计划的起点代码）、[plan-stage1b.md](./plan-stage1b.md)（治理范围，不受本次重写影响，仍在其冻结范围内）。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: 用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans` 逐任务实施。任务用 checkbox（`- [ ] `）追踪。
@@ -123,9 +123,24 @@
 | cfr3-02 | Critical | **采纳**：`retryable` 字段自 cfr2-07 引入以来，赋值规则始终是"`failed_transport` 恒真、`capability_drift` 恒假"——三轮评审反复指出这只是把旧的"全部重试"策略换了个字段名字，没有做终态分类本身；`error_max_budget_usd`（预算耗尽）与确定性协议异常（重复 init/result 事件）不应被无差别当作可重试的传输故障。修正：Task 2.1 让 `InvocationResult` 暴露 `subtype` 字段（透传终态事件原始值），Task 5.3 新增可测试的终态分类表（区分预算耗尽/确定性协议异常"不可重试" vs 真实传输抖动/schema 校验失败"可重试"），`_classify_retryable` 函数体现分类表全部行，不是"看 status 字面量做二元判断" | Phase 2 Task 2.1（`subtype` 透传）、Phase 5 Task 5.3（终态分类表 + `_classify_retryable`） |
 | cfr3-03 | Important | **采纳**：开放发现处置表宣称三项修复（rmf-04 的 `protocol_errors` 进 `detail`、`record_degraded` 双写 `agentType`、rmf-17 显式设规范 `model`），但对应任务的不变量与测试清单从未真正覆盖这三点——处置表记的是作者相信会做的事，不是任务清单里真正执行的断言。修正：三项全部补进**实际任务**的不变量与测试清单：`record_degraded` 双写测试补进 Task 5.2；`protocol_errors` 聚合测试补进 Task 5.6；`_format_detail` 消费聚合结果与 `model=DEFAULT_AGENT_MODEL` 显式传入的测试补进 Task 6.1 | Phase 5 Task 5.2（`agentType` 双写测试）、Task 5.6（`protocol_errors` 聚合测试）、Phase 6 Task 6.1（`_format_detail`/`model` 显式传入测试） |
 
-**非阻塞但需明确处置的一项（rmf-08）**：第三轮评审明确指出"本计划把每轮日志从 1 份扩大到多份，属于直接放大，不是无关任务"——不能再简单写"与本次改动无关"。已处置：Phase 2 Task 2.1 把 stream 落盘权限从系统默认收紧为显式 `0o600`（成本最低、无需额外设计决策，随手做掉）；脱敏与轮转/保留策略仍明确延后（需要新的设计决策，非本计划范围），但已量化说明暴露面放大 7 倍（原 1 个文件→最多 7 个），供用户择期裁决，不再是模糊的"无关"表述。
+**非阻塞但需明确处置的一项（rmf-08）**：第三轮评审明确指出"本计划把每轮日志从 1 份扩大到多份，属于直接放大，不是无关任务"——不能再简单写"与本次改动无关"。已处置：Phase 2 Task 2.1 把 stream 落盘改为创建时即以显式 `0o600` 模式打开（第四轮评审订正：不是"落盘后 chmod"，那样会有短暂的默认权限窗口）；脱敏与轮转/保留策略仍明确延后（需要新的设计决策，非本计划范围），但已量化说明暴露面**最坏情形放大 39 倍**（第四轮评审订正：原"7 倍"未计入 fork 重试的多次 attempt 与 judge 侧对多个候选的持续裁决，正确算法见下方 Task 2.1 补充说明），供用户择期裁决，不再是模糊或错误的表述。
 
 **未被反驳的条目**：本轮 3 条经复核**全部成立，无一条被驳回**。cfr3-01/cfr3-03 是"因降级丢失"的细节缺口（第二轮修订在把代码草图收窄为契约时，一并收窄掉了原本存在于详尽代码里的交叉验证），cfr3-02 是三轮评审持续指出、直到本轮才真正给出可测试终态分类表的设计缺陷——三者均非评审误判，予以全部采纳。
+
+---
+
+## 评审处置台账（第四轮，`cfr4-01`–`cfr4-02`，`docs/harness/plan-control-flow-rewrite-review-4.md`）
+
+> 第四轮是对第三轮三个阻塞项 + rmf-08 的**定点核验**（未做全面复评）。结果：cfr3-03 已关闭，rmf-08 部分关闭（权限位测试可证伪成立，但倍数计算与创建方式有误），**cfr3-01/cfr3-02 仍开且阻塞**。评审明确指出"只改这四条"的约束本身造成了两处接缝不一致——本表沿用 cfr4 编号记录 v5 修订的贯通处置，不再局部打补丁。
+
+| 编号 | 严重级别 | 处置 | 落点（v5 修订后的章节） |
+|---|---|---|---|
+| cfr4-01 | Critical | **采纳**（两处，贯通修复）：(a) Task 5.5 v4 的联合测试 oracle 写错——要求 `session_id`（UUIDv5）与 `attempt_key`/`stream_log` 里的明文 `round_id:task_role:attempt` 段"逐字一致"，但两者类型不同不可能字面相等；订正为"三者分别与各自独立计算的预期值比对"（同源验证，不是字面相等）。(b) 契约未要求 fork 续跑时重建 `stream_log`——`build_continuation_request` 只覆盖 `prompt`/`session_id`/`resume`/`fork_session` 四个字段，`stream_log` 原样保留自上一次请求，导致 attempt 2 覆盖 attempt 1（恰是最需要判因的失败记录）的日志；订正为 `make_request` 签名改为 `(role, attempt) -> RoleInvocationRequest`，每一波都先取得该 attempt 对应的骨架请求（含随 attempt 变化的 `stream_log`），fork 只在此骨架上覆盖四个字段，不复用上一次的请求对象 | Phase 5 Task 5.4（`make_request` 签名+骨架请求+新不变量 9+测试 10）、Task 5.5（`_make_request` 签名同步+联合测试 oracle 订正+新测试 10） |
+| cfr4-02 | Critical | **采纳**：v4 的终态分类表仍有两处未定义区域——(a) parser 层模型输出失败（`InvocationResult.ok=False`、**`subtype="success"`**、`protocol_errors` 含 `"unparseable or malformed payload"`）进不了表中任何一行，因为它既不是 `subtype is None`（超时）也不是 `error_max_budget_usd`，`validate()` 更不会被调用（`invocation.ok` 已经是 `False`）；(b) `subtype=None` 被一律判可重试，但 CLI 启动/认证失败同样不产生终态事件、同样是 `subtype=None`，重试无意义。修正：v5 分类表补齐两行——`subtype="success"` 但 payload 解析失败→可重试（与 schema 校验失败同源）；`protocol_errors` 含 `"missing init event"`（CLI 从未完成协议握手的特征）→ 不可重试，与"真正超时但 `protocol_errors` 为空"的既有可重试分支明确区分；补充优先级顺序不变量与对应测试 | Phase 5 Task 5.3（终态分类表 v5，新增不变量 9，新增测试 14/15/16） |
+
+**非阻塞项复核（rmf-08）**：第四轮指出 v4 的处置有两处需订正——(a) `_persist_stream()` 描述为"落盘后 chmod"，存在从默认权限创建到 `chmod` 生效之间的短暂窗口；已订正为直接以 `os.open(..., 0o600)` 创建，不再有事后 `chmod` 步骤（见 Task 2.1）。(b) 放大倍数"7 倍"计算有误——遗漏了 fork 重试（每个 attempt 各写一次 stream_log）与 judge 侧对多个候选的持续裁决（redline 否决一个候选后仍会裁决下一个候选，不是恒定角色数）；已订正为**最坏情形 39 个文件**（4 finder × 最多 3 次尝试 = 12 + 最多 3 个候选 × 最多 3 个 judge × 最多 3 次尝试 = 27），倍数按 39 计（见 Task 2.1 与开放发现处置表 rmf-08 行）。**这处订正是本计划已转述给用户的一处错误数字，属于必须修正而非润色的类别**。
+
+**未被反驳的条目**：本轮 2 条经复核**全部成立，无一条被驳回**。评审对协调者"只改四条是否造成接缝不一致"的提问给出了肯定回答，两条阻塞项确实分别源于"局部改了一处、遗漏了贯通到相邻任务"——cfr4-01 的联合测试 oracle 错误与 stream_log 未随 attempt 更新是同一个契约缺口的两个表现（`build_continuation_request` 只知道覆盖哪些字段，不知道"骨架请求应该随 attempt 变化"这件事此前完全没写进契约）；cfr4-02 的两处遗漏都是"分类表只覆盖了此前想到的情形，没有系统性枚举 `InvocationResult` 全部可能的字段组合"。本轮采用"贯通修复"而非继续局部打补丁，正是针对这个根因。
 
 ---
 
@@ -138,7 +153,7 @@
 | rmf-04 | `invocation-failed`/`capability-drift` 分支只带 `raw_tail`（末 5 行），`protocol_errors` 结论被丢弃 | **仍开放，且扇出后影响面扩大**——每轮最多 7 次独立子调用，每次失败都可能需要这条判因链路，而不是过去"一次顶层调用" | **新增处置**：Phase 5 的 `AttemptRecord`（见 Task 5.3）已含字段 `protocol_errors: list[str]`，直接透传 `InvocationResult.protocol_errors`；Phase 6 的 `FanoutSettlement` 聚合时保留每个失败角色的 `protocol_errors`，写入 `round.py` 返回的 `detail` 字段（沿用 rmf-04 建议的 `"; ".join(protocol_errors) or raw_tail` 拼接方式）。落点：Phase 5 Task 5.3/5.6、Phase 6 Task 6.1 |
 | rmf-05 | 成本已知时仍按预留满额计费 | **已被 `round.py` 现状代码修复**（`_settle_failed()` 按 `cost_known` 分支），本次改动不改这段逻辑，且 Phase 5/6 的新增 `_BudgetTracker`（cfr-05 修复）与其正交——`_BudgetTracker` 管"本轮扇出内部的并发预留"，`_settle_failed`/`budget.settle`/`budget.abandon` 管"整轮对 `budget_days` 的最终结算"，两层不冲突 | 无需处置，确认不回归 |
 | rmf-06 | env "deny-by-default" 是前缀级黑名单而非白名单，`CLAUDECODE` 等变量穿透 | **不在本次改动范围**——`_sanitize_env()` 完全不因扇出重写而改变，七个子调用复用同一份 `_sanitize_env()` 逻辑（每次调用各自构造 argv 与 env，但函数本身不变） | **仍开放，理由是**：修复 `_sanitize_env` 的白名单化是独立的安全加固任务，与"扇出架构从 JS 迁到 Python"无逻辑依赖，混在本计划里会扩大变更面而不利于审查。**不落 backlog 编号**（第二轮评审 cfr2-09 指出此前登记的"backlog 项 5"并不存在于下方「通用化接缝」章节的 backlog 列表里，是自填的假引用）——如需正式排期，应在本计划提交合入后由主会话另开一个独立 issue/backlog 条目登记，本计划只如实记录"仍开放、未处置、原因如上"这个状态，不预先编造一个不存在的追踪编号 |
-| rmf-08 | stream 落盘默认权限 0644、无脱敏、无轮转、无限增长 | **本次改动扩大暴露面**：原来一轮一个 stream 文件，扇出后一轮最多 7 个（每个子调用一个，Phase 2 Task 2.3 的 `RoleInvocationRequest.stream_log` 字段承载 per-call 路径，解决 cfr-01 关联的可观测性缺口）——暴露面**放大 7 倍**（4 finder + 3 judge），第三轮评审明确指出"这是直接放大，不是无关任务"，不能一概推给独立加固 | **权限部分已处置**：Phase 2 Task 2.1 已把 `_persist_stream()` 落盘权限从系统默认（通常 0644）收紧为显式 `0o600`，并有测试断言权限位（第三轮评审 cfr3 附带处置，成本最低、可在本计划内直接完成）。**脱敏与轮转/保留策略仍明确延后，非"与本次改动无关"**：这两项需要新的设计决策（脱敏规则、保留窗口长度），不是本计划可以顺手做的一行修改；已量化说明放大倍数（7 倍）供用户择期裁决是否值得单独立项，不越权替用户决定优先级，不落 backlog 编号（同一处 cfr2-09 反例，见上） |
+| rmf-08 | stream 落盘默认权限 0644、无脱敏、无轮转、无限增长 | **本次改动扩大暴露面**：原来一轮一个 stream 文件，扇出后一轮**最坏情形 39 个**（4 finder × 最多 3 次尝试 = 12 个，最多 3 个候选 × 最多 3 个 judge × 最多 3 次尝试 = 27 个，第四轮评审订正：v4 曾错误估算为"7 个/7 倍"，遗漏了 fork 重试的多次 attempt 与 judge 侧对多个候选的持续裁决——redline 否决一个候选后扇出仍会继续裁决下一个候选，不是恒定 5 个） | **权限部分已处置**：Phase 2 Task 2.1 已把 `_persist_stream()` 改为创建时即以显式 `0o600` 模式打开（不是"落盘后 chmod"，避免中间权限窗口，第四轮评审订正），并有测试断言权限位与创建方式（第三/四轮评审 cfr3/cfr4 附带处置，成本最低、可在本计划内直接完成）。**脱敏与轮转/保留策略仍明确延后，非"与本次改动无关"**：这两项需要新的设计决策（脱敏规则、保留窗口长度），不是本计划可以顺手做的一行修改；已量化说明放大倍数（**最坏情形 39 倍**，非此前错误估算的 7 倍）供用户择期裁决是否值得单独立项，不越权替用户决定优先级，不落 backlog 编号（同一处 cfr2-09 反例，见上） |
 | rmf-14 | `TaskOutput` 是官方标记 `[Deprecated]` 的工具，CLI 无版本钉死 | **本次改动直接消灭该发现的触发对象**——`TaskOutput` 随 Phase 6/7 完全退出 `STAGE1_ALLOWED_TOOLS` 与 `harness-settings.json`，新架构不再依赖任何后台任务通知机制 | **确认关闭（部分）**：`TaskOutput` 依赖本身随本计划核心设计目标消灭（ADR D1 就是为了消灭对 `TaskOutput`/`Workflow` 的依赖）。**CLI 版本钉死这条建议仍开放，理由是**：与本次架构重写无直接关联，是通用的可用性加固（`precheck` 里加 `claude --version` 断言），**不落 backlog 编号**（同上 cfr2-09 反例，此前的"backlog 项 6"同样是不存在的假引用） |
 | rmf-16 | `.claude/systemd/` 需调整三处（`flock -E`、日志轮转、`OnFailure`） | **不在本次改动范围**——systemd 单元文件本身不受扇出架构影响，`round.py` 对外的 CLI 接口（`python3 -m harness.cli round`）签名不变 | 无需处置，非本次改动触及的文件；`.claude/systemd/` 不在本计划「文件结构」清单内 |
 | rmf-17 | 内层 13 个 agent 用别名 `'sonnet'` 而非规范模型 ID | **本次改动直接消灭该发现的触发对象**——旧架构的"内层 agent" 概念本身消失（不再有 Workflow 内部的 `agent(prompt, {model:'sonnet'})` 调用），新架构里每个 finder/judge 都是顶层 `invoke()` 调用，Phase 2 的 `RoleInvocationRequest.model` 字段要求显式传入 | **确认关闭并加固**：Phase 6 `round.py` 接线时为每个角色的 `RoleInvocationRequest` 显式设置 `model=DEFAULT_AGENT_MODEL`（复用 `claude_runner.DEFAULT_AGENT_MODEL` 规范 ID 常量，与 rmf-17 建议一致），新增测试断言"七个角色的调用请求 `model` 字段均等于 `DEFAULT_AGENT_MODEL`"。落点：Phase 6 Task 6.1 |
@@ -396,9 +411,11 @@ git commit -m "feat(harness): agent_attempts 谱系账本（纯追加表，状�
 
 ### Task 2.1（含 rmf-08 权限收紧）：`build_argv`/`invoke` 新增会话身份参数（含 cfr3-02 所需的 `subtype` 暴露）
 
-**rmf-08 补充（第三轮评审明确指出"延后理由站不住"，本任务落实其中可低成本处理的一项）**：本计划把每轮 stream 落盘从 1 份扩大到最多 7 份（Phase 2 Task 2.3 的 `RoleInvocationRequest.stream_log`，Phase 6 接线时每个子调用各自一个文件），这是**直接放大**暴露面，不是无关任务，不能一概推给"独立安全加固、非本计划引入"。本任务借 Task 2.1 已经在改 `claude_runner.py` 的机会，把 `_persist_stream()` 落盘时的文件权限从当前系统 umask 决定的默认值（通常 0644，全用户可读）收紧为 0600（仅所有者可读写）——这是成本最低、风险最小的一项（不改变落盘逻辑、不改变调用方接口，只是 `os.chmod` 一次），可以在不引入新设计决策的前提下立即处理，不需要用户额外裁决。
+**rmf-08 补充（第三轮评审明确指出"延后理由站不住"，本任务落实其中可低成本处理的一项；第四轮评审订正放大倍数与创建方式）**：本计划把每轮 stream 落盘从 1 份扩大到多份（Phase 2 Task 2.3 的 `RoleInvocationRequest.stream_log`，Phase 6 接线时每个子调用各自一个文件，Phase 5 fork 重试后每个 attempt 各自一个文件，见下方 cfr4-01 的贯通修复），这是**直接放大**暴露面，不是无关任务，不能一概推给"独立安全加固、非本计划引入"。本任务借 Task 2.1 已经在改 `claude_runner.py` 的机会处理权限收紧。**第四轮评审指出两处问题**：(1) v4 用"落盘后 `os.chmod`"，存在从"文件创建"到"chmod 生效"之间的短暂窗口，期间文件按系统 umask 的默认权限（通常 0644，全用户可读）存在，这个窗口本身就是暴露；(2) `os.chmod` 与"创建时直接指定权限"相比是多余的一步。**修正**：改为用 `os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)` 直接以 `0o600` 模式创建文件（`os.open()` 传入的 `mode` 参数是创建新文件时的权限位，只会被 umask "清除"其中出现的位，而 `0o600` 只含 owner 读写位，常见 umask 配置不会清除 owner 位，因此这个调用能保证文件从创建的第一个字节起就是 `0o600`，不存在任何中间窗口），不再需要事后 `chmod`。
 
-**脱敏与轮转/保留策略明确仍延后，量化说明放大倍数（rmf-08 不能再模糊处置的部分）**：脱敏（落盘前对 prompt/输出做敏感信息过滤）与轮转/保留（防止 `.claude/state/rounds/` 无限增长）需要新的设计决策（脱敏规则、保留窗口长度），不是本计划可以顺手做的一行修改，继续登记为**明确的延后项，而非"与本次改动无关"**：暴露面从"每轮 1 个文件"变为"每轮最多 7 个文件"，**放大倍数为 7 倍**（4 finder + 3 judge，redline reject 时降为最多 5 个）；磁盘增长速度同比例放大 7 倍。这两条需要用户在本计划实施前后择期裁决是否值得单独立项，本计划只负责把"权限"这一项在低成本范围内做掉、把"脱敏/轮转"的延后决策讲清楚量化后果，不越权替用户决定优先级。
+**放大倍数订正（第四轮评审指出 v4 的"7 倍"不诚实）**：v4 的表述"每轮最多 7 个文件"只考虑了"一个角色一个文件"，没有考虑 Phase 5 的 fork 重试——**每个 attempt 都会写一次 `stream_log`**（Phase 5 Task 5.4 的 `run_wave_scheduled` 每一波都可能重新调用 `invoke()`），且 judge 侧的短路规则不保证角色数恒定（redline 否决一个候选后，扇出仍会对**下一个候选**继续裁决，不是"最多裁决一次就结束"）。按最坏情形重新计算：4 个 finder × 最多 3 次尝试 = 12 个文件；`ranked` 候选最多 3 个（`fanout.dedupe_and_rank` 的 `_MAX_RANKED_CANDIDATES` 上限），每个候选最多裁决 3 个 judge × 最多 3 次尝试 = 9 个文件，3 个候选最多 27 个 judge 文件——**最坏情形总计 12 + 27 = 39 个文件**，不是 7 个。磁盘增长速度同比例按 39 倍估算，不是 7 倍。这是本计划已经转述给用户的一处错误数字，本次订正修正。
+
+**脱敏与轮转/保留策略明确仍延后，量化说明放大倍数（rmf-08 不能再模糊处置的部分，第四轮评审订正倍数计算）**：脱敏（落盘前对 prompt/输出做敏感信息过滤）与轮转/保留（防止 `.claude/state/rounds/` 无限增长）需要新的设计决策（脱敏规则、保留窗口长度），不是本计划可以顺手做的一行修改，继续登记为**明确的延后项，而非"与本次改动无关"**：暴露面从"每轮 1 个文件"变为"每轮最坏情形 39 个文件"——**订正计算**（第四轮评审指出 v4 的"7 倍"遗漏了两个维度）：(a) fork 重试维度，Phase 5 波次调度每个 attempt 都各自写一次 `stream_log`（不是一个角色只写一次），4 个 finder 各自最多 3 次尝试 = 12 个文件；(b) judge 侧持续裁决维度，`fanout.dedupe_and_rank` 的候选上限是 3（`_MAX_RANKED_CANDIDATES`），redline 否决一个候选后扇出会继续裁决**下一个候选**而非结束，因此 judge 侧最坏情形是 3 个候选 × 最多 3 个 judge × 最多 3 次尝试 = 27 个文件——**总计最坏情形 12+27=39 个文件，放大倍数 39 倍**，不是此前算错的 7 倍。磁盘增长速度同比例按 39 倍估算。这两条需要用户在本计划实施前后择期裁决是否值得单独立项，本计划只负责把"权限"这一项在低成本范围内做掉、把"脱敏/轮转"的延后决策讲清楚量化后果，不越权替用户决定优先级。
 
 **接口契约**：
 
@@ -415,7 +432,7 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
 - `session_id`/`resume` 若提供，必须是合法 UUID 格式字符串，否则拒绝（`UnsafeInvocationError`，与既有 `_validate_tools` 等校验同一层级、同一异常类型）。
 - `invoke()` 同步新增三个透传参数；`InvocationResult` 新增字段 `session_id: str | None = None`，取自 stream 的 `init`/`result` 事件里的 `session_id` 字段（若存在）。
 - **`InvocationResult` 同时新增字段 `subtype: str | None = None`**（第三轮评审 cfr3-02 要求：`_parse_terminal_result` 内部已经读取了终态 `result` 事件的 `subtype` 字段用于判断是否 `success`，但此前这个值读完即弃，`AttemptRecord`/Phase 5 的重试判定完全看不到它，只能靠"`ok` 是否为真"这一个粗粒度信号）。`subtype` 取值直接透传终态事件的原始字符串（`"success"`/`"error_max_turns"`/`"error_max_budget_usd"`/`"error_during_execution"` 等，不做枚举校验——本层只负责如实传递，分类判断是 Phase 5 Task 5.3 的职责）；超时（未见任何终态事件）时 `subtype` 为 `None`。
-- **`_persist_stream()` 落盘后立即 `os.chmod(path, 0o600)`**（rmf-08）：不改变函数签名、不改变调用方式，落盘失败时的容错语义（吞 `OSError`、写 stderr）不变，`chmod` 失败同样吞掉并写 stderr（不能让一次权限收紧失败反而让本来成功的调用变成异常）。
+- **`_persist_stream()` 改为创建时即以 `0o600` 模式打开，不事后 `chmod`**（rmf-08，第四轮评审订正）：用 `os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)` 拿到文件描述符，再 `os.fdopen(fd, "w", encoding="utf-8")` 包装成文件对象写入——不存在"先以默认权限创建、再收紧"的中间窗口。不改变函数签名、不改变调用方式，落盘失败时的容错语义（吞 `OSError`、写 stderr）不变。
 
 **测试清单**：
 1. 提供 `session_id` 时 argv 含 `--session-id <值>`。
@@ -426,12 +443,12 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
 6. `invoke()` 的返回值 `InvocationResult.session_id` 能正确带出 stream 里 `init` 事件的 `session_id`（复用文件内既有的 fake stream 构造 fixture 模式）。
 7. **cfr3-02 新增**：终态事件 `subtype="error_max_budget_usd"` 时，`InvocationResult.subtype == "error_max_budget_usd"`（`ok` 仍为 `False`，与现有行为一致，只是新增字段可读）。
 8. **cfr3-02 新增**：超时场景（`subprocess.TimeoutExpired`，无终态事件）时，`InvocationResult.subtype is None`。
-9. **rmf-08 新增**：调用 `invoke(..., stream_log=<临时文件路径>)` 后，该文件的权限位恰为 `0o600`（用 `stat.S_IMODE(path.stat().st_mode)` 断言，不依赖测试环境的 umask）。
+9. **rmf-08 新增**：调用 `invoke(..., stream_log=<临时文件路径>)` 后，该文件的权限位恰为 `0o600`（用 `stat.S_IMODE(path.stat().st_mode)` 断言，不依赖测试环境的 umask）——测试还需验证**没有中间窗口**：用一个记录每次 `os.open`/`os.chmod` 调用的假 `os` 模块替身（或直接检查落盘函数源码不含 `chmod` 调用，只含一次 `os.open(..., 0o600)`），断言权限收紧发生在创建调用本身，不是创建后的第二步。
 
 - [ ] **Step 1**：按测试清单写测试（追加到 `test_claude_runner.py`），跑至因 `build_argv`/`invoke` 不接受这些参数、或落盘权限不是 `0o600` 而红。
-- [ ] **Step 2**：实现改动（`build_argv` 新增参数与校验；`invoke()` 透传；`InvocationResult` 新增 `session_id`/`subtype` 字段；`parse_stream_json`/`_parse_terminal_result` 解析 `init`/`result` 事件时带出这两个字段——`subtype` 只是把已经读到的值透传出去，不新增解析逻辑；`_persist_stream()` 落盘成功后追加 `path.chmod(0o600)`，用 `try/except OSError` 包裹，失败仅写 stderr）。
+- [ ] **Step 2**：实现改动（`build_argv` 新增参数与校验；`invoke()` 透传；`InvocationResult` 新增 `session_id`/`subtype` 字段；`parse_stream_json`/`_parse_terminal_result` 解析 `init`/`result` 事件时带出这两个字段——`subtype` 只是把已经读到的值透传出去，不新增解析逻辑；`_persist_stream()` 改为 `os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)` + `os.fdopen(fd, "w", encoding="utf-8")`，不再有事后 `chmod` 步骤）。
 - [ ] **Step 3**：跑通，重跑既有全部用例确认无回归。
-- [ ] **Step 4（正控）**：临时删除互斥校验，确认对应用例变红；恢复。另临时删除 `_persist_stream()` 里新增的 `chmod` 调用，跑用例 9，确认变红；恢复。
+- [ ] **Step 4（正控）**：临时删除互斥校验，确认对应用例变红；恢复。另临时把 `_persist_stream()` 的 `os.open` 调用改回 `path.open("w", encoding="utf-8")`（即恢复到"用系统默认权限创建"），跑用例 9，确认变红；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
@@ -943,25 +960,30 @@ git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fan
 git commit -m "feat(harness): fanout —— 错误规范化折叠（修复 rmf-10 的 UUID/尾部差异漏检；record_degraded 真正双写 agentType，cfr3-03）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
-### Task 5.3（处置 cfr-02/cfr-03/cfr-06/cfr-12/cfr2-07/cfr3-02）：单次尝试原语 `run_one_attempt`（不含重试循环、不含并发、不含账本 IO）
+### Task 5.3（处置 cfr-02/cfr-03/cfr-06/cfr-12/cfr2-07/cfr3-02/cfr4-02）：单次尝试原语 `run_one_attempt`（不含重试循环、不含并发、不含账本 IO）
 
-**v4 重写说明**：v1 草图的 `run_role_with_retry` 把"单次调用"与"最多 3 次重试循环"揉在一个函数里，且直接用宽松 `**kwargs` 调 `invoke_fn`、直接访问 `conn` 写账本。cfr-12 指出重试循环应提升到跨角色的"波次"层（Task 5.4），本任务因此只保留一个不做重试、不做并发、不碰账本的最小原语——它只负责"用给定的 `RoleInvocationRequest` 发起一次调用，判定结果"。
+**v5 重写说明**：v1 草图的 `run_role_with_retry` 把"单次调用"与"最多 3 次重试循环"揉在一个函数里，且直接用宽松 `**kwargs` 调 `invoke_fn`、直接访问 `conn` 写账本。cfr-12 指出重试循环应提升到跨角色的"波次"层（Task 5.4），本任务因此只保留一个不做重试、不做并发、不碰账本的最小原语——它只负责"用给定的 `RoleInvocationRequest` 发起一次调用，判定结果"。
 
 **cfr2-07（Critical，本轮修复引入）**：`AttemptRecord` 新增两个显式布尔位 `retryable`/`resumable`，把"值得再试一次"与"能不能 fork 续接"拆成两个独立问题。
 
-**cfr3-02（Critical，三轮未关闭，本轮必须真正关闭）**：第二轮修订新增了 `retryable` 字段，但字段值的**赋值规则**仍是"`failed_transport` 恒 `True`、`capability_drift` 恒 `False`"——这只是把"全部重试"这个旧策略换了个字段名字，没有做终态分类本身。第三轮评审明确指出：`error_max_budget_usd`（预算耗尽，重试只会立刻再次撞预算，属于确定性失败）、`UnsafeInvocationError` 之类的参数错误（配置问题，重试不会变好）、以及"协议异常但明确是确定性的"（如同一份 stream 出现重复 `init`/重复 `result`，这不是随机噪声而是调用侧构造错误）都不应该被无差别归入"传输故障，值得重试"。**本任务因此把 `status="failed_transport"` 拆分为更细的终态分类**，用 `AttemptRecord.subtype`（Task 2.1 已在 `InvocationResult` 上新增此字段，本任务原样透传）与 `protocol_errors` 的具体内容共同决定 `retryable`，不再是"只要不是 capability_drift 就重试"的粗粒度判断。
+**cfr3-02/cfr4-02（Critical，四轮未真正关闭，本轮补齐两处遗漏分支）**：第二轮修订新增了 `retryable` 字段，但赋值规则仍是"`failed_transport` 恒 `True`、`capability_drift` 恒 `False`"——只是把"全部重试"策略换了名字。第三轮修订加了预算耗尽/确定性协议异常两条分类，但**第四轮评审指出这张表本身仍有未定义区域**：
 
-**可测试的终态分类表**（本任务的核心交付物，取代此前"全部归为 failed_transport 可重试"的粗粒度规则）：
+1. **parser 层模型输出失败未落表**：模型返回无法解析或缺 `candidates` 的 payload 时（`claude_runner._parse_terminal_result` 里 `event.get("subtype") == "success"` 但 `_extract_payload`/`_extract_json_object` 返回 `None`），产出的 `InvocationResult` 是 `ok=False`、**`subtype="success"`**（终态事件本身没有报错，只是 payload 解不出来）、`protocol_errors=["unparseable or malformed payload in success result"]`。这个组合**进不了**第三轮表格任何一行——它不是 `subtype is None`（超时），不是 `error_max_budget_usd`，也不是 `validate()` 拒绝（那是 `invocation.ok=True` 时才会调用 `validate`，这里 `invocation.ok` 已经是 `False`，`validate` 根本不会被调用到）。`_classify_retryable` 对这个真实且高频的情形（真机实测中模型偶发返回非 JSON 文本是常见故障模式）此前结果**未定义**。修正：这类情形与"schema 校验失败"同源——都是模型输出的随机波动，可重试（沿用 rmf-07 精神）。
+2. **`subtype=None` 不能一律判可重试**：v4 的表格把"`subtype` 为 `None`"整体归为"真正的传输抖动，可重试"，但 CLI 进程启动失败或认证失败同样不会产生任何终态事件，`subtype` 同样是 `None`——这类失败重试多少次都没用（配置/凭据问题，不是网络抖动）。**区分依据**：`claude_runner.invoke()` 里唯二两条不经过 `parse_stream_json()` 就直接返回的路径是 `subprocess.TimeoutExpired`（真正的执行中超时，`protocol_errors` 恒为空列表，因为这条路径根本不调用 `parse_stream_json`）；而 CLI 启动失败/认证失败会让进程带着空的或非法的 stdout 退出，仍然会走到 `parse_stream_json(空或非法 lines)`，产出 `init_count == 0` → `protocol_errors` 含 `"missing init event"`。**`protocol_errors` 是否含 `"missing init event"` 是可机械核对的区分点**：为空（超时路径）→ 可重试；含 `"missing init event"`（CLI 从未建立协议握手）→ 不可重试。
 
-| 终态特征 | `status` | `retryable` | 理由 |
-|---|---|---|---|
-| `invocation.ok=True`，`validate()` 无错误 | `success` | `False` | 已成功 |
-| 能力漂移（`init_tools` 等与 `expected_tools` 不符） | `capability_drift` | `False` | 配置信号，重试大概率复现同样问题（cfr-06 既有结论） |
-| `invocation.subtype` 为 `None`（超时/进程被杀，无终态事件）或明确的传输层信号（`raw_tail` 匹配现有 `normalize_error` 判定的传输故障样式，如 `"API Error: Server error"`） | `failed_transport` | `True` | 真正的传输抖动，值得重试 |
-| `invocation.subtype == "error_max_budget_usd"` | `failed_transport` | **`False`** | 预算耗尽是确定性结果——同一 `grant_usd` 重试大概率再次撞线，不是随机噪声（cfr3-02 核心修复点） |
-| `validate(payload)` 返回非空错误列表（schema 校验失败，`invocation.ok=True`） | `failed_transport` | `True` | schema 校验失败在真机场景下多为模型输出随机波动，重试可能恢复（沿用 rmf-07 既有结论，不改） |
-| `invocation.protocol_errors` 含 `"duplicate init events"` 或 `"duplicate terminal result events"`（同一次调用内部出现结构性重复，不是网络层面的随机噪声，而是这次调用本身的 stream 已经确定性地损坏） | `failed_transport` | **`False`** | 确定性协议异常——损坏的是这次调用产生的 stream 结构本身，重试大概率产生同样结构的 stream（与预算耗尽同理：问题不在"这次网络抖了一下"，而在"这次调用的产出形状本身有问题"） |
-| `UnsafeInvocationError`（或任何编程/配置类异常）从 `invoke_fn` 抛出 | 不产生 `AttemptRecord`，异常穿透 | 不适用 | 配置错误不重试、不降级（既有规则，本任务不改） |
+**可测试的终态分类表（v5，贯通覆盖 parser 层与 validate 层，按下方优先级顺序判断，命中即返回，不再继续检查后续行）**：
+
+| 优先级 | 终态特征 | `status` | `retryable` | 理由 |
+|---|---|---|---|---|
+| 1 | `invocation.ok=True`，`validate(payload)` 无错误 | `success` | `False` | 已成功 |
+| 2 | 能力漂移（`init_tools` 等与 `expected_tools` 不符） | `capability_drift` | `False` | 配置信号，重试大概率复现同样问题（cfr-06 既有结论） |
+| 3 | `invocation.protocol_errors` 含 `"duplicate init events"` 或 `"duplicate terminal result events"`（同一次调用内部出现结构性重复） | `failed_transport` | `False` | 确定性协议异常——损坏的是这次调用产生的 stream 结构本身，重试大概率产生同样结构的 stream |
+| 4 | `invocation.protocol_errors` 含 `"missing init event"`（CLI 进程退出但从未产生任何 init 事件——启动失败/认证失败/参数错误的特征，第四轮评审 cfr4-02 新增） | `failed_transport` | `False` | 配置/环境/凭据问题，重试多少次都没用，与"传输抖动"不同源 |
+| 5 | `invocation.subtype == "error_max_budget_usd"` | `failed_transport` | `False` | 预算耗尽是确定性结果——同一 `grant_usd` 重试大概率再次撞线 |
+| 6 | `invocation.ok=False` 且 `invocation.subtype == "success"` 且 `protocol_errors` 含 `"unparseable or malformed payload"`（终态事件本身没报错，是模型输出解不出 JSON，第四轮评审 cfr4-02 新增） | `failed_transport` | `True` | parser 层模型输出随机失败——与下一行 schema 校验失败同源，都是模型输出的随机波动，重试可能恢复（rmf-07 精神） |
+| 7 | `validate(payload)` 返回非空错误列表（schema 校验失败，`invocation.ok=True`） | `failed_transport` | `True` | schema 校验失败在真机场景下多为模型输出随机波动，重试可能恢复（沿用 rmf-07 既有结论） |
+| 8（默认兜底） | 以上均不命中——典型是 `invocation.subtype is None` 且 `protocol_errors` 为空（`subprocess.TimeoutExpired` 路径，真正的执行中超时），或 `subtype` 是其它非上述值且 `protocol_errors` 干净（如 `"error_during_execution"` 搭配传输层错误文本） | `failed_transport` | `True` | 真正的传输抖动/进程被中途杀死，值得重试 |
+| — | `UnsafeInvocationError`（或任何编程/配置类异常）从 `invoke_fn` 抛出 | 不产生 `AttemptRecord`，异常穿透 | 不适用 | 配置错误不重试、不降级（既有规则，本任务不改） |
 
 **接口契约**：
 
@@ -980,14 +1002,17 @@ class AttemptRecord:
     protocol_errors: list = field(default_factory=list)
     payload: dict | None = None
     last_error: str | None = None
-    retryable: bool = False   # cfr2-07 新增，cfr3-02 修正赋值规则（见上方分类表）
+    retryable: bool = False   # cfr2-07 新增，cfr3-02/cfr4-02 修正赋值规则（见上方分类表）
     resumable: bool = False   # cfr2-07 新增
     subtype: str | None = None  # cfr3-02 新增：原样透传 InvocationResult.subtype，供分类表判断依据可审计
 
 def _classify_retryable(invocation: InvocationResult, status: str,
                         validation_errors: list[str]) -> bool: ...
-    # 按上方终态分类表实现；status="success" 恒 False；status="capability_drift" 恒 False；
-    # status="failed_transport" 时再细分 subtype/protocol_errors，见分类表
+    # 按上方 v5 终态分类表逐行实现，按优先级顺序判断、命中即返回；
+    # status="success"/"capability_drift" 两行照旧恒定返回；
+    # status="failed_transport" 时依次检查 protocol_errors 的三种特征
+    # （duplicate/missing init/unparseable payload）与 subtype
+    # （error_max_budget_usd），均不命中才落到默认可重试兜底
 def _check_capability_drift(invocation: InvocationResult, expected_tools: frozenset[str]) -> list[str]: ...
 def run_one_attempt(*, role: str, attempt: int, request: RoleInvocationRequest,
                     invoke_fn, validate,
@@ -998,16 +1023,17 @@ def build_continuation_request(previous: RoleInvocationRequest, resume_session_i
 **不变量**：
 1. `invoke_fn` 必须接受**唯一一个位置参数** `RoleInvocationRequest`（cfr-02）——不用宽松 `**kwargs`，测试替身与生产代码共用同一个类型。
 2. `AttemptRecord` 是纯数据（`dataclasses.asdict()` 递归取值不含任何 `Connection`/`Lock` 类型实例），可安全跨线程通过 `future.result()` 传回主线程（cfr-03 的前提）。
-3. `expected_tools` 非空且 `invocation.init_seen` 为真时才做能力漂移检查（cfr-06）；命中漂移 → `status="capability_drift"`，`retryable=False`（分类表第 2 行），`resumable` 按下方规则从 `invocation.session_id` 是否非空决定。
-4. **`retryable` 的赋值必须调用 `_classify_retryable`（分类表），不得用"是否等于 `capability_drift`"这种二元判断代替**（cfr3-02 核心：三轮评审反复指出的问题正是"新增字段只是给旧策略换了名字"，本任务要求赋值逻辑本身体现分类表的全部行，而不只是把原有的 if/elif 换个字段名输出）。
+3. `expected_tools` 非空且 `invocation.init_seen` 为真时才做能力漂移检查（cfr-06）；命中漂移 → `status="capability_drift"`，`retryable=False`（分类表优先级 2），`resumable` 按下方规则从 `invocation.session_id` 是否非空决定。
+4. **`retryable` 的赋值必须调用 `_classify_retryable`（v5 分类表），按优先级顺序逐行判断，不得用"是否等于 `capability_drift`"这种二元判断代替，也不得只覆盖 validate 层而遗漏 parser 层的同类失败**（cfr3-02/cfr4-02 核心：`_classify_retryable` 必须能正确处理"`invocation.ok=False` 但 `subtype="success"`"这个 parser 层失败的具体组合，不能假设"`ok=False` 就必然是传输失败"）。
 5. `resumable` 的计算**只看** `invocation.session_id`（`InvocationResult` 字段），不回退到 `request.session_id`/`request.resume`——`session_id`（`AttemptRecord` 字段，供审计与下一波构造 `parent_session_id` 用）允许在 `invocation.session_id` 为空时回退到 `request.session_id or request.resume`（这是"记录我们认为这次尝试用的是哪个身份"，与"能否安全 fork"是两件事，`resumable` 只回答后者）。
 6. 编程/配置类异常（如 `UnsafeInvocationError`）不被本函数捕获，原样穿透——不属于"传输故障"，不重试、不降级。
 7. `build_continuation_request`：`resume`+`fork_session=True`，`session_id` 置空（与原有互斥校验一致），`prompt` 换成续接指令（不是重发原始任务）。
 8. `AttemptRecord.subtype` 原样保留 `InvocationResult.subtype`（不做转换），供下游（账本、故障排查）审计"这次判定 `retryable` 的依据具体是什么"，不是只留一个布尔结论看不出理由。
+9. **优先级顺序不可颠倒**（cfr4-02）：`protocol_errors` 的三种检查（duplicate/missing init/unparseable payload）必须先于"默认兜底可重试"判断；`error_max_budget_usd` 检查必须先于"默认兜底"；这保证"表面上都是 `ok=False`"的多种情形被正确分流，不会被更靠后的宽泛规则提前捕获。
 
 **测试清单**（断言点，不是完整测试源码）：
 1. 成功调用 → `status="success"`，`session_id` 取自 `InvocationResult.session_id`，`payload` 原样带出，`retryable=False`。
-2. 传输失败（`invocation.ok=False`，`subtype=None`，模拟超时）→ `status="failed_transport"`，`retryable=True`，`last_error` 非空。
+2. 传输失败（`invocation.ok=False`，`subtype=None`，`protocol_errors=[]`，模拟真正的执行中超时）→ `status="failed_transport"`，`retryable=True`，`last_error` 非空。
 3. schema 校验失败（`invocation.ok=True` 但 `validate()` 返回错误）→ `status="failed_transport"`，`retryable=True`（不是致命错误，沿用 rmf-07 结论）。
 4. `UnsafeInvocationError` 从 `invoke_fn` 抛出 → 原样穿透，不被本函数捕获或转换。
 5. 能力漂移（`init_tools` 多出未预期工具）→ `status="capability_drift"`，`retryable=False`，`last_error` 含多出的工具名。
@@ -1018,30 +1044,34 @@ def build_continuation_request(previous: RoleInvocationRequest, resume_session_i
 10. `build_continuation_request` 产出的请求 `resume == 传入的 session_id`、`fork_session is True`、`session_id is None`、`prompt` 与原始 prompt 不同。
 11. **cfr3-02 核心之一（不可重试）**：`InvocationResult(ok=False, subtype="error_max_budget_usd", ...)` → `status="failed_transport"` 但 `retryable=False`（区别于用例 2 的普通传输故障）。
 12. **cfr3-02 核心之二（不可重试）**：`InvocationResult(ok=False, protocol_errors=["duplicate terminal result events: 2"], ...)` → `status="failed_transport"` 但 `retryable=False`（确定性协议异常，不是随机传输抖动）。
-13. **cfr3-02 核心之三（可重试，对照组）**：`InvocationResult(ok=False, subtype="error_during_execution", raw_tail="API Error: Server error mid-response", ...)`（无 `protocol_errors`，非预算耗尽）→ `status="failed_transport"` 且 `retryable=True`（真正的传输抖动分支仍然可重试，不能因为新增分类而误伤这条既有路径）。
+13. **cfr3-02 核心之三（可重试，对照组）**：`InvocationResult(ok=False, subtype="error_during_execution", protocol_errors=[], raw_tail="API Error: Server error mid-response", ...)`（无 `protocol_errors`，非预算耗尽）→ `status="failed_transport"` 且 `retryable=True`（真正的传输抖动分支仍然可重试，不能因为新增分类而误伤这条既有路径）。
+14. **cfr4-02 核心之一（parser 层失败，可重试）**：`InvocationResult(ok=False, subtype="success", protocol_errors=["unparseable or malformed payload in success result"], payload=None, ...)` → `status="failed_transport"` 且 `retryable=True`（终态事件本身报的是 `success`，只是 payload 解不出来——第四轮评审指出的、v4 分类表未定义的具体组合，现在有明确归属）。
+15. **cfr4-02 核心之二（CLI 启动/认证失败，不可重试）**：`InvocationResult(ok=False, subtype=None, protocol_errors=["missing init event", "missing terminal result event"], ...)`（模拟 CLI 进程退出但从未产生 init 事件）→ `status="failed_transport"` 但 `retryable=False`（区别于用例 2 的"真正超时"——两者都是 `subtype=None`，但 `protocol_errors` 是否含 `"missing init event"` 是区分依据）。
+16. **优先级顺序验证（cfr4-02）**：构造一个同时满足"`protocol_errors` 含 `missing init event`"与"`subtype` 恰好是 `error_max_budget_usd`"的病态输入（人为构造，验证代码鲁棒性而非真实场景）→ 断言 `_classify_retryable` 按分类表优先级顺序（`missing init event` 检查在前）返回，不因为检查顺序写反而产生歧义结果——这条测试的价值是把"优先级顺序"从注释里的口头约定变成可回归的断言。
 
 - [ ] **Step 1**：按测试清单写测试（追加到 `test_fanout.py`），跑至因 `AttemptRecord.retryable`/`resumable`/`subtype` 字段或 `run_one_attempt`/`_classify_retryable` 不存在而红。
-- [ ] **Step 2**：按接口契约实现（`fanout.py` 追加 `AttemptRecord`/`_classify_retryable`/`_check_capability_drift`/`run_one_attempt`/`build_continuation_request`）。
+- [ ] **Step 2**：按接口契约实现（`fanout.py` 追加 `AttemptRecord`/`_classify_retryable`/`_check_capability_drift`/`run_one_attempt`/`build_continuation_request`；`_classify_retryable` 内部按分类表优先级顺序写 `if`/`elif` 链，不用字典查表这种不保证顺序的写法）。
 - [ ] **Step 3**：跑通全部用例；重跑既有 `test_fanout.py`（Task 5.1/5.2）确认无回归。
-- [ ] **Step 4（正控）**：临时把 `resumable` 的计算改为直接读 `bool(session_id)`（即回退到 `request.session_id` 也算数），跑用例 8，确认变红（复现 cfr2-07 指出的"用预分配值冒充真实 ID"）；恢复。另临时把 `_classify_retryable` 简化回"`status != 'capability_drift'` 就返回 `True`"（复现三轮未关闭的 cfr-12/cfr3-02 缺陷），跑用例 11/12，确认变红（预算耗尽与确定性协议异常被误判为可重试）；恢复。
+- [ ] **Step 4（正控）**：临时把 `resumable` 的计算改为直接读 `bool(session_id)`（即回退到 `request.session_id` 也算数），跑用例 8，确认变红（复现 cfr2-07 指出的"用预分配值冒充真实 ID"）；恢复。另临时把 `_classify_retryable` 简化回"`status != 'capability_drift'` 就返回 `True`"（复现四轮未关闭的 cfr-12/cfr3-02/cfr4-02 缺陷），跑用例 11/12/15，确认变红（预算耗尽、确定性协议异常、CLI 启动失败均被误判为可重试）；恢复。**再做一次针对性正控（cfr4-02 要求）**：临时把 `_classify_retryable` 里"`protocol_errors` 含 `missing init event`"这一行判断删掉（但保留其余分支不变），跑用例 15，确认变红（CLI 启动失败被误判为可重试，落到默认兜底）；恢复。这一步专门验证"CLI 启动失败"与"真正超时"两个同为 `subtype=None` 的分支确实被分开处理，不是共用同一段默认逻辑侥幸算对。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
-git commit -m "feat(harness): fanout —— run_one_attempt 单次尝试原语，retryable 分类表区分预算耗尽/确定性协议异常与真实传输故障（cfr-02/03/06/12, cfr2-07, cfr3-02）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
+git commit -m "feat(harness): fanout —— run_one_attempt 单次尝试原语，retryable 分类表贯通覆盖 parser 层与 validate 层失败、区分 CLI 启动失败与真正超时（cfr-02/03/06/12, cfr2-07, cfr3-02, cfr4-02）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
 
-### Task 5.4（处置 cfr-03/cfr-05/cfr-09/cfr-12/cfr2-03/cfr2-07）：`BudgetTracker`（线程安全原子预留，允许变负）+ 波次调度器 `run_wave_scheduled`（返回全部 attempts）
+### Task 5.4（处置 cfr-03/cfr-05/cfr-09/cfr-12/cfr2-03/cfr2-07/cfr4-01）：`BudgetTracker`（线程安全原子预留，允许变负）+ 波次调度器 `run_wave_scheduled`（返回全部 attempts，per-attempt stream_log 贯穿）
 
-**v3 重写说明（在 v2 基础上修正第二轮评审新发现的两处设计缺陷）**：
+**v4 重写说明（在 v3 基础上修正第四轮评审新发现的一处设计缺陷）**：
 
 - **cfr2-03（Critical，本轮修复引入）第一处**：v2 的 `BudgetTracker.settle()` 用 `remaining += max(reserved - actual, 0.0)` 计算刷正差额——`actual > reserved`（超额）时这个表达式恒为 0，超支部分从未从 `remaining` 里真正扣除（评审实测：预留 0.3、实花 0.5，`remaining` 仍是刷正前的值 + 0.3，等同于超支被系统免单）。修正：`settle()` 无条件执行 `remaining += reserved - actual`（不夹 `max`），允许 `remaining` 变负；一旦变负，任何后续 `try_reserve(amount>0)` 因 `remaining < amount` 恒为 `False`，自然阻止后续调用，不需要额外的"熔断"分支。
 - **cfr2-03 第二处**：v2 的 `run_wave_scheduled` 只返回 `{role: 最终 AttemptRecord}`，前几波失败的尝试（连同它们已花费的真实成本）在返回值里完全消失，Task 5.6 的 `FanoutSettlement` 据此聚合的总成本会漏掉这部分真实支出。修正：返回类型改为 `WaveResult`（见下），同时携带 `final`（供路由/裁决消费，行为与 v2 一致）与 `all_attempts`（供 Task 5.6 聚合全部真实花费，不止最后一条）。
-- **cfr2-07（Critical，本轮修复引入）**：v2 用 `request.session_id`（预分配、派生值）冒充"上一次的真实 session_id"去构造 fork 续跑请求；但超时或进程在 `init` 事件之前被杀时，这个会话可能从未在 CLI 侧真正创建，`--resume <伪造 ID>` 大概率失败或续接到错误上下文。修正：`AttemptRecord`（Task 5.3 同步新增两个字段，见该任务）携带 `resumable: bool`（`True` 当且仅当 `session_id` 取自 `InvocationResult.session_id`——即 CLI 通过 `init`/`result` 事件真正报告过的值，而不是回退用的 `request.session_id`/`request.resume`）。本任务的波次调度器只在 `record.retryable and record.resumable` 同时成立时才发起 fork 续跑；`retryable=True` 但 `resumable=False` 时发起一次**全新**尝试——用 `make_request(role)` 重新构造原始（非续接）请求，`session_id` 改用 `session_identity.derive_session_id(round_id, role, attempt)` 为这次新 attempt 派生的值，不带 `resume`/`fork_session`。
+- **cfr2-07（Critical，本轮修复引入）**：v2 用 `request.session_id`（预分配、派生值）冒充"上一次的真实 session_id"去构造 fork 续跑请求；但超时或进程在 `init` 事件之前被杀时，这个会话可能从未在 CLI 侧真正创建，`--resume <伪造 ID>` 大概率失败或续接到错误上下文。修正：`AttemptRecord`（Task 5.3 同步新增两个字段，见该任务）携带 `resumable: bool`（`True` 当且仅当 `session_id` 取自 `InvocationResult.session_id`——即 CLI 通过 `init`/`result` 事件真正报告过的值，而不是回退用的 `request.session_id`/`request.resume`）。本任务的波次调度器只在 `record.retryable and record.resumable` 同时成立时才发起 fork 续跑；`retryable=True` 但 `resumable=False` 时发起一次**全新**尝试。
 - **cfr-09（沿用 v2 判断逻辑，新增动态 `timeout_s`）**：v2 只判断"截止时间是否足够开始新的一波"，但请求本身的 `timeout_s` 从未随之收缩（仍固定为 60 秒）。修正：每一波构造请求时，`timeout_s` 取 `min(原始 timeout_s 上限, deadline_monotonic - time.monotonic() - _CALL_TEARDOWN_MARGIN_S)`，随实际剩余时间收缩，不小于 0；不使用 `max()` 垫底（那正是 cfr-09 指出的、`round.py` 历史上已修过一次的反模式）。
 - **cfr-12**：波次调度"是否进入下一波"的判定，从"看 `status` 字面量做 if/elif"改为直接读 `AttemptRecord.retryable` 布尔位（Task 5.3 产出）——状态判定与重试策略解耦，以后新增状态词不需要同时改这里的分支逻辑。
+- **cfr4-01（Critical，第四轮评审指出，因契约未贯穿波次调度而暴露的具体 bug）**：v4 的 `make_request` 工厂签名是 `make_request(role: str) -> RoleInvocationRequest`——**不接受 `attempt` 参数**。`build_continuation_request(previous, resume_session_id)`（Task 5.3 定义）用 `dataclasses.replace(previous, prompt=..., session_id=None, resume=..., fork_session=True)` 从**上一次的请求对象**派生新请求，只覆盖了 `prompt`/`session_id`/`resume`/`fork_session` 四个字段——**`stream_log` 字段原样保留自 `previous`，从未随 attempt 编号更新**。真实后果：attempt 1 失败后 fork 出 attempt 2，attempt 2 会把输出写到与 attempt 1 完全相同的 `stream_log` 路径，**覆盖掉 attempt 1 的日志**——而 attempt 1 恰恰是失败的那一次，是最需要事后判因的一次。**修正**：`make_request` 工厂签名改为 `make_request(role: str, attempt: int) -> RoleInvocationRequest`（Task 5.5 的 `_make_request` 内部据此调用 `role_invocation.build_stream_log_path(context.stream_log_dir, round_id, task_role, attempt)`，`attempt` 参数直接决定 stream_log 路径的一部分，见 Task 5.5）；`run_wave_scheduled` 在每一波（包括 fork 续跑）都先调用 `make_request(role, attempt)` 取得这个 attempt 编号对应的"骨架请求"（含正确的 per-attempt `stream_log`/`session_id` 默认值），再在 fork 场景下用 `build_continuation_request(base_request, resume_session_id)` 只覆盖 `prompt`/`session_id`/`resume`/`fork_session` 四个字段（`stream_log` 取自这个"骨架请求"，不再取自 `previous`）——`build_continuation_request` 的第一个参数含义因此从"上一次的请求"变为"本次 attempt 的骨架请求"，两者字段集合相同，唯一区别是调用点传入哪个对象。
 
 **接口契约**：
 
@@ -1062,6 +1092,10 @@ def run_wave_scheduled(*, roles: tuple[str, ...], make_request, invoke_fn, valid
                        single_call_cap_usd: float = _DEFAULT_SINGLE_CALL_CAP_USD,
                        expected_tools: frozenset[str] | None = None,
                        conn=None, round_id: str = "") -> WaveResult: ...
+    # make_request 签名变化（cfr4-01）：Callable[[str, int], RoleInvocationRequest]
+    # ——第二个参数是本次调用对应的 attempt 编号（从 1 起），供调用方构造
+    # per-attempt 的 stream_log 路径；run_wave_scheduled 每一波都传入当前
+    # attempt 编号调用它，不止 attempt 1 才调用
 ```
 
 **不变量**：
@@ -1071,8 +1105,9 @@ def run_wave_scheduled(*, roles: tuple[str, ...], make_request, invoke_fn, valid
 4. `run_wave_scheduled` 返回的 `all_attempts` 长度 = 全部角色在全部波次里**实际发起调用**的次数总和（因预算不足/截止时间不足而未发起调用的角色不产生 `AttemptRecord`，只体现在 `final` 里）。
 5. 每一波开始前，若 `deadline_monotonic - time.monotonic() < _MIN_CALL_WINDOW_S`，尚未成功的角色直接标记 `failed_transport`（`last_error` 含 `"deadline-exhausted"`）并结束循环，不构造请求、不发起调用、不计入 `all_attempts`。
 6. 每次实际构造的请求，其 `timeout_s` 字段等于 `min(request 原 timeout_s, deadline_monotonic - time.monotonic() - _CALL_TEARDOWN_MARGIN_S)`，不小于 0；不使用 `max(x, 下限)` 这种会在剩余为负时把负值垫成正值的写法。
-7. 决定"该角色是否进入下一波"只读 `AttemptRecord.retryable`（`True` 才留在 pending）；`retryable=True` 且 `resumable=False` 时，下一波必须发起**全新**（非 fork）尝试，`session_id` 用该 attempt 编号重新派生，不带 `resume`/`fork_session`；`retryable=True` 且 `resumable=True` 时才用 `build_continuation_request` 发起 fork。
+7. 决定"该角色是否进入下一波"只读 `AttemptRecord.retryable`（`True` 才留在 pending）；每一波无论 fork 与否都先调用 `make_request(role, attempt)` 取得该 attempt 编号对应的骨架请求（含正确的 per-attempt `stream_log`，cfr4-01）；`retryable=True` 且 `resumable=False` 时直接使用这个骨架请求发起**全新**（非 fork）尝试；`retryable=True` 且 `resumable=True` 时用 `build_continuation_request(骨架请求, resume_session_id)` 在骨架请求基础上覆盖 `prompt`/`session_id`/`resume`/`fork_session` 四个字段后发起 fork。
 8. 主线程串行写账本（继承 v2）；`ledger.record_attempt_started/finished` 的调用点显式 `try/except Exception`（cfr-11 修复：v2 只在文字里声明"写账本失败不阻断本轮"，代码里从未真正包裹）——捕获后仅记录到 stderr（或调用方注入的 logger），不重新抛出，本轮流程继续。
+9. **每个 attempt 的 `stream_log` 路径必须随 attempt 编号变化，不得复用上一次 attempt 的路径**（cfr4-01）：`all_attempts` 里任意两条记录，若角色相同但 `attempt` 不同，两者对应发出的请求 `stream_log` 字段必须不同——这是 fork 场景下"attempt 1 的失败日志不被 attempt 2 覆盖"这个具体后果的直接不变量。
 
 **测试清单**（断言点，不是完整测试源码）：
 
@@ -1086,8 +1121,8 @@ def run_wave_scheduled(*, roles: tuple[str, ...], make_request, invoke_fn, valid
 7. 连续两次超额 `settle` 后 `remaining` 变负；此后任何 `try_reserve(amount>0)` 返回 `False`。
 
 `run_wave_scheduled`／`WaveResult`：
-1. 全部角色首波成功 → `final` 含全部角色、状态皆 `success`；`all_attempts` 长度等于角色数（每角色恰一次尝试）。
-2. 一角色首波失败（`retryable=True, resumable=True`，即返回了真实 `session_id`）、次波经 fork 成功 → `final[该角色].attempt == 2`；`all_attempts` 含该角色两条记录（首波失败 + 次波成功）。
+1. 全部角色首波成功 → `final` 含全部角色、状态皆 `success`；`all_attempts` 长度等于角色数（每角色恰一次尝试）；`make_request` 收到的 `attempt` 参数恒为 `1`。
+2. 一角色首波失败（`retryable=True, resumable=True`，即返回了真实 `session_id`）、次波经 fork 成功 → `final[该角色].attempt == 2`；`all_attempts` 含该角色两条记录（首波失败 + 次波成功）；`make_request` 第二次被以 `attempt=2` 调用（不是只在 attempt 1 调用一次）。
 3. **cfr2-07 核心**：一角色首波因超时失败（从未观察到真实 `session_id`，`resumable=False`，但 `retryable=True`）→ 次波必须是全新尝试（断言传给 `invoke_fn` 的 `request.resume is None` 且 `request.fork_session is False`，`request.session_id` 等于该角色 attempt=2 的新派生值，不等于首波使用的值）。
 4. **cfr2-03 核心**：一角色连续两波失败，每波 `reserved=0.3, actual=0.5`（超额）→ 调用结束后 `budget.remaining()` 体现两次超额的累计扣减（不是只扣一次），且 `all_attempts` 长度为 2（两次尝试都被记录，即便都失败）。
 5. 截止时间在波次开始前已耗尽 → `final` 标记 `failed_transport` 且 `last_error` 含 `"deadline-exhausted"`；`invoke_fn` 全程未被调用；`all_attempts` 为空。
@@ -1095,27 +1130,31 @@ def run_wave_scheduled(*, roles: tuple[str, ...], make_request, invoke_fn, valid
 7. 能力漂移（`expected_tools` 与返回 `init_tools` 不等）→ `AttemptRecord.retryable` 为 `False`（不重试），只调用一次，`final` 状态为 `capability_drift`。
 8. **cfr-09 核心**：用两个不同的 `deadline_monotonic`（一个宽松、一个紧张）各跑一次，断言两次传给 `invoke_fn` 的 `request.timeout_s` 不相等，且都不等于任何硬编码常量（如 `60.0`）——验证 timeout 随截止时间动态收缩。
 9. **cfr-11 核心**：注入一个在 `record_attempt_started`/`finished` 调用时抛异常的假 `conn`（或 monkeypatch `ledger` 模块函数）→ `run_wave_scheduled` 正常返回预期的 `WaveResult`，不因账本写入异常而中断或向上抛出。
+10. **cfr4-01 核心（fork 后 stream_log 不覆盖）**：一角色首波失败（`resumable=True`）、次波经 fork 成功——构造 `make_request(role, attempt)` 返回的骨架请求，其 `stream_log` 字段按 `attempt` 参数变化（如 `f"log-attempt-{attempt}.jsonl"` 这种测试替身）→ 断言传给 `invoke_fn` 的 attempt 1 请求与 attempt 2 请求的 `stream_log` 字段**不相等**（验证 fork 场景下确实调用了 `make_request(role, 2)` 取得新骨架、而不是直接复用 attempt 1 请求对象的 `stream_log`）。
 
 - [ ] **Step 1**：按上方测试清单写测试（追加到 `test_fanout.py`），跑至因 `WaveResult`/新签名/新字段不存在而红。
-- [ ] **Step 2**：按接口契约与不变量实现 `BudgetTracker`、`WaveResult`、`run_wave_scheduled`（依赖 Task 5.3 同步产出的 `AttemptRecord.retryable`/`resumable` 字段与 `session_identity.derive_session_id`，两个任务需交叉核对字段名一致）。
+- [ ] **Step 2**：按接口契约与不变量实现 `BudgetTracker`、`WaveResult`、`run_wave_scheduled`（依赖 Task 5.3 同步产出的 `AttemptRecord.retryable`/`resumable` 字段与 `session_identity.derive_session_id`，两个任务需交叉核对字段名一致；`make_request` 每一波都调用，不止 attempt 1）。
 - [ ] **Step 3**：跑通全部用例；重跑既有 `test_fanout.py` 用例（Task 5.1–5.3）确认无回归。
-- [ ] **Step 4（正控）**：临时把 `settle()` 的刷正表达式改回 `remaining += max(reserved - actual, 0.0)`，跑用例 5 与 7，确认变红（复现 cfr2-03 指出的缺陷）；恢复。另临时把"是否 fork"的判断从 `record.retryable and record.resumable` 改回只看 `record.retryable`，跑用例 3，确认变红（复现 cfr2-07 指出的"用预分配 ID 冒充真实 ID 去 fork"）；恢复。
+- [ ] **Step 4（正控）**：临时把 `settle()` 的刷正表达式改回 `remaining += max(reserved - actual, 0.0)`，跑用例 5 与 7，确认变红（复现 cfr2-03 指出的缺陷）；恢复。另临时把"是否 fork"的判断从 `record.retryable and record.resumable` 改回只看 `record.retryable`，跑用例 3，确认变红（复现 cfr2-07 指出的"用预分配 ID 冒充真实 ID 去 fork"）；恢复。再临时把 fork 分支改回"直接对 attempt 1 的请求对象调用 `build_continuation_request`"（不先调用 `make_request(role, 2)` 取新骨架），跑用例 10，确认变红（两次 attempt 的 `stream_log` 相同，复现 cfr4-01 指出的"fork 后覆盖上一次日志"缺陷）；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
-git commit -m "feat(harness): fanout —— BudgetTracker 允许变负结算 + 波次调度器返回全部 attempts（cfr-03/05/09/12, cfr2-03/07）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
+git commit -m "feat(harness): fanout —— BudgetTracker 允许变负结算 + 波次调度器返回全部 attempts，make_request 携带 attempt 编号确保 fork 后 stream_log 不覆盖上一次日志（cfr-03/05/09/12, cfr2-03/07, cfr4-01）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
 
-### Task 5.5（处置 cfr-06/cfr-07/cfr-14/cfr2-02/cfr2-04/cfr3-01）：finder 并发扇出 + judge 短路裁决（组合编排，消费 `WaveResult`）
+### Task 5.5（处置 cfr-06/cfr-07/cfr-14/cfr2-02/cfr2-04/cfr3-01/cfr4-01）：finder 并发扇出 + judge 短路裁决（组合编排，消费 `WaveResult`）
 
-**v4 重写说明**：本任务把 `run_finders`/`judge_candidate` 改为调用 Task 5.4 产出的 `run_wave_scheduled`（返回 `WaveResult`，而非 v2 的裸 `dict[str, AttemptRecord]`），并在 v2 已修复的三处（`skipped_judges` cfr-14、judge 降级同步顶层 `degraded` cfr-07、`expected_tools` 透传 cfr-06）之上，补齐三处评审指出的设计缺陷：
+**v5 重写说明**：本任务把 `run_finders`/`judge_candidate` 改为调用 Task 5.4 产出的 `run_wave_scheduled`（返回 `WaveResult`，而非 v2 的裸 `dict[str, AttemptRecord]`），并在 v2 已修复的三处（`skipped_judges` cfr-14、judge 降级同步顶层 `degraded` cfr-07、`expected_tools` 透传 cfr-06）之上，补齐四处评审指出的设计缺陷：
 
 - **cfr2-02（Critical，已核实）**：`judge_candidate` 每次调用都必须为该候选构造**携带 fingerprint 的 task identity**（Task 1.1 的新设计），不能再对 `judge:redline` 这类静态角色字符串重复派生 session_id——否则同一轮内两个候选依次裁决时，第二个候选的账本写入会与第一个候选撞主键，且实际发出的是第一个候选的会话。本任务的 `_make_request` 必须先算出 `task_role = f"{role}:{queue.fingerprint(candidate['goal'], candidate['invariant'], candidate['primary_path'], candidate['oracle'])}"`，把 `task_role`（而不是裸的 `judge:redline`）传给 `session_identity.derive_session_id`、`run_wave_scheduled` 的 `roles=`、以及 `AttemptRecord.role`/`all_records`/`degraded` 里记录的 `role` 字段——四处统一（Task 1.1 已定的不变量），`_JUDGE_ROLE_TO_TYPE` 等按类型分派的查表逻辑改为对 `task_role` 做前缀匹配（`task_role.split(":", 2)[:2]` 取出 `("judge", "redline")` 这一级用于查表），不能整串相等匹配。
 - **cfr2-04（Critical，已核实）**：`judge_candidate` 的三次 `run_wave_scheduled` 调用（redline 一次、`completed`+`oracle` 一次）此前均未传 `expected_tools`，Bash/MCP 等能力漂移在 judge 侧完全不会被发现。修正：`judge_candidate` 与 `run_finders` 一样，把 `_STAGE1_EXPECTED_TOOLS` 透传给每一次 `run_wave_scheduled` 调用。
-- **cfr3-01（Critical，因降级丢失，第三轮评审指出）**：此前的测试清单第 6 条只断言"两个候选调用的 `request.session_id` 不相等"，**没有验证 `attempt_key`（账本主键）与 `stream_log` 路径是否同样由这个含 fingerprint 的 task identity 派生、且三者共用同一个源字符串**——`session_id` 算对了，`attempt_key`/`stream_log` 完全可能各自独立拼接、在某处不小心漏加 fingerprint 而不被任何测试发现（因为它们分别在 `ledger.py`/`role_invocation.build_stream_log_path` 里各自实现，没有交叉核对）。本任务补上跨三处的联合测试，并要求 `_make_request` 显式使用 `role_invocation.build_stream_log_path`（Task 2.3 新增）而不是自行拼接 stream 路径字符串；`cwd`/`settings_path`/`model` 三个字段的值改为从调用方传入的 `RequestContext`（Task 2.3 新增）读取，不再是本函数内部硬编码的占位字符串。
+- **cfr3-01（Critical，因降级丢失，第三轮评审指出）**：此前的测试清单第 6 条只断言"两个候选调用的 `request.session_id` 不相等"，没有验证 `attempt_key`（账本主键）与 `stream_log` 路径是否同样由这个含 fingerprint 的 task identity 派生。本任务补上跨三处的联合测试，并要求 `_make_request` 显式使用 `role_invocation.build_stream_log_path`（Task 2.3 新增）而不是自行拼接 stream 路径字符串；`cwd`/`settings_path`/`model` 三个字段的值改为从调用方传入的 `RequestContext`（Task 2.3 新增）读取，不再是本函数内部硬编码的占位字符串。
+- **cfr4-01（Critical，第四轮评审指出，两处修正）**：
+  1. **联合测试的 oracle 本身写错了**——v4 的测试清单第 8 条要求"`request.session_id` 与 `attempt_key`/`stream_log` 路径里的 `round_id:task_role:attempt` 段**逐字一致**"，但 `session_id` 是 `session_identity.derive_session_id()` 产出的 **UUIDv5**（一段确定性哈希值，形如 `d4a0c718-d6eb-43c7-ab6d-aaabadc9966d`），**不可能**与 `round_id:task_role:attempt` 这种明文拼接字符串相等——这条测试若按字面实现，一写出来就必然失败，任何按此验收的实施者都会卡在这一步。**正确的 oracle**：三者不是"字面相等"关系，而是"**同源**"关系——分别独立计算出预期的 `session_id`（调用 `session_identity.derive_session_id(round_id, task_role, attempt)`）、预期的 `attempt_key`（`f"{round_id}:{task_role}:{attempt}"`）、预期的 `stream_log` 路径（调用 `role_invocation.build_stream_log_path(...)`），再断言被测函数产出的三个值分别等于这三个**独立计算的预期值**——这才是能验证"三处用了同一个 `task_role`"的正确断言方式，而不是要求三个不同类型的值互相字面相等。
+  2. **`_make_request` 签名需要接受 `attempt` 参数**（承接 Task 5.4 cfr4-01 的贯通修复）：Task 5.4 的 `make_request` 工厂签名已改为 `(role: str, attempt: int) -> RoleInvocationRequest`，本任务的 `_make_request`（`run_finders`/`judge_candidate` 内部构造后传给 `run_wave_scheduled` 的那个闭包）必须实现这个新签名，`attempt` 参数直接传给 `role_invocation.build_stream_log_path(context.stream_log_dir, round_id, task_role, attempt)`——这保证了同一角色的不同 attempt 产出不同的 `stream_log` 路径，fork 续跑不会覆盖上一次失败尝试的日志。
 
 **接口契约**：
 
@@ -1148,7 +1187,7 @@ def judge_candidate(*, round_id: str, candidate: dict, invoke_fn,
 6. 任一 judge 降级（耗尽重试仍失败）→ 该 judge 的局部 verdict 是 `{"judge": ..., "verdict": "reject", "reason": "judge-unavailable", <该 judge 专有字段>: None, "degraded": True, "skipped_judges": [...]}`（rmf-12 占位字段 + cfr-14 skipped_judges），**同时**该 judge 被 `record_degraded` 记入本函数返回的顶层 `degraded` 列表（cfr-07：不能只在局部 verdict 体现，顶层数组必须同步非空，否则 round.py 侧会把这种场景误判为干净的 no-candidate，精确复发 rmf-03）。
 7. `run_finders` 里任一 finder 非成功 → 记入 `degraded`（`record_degraded` 折叠），不产出候选；`known_canonical_keys`/`blocked_lanes` 的过滤逻辑复用 Task 5.1 的 `dedupe_and_rank`，不重复实现。
 8. **`_make_request` 的 `cwd`/`settings_path`/`model` 三个字段值取自入参 `context: RequestContext`**（cfr3-01），不是函数内部硬编码的字面量——生产路径（Phase 6 接线）传入携带真实值的 `RequestContext`，测试路径传入携带测试替身值的 `RequestContext`，两条路径共用同一个"从哪里取值"的结构，不会出现"生产该传什么值"只停留在文档说明、代码里各自硬编码一份的情况。
-9. **`_make_request` 的 `stream_log` 字段通过 `role_invocation.build_stream_log_path(context.stream_log_dir, round_id, task_role, attempt)` 构造**（cfr3-01），不自行拼接路径字符串——`task_role` 与传给 `derive_session_id`/账本的值完全相同（同一个变量，不重新计算）。
+9. **`_make_request` 签名是 `(role: str, attempt: int) -> RoleInvocationRequest`**（cfr4-01，与 Task 5.4 `run_wave_scheduled` 要求的 `make_request` 签名一致），其 `stream_log` 字段通过 `role_invocation.build_stream_log_path(context.stream_log_dir, round_id, task_role, attempt)` 构造，不自行拼接路径字符串——`task_role` 与传给 `derive_session_id`/账本的值完全相同（同一个变量，不重新计算），`attempt` 参数保证同一角色不同尝试产出不同路径。
 
 **测试清单**（断言点，不是完整测试源码）：
 
@@ -1162,19 +1201,20 @@ def judge_candidate(*, round_id: str, candidate: dict, invoke_fn,
 5. 全部 judge 持续失败降级 → redline 局部 verdict 的 `verdict/reason/degraded/skipped_judges` 字段符合 6 号不变量；**顶层 `degraded` 长度为 1 且 `role` 字段等于该次调用实际使用的 `task_role`**（不是裸 `judge:redline`）。
 6. **cfr2-02 核心**：对两个不同 `candidate`（不同 fingerprint）分别调用 `judge_candidate`，断言两次调用中传给 `invoke_fn` 的 `request.session_id` 不相等（验证 task identity 确实携带了 fingerprint，不会在同一轮内撞车）。
 7. **cfr2-04 核心**：任一 judge 调用返回能力漂移（`init_tools` 含未预期工具）→ 该 judge 的 `AttemptRecord.status == "capability_drift"` 被正确传导（通过 mock/monkeypatch 断言传给 `run_wave_scheduled` 的 `expected_tools` 参数非 `None`，或直接构造漂移场景断言最终 verdict 走"judge-unavailable"降级分支而非误判为成功）。
-8. **cfr3-01 核心（联合测试，第三轮评审明确要求）**：对**两个不同候选**分别调用 `judge_candidate`，对每个候选各自捕获传给 `invoke_fn` 的 `request.session_id`、写入账本的 `attempt_key`（通过传入的假 `conn`/`ledger` 替身捕获实际写入的主键值）、`request.stream_log` 路径——断言：(a) 同一候选内，`request.session_id`、`attempt_key` 的 `round_id:task_role:attempt` 段、`stream_log` 路径里的 `round_id:task_role:attempt` 段三者**逐字一致**（不是"看起来差不多"，是字符串相等比较）；(b) 两个候选之间，这三组值**分别互不相同**（不会出现"session_id 变了但 stream_log 路径没变"这种部分更新的漂移）。
+8. **cfr3-01/cfr4-01 核心（联合测试，oracle 已订正为"同源"而非"字面相等"）**：对**两个不同候选** `candidate_a`/`candidate_b`（不同 fingerprint）分别调用 `judge_candidate`，各自捕获传给 `invoke_fn` 的 `request.session_id` 与 `request.stream_log`，以及写入账本的 `attempt_key`（通过传入的假 `conn`/`ledger` 替身捕获实际写入的主键值）。对每个候选**独立计算**三个预期值：`expected_session_id = session_identity.derive_session_id(round_id, task_role, 1)`、`expected_attempt_key = f"{round_id}:{task_role}:1"`、`expected_stream_log = role_invocation.build_stream_log_path(context.stream_log_dir, round_id, task_role, 1)`（`task_role` 由测试自己按 cfr2-02 的公式算出）。断言：(a) 被测函数产出的 `request.session_id`/账本 `attempt_key`/`request.stream_log` **分别等于**这三个独立计算的预期值（不是三者互相字面相等）；(b) 两个候选之间，这三组实际值**分别互不相同**（不会出现"session_id 变了但 stream_log 路径没变"这种部分更新的漂移）。
 9. **cfr3-01 核心（生产值验证）**：传入一个 `RequestContext(cwd="/real/repo", settings_path=".claude/harness-settings.json", model="claude-sonnet-5", stream_log_dir="/real/repo/.claude/state/rounds")` → 断言传给 `invoke_fn` 的**全部**请求（4 finder + 最多 3 judge）的 `cwd`/`settings_path`/`model` 字段都等于这个 `RequestContext` 里的值，不是函数内部残留的硬编码占位符（如 `"/tmp"`、`""`、`None`）。
+10. **cfr4-01 核心（fork 后 stream_log 不覆盖，端到端）**：构造 redline judge 首波失败（`resumable=True`）、次波 fork 成功的场景 → 断言 attempt 1 与 attempt 2 两次调用 `invoke_fn` 收到的 `request.stream_log` 不相等（`build_stream_log_path` 的 `attempt` 参数从 1 变为 2），这条测试验证 `_make_request(role, attempt)` 签名确实按 attempt 变化产出不同路径，是 Task 5.4 用例 10 在 `judge_candidate` 这一层的端到端复现。
 
 - [ ] **Step 1**：按测试清单写测试（追加到 `test_fanout.py`），跑至因签名/字段不匹配而红。
-- [ ] **Step 2**：按接口契约与不变量实现 `run_finders`/`judge_candidate`（复用 Task 1.1 的 `session_identity.derive_session_id`、Task 2.3 的 `role_invocation.RequestContext`/`build_stream_log_path`、Task 5.4 的 `run_wave_scheduled`/`WaveResult`）。
+- [ ] **Step 2**：按接口契约与不变量实现 `run_finders`/`judge_candidate`（复用 Task 1.1 的 `session_identity.derive_session_id`、Task 2.3 的 `role_invocation.RequestContext`/`build_stream_log_path`、Task 5.4 的 `run_wave_scheduled`/`WaveResult`；`_make_request` 内部签名与 `run_wave_scheduled` 要求的 `make_request(role, attempt)` 一致）。
 - [ ] **Step 3**：跑通全部用例；重跑既有 `test_fanout.py`（Task 5.1–5.4）确认无回归。
-- [ ] **Step 4（正控）**：临时把短路判断注释掉（改成永不短路），跑用例 3，确认失败（`invoke_fn` 对其余 judge 分支的 `AssertionError` 被触发）；恢复。另临时删除"降级同步顶层 `degraded`"这一步，跑用例 5，确认失败（顶层 `degraded` 为空，复现 cfr-07）；恢复。再临时把 `judge_candidate` 的 `task_role` 构造改回裸角色字符串（去掉 fingerprint 拼接），跑用例 6，确认失败（两次调用 session_id 相同，复现 cfr2-02）；恢复。最后临时让 `stream_log` 构造改用裸 `role` 而不是 `task_role`（模拟"session_id 对了但 stream path 漏加 fingerprint"这种局部更新遗漏），跑用例 8，确认失败（两个候选的 `stream_log` 路径里的 task identity 段相同，复现 cfr3-01 指出的联合一致性缺口）；恢复。
+- [ ] **Step 4（正控）**：临时把短路判断注释掉（改成永不短路），跑用例 3，确认失败（`invoke_fn` 对其余 judge 分支的 `AssertionError` 被触发）；恢复。另临时删除"降级同步顶层 `degraded`"这一步，跑用例 5，确认失败（顶层 `degraded` 为空，复现 cfr-07）；恢复。再临时把 `judge_candidate` 的 `task_role` 构造改回裸角色字符串（去掉 fingerprint 拼接），跑用例 6 与用例 8，确认均变红（用例 6：两次调用 session_id 相同，复现 cfr2-02；用例 8：两个候选的 `session_id`/`attempt_key`/`stream_log` 都不等于各自独立计算的预期值，因为预期值本身按 fingerprint 算出而实现没有加）；恢复。最后临时把 `_make_request` 的 `attempt` 参数忽略（`build_stream_log_path` 调用硬编码传 `1`），跑用例 10，确认变红（两次 attempt 的 `stream_log` 相同，复现 cfr4-01 指出的"fork 后覆盖上一次日志"缺陷）；恢复。
 - [ ] **Step 5**：提交。
 
 ```bash
 cd /home/xp/src/zipfs
 git add .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
-git commit -m "feat(harness): fanout —— finder/judge 组合编排消费 WaveResult 与 RequestContext，judge task identity 携带 fingerprint 且贯穿 session/ledger/stream 三处一致，expected_tools 透传（cfr-06/07/14, cfr2-02/04, cfr3-01）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
+git commit -m "feat(harness): fanout —— finder/judge 组合编排消费 WaveResult 与 RequestContext，judge task identity 携带 fingerprint，联合测试 oracle 订正为同源比对，_make_request 携带 attempt 编号（cfr-06/07/14, cfr2-02/04, cfr3-01, cfr4-01）" -- .claude/scripts/harness/fanout.py .claude/scripts/harness/tests/test_fanout.py
 ```
 
 
@@ -1628,7 +1668,7 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 
 ## 自审
 
-> 本节随 v4 修订（第三轮跨模型对抗评审 cfr3-01–cfr3-03 处置后）同步更新。v4 相对 v3 的核心变化：(a) 新增 `RequestContext`/`build_stream_log_path` 契约，把生产环境 `cwd`/`settings_path`/`model`/`stream_log` 的取值收敛到 Phase 6 Task 6.1 单一构造点，并补齐 judge task identity 贯穿 session/ledger/stream 三处一致性的联合测试（cfr3-01）；(b) `InvocationResult` 新增 `subtype` 字段透传终态事件原始值，`AttemptRecord.retryable` 的赋值从"二元判断"改为可测试的终态分类表，区分预算耗尽/确定性协议异常（不可重试）与真实传输抖动/schema 校验失败（可重试）（cfr3-02）；(c) 把开放发现处置表宣称但从未被任务清单断言的三项（`protocol_errors` 进 detail、`record_degraded` 双写 `agentType`、显式设规范 `model`）补进 Task 5.2/5.6/6.1 的实际不变量与测试清单（cfr3-03）；(d) rmf-08 的 stream 权限收紧为 0600（Task 2.1 顺手处置），脱敏/轮转仍延后但量化说明放大 7 倍。v3 相对 v2 的变化（cfr2 系列）保留在下方历史记录：(e) 全篇代码块降级为「接口契约+不变量+测试清单」（cfr2-05）；(f) `AttemptRecord` 新增 `retryable`/`resumable` 两个布尔位（cfr2-07）；(g) judge task identity 携带 candidate fingerprint（cfr2-02）；(h) `WaveResult` 携带全部 attempts 供 `FanoutSettlement` 正确聚合（cfr2-03）；(i) `BudgetTracker.settle()` 允许变负（cfr2-03）；(j) judge 调用补传 `expected_tools`（cfr2-04）；(k) Task 8.4 探针改用专用 parser（cfr2-06）；(l) 开放发现处置表删除自填的假 backlog 编号（cfr2-09）；(m) Phase 7 Task 7.5 验收 oracle 改为定点检查（cfr2-10）。
+> 本节随 v5 修订（第四轮定点核验 cfr4-01–cfr4-02 处置后）同步更新。v5 相对 v4 的核心变化：(a) 修正 Task 5.5 联合测试的错误 oracle——`session_id`（UUIDv5）与 `attempt_key`/`stream_log` 的明文段不可能字面相等，订正为三者分别与各自独立计算的预期值比对（同源验证）；`make_request`/`_make_request` 签名统一改为 `(role, attempt)`，fork 续跑时每个 attempt 取得随编号变化的骨架请求，`stream_log` 不再被 fork 后的新 attempt 覆盖（cfr4-01，Task 5.4/5.5）；(b) 终态分类表补齐两处此前未定义的区域——parser 层模型输出失败（`ok=False` 但 `subtype="success"`）归类为可重试，CLI 启动/认证失败（`protocol_errors` 含 `missing init event`）归类为不可重试，与"真正超时"明确区分（cfr4-02，Task 5.3）；(c) rmf-08 的放大倍数从错误的"7 倍"订正为"最坏情形 39 倍"，`_persist_stream()` 改为创建时直接指定 `0o600`（不再是落盘后 `chmod`，消除中间权限窗口）。v4 相对 v3 的变化（cfr3 系列）保留在下方历史记录：(d) 新增 `RequestContext`/`build_stream_log_path` 契约，把生产环境 `cwd`/`settings_path`/`model`/`stream_log` 的取值收敛到 Phase 6 Task 6.1 单一构造点（cfr3-01）；(e) `InvocationResult` 新增 `subtype` 字段透传终态事件原始值，`AttemptRecord.retryable` 的赋值从"二元判断"改为可测试的终态分类表（cfr3-02）；(f) 把开放发现处置表宣称但从未被任务清单断言的三项补进 Task 5.2/5.6/6.1 的实际不变量与测试清单（cfr3-03）。v3 相对 v2 的变化（cfr2 系列）：(g) 全篇代码块降级为「接口契约+不变量+测试清单」（cfr2-05）；(h) `AttemptRecord` 新增 `retryable`/`resumable` 两个布尔位（cfr2-07）；(i) judge task identity 携带 candidate fingerprint（cfr2-02）；(j) `WaveResult` 携带全部 attempts 供 `FanoutSettlement` 正确聚合（cfr2-03）；(k) `BudgetTracker.settle()` 允许变负（cfr2-03）；(l) judge 调用补传 `expected_tools`（cfr2-04）；(m) Task 8.4 探针改用专用 parser（cfr2-06）；(n) 开放发现处置表删除自填的假 backlog 编号（cfr2-09）；(o) Phase 7 Task 7.5 验收 oracle 改为定点检查（cfr2-10）。
 
 ### ADR-002 D0/D1/D2 覆盖检查
 
@@ -1692,7 +1732,7 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 
 ## 执行状态（逐任务同步，跨会话据此判断进度）
 
-> v4 修订（第三轮跨模型对抗评审 cfr3-01–cfr3-03 处置后）：任务编号相对 v3 不变，但多个任务补充了新的不变量与测试清单条目——Task 2.1（`InvocationResult` 新增 `subtype` 字段 + stream 落盘权限收紧 0600，cfr3-02/rmf-08）、Task 2.3（新增 `RequestContext`/`build_stream_log_path` 契约，cfr3-01）、Task 5.2（`record_degraded` 双写 `agentType` 补测试，cfr3-03）、Task 5.3（新增可测试的终态分类表，`_classify_retryable` 取代二元判断，cfr3-02）、Task 5.5（新增 `context: RequestContext` 参数 + 三处 task identity 一致性联合测试，cfr3-01）、Task 5.6（`protocol_errors` 聚合补测试，cfr3-03）、Task 6.1（新增 `_build_request_context`/`_format_detail`，补 rmf-04/rmf-17/cfr3-01 端到端测试）。若此前有会话已按 v3 的契约开始实施，**请对照本次修订的具体测试清单新增项补齐**，尤其是 Task 5.3 的终态分类表与 Task 5.5 的联合测试，不要假设 v3 版本已经足够。
+> v5 修订（第四轮定点核验 cfr4-01–cfr4-02 处置后）：任务编号相对 v4 不变，但 Task 5.3/5.4/5.5 有实质性修正——Task 5.3 的终态分类表补齐两处此前未定义的区域（parser 层模型输出失败可重试、CLI 启动/认证失败不可重试，cfr4-02）；Task 5.4 的 `make_request` 签名改为 `(role, attempt)`，fork 续跑不再复用上一次请求对象的 `stream_log`（cfr4-01）；Task 5.5 的联合测试 oracle 从错误的"字面相等"订正为"同源比对"，`_make_request` 签名同步（cfr4-01）。Task 2.1 的 rmf-08 处置同步订正（放大倍数 39、创建时直接指定 0600）。若此前有会话已按 v4 的契约开始实施，**请特别核对 Task 5.4/5.5 的 `make_request`/`_make_request` 签名是否已经是 `(role, attempt)` 两参数**，以及 Task 5.5 的联合测试是否已按"同源比对"而非"字面相等"实现——v4 按字面实现的联合测试必然无法通过，需要重写而非补丁。
 
 | # | 任务 | 状态 | 验证证据 | 偏差 |
 |---|---|---|---|---|
@@ -1708,9 +1748,9 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 | 4.1 | prompts.py | 待开始 | | |
 | 5.1 | dedupe_and_rank | 待开始 | | |
 | 5.2 | normalize_error/record_degraded（双写 agentType 补测试，cfr3-03/rmf-04 反例） | 待开始 | | |
-| 5.3 | run_one_attempt 单次尝试原语（cfr-02/03/06/12, cfr2-07 新增 retryable/resumable, cfr3-02 终态分类表） | 待开始 | | |
-| 5.4 | BudgetTracker + run_wave_scheduled 波次调度（cfr-03/05/09/12, cfr2-03 允许变负+全部attempts, cfr2-07 fork判定） | 待开始 | | |
-| 5.5 | run_finders/judge_candidate 基于波次重写（cfr-06/07/14, cfr2-02 fingerprint task identity, cfr2-04 expected_tools, cfr3-01 RequestContext+联合测试） | 待开始 | | |
+| 5.3 | run_one_attempt 单次尝试原语（cfr-02/03/06/12, cfr2-07 新增 retryable/resumable, cfr3-02 终态分类表, cfr4-02 补齐 parser 层与 CLI 启动失败分支） | 待开始 | | |
+| 5.4 | BudgetTracker + run_wave_scheduled 波次调度（cfr-03/05/09/12, cfr2-03 允许变负+全部attempts, cfr2-07 fork判定, cfr4-01 make_request 携带 attempt+stream_log 不覆盖） | 待开始 | | |
+| 5.5 | run_finders/judge_candidate 基于波次重写（cfr-06/07/14, cfr2-02 fingerprint task identity, cfr2-04 expected_tools, cfr3-01 RequestContext+联合测试, cfr4-01 oracle 订正为同源比对） | 待开始 | | |
 | 5.6 | run_fanout + FanoutSettlement 聚合（cfr-04/06, cfr2-03 基于全部attempts, cfr3-03 protocol_errors 补测试） | 待开始 | | |
 | 6.1 | round.py 接线 + 工具收窄 + 结算分支迁移 + cli.py 适配闭包（cfr-02/04/06/08/09/15, cfr2-01, cfr3-01 RequestContext 构造点, cfr3-03 detail/model 补测试） | 待开始 | | |
 | 7.2 | 写继任测试（提前执行，冻结 canonical key 真值，cfr-18） | 待开始 | | |
