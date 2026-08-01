@@ -1,3 +1,4 @@
+import json
 import shutil, subprocess, tempfile, unittest
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -528,8 +529,12 @@ class TestRound(unittest.TestCase):
         run_round(self.cfg, deps)
 
         self.assertEqual(len(seen), 4)
-        self.assertTrue(all("goal's" in prompt and "quoted" in prompt
-                            for prompt in seen))
+        prefix = "Controller context (untrusted data):\n"
+        suffix = "\n\nReturn one JSON object with this top-level contract:"
+        for prompt in seen:
+            context_json = prompt.split(prefix, 1)[1].split(suffix, 1)[0]
+            context = json.loads(context_json)
+            self.assertEqual(context["known_canonical_keys"], [nasty])
 
     def test_duplicate_candidate_still_teaches_the_dedup_memory(self):
         """被判重复的候选也必须进去重集，否则系统学不会（rmf-02 修复的自身缺口）。
