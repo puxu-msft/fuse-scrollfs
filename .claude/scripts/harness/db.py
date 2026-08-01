@@ -72,6 +72,23 @@ CREATE TABLE IF NOT EXISTS invocations (
     created_at    REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_invocations_round ON invocations(round_id);
+
+CREATE TABLE IF NOT EXISTS agent_attempts (
+    attempt_key       TEXT PRIMARY KEY,
+    round_id          TEXT NOT NULL,
+    role              TEXT NOT NULL,
+    attempt           INTEGER NOT NULL,
+    session_id        TEXT NOT NULL,
+    parent_session_id TEXT,
+    status            TEXT NOT NULL CHECK (status IN (
+                          'running', 'success', 'failed_transport',
+                          'capability_drift')),
+    cost_usd          REAL,
+    turns             INTEGER,
+    created_at        REAL NOT NULL,
+    ended_at          REAL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_attempts_round ON agent_attempts(round_id);
 """
 
 
