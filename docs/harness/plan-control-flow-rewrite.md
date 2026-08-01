@@ -1744,7 +1744,7 @@ git commit -m "docs(harness): 同步修订 spec.md/plan-stage1b.md 的 Workflow 
 | 2.2 | claude_runner 可注入 payload_parser（cfr-01） | 已完成 | `python3 -m unittest harness.tests.test_claude_runner`：60 tests OK；全量：333 tests + 13 tests OK；正控放宽 `_extract_json_object` 允许 list 后拒绝非 dict 测试失败 | 无 |
 | 2.3 | RoleInvocationRequest + RequestContext 唯一调用契约（cfr-02, cfr3-01） | 已完成 | `python3 -m unittest harness.tests.test_role_invocation`：7 tests OK；全量：340 tests + 13 tests OK；正控将 `invoke.session_id` 改名后签名一致性测试失败，将 stream path 去掉 task_role 后 identity 测试失败 | 无 |
 | 2.4 | STAGE1_ALLOWED_TOOLS 收窄（挪至 Phase 6 Task 6.1 执行） | 延后至 6.1 | 未修改 `STAGE1_ALLOWED_TOOLS`；全量测试 init 工具集仍为 `Glob,Grep,Read,Skill,TaskOutput,Workflow` | 按本节明确要求，本阶段只新增能力、不改变生产调用路径 |
-| 3.1 | fanout_schema.py（含 cfr-13 类型前置检查） | 待开始 | | |
+| 3.1 | fanout_schema.py（含 cfr-13 类型前置检查） | 已完成 | `python3 -m unittest harness.tests.test_fanout_schema`：14 tests OK；全量：354 tests + 13 tests OK；正控禁用 finder 顶层未知字段检测后额外字段测试失败，删除 `_check_enum` 类型前置检查后 size/priority/verdict 的 list/dict 用例以未捕获 `TypeError` 失败；每次正控均先清理 `__pycache__` | 无 |
 | 4.1 | prompts.py | 待开始 | | |
 | 5.1 | dedupe_and_rank | 待开始 | | |
 | 5.2 | normalize_error/record_degraded（双写 agentType 补测试，cfr3-03/rmf-04 反例） | 待开始 | | |
