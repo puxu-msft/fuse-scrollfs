@@ -4,81 +4,51 @@
 > 权威文档：规格 [spec.md](./spec.md) v7 · 1a 计划 [plan-stage1a.md](./plan-stage1a.md) · 1b 冻结范围 [plan-stage1b.md](./plan-stage1b.md)
 > 进度账本：`.superpowers/sdd/progress.md`（git-ignored，崩溃后靠它 + `git log` 恢复认知）
 
-## ⚑ 当前阶段：控制流重写（ADR-002 已采纳）· Phase 1 已完成
+## ⚑ 控制流重写：Phase 0–7 已完成，**只剩 Phase 8（真机切换验收）**
 
-**接手者从这里开始读。** 计划经**五轮跨模型对抗评审**判 `ready`、零阻塞；Phase 0 真机验证两项 `confirmed`；Phase 1 已实施并加固。**下一步是 Phase 2。**
+**接手者从这里开始读。** 计划经**五轮跨模型对抗评审**判 `ready`，实施过程中又经**三轮合并态评审**（Phase 1+2、Phase 5、Phase 6），每轮发现均已修完。
 
 | 产物 | 位置 |
 |---|---|
 | 决策 | [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md) |
-| 计划（v5，权威） | [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md) + [kickoff](./plan-control-flow-rewrite-kickoff.md) |
-| 五轮评审 | `plan-control-flow-rewrite-review{,-2,-3,-4,-5}.md` |
-| stdio PoC | [../../exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md) |
-| Phase 0 实测 | [../../exp/control-flow-rewrite-probe/CONCLUSIONS.md](../../exp/control-flow-rewrite-probe/CONCLUSIONS.md) |
+| 计划（权威） | [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md) + [kickoff](./plan-control-flow-rewrite-kickoff.md) |
+| 计划评审（五轮）| `plan-control-flow-rewrite-review{,-2,-3,-4,-5}.md` |
+| 实施评审（三轮）| `code-review-phase1-2.md`、`code-review-phase5.md`、`code-review-phase6.md` |
+| 真机实测 | [../../exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md)、[../../exp/control-flow-rewrite-probe/CONCLUSIONS.md](../../exp/control-flow-rewrite-probe/CONCLUSIONS.md) |
 
 ### 进度
 
 | Phase | 状态 |
 |---|---|
 | 0 · 会话原语真机验证 | ✅ 两项 `confirmed`，约 $0.10 |
-| 1 · 会话身份派生 + 谱系账本 | ✅ `session_identity.py` / `ledger.py` / `agent_attempts` 表；318 + 13 测试绿 |
-| 2–8 | 待做 |
+| 1 · 会话身份 + 谱系账本 | ✅ `session_identity.py`、`ledger.py`、`agent_attempts` 表 |
+| 2 · `claude_runner` 扩展 | ✅ 会话身份参数、`subtype` 透传、可注入 parser、stream 0600 |
+| 3 · `fanout_schema.py` | ✅ 候选/裁决校验（类型前置于枚举、顶层字段集合封闭） |
+| 4 · `prompts.py` | ✅ agent 定义装配（目录经参数注入，为 my-ade 通用化预留） |
+| 5 · `fanout.py` | ✅ 并发扇出、波次调度、fork 重试、预算追踪、redline 短路、降级折叠 |
+| 6 · `round.py` 接线 | ✅ **生产路径已切换**；工具集与 settings allow 均收窄为 `{Read,Grep,Glob}` |
+| 7 · 退役旧资产 | ✅ JS workflow / skill / 跨语言测试已删，继任测试冻结当前真值 |
+| **8 · 真机切换验收** | **待做——会花钱并写公开仓库，需用户逐步确认** |
 
-### Phase 0 推翻了计划的一条预设——**别采信计划里那句话**
+**测试：453 + 13 全绿**（会话开始时 304 + 13）。定时器全程 `disabled`/`inactive`。
 
-计划原写「理论上只读工具不应触发权限请求」。**实测推翻**：开启 `--permission-prompt-tool stdio` 后，一次 `Read /etc/hostname` 确实产生 `control_request`。
+### Phase 8 之前必须知道的
 
-最终决策不变（Stage 1 不启用 stdio），但理由换成：启用它会给**每次** `Read`/`Grep`/`Glob` 都带来必须应答的 `control_request`，每轮最多 39 次子调用，凭空引入一个必须正确实现的 control 循环而收益为零。
+- **会花真钱、会向公开仓库写入**（建 Issue、推提案卡）。按 `plan-stage1a.md` Task 13 的既有纪律：**逐步执行、每步之间停下确认，不得连跑**。
+- 上一代实现真机跑通过一次（Issue #1 + 提案卡 `d2ca47e`），那条回路的经验见下方「Stage 1a」段——特别是「零副作用核查」的做法可直接复用。
+- 单轮成本参考：旧回路实测 $5.45。新回路是 7 次独立子调用，成本结构不同，**Phase 8 的首轮要实测而不是外推**。
 
-**准确表述**：只读工具**并不豁免**权限门；生产配置下不触发是因为 `permissions.allow` 预先放行，不是因为工具只读。`can_use_tool` 的触发面取决于「工具 × 权限模式 × allow 列表」，**不能凭读写属性推断**。
+### 实施中被抓到的三处**计划**缺陷（都在写代码之前）
 
-### 实施 Phase 2+ 必须带走的三条
+1. **第二份 `agent_attempts` schema**——「设计回答」段留着 v2 旧版（含 `degraded`、缺 `capability_drift`），照它实现会让能力漂移写账本时抛 `IntegrityError`
+2. **跨线程闭包**——计划让 `invoke_fn` 闭包内写 `budget.record_invocation()`，而它跑在 worker 线程，必抛 `ProgrammingError`。**这是我修 `cfr-p5-merged-01` 时自己引入的**：改了消费侧没检查生产侧能否兑现
+3. **Task 7.1 的「零命中」门**——与评审 `cfr2-10` 对 Task 7.5 的批评同源，当时只订正了 7.5。仓库里有大量合法历史引用，零命中永远达不到；改为逐条归类 + 检查活跃引用
 
-1. **`attempt >= 2` 的 `session_id` 必须是 CLI 实际返回的新 id**，不是预派生值（评审 cfr2-07）。拿预分配 ID 冒充会导致下次 fork 去 resume 一个**从未被 CLI 创建过的会话**。`ledger.py` 的 docstring 记了这条。
-2. **状态词没有 `degraded`**——「降级」是编排层对「重试耗尽」的结论，不是单次 attempt 状态。`test_ledger.TestStatusVocabularyIsPinned` 把 Python 集合与建表 CHECK 钉在一起，改一处忘另一处会被拦下。
-3. **`--max-budget-usd` 是滞后停止触发器，不是硬上限**（PoC 实测传 0.001 花掉 $0.048）。`budget.settle` 已按「不截断超额 + 标 `budget_breach`」设计，别再假设传了上限就不会超。
+### 三轮实施评审各自抓到的要害
 
-### 五轮评审的收敛轨迹（说明这份计划为什么可信）
-
-| 轮次 | 关闭 | 仍开 | **新引入** | 阻塞 |
-|---|---|---|---|---|
-| 1 | — | 19 | — | 10 Critical |
-| 2 | 9 | 10 | **4** | 6 |
-| 3 | 7 | 3 | **0** | 3 |
-| 4 | 1 | 3 | 0 | 2 |
-| 5 | 2 | 0 | 0 | **0** |
-
-第 3 轮做了一次形态改变：**把不可执行的 Python 草图降级为「接口契约 + 不变量 + 测试清单」**（3239 → 1604 行）。此前评审得**独立执行草图**才能发现缺陷——文档精确到足以出错，却不可执行到能被验证。降级后新引入归零并保持。
-
-
-
-**Stage 1a 的发布回路已真机跑通并发布过 Issue #1，但扇出层要整条替换。** 用户 2026-07-31 裁定：控制流设计不当，应在更低层接管对话，实现精细化 fork/retry；**先在 zipfs 跑通，再由同伴搬进 `~/src/my-ade`**；**2 小时定时器在重写完成前不启用**。
-
-- 决策：[adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md)
-- 事实基础：[../../exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md)（四条全部 confirmed，$0.52，零外部副作用）
-- 实施计划：`plan-control-flow-rewrite.md`（撰写中）
-
-### 根因：控制器不拥有对话链上的任何一个环节
-
-它只拥有起点（argv）与终点（stdout 解析），中间全靠**请求模型配合**。三次真机失败是同一形态——**我请求了，模型答应了，然后没做到**：模型原话「我会等待完成通知后再取结果，不会在此之前结束本轮」，紧接着 `stop_reason: end_turn`。它不是不听话，是 `-p` 模式下**它没有「跨回合等待」这个动作**。
-
-`TaskOutput(block=true)` 与 workflow 内 `safeAgent` 重试都是在这条链上加补丁，没改所有权。
-
-### PoC 中三条**改变设计**的实测结果
-
-| 结果 | 影响 |
-|---|---|
-| 「每次 stdin 输入恰好一个顶层 `result`」这个**全称命题被真实反例推翻**（后台 `Task` 路径上进程存活时会出现第二个 result） | 扇出**不得**用内联 `Task`，必须一子任务一个顶层 process/session |
-| `--max-budget-usd 0.001` 实际花掉 **$0.048197** | CLI 预算是**滞后停止触发器，不是硬费用上限**。所幸 `budget.settle` 早已按「不截断 + 标 `budget_breach`」设计，未引入新缺口 |
-| 本地分类器自动放行的安全 Bash **不产生** `can_use_tool` | stdio 拦截是增强，`--tools` allowlist 与 permissions 仍须是主边界 |
-
-已验实且可直接用的：stdin 行格式、多轮上下文保留、`control_response` 的 deny 与 `updatedInput` 机械改写（文件系统 oracle）、`--session-id` 预分配 + `--resume --fork-session` 只重试失败会话而不影响兄弟、`--agents <json>` 完全内联定义 agent（**迁移 my-ade 时不必依赖目标仓库内的 `.claude/agents/*.md`**）。
-
-未验证：消息级 `forkSession(upToMessageId)`、长期运行/传输断流恢复、全部 built-in tool 的分类。
-
-### 不受重写影响的模块（接口是「一个候选」，与扇出如何产生无关）
-
-`outbox` · `budget` · `queue` · `publish` · `lifecycle` · `gitops` · `precheck` · `db` —— **不要顺手重构它们**。
+- **Phase 1+2**：`RequestContext` 的测试**在断言自己刚写的字面量**（`cwd="/tmp"` 照样能构造）；`_persist_stream` 的 `0o600` **只在首次创建生效**，而 stream 路径确定性生成、重跑必然命中既有文件
+- **Phase 5**：调度器按 `single_call_cap_usd` 预留却**没写进 `request.grant_usd`**，总请求上限是预算池的 3 倍；预算用二进制 float 严格比较导致**少调度**
+- **Phase 6**：`no-candidate-degraded` 的退出码**没有任何测试守着**（行为正确但可被自由破坏）；`Budget.settle` 写的 `budget_breach` 被 `record_outcome` **覆盖成 `published`**，超支静默消失
 
 ## ✅ Stage 1a 发布回路已真机跑通（2026-07-31）
 
