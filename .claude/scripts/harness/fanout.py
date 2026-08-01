@@ -15,8 +15,16 @@ from dataclasses import dataclass, field, replace
 
 from . import ledger
 from .claude_runner import InvocationResult
-from .queue import canonical_key
-from .role_invocation import RoleInvocationRequest
+from .fanout_schema import validate_finder_output, validate_judge_output
+from .prompts import AgentDef, build_finder_prompt, build_judge_prompt
+from .queue import canonical_key, fingerprint
+from .role_invocation import (
+    RequestContext,
+    RoleInvocationRequest,
+    build_stream_log_path,
+    for_judge,
+)
+from .session_identity import derive_session_id
 
 
 _PRIORITY_ORDER = {"T0": 0, "T1": 1, "T2": 2, "T3": 3, "T4": 4}
@@ -26,6 +34,34 @@ _MAX_AGENT_ATTEMPTS = 3
 _DEFAULT_SINGLE_CALL_CAP_USD = 0.3
 _MIN_CALL_WINDOW_S = 5.0
 _CALL_TEARDOWN_MARGIN_S = 1.0
+_STAGE1_EXPECTED_TOOLS = frozenset({"Read", "Grep", "Glob"})
+_FINDER_ROLES = (
+    "finder:roadmap",
+    "finder:code",
+    "finder:bench",
+    "finder:hygiene",
+)
+_FINDER_AGENT_NAMES = {
+    "finder:roadmap": "harness-finder-roadmap",
+    "finder:code": "harness-finder-code",
+    "finder:bench": "harness-finder-bench",
+    "finder:hygiene": "harness-finder-hygiene",
+}
+_FINDER_LANES = {
+    "finder:roadmap": "roadmap",
+    "finder:code": "defect",
+    "finder:bench": "perf",
+    "finder:hygiene": "hygiene",
+}
+_JUDGE_AGENT_NAMES = {
+    "redline": "harness-judge-redline",
+    "completed": "harness-judge-completed",
+    "oracle": "harness-judge-oracle",
+}
+_JUDGE_ORDER = ("redline", "completed", "oracle")
+_JUDGE_TYPES = tuple(_JUDGE_AGENT_NAMES[kind] for kind in _JUDGE_ORDER)
+_DEFAULT_MAX_TURNS = 10
+_DEFAULT_REQUEST_TIMEOUT_S = 60.0
 
 # 顺序敏感：UUID 必须先于裸 hex，否则第一段会被提前替换。
 _ID_PATTERNS = (
@@ -452,3 +488,263 @@ def run_wave_scheduled(
         pending = retry_roles
 
     return WaveResult(final=final, all_attempts=all_attempts)
+
+
+def _agent_for(
+    agents: dict[str, AgentDef] | None, agent_name: str
+) -> AgentDef:
+    if agents is None or agent_name not in agents:
+        raise ValueError(f"missing agent definition for {agent_name}")
+    return agents[agent_name]
+
+
+def _base_request(
+    *,
+    task_role: str,
+    attempt: int,
+    prompt: str,
+    agent: AgentDef,
+    context: RequestContext,
+    round_id: str,
+    judge: bool = False,
+) -> RoleInvocationRequest:
+    kwargs = {
+        "role": task_role,
+        "prompt": prompt,
+        "tools": ",".join(sorted(agent.tools)),
+        "grant_usd": _DEFAULT_SINGLE_CALL_CAP_USD,
+        "max_turns": _DEFAULT_MAX_TURNS,
+        "settings_path": context.settings_path,
+        "cwd": context.cwd,
+        "timeout_s": _DEFAULT_REQUEST_TIMEOUT_S,
+        "model": context.model,
+        "stream_log": build_stream_log_path(
+            context.stream_log_dir, round_id, task_role, attempt
+        ),
+        "session_id": derive_session_id(round_id, task_role, attempt),
+    }
+    return for_judge(**kwargs) if judge else RoleInvocationRequest(**kwargs)
+
+
+def run_finders(
+    *,
+    round_id: str,
+    invoke_fn,
+    budget: BudgetTracker,
+    deadline_monotonic: float,
+    blocked_lanes: list[str],
+    known_canonical_keys: set[str],
+    context: RequestContext,
+    agents: dict[str, AgentDef] | None = None,
+    conn=None,
+    all_records: list[AttemptRecord] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    prompts_by_role = {
+        role: build_finder_prompt(
+            _agent_for(agents, _FINDER_AGENT_NAMES[role]),
+            blocked_lanes=blocked_lanes,
+            known_canonical_keys=sorted(known_canonical_keys),
+        )
+        for role in _FINDER_ROLES
+    }
+
+    def make_request(role: str, attempt: int) -> RoleInvocationRequest:
+        agent = _agent_for(agents, _FINDER_AGENT_NAMES[role])
+        return _base_request(
+            task_role=role,
+            attempt=attempt,
+            prompt=prompts_by_role[role],
+            agent=agent,
+            context=context,
+            round_id=round_id,
+        )
+
+    wave = run_wave_scheduled(
+        roles=_FINDER_ROLES,
+        make_request=make_request,
+        invoke_fn=invoke_fn,
+        validate=validate_finder_output,
+        budget=budget,
+        deadline_monotonic=deadline_monotonic,
+        expected_tools=_STAGE1_EXPECTED_TOOLS,
+        conn=conn,
+        round_id=round_id,
+    )
+    if all_records is not None:
+        all_records.extend(wave.all_attempts)
+
+    candidates: list[dict] = []
+    degraded: list[dict] = []
+    for role in _FINDER_ROLES:
+        record = wave.final[role]
+        if record.status == "success" and record.payload is not None:
+            candidates.extend(
+                dict(candidate, lane=_FINDER_LANES[role])
+                for candidate in record.payload["candidates"]
+            )
+        else:
+            record_degraded(
+                degraded,
+                role=role,
+                error=normalize_error(record.last_error or record.status),
+                attempts=sum(r.role == role for r in wave.all_attempts),
+            )
+    return (
+        dedupe_and_rank(
+            candidates,
+            known_canonical_keys=known_canonical_keys,
+            blocked_lanes=blocked_lanes,
+        ),
+        degraded,
+    )
+
+
+def _judge_kind(task_role: str) -> str:
+    namespace, kind, _fingerprint = task_role.split(":", 2)
+    if namespace != "judge" or kind not in _JUDGE_AGENT_NAMES:
+        raise ValueError(f"invalid judge task role: {task_role}")
+    return kind
+
+
+def _judge_verdict(
+    judge_type: str,
+    payload: dict,
+    *,
+    degraded: bool,
+    skipped_judges: list[str],
+) -> dict:
+    if degraded:
+        verdict = {
+            "judge": judge_type,
+            "verdict": "reject",
+            "reason": "judge-unavailable",
+            "degraded": True,
+            "skipped_judges": skipped_judges,
+        }
+        exclusive_field = {
+            "harness-judge-redline": "invariant_at_risk",
+            "harness-judge-completed": "evidence",
+            "harness-judge-oracle": "suggested_oracle",
+        }[judge_type]
+        verdict[exclusive_field] = None
+        return verdict
+    return {
+        "judge": judge_type,
+        **payload,
+        "degraded": False,
+        "skipped_judges": skipped_judges,
+    }
+
+
+def judge_candidate(
+    *,
+    round_id: str,
+    candidate: dict,
+    invoke_fn,
+    budget: BudgetTracker,
+    deadline_monotonic: float,
+    inflight_paths: list[str],
+    context: RequestContext,
+    agents: dict[str, AgentDef] | None = None,
+    conn=None,
+    all_records: list[AttemptRecord] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    fp = fingerprint(
+        candidate["goal"],
+        candidate["invariant"],
+        candidate["primary_path"],
+        candidate["oracle"],
+    )
+    degraded_records: list[dict] = []
+    verdicts: list[dict] = []
+
+    def run_judges(kinds: tuple[str, ...]) -> WaveResult:
+        task_roles = tuple(f"judge:{kind}:{fp}" for kind in kinds)
+
+        def make_request(task_role: str, attempt: int) -> RoleInvocationRequest:
+            kind = _judge_kind(task_role)
+            agent_name = _JUDGE_AGENT_NAMES[kind]
+            agent = _agent_for(agents, agent_name)
+            return _base_request(
+                task_role=task_role,
+                attempt=attempt,
+                prompt=build_judge_prompt(
+                    agent, candidate, inflight_paths=inflight_paths
+                ),
+                agent=agent,
+                context=context,
+                round_id=round_id,
+                judge=True,
+            )
+
+        validation_context = threading.local()
+
+        def validate(payload: dict) -> list[str]:
+            task_role = validation_context.task_role
+            judge_type = _JUDGE_AGENT_NAMES[_judge_kind(task_role)]
+            return validate_judge_output(judge_type, payload)
+
+        def run_role(request: RoleInvocationRequest) -> InvocationResult:
+            validation_context.task_role = request.role
+            return invoke_fn(request)
+
+        return run_wave_scheduled(
+            roles=task_roles,
+            make_request=make_request,
+            invoke_fn=run_role,
+            validate=validate,
+            budget=budget,
+            deadline_monotonic=deadline_monotonic,
+            expected_tools=_STAGE1_EXPECTED_TOOLS,
+            conn=conn,
+            round_id=round_id,
+        )
+
+    redline_wave = run_judges(("redline",))
+    if all_records is not None:
+        all_records.extend(redline_wave.all_attempts)
+    redline_role = f"judge:redline:{fp}"
+    redline_record = redline_wave.final[redline_role]
+    redline_failed = redline_record.status != "success"
+    if redline_failed:
+        record_degraded(
+            degraded_records,
+            role=redline_role,
+            error=normalize_error(redline_record.last_error or redline_record.status),
+            attempts=sum(r.role == redline_role for r in redline_wave.all_attempts),
+        )
+    skipped = list(_JUDGE_TYPES[1:]) if redline_failed or redline_record.payload["verdict"] == "reject" else []
+    verdicts.append(
+        _judge_verdict(
+            _JUDGE_AGENT_NAMES["redline"],
+            redline_record.payload or {},
+            degraded=redline_failed,
+            skipped_judges=skipped,
+        )
+    )
+    if verdicts[0]["verdict"] == "reject":
+        return verdicts, degraded_records
+
+    other_wave = run_judges(("completed", "oracle"))
+    if all_records is not None:
+        all_records.extend(other_wave.all_attempts)
+    for kind in ("completed", "oracle"):
+        task_role = f"judge:{kind}:{fp}"
+        record = other_wave.final[task_role]
+        failed = record.status != "success"
+        if failed:
+            record_degraded(
+                degraded_records,
+                role=task_role,
+                error=normalize_error(record.last_error or record.status),
+                attempts=sum(r.role == task_role for r in other_wave.all_attempts),
+            )
+        verdicts.append(
+            _judge_verdict(
+                _JUDGE_AGENT_NAMES[kind],
+                record.payload or {},
+                degraded=failed,
+                skipped_judges=[],
+            )
+        )
+    return verdicts, degraded_records

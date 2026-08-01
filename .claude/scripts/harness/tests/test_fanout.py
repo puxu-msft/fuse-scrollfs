@@ -715,5 +715,347 @@ class TestRunWaveScheduled(unittest.TestCase):
         self.assertTrue(str(seen[1].stream_log).endswith("-2.jsonl"))
 
 
+class TestFanoutComposition(unittest.TestCase):
+    _CONTEXT = None
+
+    @classmethod
+    def setUpClass(cls):
+        from harness.prompts import AgentDef
+        from harness.role_invocation import RequestContext
+
+        cls._CONTEXT = RequestContext(
+            cwd="/real/repo",
+            settings_path=".claude/harness-settings.json",
+            model="claude-sonnet-5",
+            stream_log_dir="/real/repo/.claude/state/rounds",
+        )
+        cls._AGENTS = {
+            name: AgentDef(
+                name=name,
+                description=name,
+                tools=("Glob", "Grep", "Read"),
+                body=f"persona for {name}",
+            )
+            for name in (
+                "harness-finder-roadmap",
+                "harness-finder-code",
+                "harness-finder-bench",
+                "harness-finder-hygiene",
+                "harness-judge-redline",
+                "harness-judge-completed",
+                "harness-judge-oracle",
+            )
+        }
+
+    @staticmethod
+    def _candidate(**overrides):
+        candidate = {
+            "title": "candidate",
+            "goal": "goal",
+            "invariant": "invariant",
+            "primary_path": "src/main.py",
+            "oracle": "python -m unittest",
+            "evidence": "evidence",
+            "touched_paths": ["src/main.py"],
+            "size": "S",
+            "priority": "T0",
+            "needs_decision": False,
+            "body_md": "body",
+            "slug": "candidate",
+            "lane": "defect",
+        }
+        candidate.update(overrides)
+        return candidate
+
+    @staticmethod
+    def _invocation(payload, *, request, ok=True, init_tools=None,
+                    session_id=None, raw_tail=""):
+        return InvocationResult(
+            ok=ok,
+            payload=payload if ok else None,
+            cost_usd=0.01,
+            turns=1,
+            cost_known=True,
+            session_id=session_id or request.session_id,
+            subtype="success" if ok else "error_during_execution",
+            init_seen=True,
+            init_tools=init_tools or ["Glob", "Grep", "Read"],
+            raw_tail=raw_tail,
+        )
+
+    def _run_finders(self, invoke_fn, **overrides):
+        import time
+        from harness.fanout import BudgetTracker, run_finders
+
+        values = {
+            "round_id": "round-1",
+            "invoke_fn": invoke_fn,
+            "budget": BudgetTracker(3.0),
+            "deadline_monotonic": time.monotonic() + 120.0,
+            "blocked_lanes": [],
+            "known_canonical_keys": set(),
+            "context": self._CONTEXT,
+            "agents": self._AGENTS,
+        }
+        values.update(overrides)
+        return run_finders(**values)
+
+    def _judge(self, candidate, invoke_fn, **overrides):
+        import time
+        from harness.fanout import BudgetTracker, judge_candidate
+
+        values = {
+            "round_id": "round-1",
+            "candidate": candidate,
+            "invoke_fn": invoke_fn,
+            "budget": BudgetTracker(3.0),
+            "deadline_monotonic": time.monotonic() + 120.0,
+            "inflight_paths": ["src/inflight.py"],
+            "context": self._CONTEXT,
+            "agents": self._AGENTS,
+        }
+        values.update(overrides)
+        return judge_candidate(**values)
+
+    def test_finders_return_ranked_candidate_without_degradation(self):
+        candidate = self._candidate()
+
+        def invoke(request):
+            finder_candidate = {k: v for k, v in candidate.items() if k != "lane"}
+            payload = {"candidates": [finder_candidate]} if request.role == "finder:code" else {"candidates": []}
+            return self._invocation(payload, request=request)
+
+        ranked, degraded = self._run_finders(invoke)
+        self.assertEqual([c["title"] for c in ranked], [candidate["title"]])
+        self.assertEqual(degraded, [])
+
+    def test_failed_finder_does_not_discard_other_finder_candidate(self):
+        candidate = self._candidate()
+
+        def invoke(request):
+            if request.role == "finder:roadmap":
+                return self._invocation(
+                    None,
+                    request=request,
+                    ok=False,
+                    session_id="real-roadmap",
+                    raw_tail="transient",
+                )
+            finder_candidate = {k: v for k, v in candidate.items() if k != "lane"}
+            payload = {"candidates": [finder_candidate]} if request.role == "finder:code" else {"candidates": []}
+            return self._invocation(payload, request=request)
+
+        ranked, degraded = self._run_finders(invoke)
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual([d["role"] for d in degraded], ["finder:roadmap"])
+
+    def test_redline_reject_short_circuits_other_judges(self):
+        calls = []
+
+        def invoke(request):
+            calls.append(request.role)
+            self.assertTrue(request.role.startswith("judge:redline:"))
+            return self._invocation(
+                {
+                    "verdict": "reject",
+                    "reason": "redline",
+                    "invariant_at_risk": "risk",
+                },
+                request=request,
+            )
+
+        verdicts, degraded = self._judge(self._candidate(), invoke)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(degraded, [])
+        self.assertEqual(
+            verdicts[0]["skipped_judges"],
+            ["harness-judge-completed", "harness-judge-oracle"],
+        )
+
+    def test_redline_pass_runs_all_judges_with_no_skips(self):
+        def invoke(request):
+            kind = request.role.split(":", 2)[1]
+            payloads = {
+                "redline": {
+                    "verdict": "pass",
+                    "reason": "safe",
+                    "invariant_at_risk": "none",
+                },
+                "completed": {
+                    "verdict": "pass",
+                    "reason": "new",
+                    "evidence": "none",
+                },
+                "oracle": {
+                    "verdict": "pass",
+                    "reason": "strong",
+                    "suggested_oracle": "none",
+                },
+            }
+            return self._invocation(payloads[kind], request=request)
+
+        verdicts, degraded = self._judge(self._candidate(), invoke)
+        self.assertEqual(len(verdicts), 3)
+        self.assertEqual(degraded, [])
+        self.assertTrue(all(v["skipped_judges"] == [] for v in verdicts))
+
+    def test_degraded_redline_is_reject_and_top_level_degraded(self):
+        def invoke(request):
+            return self._invocation(
+                None,
+                request=request,
+                ok=False,
+                session_id="real-redline",
+                raw_tail="transient",
+            )
+
+        verdicts, degraded = self._judge(self._candidate(), invoke)
+        self.assertEqual(verdicts[0]["verdict"], "reject")
+        self.assertEqual(verdicts[0]["reason"], "judge-unavailable")
+        self.assertTrue(verdicts[0]["degraded"])
+        self.assertEqual(len(degraded), 1)
+        self.assertTrue(degraded[0]["role"].startswith("judge:redline:"))
+
+    def test_different_candidates_get_distinct_judge_session_identity(self):
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            return self._invocation(
+                {
+                    "verdict": "reject",
+                    "reason": "redline",
+                    "invariant_at_risk": "risk",
+                },
+                request=request,
+            )
+
+        self._judge(self._candidate(goal="goal-a"), invoke)
+        self._judge(self._candidate(goal="goal-b"), invoke)
+        self.assertNotEqual(seen[0].session_id, seen[1].session_id)
+
+    def test_judge_capability_drift_becomes_degraded_reject(self):
+        def invoke(request):
+            return self._invocation(
+                {
+                    "verdict": "pass",
+                    "reason": "safe",
+                    "invariant_at_risk": "none",
+                },
+                request=request,
+                init_tools=["Bash", "Glob", "Grep", "Read"],
+            )
+
+        verdicts, degraded = self._judge(self._candidate(), invoke)
+        self.assertEqual(verdicts[0]["reason"], "judge-unavailable")
+        self.assertEqual(len(degraded), 1)
+
+    def test_judge_identity_drives_session_ledger_and_stream_log(self):
+        from unittest.mock import patch
+        from harness.queue import fingerprint
+        from harness.role_invocation import build_stream_log_path
+        from harness.session_identity import derive_session_id
+
+        candidate_a = self._candidate(goal="goal-a")
+        candidate_b = self._candidate(goal="goal-b")
+        actual_requests = []
+        started = []
+
+        def invoke(request):
+            actual_requests.append(request)
+            return self._invocation(
+                {
+                    "verdict": "reject",
+                    "reason": "redline",
+                    "invariant_at_risk": "risk",
+                },
+                request=request,
+            )
+
+        def record_started(conn, **kwargs):
+            started.append(kwargs)
+
+        with patch("harness.fanout.ledger.record_attempt_started", record_started), patch(
+            "harness.fanout.ledger.record_attempt_finished"
+        ):
+            self._judge(candidate_a, invoke, conn=object())
+            self._judge(candidate_b, invoke, conn=object())
+
+        for candidate, request, ledger_row in zip(
+            (candidate_a, candidate_b), actual_requests, started, strict=True
+        ):
+            fp = fingerprint(
+                candidate["goal"],
+                candidate["invariant"],
+                candidate["primary_path"],
+                candidate["oracle"],
+            )
+            task_role = f"judge:redline:{fp}"
+            self.assertEqual(request.session_id, derive_session_id("round-1", task_role, 1))
+            self.assertEqual(
+                request.stream_log,
+                build_stream_log_path(
+                    self._CONTEXT.stream_log_dir, "round-1", task_role, 1
+                ),
+            )
+            self.assertEqual(
+                f"{ledger_row['round_id']}:{ledger_row['role']}:{ledger_row['attempt']}",
+                f"round-1:{task_role}:1",
+            )
+        self.assertNotEqual(actual_requests[0].stream_log, actual_requests[1].stream_log)
+
+    def test_request_context_populates_every_role_request(self):
+        seen = []
+
+        def finder_invoke(request):
+            seen.append(request)
+            return self._invocation({"candidates": []}, request=request)
+
+        self._run_finders(finder_invoke)
+
+        def judge_invoke(request):
+            seen.append(request)
+            kind = request.role.split(":", 2)[1]
+            payload = {
+                "redline": {"verdict": "pass", "reason": "safe", "invariant_at_risk": "none"},
+                "completed": {"verdict": "pass", "reason": "new", "evidence": "none"},
+                "oracle": {"verdict": "pass", "reason": "strong", "suggested_oracle": "none"},
+            }[kind]
+            return self._invocation(payload, request=request)
+
+        self._judge(self._candidate(), judge_invoke)
+        self.assertEqual(len(seen), 7)
+        for request in seen:
+            self.assertEqual(request.cwd, self._CONTEXT.cwd)
+            self.assertEqual(request.settings_path, self._CONTEXT.settings_path)
+            self.assertEqual(request.model, self._CONTEXT.model)
+
+    def test_judge_retry_uses_distinct_per_attempt_stream_logs(self):
+        seen = []
+
+        def invoke(request):
+            seen.append(request)
+            if len(seen) == 1:
+                return self._invocation(
+                    None,
+                    request=request,
+                    ok=False,
+                    session_id="real-redline",
+                    raw_tail="transient",
+                )
+            return self._invocation(
+                {
+                    "verdict": "reject",
+                    "reason": "redline",
+                    "invariant_at_risk": "risk",
+                },
+                request=request,
+            )
+
+        self._judge(self._candidate(), invoke)
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0].stream_log, seen[1].stream_log)
+
+
 if __name__ == "__main__":
     unittest.main()
