@@ -21,7 +21,8 @@ from .queue import Queue, canonical_key, fingerprint
 # 字符串，加 TaskOutput 时两边立刻漂移——被 build_argv 的入口强制拦下（真机实测
 # 2026-07-31）。拦住是对的，但正确的形态是让漂移**无法发生**。
 STAGE1_TOOLS = ",".join(sorted(STAGE1_ALLOWED_TOOLS))
-SETTINGS_PATH = ".claude/harness-settings.json"
+# 真相源在 config；此处再导出，保持 `from .round import SETTINGS_PATH` 的既有调用点不变。
+from .config import SETTINGS_PATH  # noqa: F401
 ROUND_DEADLINE_S = 20 * 60
 # 结算窗口：为 checkpoint/记账预留的时间，绝不能被 `max(x, 60)` 之类的下限
 # 放大——`max(deadline - elapsed, 60)` 在剩余为负时会返回 60，使子进程超时

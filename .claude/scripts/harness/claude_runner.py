@@ -428,18 +428,39 @@ def _persist_stream(stream_log, stdout: str, stderr: str) -> None:
     """
     if stream_log is None:
         return
+    tmp_path = None
     try:
         path = pathlib.Path(stream_log)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # 写同目录临时文件再原子 replace，**不是**直接打开目标路径（评审
+        # cfr-p12-merged-02）：`os.open(..., O_CREAT|O_TRUNC, 0o600)` 的 mode
+        # 只在**首次创建**时生效，打开一个**已存在**的文件时 mode 被完全忽略、
+        # 权限保持原样。而 stream 路径按 round/role/attempt 确定性生成，重跑
+        # 同一轮、崩溃恢复、上次留下的残留文件都会命中同一路径——届时新的敏感
+        # stream 会写进一个 0644 的 inode，而只覆盖新文件的权限测试仍然全绿。
+        #
+        # 也**不能**改用「写完再 chmod」：那会重新引入从默认权限到 chmod 生效
+        # 之间的窗口，正是 rmf-08 修掉的东西。临时文件由本进程新建，mode 必然
+        # 生效；`os.replace` 是原子的，且保留新 inode 的权限位。
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(stdout or "")
             if stderr:
                 fh.write("\n===== stderr =====\n")
                 fh.write(stderr)
+        os.replace(str(tmp_path), str(path))
+        tmp_path = None
     except OSError as exc:
         print(f"harness: 无法写入 stream 日志 {stream_log}: {exc}",
               file=sys.stderr)
+    finally:
+        # 中途失败时不留半截临时文件；清理本身失败也不得影响本轮结论。
+        if tmp_path is not None:
+            try:
+                os.unlink(str(tmp_path))
+            except OSError:
+                pass
 
 
 def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,

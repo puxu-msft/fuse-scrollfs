@@ -28,6 +28,12 @@ class Config:
     lane_cap: int
 
 
+# headless 子进程的 settings 文件（相对仓库根）。放在 config 而非 round：
+# Phase 6 起 round → fanout → role_invocation，若 role_invocation 反过来从
+# round 取这个常量就成环。它本就是路径常量，属于 config。
+SETTINGS_PATH = ".claude/harness-settings.json"
+
+
 def _read_env_file(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     if not path.exists():

@@ -30,6 +30,13 @@ ATTEMPT_STATUSES = frozenset(
     {"running", "success", "failed_transport", "capability_drift"}
 )
 
+# 终态集合：**由完整词表派生**，不是第三份硬编码（评审 cfr-p12-merged-03）。
+# `record_attempt_finished` 此前用整个 `ATTEMPT_STATUSES` 校验，于是可以把一行
+# 标成 `running` 却同时写入 `ended_at`——按 status 判它还在跑、按 ended_at 判它
+# 已结束，一条自相矛盾的审计行。数据库词表保持四值（`running` 是合法的行状态），
+# 只是 finished 这个**动作**不接受它。
+ATTEMPT_TERMINAL_STATUSES = ATTEMPT_STATUSES - {"running"}
+
 
 def record_attempt_started(
     conn: sqlite3.Connection,
@@ -66,8 +73,11 @@ def record_attempt_finished(
     cost_usd: float,
     turns: int,
 ) -> None:
-    if status not in ATTEMPT_STATUSES:
-        raise ValueError(f"invalid attempt status: {status!r}")
+    if status not in ATTEMPT_TERMINAL_STATUSES:
+        raise ValueError(
+            f"invalid terminal attempt status: {status!r}"
+            f"（合法终态：{sorted(ATTEMPT_TERMINAL_STATUSES)}；"
+            f"'running' 是行状态，不是可结算的终态）")
     conn.execute(
         "UPDATE agent_attempts SET status=?, cost_usd=?, turns=?, ended_at=?"
         " WHERE attempt_key=?",

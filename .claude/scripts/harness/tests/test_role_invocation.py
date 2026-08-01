@@ -1,5 +1,7 @@
 import inspect
+import tempfile
 import unittest
+from pathlib import Path
 from dataclasses import fields
 from typing import get_type_hints
 
@@ -96,3 +98,50 @@ class TestRequestContext(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProductionRequestContext(unittest.TestCase):
+    """`RequestContext` 必须有唯一的**生产** factory（评审 cfr-p12-merged-01）。
+
+    此前 `RequestContext` 只是个接受任意值的容器：`cwd="/tmp"`、
+    `settings_path=""`、`model=None` 照样能构造，而全仓唯一构造点是测试自己。
+    测试写下一组正确字面量再断言它们正确——**断言的是自己刚写的东西**，
+    cfr3-01「生产值必须是真值」这条要求因此没有任何可执行地基：
+    Phase 5/6 即使重新引入被评审明令禁止的占位值，本阶段测试仍会全绿。
+
+    修法是让 factory 成为唯一来源，测试**调用它**而不是自填期望值。
+    """
+
+    def _cfg(self, root):
+        class _Cfg:
+            repo_root = Path(root)
+            state_db = Path(root) / ".claude/state/harness.db"
+        return _Cfg()
+
+    def test_factory_binds_real_production_values(self):
+        from harness import config as _config
+        from harness.claude_runner import DEFAULT_AGENT_MODEL
+        from harness.role_invocation import build_request_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = build_request_context(self._cfg(tmp))
+            self.assertEqual(ctx.cwd, tmp)
+            self.assertEqual(ctx.settings_path, _config.SETTINGS_PATH)
+            self.assertEqual(ctx.model, DEFAULT_AGENT_MODEL)
+            self.assertEqual(ctx.stream_log_dir,
+                             str(Path(tmp) / ".claude/state/rounds"))
+
+    def test_factory_never_yields_the_placeholders_review_banned(self):
+        """占位值是评审明确点名的失败态，必须逐个排除。"""
+        from harness.role_invocation import build_request_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = build_request_context(self._cfg(tmp))
+            self.assertNotEqual(ctx.cwd, "/tmp")
+            self.assertNotEqual(ctx.settings_path, "")
+            self.assertIsNotNone(ctx.model)
+            self.assertNotIn(ctx.stream_log_dir, ("", "/tmp"))
+            for value in (ctx.cwd, ctx.settings_path, ctx.model,
+                          ctx.stream_log_dir):
+                self.assertIsInstance(value, str)
+                self.assertTrue(value.strip(), "生产值不得为空串")

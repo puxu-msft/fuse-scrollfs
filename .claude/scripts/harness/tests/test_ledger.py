@@ -89,7 +89,10 @@ class TestLedger(unittest.TestCase):
 
     def test_degraded_is_rejected_before_sql_execution(self):
         self._start()
-        with self.assertRaisesRegex(ValueError, "invalid attempt status"):
+        # 只断言「拒绝了、且消息点名了非法值」，不绑死措辞——本条曾因把错误
+        # 消息改精确（invalid attempt status → invalid terminal attempt status）
+        # 而误红，可行为一步没变。测的应是「SQL 之前被拒」这个性质。
+        with self.assertRaisesRegex(ValueError, "degraded"):
             ledger.record_attempt_finished(
                 self.conn,
                 attempt_key="round-1:finder:roadmap:1",
@@ -142,3 +145,44 @@ class TestStatusVocabularyIsPinned(unittest.TestCase):
             sql_statuses, set(ATTEMPT_STATUSES),
             "ledger.ATTEMPT_STATUSES 与建表 CHECK 漂移了——"
             "改一处必须同步另一处，否则合法状态会在写入时抛 IntegrityError")
+
+
+class TestFinishedRequiresTerminalStatus(unittest.TestCase):
+    """`record_attempt_finished` 只接受**终态**（评审 cfr-p12-merged-03）。
+
+    `ATTEMPT_STATUSES` 同时含运行态 `running` 与三个终态，而 finished 用整个
+    集合校验——于是可以把一行标成 `running` 却同时写入 `ended_at`，产出一条
+    **自相矛盾的审计行**：按 `status` 判它还在跑，按 `ended_at` 判它已结束。
+
+    数据库词表保持四值不变（`running` 是合法的行状态），只是 finished 这个
+    **动作**不接受它。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = db.connect(Path(self.tmp.name) / "h.db")
+        db.migrate(self.conn)
+        self.addCleanup(self.conn.close)
+        ledger.record_attempt_started(
+            self.conn, round_id="r1", role="finder:code", attempt=1,
+            session_id="s1", parent_session_id=None)
+
+    def test_running_is_rejected_as_a_finished_status(self):
+        with self.assertRaises(ValueError):
+            ledger.record_attempt_finished(
+                self.conn, attempt_key="r1:finder:code:1",
+                status="running", cost_usd=0.1, turns=1)
+
+    def test_terminal_statuses_are_accepted(self):
+        for status in ("success", "failed_transport", "capability_drift"):
+            with self.subTest(status=status):
+                ledger.record_attempt_finished(
+                    self.conn, attempt_key="r1:finder:code:1",
+                    status=status, cost_usd=0.1, turns=1)
+
+    def test_terminal_set_is_the_full_set_minus_running(self):
+        self.assertEqual(
+            set(ledger.ATTEMPT_TERMINAL_STATUSES),
+            set(ledger.ATTEMPT_STATUSES) - {"running"},
+            "终态集合必须由完整词表派生，不能是第三份硬编码")

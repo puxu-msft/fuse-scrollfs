@@ -637,13 +637,32 @@ class TestInvoke(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
 
     def test_stream_file_is_created_with_mode_not_chmodded_afterward(self):
+        """权限必须在创建调用本身收紧，不能是创建后的第二步。
+
+        「创建后再 chmod」存在一个从默认权限（通常 0644，全用户可读）到 chmod
+        生效之间的窗口，那个窗口本身就是暴露面（rmf-08）。
+
+        断言的是**意图**不是实现形状：原版还断言了 `source.count("os.open") == 1`，
+        那绑得太死——修 cfr-p12-merged-02 时注释里提到 `os.open` 就会让它失败，
+        而安全属性并没有被削弱。现在只要求「无 chmod」+「每个创建调用都带
+        0o600」，具体用几次 `os.open`、是否走临时文件+replace 由实现决定。
+        """
         from harness import claude_runner
 
         source = inspect.getsource(claude_runner._persist_stream)
-        self.assertIn("os.open", source)
-        self.assertIn("0o600", source)
-        self.assertEqual(source.count("os.open"), 1)
-        self.assertNotIn("chmod", source)
+        # 断言只看**代码行**：注释与 docstring 里会解释「为什么不用 chmod」，
+        # 对整段源文本做子串检查会被这些解释文字误伤（实测踩过一次）。
+        body = source.split('"""')[-1] if source.count('"""') >= 2 else source
+        code_lines = [ln for ln in body.splitlines()
+                      if not ln.lstrip().startswith("#")]
+        code = "\n".join(code_lines)
+        self.assertNotIn("chmod", code,
+                         "落盘后 chmod 会重新引入默认权限窗口")
+        opens = [ln for ln in code_lines if "os.open(" in ln]
+        self.assertTrue(opens, "必须用 os.open 显式指定创建权限")
+        for line in opens:
+            self.assertIn("0o600", line,
+                          f"创建调用未带 0o600：{line.strip()}")
 
     def test_stream_is_persisted_even_when_the_call_times_out(self):
         """超时是最需要事后判因的情形，不能反而什么都不留。"""
@@ -676,3 +695,42 @@ class TestInvoke(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStreamLogPermissionsOnExistingFile(unittest.TestCase):
+    """0o600 必须对**既有文件**也成立（评审 cfr-p12-merged-02）。
+
+    `os.open(..., O_CREAT|O_TRUNC, 0o600)` 的 mode 只在**首次创建**时生效；
+    打开一个已存在的文件时 mode 被完全忽略，权限保持原样。
+
+    这不是理论风险：stream 路径按 `round_id`/`role`/`attempt` **确定性**生成，
+    重跑同一轮、崩溃恢复、或上一次留下的残留文件都会命中同一路径。届时新的
+    敏感 stream 会写进一个全用户可读的 inode，而权限位测试（只覆盖新文件）
+    仍然全绿——典型的假绿。
+    """
+
+    def test_existing_world_readable_file_is_not_written_through(self):
+        import stat as _stat
+        import tempfile
+
+        stdout = _CLEAN_STDOUT if "_CLEAN_STDOUT" in globals() else None
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "r1.jsonl"
+            log.write_text("stale", encoding="utf-8")
+            log.chmod(0o644)
+            self.assertEqual(_stat.S_IMODE(log.stat().st_mode), 0o644)
+
+            runner = FakeRunner(result=subprocess.CompletedProcess(
+                args=["claude"], returncode=0,
+                stdout=(stdout or self._valid_stdout()), stderr=""))
+            invoke(prompt="/x", tools=VALID_TOOLS, grant_usd=0.5, max_turns=5,
+                  settings_path="s.json", cwd="/tmp", timeout_s=5.0,
+                  env={"HOME": "/h", "PATH": "/bin"}, runner=runner,
+                  stream_log=log)
+
+            self.assertEqual(
+                _stat.S_IMODE(log.stat().st_mode), 0o600,
+                "既有文件的权限没有被收紧——敏感 stream 写进了全用户可读的 inode")
+
+    def _valid_stdout(self):
+        return TestInvoke()._valid_stdout()

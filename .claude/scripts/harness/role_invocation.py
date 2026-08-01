@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Callable
 
-from .claude_runner import _extract_json_object, _extract_payload
+from .claude_runner import (DEFAULT_AGENT_MODEL, _extract_json_object,
+                            _extract_payload)
+from .config import SETTINGS_PATH
 
 
 @dataclass(frozen=True)
@@ -56,3 +58,23 @@ def build_stream_log_path(stream_log_dir: str, round_id: str, task_role: str,
     """按与账本 attempt_key 相同的 identity 模板构造日志路径。"""
     attempt_key = f"{round_id}:{task_role}:{attempt}"
     return f"{stream_log_dir}/{attempt_key}.jsonl"
+
+
+def build_request_context(cfg) -> RequestContext:
+    """扇出请求上下文的**唯一生产构造点**（评审 cfr-p12-merged-01）。
+
+    `RequestContext` 本身只是个容器——`cwd="/tmp"`、`settings_path=""`、
+    `model=None` 都能构造出来。若测试各自手写一组"看起来对"的字面量，断言的
+    就是它自己刚写的东西，「生产值必须是真值」这条要求便没有可执行地基：
+    Phase 5/6 重新引入占位值时，测试照样全绿。
+
+    因此生产路径**只能**经由本函数取得上下文，测试也调用它而不是自填期望值。
+    四个值各自绑到真实来源：仓库根、settings 常量、规范模型 ID、stream 目录。
+    """
+    stream_dir = cfg.state_db.parent / "rounds"
+    return RequestContext(
+        cwd=str(cfg.repo_root),
+        settings_path=SETTINGS_PATH,
+        model=DEFAULT_AGENT_MODEL,
+        stream_log_dir=str(stream_dir),
+    )
