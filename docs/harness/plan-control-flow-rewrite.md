@@ -215,6 +215,20 @@
 
 ## Phase 0 · 会话原语真机验证（go/no-go，花真钱但零外部写入）
 
+> ### ✅ 已执行（2026-08-02，提交 `77a0237`，实花约 $0.10 / 预算 $2，零外部写入）
+>
+> 结论文档：[`exp/control-flow-rewrite-probe/CONCLUSIONS.md`](../../exp/control-flow-rewrite-probe/CONCLUSIONS.md)
+>
+> - **Task 0.1 / 待决 A：`confirmed`** —— 单发 `-p` 下 `--session-id` 被原样接受、`--resume --fork-session` 产生新 ID 且完整保留上文。**Phase 2 按推荐路线扩展现有 `invoke()`，不转 dual-pipe，接口形状不变。**
+> - **Task 0.2 / 设计问题 5：`confirmed`，但本节下文原本的预设被推翻。**
+>
+> **⚠️ 下文「理论上只读工具不应触发」这句是错的，实施时不要采信。** 实测：开启 `--permission-prompt-tool stdio` 后，一次 `Read /etc/hostname` **确实产生了 `control_request`**。
+>
+> **最终决策不变（Stage 1 不启用 stdio），但理由改为：** 启用它会给每次 `Read`/`Grep`/`Glob` 都带来一个必须应答的 `control_request`——每轮最多 39 次子调用，等于凭空引入一个必须正确实现的 control 循环，而收益为零（工具集已收窄到只读三件，`permissions.allow` 是主防线，没有需要拦截的写操作）。
+>
+> **准确表述**：只读工具**并不豁免**权限门；它们在生产配置（`--permission-mode dontAsk` + `permissions.allow`，不带 stdio 标志）下不触发，是因为 allow 列表**预先放行**了，不是因为工具只读。`can_use_tool` 的触发面取决于「工具 × 权限模式 × allow 列表」的组合，**不能凭工具的读写属性推断**。
+
+
 **目标**：在写一行生产代码之前，验证「待决 A」的推荐路线（单发 `-p` + `session_id`/`resume`/`fork-session`）在真机上成立，并对设计问题 5（Stage 1 只读工具是否需要 `--permission-prompt-tool stdio`）给出实测结论而非推断。这一阶段**不属于 TDD 五步**（它是可行性探针，不是产品代码），产物是一份实测结论文档 + 复现脚本，仿照 `exp/stdio-driver/` 的证据纪律（`report_id`/`finding_id`/`conclusion_strength`/字节级证据）。
 
 **为什么要单列一个 Phase 而不是在 Phase 2 里顺带验证**：如果推断被证伪（`-p` 单发模式不支持 `--resume --fork-session`，必须走 dual-pipe），Phase 2 及以后所有任务的 `claude_runner.py` 接口形状都要改。提前在 Phase 0 花 $1 以内验证清楚，比在 Phase 5 发现推断有误再返工便宜。
