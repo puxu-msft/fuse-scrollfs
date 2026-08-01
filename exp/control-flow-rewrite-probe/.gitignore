@@ -1,0 +1,4 @@
+# 逐轮 wire 证据（stdin/stdout 原始字节）。体积大、随每次重跑变化，结论已固化在
+# CONCLUSIONS.md 并附脱敏片段；需要复现时按文档重跑即可。
+artifacts/
+__pycache__/
