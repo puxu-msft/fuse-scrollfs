@@ -4,7 +4,53 @@
 > 权威文档：规格 [spec.md](./spec.md) v7 · 1a 计划 [plan-stage1a.md](./plan-stage1a.md) · 1b 冻结范围 [plan-stage1b.md](./plan-stage1b.md)
 > 进度账本：`.superpowers/sdd/progress.md`（git-ignored，崩溃后靠它 + `git log` 恢复认知）
 
-## ⚑ 当前阶段：控制流重写（ADR-002 已采纳）
+## ⚑ 当前阶段：控制流重写（ADR-002 已采纳）· Phase 1 已完成
+
+**接手者从这里开始读。** 计划经**五轮跨模型对抗评审**判 `ready`、零阻塞；Phase 0 真机验证两项 `confirmed`；Phase 1 已实施并加固。**下一步是 Phase 2。**
+
+| 产物 | 位置 |
+|---|---|
+| 决策 | [adr-002-control-flow-ownership.md](./adr-002-control-flow-ownership.md) |
+| 计划（v5，权威） | [plan-control-flow-rewrite.md](./plan-control-flow-rewrite.md) + [kickoff](./plan-control-flow-rewrite-kickoff.md) |
+| 五轮评审 | `plan-control-flow-rewrite-review{,-2,-3,-4,-5}.md` |
+| stdio PoC | [../../exp/stdio-driver/CONCLUSIONS.md](../../exp/stdio-driver/CONCLUSIONS.md) |
+| Phase 0 实测 | [../../exp/control-flow-rewrite-probe/CONCLUSIONS.md](../../exp/control-flow-rewrite-probe/CONCLUSIONS.md) |
+
+### 进度
+
+| Phase | 状态 |
+|---|---|
+| 0 · 会话原语真机验证 | ✅ 两项 `confirmed`，约 $0.10 |
+| 1 · 会话身份派生 + 谱系账本 | ✅ `session_identity.py` / `ledger.py` / `agent_attempts` 表；318 + 13 测试绿 |
+| 2–8 | 待做 |
+
+### Phase 0 推翻了计划的一条预设——**别采信计划里那句话**
+
+计划原写「理论上只读工具不应触发权限请求」。**实测推翻**：开启 `--permission-prompt-tool stdio` 后，一次 `Read /etc/hostname` 确实产生 `control_request`。
+
+最终决策不变（Stage 1 不启用 stdio），但理由换成：启用它会给**每次** `Read`/`Grep`/`Glob` 都带来必须应答的 `control_request`，每轮最多 39 次子调用，凭空引入一个必须正确实现的 control 循环而收益为零。
+
+**准确表述**：只读工具**并不豁免**权限门；生产配置下不触发是因为 `permissions.allow` 预先放行，不是因为工具只读。`can_use_tool` 的触发面取决于「工具 × 权限模式 × allow 列表」，**不能凭读写属性推断**。
+
+### 实施 Phase 2+ 必须带走的三条
+
+1. **`attempt >= 2` 的 `session_id` 必须是 CLI 实际返回的新 id**，不是预派生值（评审 cfr2-07）。拿预分配 ID 冒充会导致下次 fork 去 resume 一个**从未被 CLI 创建过的会话**。`ledger.py` 的 docstring 记了这条。
+2. **状态词没有 `degraded`**——「降级」是编排层对「重试耗尽」的结论，不是单次 attempt 状态。`test_ledger.TestStatusVocabularyIsPinned` 把 Python 集合与建表 CHECK 钉在一起，改一处忘另一处会被拦下。
+3. **`--max-budget-usd` 是滞后停止触发器，不是硬上限**（PoC 实测传 0.001 花掉 $0.048）。`budget.settle` 已按「不截断超额 + 标 `budget_breach`」设计，别再假设传了上限就不会超。
+
+### 五轮评审的收敛轨迹（说明这份计划为什么可信）
+
+| 轮次 | 关闭 | 仍开 | **新引入** | 阻塞 |
+|---|---|---|---|---|
+| 1 | — | 19 | — | 10 Critical |
+| 2 | 9 | 10 | **4** | 6 |
+| 3 | 7 | 3 | **0** | 3 |
+| 4 | 1 | 3 | 0 | 2 |
+| 5 | 2 | 0 | 0 | **0** |
+
+第 3 轮做了一次形态改变：**把不可执行的 Python 草图降级为「接口契约 + 不变量 + 测试清单」**（3239 → 1604 行）。此前评审得**独立执行草图**才能发现缺陷——文档精确到足以出错，却不可执行到能被验证。降级后新引入归零并保持。
+
+
 
 **Stage 1a 的发布回路已真机跑通并发布过 Issue #1，但扇出层要整条替换。** 用户 2026-07-31 裁定：控制流设计不当，应在更低层接管对话，实现精细化 fork/retry；**先在 zipfs 跑通，再由同伴搬进 `~/src/my-ade`**；**2 小时定时器在重写完成前不启用**。
 
