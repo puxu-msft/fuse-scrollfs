@@ -23,6 +23,20 @@ from .role_invocation import (RoleInvocationRequest, build_request_context)
 STAGE1_TOOLS = ",".join(sorted(STAGE1_ALLOWED_TOOLS))
 # 真相源在 config；此处再导出，保持 `from .round import SETTINGS_PATH` 的既有调用点不变。
 from .config import SETTINGS_PATH  # noqa: F401
+ROUND_RESULTS = frozenset({
+    "precheck-failed",
+    "resumed",
+    "budget-exhausted",
+    "deadline-exhausted",
+    "invocation-failed",
+    "capability-drift",
+    "invalid-candidate",
+    "no-candidate-degraded",
+    "no-candidate",
+    "duplicate",
+    "published",
+    "unhandled-exception",
+})
 ROUND_DEADLINE_S = 20 * 60
 # 结算窗口：为 checkpoint/记账预留的时间，绝不能被 `max(x, 60)` 之类的下限
 # 放大——`max(deadline - elapsed, 60)` 在剩余为负时会返回 60，使子进程超时

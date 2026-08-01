@@ -17,7 +17,7 @@ from .lifecycle import State
 from .outbox import Outbox
 from .precheck import inspect_facts
 from .queue import Queue
-from .round import SETTINGS_PATH, STAGE1_TOOLS, Deps, run_round
+from .round import ROUND_RESULTS, SETTINGS_PATH, STAGE1_TOOLS, Deps, run_round
 
 
 
@@ -55,6 +55,28 @@ def _publish_or_resume_succeeded(result: dict) -> bool:
     误报为成功。
     """
     return result.get("state") == State.RECEIPT_COMPLETE
+
+
+ROUND_EXIT_POLICIES = {
+    "precheck-failed": lambda result: 1,
+    "resumed": lambda result: 0 if _publish_or_resume_succeeded(result) else 1,
+    "budget-exhausted": lambda result: 1,
+    "deadline-exhausted": lambda result: 1,
+    "invocation-failed": lambda result: 1,
+    "capability-drift": lambda result: 1,
+    "invalid-candidate": lambda result: 1,
+    "no-candidate-degraded": lambda result: 1,
+    "no-candidate": lambda result: 0,
+    "duplicate": lambda result: 0,
+    "published": lambda result: 0 if _publish_or_resume_succeeded(result) else 1,
+    "unhandled-exception": lambda result: 1,
+}
+if set(ROUND_EXIT_POLICIES) != set(ROUND_RESULTS):
+    raise RuntimeError("round result vocabulary and CLI exit policies differ")
+
+
+def _round_exit_code(result: dict) -> int:
+    return ROUND_EXIT_POLICIES[result["result"]](result)
 
 
 def _build_invoke_adapter():
@@ -152,18 +174,7 @@ def main(argv: list[str] | None = None) -> int:
                 queue=Queue(conn), invoke=_build_invoke_adapter())
     result = run_round(cfg, deps)
     print(json.dumps(result, ensure_ascii=False))
-    # `no-candidate-degraded` **刻意**不在这里：它表示本轮有 agent 反复失败后
-    # 被跳过，与「仓库确实没东西可提」是两件事，必须让 systemd 看见（评审 rmf-03）。
-    if result["result"] in ("no-candidate", "duplicate"):
-        return 0
-    # 新发布（`published`）与恢复（`resumed`）共用同一个成功谓词（评审
-    # Critical B）：终态必须是 `publication-receipt-complete` 才算真正收敛。
-    # 修复前 `published` 无条件判 0，即便 `state` 是 `inconsistent` 或
-    # `proposal-published`（收据未核验通过）——一次半途而废的发布会被
-    # systemd 误报为成功。
-    if result["result"] in ("published", "resumed"):
-        return 0 if _publish_or_resume_succeeded(result) else 1
-    return 1
+    return _round_exit_code(result)
 
 
 if __name__ == "__main__":

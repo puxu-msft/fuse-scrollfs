@@ -91,6 +91,36 @@ class TestCliRoundExitCode(unittest.TestCase):
         result = {"round_id": "r1", "mode": "scan", "result": "budget-exhausted"}
         self.assertEqual(self._run_with_result(result), 1)
 
+    def test_every_round_result_has_an_explicit_exit_code_case(self):
+        cases = {
+            "precheck-failed": ({}, 1),
+            "resumed": ({"state": State.RECEIPT_COMPLETE}, 0),
+            "budget-exhausted": ({}, 1),
+            "deadline-exhausted": ({}, 1),
+            "invocation-failed": ({}, 1),
+            "capability-drift": ({}, 1),
+            "invalid-candidate": ({}, 1),
+            "no-candidate-degraded": ({}, 1),
+            "no-candidate": ({}, 0),
+            "duplicate": ({}, 0),
+            "published": ({"state": State.RECEIPT_COMPLETE}, 0),
+            "unhandled-exception": ({}, 1),
+        }
+        for result_name, (extra, expected) in cases.items():
+            with self.subTest(result=result_name):
+                result = {
+                    "round_id": "r1",
+                    "mode": "scan",
+                    "result": result_name,
+                    **extra,
+                }
+                self.assertEqual(self._run_with_result(result), expected)
+
+    def test_round_result_vocabulary_matches_exit_policy_registry(self):
+        from harness.round import ROUND_RESULTS
+
+        self.assertEqual(set(cli.ROUND_EXIT_POLICIES), set(ROUND_RESULTS))
+
 
 class TestCliInvokeAdapter(unittest.TestCase):
     def test_adapter_expands_every_required_invoke_keyword(self):
