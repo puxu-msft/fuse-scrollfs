@@ -17,6 +17,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -120,6 +121,24 @@ def _validate_settings_path(settings_path) -> None:
         raise UnsafeInvocationError(f"settings_path 不能为空，实际 {settings_path!r}")
 
 
+def _validate_session_identity(session_id: str | None, resume: str | None,
+                               fork_session: bool) -> None:
+    if session_id is not None and resume is not None:
+        raise UnsafeInvocationError("session_id 与 resume 互斥")
+    if fork_session and resume is None:
+        raise UnsafeInvocationError("fork_session=True 时必须提供 resume")
+    for name, value in (("session_id", session_id), ("resume", resume)):
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise UnsafeInvocationError(f"{name} 必须是 UUID 字符串，实际 {value!r}")
+        try:
+            uuid.UUID(value)
+        except ValueError:
+            raise UnsafeInvocationError(
+                f"{name} 必须是 UUID 字符串，实际 {value!r}") from None
+
+
 @dataclass
 class InvocationResult:
     ok: bool
@@ -134,6 +153,8 @@ class InvocationResult:
     # 后者分不清「真的花了 0」与「没解析到」。失败轮该按实测成本还是按预留满额
     # 计费，取决于这一位（评审 rmf-05）。
     cost_known: bool = False
+    session_id: str | None = None
+    subtype: str | None = None
     init_seen: bool = False          # 未见 init 事件时不得宣称「无 Bash、无 MCP」
     init_tools: list[str] = field(default_factory=list)
     init_mcp_servers: list = field(default_factory=list)
@@ -146,7 +167,9 @@ class InvocationResult:
 
 
 def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
-               settings_path: str, model: str | None = None) -> list[str]:
+               settings_path: str, model: str | None = None,
+               session_id: str | None = None, resume: str | None = None,
+               fork_session: bool = False) -> list[str]:
     """构造 `claude -p` 的固定 argv。
 
     权限防线注记（真实契约探针实测，2026-07-31）：真正拦截工具调用的是
@@ -165,6 +188,7 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
     _validate_grant_usd(grant_usd)
     _validate_max_turns(max_turns)
     _validate_settings_path(settings_path)
+    _validate_session_identity(session_id, resume, fork_session)
     argv = [
         CLAUDE, "-p", prompt,
         "--setting-sources", "project",
@@ -179,6 +203,12 @@ def build_argv(prompt: str, tools: str, grant_usd: float, max_turns: int,
     ]
     if model:
         argv += ["--model", model]
+    if session_id is not None:
+        argv += ["--session-id", session_id]
+    if resume is not None:
+        argv += ["--resume", resume]
+    if fork_session:
+        argv.append("--fork-session")
     return argv
 
 
@@ -249,27 +279,28 @@ def _coerce_nonneg_int(value, field_name: str,
 
 def _parse_terminal_result(event: dict,
                            protocol_errors: list[str]
-                           ) -> tuple[float, int, bool, dict | None, bool]:
-    """解析单个 terminal result 事件，返回 (cost, turns, ok, payload, cost_known)。
+                           ) -> tuple[float, int, bool, dict | None, bool, str | None]:
+    """解析终态事件，返回 (cost, turns, ok, payload, cost_known, subtype)。
 
     cost/turns 校验独立于 subtype：即便是 error_max_turns 之类的失败事件，
     预算账本仍要记它花了多少钱、跑了多少轮，所以字段本身必须合法，只是
     ok 恒为 False。只有 subtype == success 且 payload 可解析时 ok 才可能为
     True。
     """
+    subtype = event.get("subtype")
     cost = _coerce_finite_nonneg_float(event.get("total_cost_usd"),
                                        "total_cost_usd", protocol_errors)
     turns = _coerce_nonneg_int(event.get("num_turns"), "num_turns",
                               protocol_errors)
     if cost is None or turns is None:
-        return 0.0, 0, False, None, False
-    if event.get("subtype") != "success":
-        return cost, turns, False, None, True
+        return 0.0, 0, False, None, False, subtype
+    if subtype != "success":
+        return cost, turns, False, None, True, subtype
     payload = _extract_payload(event.get("result", ""))
     if payload is None:
         protocol_errors.append("unparseable or malformed payload in success result")
-        return cost, turns, False, None, True
-    return cost, turns, True, payload, True
+        return cost, turns, False, None, True, subtype
+    return cost, turns, True, payload, True, subtype
 
 
 def parse_stream_json(lines) -> InvocationResult:
@@ -278,6 +309,8 @@ def parse_stream_json(lines) -> InvocationResult:
     result_ok = False
     init_seen = False
     cost_known = False
+    session_id: str | None = None
+    subtype: str | None = None
     init_count = 0
     result_count = 0
     init_tools: list[str] = []
@@ -304,6 +337,7 @@ def parse_stream_json(lines) -> InvocationResult:
             init_count += 1
             if init_count == 1:
                 init_seen = True
+                session_id = event.get("session_id")
                 init_tools = event.get("tools", [])
                 init_mcp = event.get("mcp_servers", [])
                 init_plugins = event.get("plugins", [])
@@ -315,8 +349,10 @@ def parse_stream_json(lines) -> InvocationResult:
         elif event.get("type") == "result":
             result_count += 1
             if result_count == 1:
-                cost, turns, result_ok, payload, cost_known = (
+                cost, turns, result_ok, payload, cost_known, subtype = (
                     _parse_terminal_result(event, protocol_errors))
+                if session_id is None:
+                    session_id = event.get("session_id")
             # 第二个及以后的 terminal result：无论 success 还是 error，都不
             # 得让它把 ok/payload 重新粘回去或维持旧值——见下方 init_count/
             # result_count 汇总校验。
@@ -333,7 +369,8 @@ def parse_stream_json(lines) -> InvocationResult:
     ok = result_ok and init_seen and not protocol_errors
 
     return InvocationResult(ok=ok, payload=payload, cost_usd=cost, turns=turns,
-                            cost_known=cost_known,
+                            cost_known=cost_known, session_id=session_id,
+                            subtype=subtype,
                             raw_tail="\n".join(tail[-5:]), init_seen=init_seen,
                             init_tools=init_tools, init_mcp_servers=init_mcp,
                             init_plugins=init_plugins, init_errors=init_errors,
@@ -387,7 +424,8 @@ def _persist_stream(stream_log, stdout: str, stderr: str) -> None:
     try:
         path = pathlib.Path(stream_log)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as fh:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(stdout or "")
             if stderr:
                 fh.write("\n===== stderr =====\n")
@@ -401,9 +439,12 @@ def invoke(prompt: str, tools: str, grant_usd: float, max_turns: int,
            settings_path: str, cwd: str, timeout_s: float,
            env: dict | None = None, model: str | None = None,
            runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
-           stream_log=None) -> InvocationResult:
+           stream_log=None, session_id: str | None = None,
+           resume: str | None = None, fork_session: bool = False
+           ) -> InvocationResult:
     argv = build_argv(prompt, tools, grant_usd, max_turns, settings_path,
-                      model=model)
+                      model=model, session_id=session_id, resume=resume,
+                      fork_session=fork_session)
     # 从完整环境出发再删凭据：只给 GIT_TERMINAL_PROMPT 会丢掉 HOME/PATH 等
     # claude 运行所必需的变量（评审 C-06）
     safe_env = _sanitize_env(env if env is not None else os.environ)

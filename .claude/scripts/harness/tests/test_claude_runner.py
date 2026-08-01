@@ -1,6 +1,8 @@
+import inspect
 import json
 import pathlib
 import math
+import stat
 import subprocess
 import unittest
 
@@ -16,9 +18,13 @@ from harness.claude_runner import (
 VALID_TOOLS = ",".join(sorted(STAGE1_ALLOWED_TOOLS))
 
 
-def _init_line(tools=("Read", "Grep", "Glob"), mcp_servers=()):
-    return json.dumps({"type": "system", "subtype": "init",
-                       "tools": list(tools), "mcp_servers": list(mcp_servers)})
+def _init_line(tools=("Read", "Grep", "Glob"), mcp_servers=(),
+               session_id=None):
+    event = {"type": "system", "subtype": "init",
+             "tools": list(tools), "mcp_servers": list(mcp_servers)}
+    if session_id is not None:
+        event["session_id"] = session_id
+    return json.dumps(event)
 
 
 def _success_line(cost=0.1, turns=1, candidates=None):
@@ -129,6 +135,46 @@ class TestArgv(unittest.TestCase):
             build_argv(prompt="p", tools=VALID_TOOLS, grant_usd=0.5,
                       max_turns=10, settings_path=None)
 
+    def test_argv_includes_session_id(self):
+        session_id = "11111111-1111-4111-8111-111111111111"
+        argv = build_argv(prompt="p", tools=VALID_TOOLS, grant_usd=0.5,
+                          max_turns=10, settings_path="s.json",
+                          session_id=session_id)
+        self.assertEqual(argv[argv.index("--session-id") + 1], session_id)
+
+    def test_argv_includes_resume_and_fork_session(self):
+        resume = "22222222-2222-4222-8222-222222222222"
+        argv = build_argv(prompt="p", tools=VALID_TOOLS, grant_usd=0.5,
+                          max_turns=10, settings_path="s.json", resume=resume,
+                          fork_session=True)
+        self.assertEqual(argv[argv.index("--resume") + 1], resume)
+        self.assertIn("--fork-session", argv)
+
+    def test_session_id_and_resume_are_mutually_exclusive(self):
+        with self.assertRaises(UnsafeInvocationError):
+            build_argv(prompt="p", tools=VALID_TOOLS, grant_usd=0.5,
+                       max_turns=10, settings_path="s.json",
+                       session_id="11111111-1111-4111-8111-111111111111",
+                       resume="22222222-2222-4222-8222-222222222222")
+
+    def test_fork_session_requires_resume(self):
+        with self.assertRaises(UnsafeInvocationError):
+            build_argv(prompt="p", tools=VALID_TOOLS, grant_usd=0.5,
+                       max_turns=10, settings_path="s.json",
+                       fork_session=True)
+
+    def test_session_id_must_be_a_uuid(self):
+        with self.assertRaises(UnsafeInvocationError):
+            build_argv(prompt="p", tools=VALID_TOOLS, grant_usd=0.5,
+                       max_turns=10, settings_path="s.json",
+                       session_id="not-a-uuid")
+
+    def test_resume_must_be_a_uuid(self):
+        with self.assertRaises(UnsafeInvocationError):
+            build_argv(prompt="p", tools=VALID_TOOLS, grant_usd=0.5,
+                       max_turns=10, settings_path="s.json",
+                       resume="not-a-uuid")
+
 
 class TestParse(unittest.TestCase):
     def test_extracts_payload_cost_and_turns(self):
@@ -152,6 +198,20 @@ class TestParse(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertAlmostEqual(res.cost_usd, 0.9)
         self.assertEqual(res.turns, 40)
+
+    def test_init_event_exposes_session_id(self):
+        session_id = "33333333-3333-4333-8333-333333333333"
+        res = parse_stream_json([_init_line(session_id=session_id),
+                                 _success_line()])
+        self.assertEqual(res.session_id, session_id)
+
+    def test_terminal_subtype_is_exposed(self):
+        res = parse_stream_json([
+            _init_line(),
+            _error_line(subtype="error_max_budget_usd"),
+        ])
+        self.assertFalse(res.ok)
+        self.assertEqual(res.subtype, "error_max_budget_usd")
 
     def test_init_event_exposes_tools_and_mcp_for_negative_verification(self):
         """Round 0 的负向验证依赖这个：必须能看到实际生效的工具集与 MCP 列表。"""
@@ -441,6 +501,19 @@ class TestInvoke(unittest.TestCase):
                     runner=runner)
         self.assertFalse(res.ok)
         self.assertEqual(res.exit_code, 124)
+        self.assertIsNone(res.subtype)
+
+    def test_invoke_passes_session_identity_arguments(self):
+        runner = FakeRunner(result=subprocess.CompletedProcess(
+            args=["claude"], returncode=0, stdout=self._valid_stdout(),
+            stderr=""))
+        session_id = "44444444-4444-4444-8444-444444444444"
+        invoke(prompt="/x", tools=VALID_TOOLS, grant_usd=0.5, max_turns=5,
+               settings_path="s.json", cwd="/tmp", timeout_s=5.0,
+               env={"HOME": "/home/x", "PATH": "/bin"}, runner=runner,
+               session_id=session_id)
+        argv = runner.calls[0]["argv"]
+        self.assertEqual(argv[argv.index("--session-id") + 1], session_id)
 
     def test_parent_claude_control_vars_cannot_reach_the_child(self):
         """父进程的 CLAUDE_CODE_*/ANTHROPIC_* 控制变量必须被清除。
@@ -518,6 +591,16 @@ class TestInvoke(unittest.TestCase):
             self.assertEqual(written.count("\n") >= stdout.count("\n"), True,
                              "必须是完整 stream，不是尾部片段")
             self.assertIn("some warning", written, "stderr 也要留")
+            self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+
+    def test_stream_file_is_created_with_mode_not_chmodded_afterward(self):
+        from harness import claude_runner
+
+        source = inspect.getsource(claude_runner._persist_stream)
+        self.assertIn("os.open", source)
+        self.assertIn("0o600", source)
+        self.assertEqual(source.count("os.open"), 1)
+        self.assertNotIn("chmod", source)
 
     def test_stream_is_persisted_even_when_the_call_times_out(self):
         """超时是最需要事后判因的情形，不能反而什么都不留。"""
