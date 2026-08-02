@@ -1425,3 +1425,28 @@ class TestPerCallTimeoutAccommodatesRealWork(unittest.TestCase):
         self.assertGreaterEqual(
             usable, fanout._DEFAULT_REQUEST_TIMEOUT_S * 2,
             "单次超时上限太大，一轮截止内放不下两波——首波失败后没有重试余地")
+
+
+class TestMaxTurnsAccommodatesRealWork(unittest.TestCase):
+    """回合上限必须容得下真实工作量（Phase 8 真机发现，与超时同源）。
+
+    真机实测（2026-08-02 Task 8.3 第二次）：`_DEFAULT_MAX_TURNS = 10`，
+    **4 个 finder 的首次尝试全部在第 11 轮撞上 `error_max_turns`**，各烧掉约
+    $0.5 后一无所得；靠 fork 重试才救回其中两个。Task 8.2 单角色冒烟实测一个
+    finder 需要 **19 轮**才能完成。
+
+    这与 `_DEFAULT_REQUEST_TIMEOUT_S = 60` 是**同一类错误**：上限被设成了
+    「正常工作量的量级」而不是「异常的量级」。用户 2026-08-02 的原话——
+    「预算上限不是为了卡住正常运行，是为了拦截异常」——同样适用于回合数与
+    超时：**能在正常运行中被触发的上限是坏上限**。
+
+    离线测试看不见的原因同上：假件瞬间返回，回合数从未被真实工作量检验过。
+    """
+
+    def test_default_max_turns_exceeds_observed_real_finder_turns(self):
+        # Task 8.2 真机实测：finder:hygiene 单独跑用了 19 turns 才完成。
+        observed_real_turns = 19
+        self.assertGreater(
+            fanout._DEFAULT_MAX_TURNS, observed_real_turns * 1.5,
+            "回合上限低于真机实测工作量的 1.5 倍——真实 finder 会在完成前被"
+            "error_max_turns 截断，且已花的钱全部作废")

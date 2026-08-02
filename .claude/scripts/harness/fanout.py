@@ -61,7 +61,14 @@ _JUDGE_AGENT_NAMES = {
 }
 _JUDGE_ORDER = ("redline", "completed", "oracle")
 _JUDGE_TYPES = tuple(_JUDGE_AGENT_NAMES[kind] for kind in _JUDGE_ORDER)
-_DEFAULT_MAX_TURNS = 10
+# 单次子调用的回合上限。与 `_DEFAULT_REQUEST_TIMEOUT_S` 同源的真机约束：
+# Task 8.2 实测单个 finder 需 **19 轮**才完成（扫仓库要反复 Grep/Read）。
+# 原值 10 导致 Task 8.3 首轮 4 个 finder 的首次尝试**全部**在第 11 轮撞上
+# `error_max_turns`，各烧约 $0.5 后一无所得，靠 fork 重试才救回两个。
+#
+# 取 40（约实测的 2 倍）：按用户 2026-08-02 立的原则——上限用来**拦截异常**，
+# 不是用来卡正常运行。能在正常工作量下被触发的上限是坏上限。
+_DEFAULT_MAX_TURNS = 40
 # 单次子调用的超时上限。**不是拍脑袋的值**——由两条真机约束夹出来：
 #   下界：Task 8.2 实测单个 finder 需 78.5 秒（19 turns），4 个并发只会更慢。
 #         取两倍余量 → 必须 > 157。
