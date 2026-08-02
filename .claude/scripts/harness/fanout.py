@@ -62,7 +62,17 @@ _JUDGE_AGENT_NAMES = {
 _JUDGE_ORDER = ("redline", "completed", "oracle")
 _JUDGE_TYPES = tuple(_JUDGE_AGENT_NAMES[kind] for kind in _JUDGE_ORDER)
 _DEFAULT_MAX_TURNS = 10
-_DEFAULT_REQUEST_TIMEOUT_S = 60.0
+# 单次子调用的超时上限。**不是拍脑袋的值**——由两条真机约束夹出来：
+#   下界：Task 8.2 实测单个 finder 需 78.5 秒（19 turns），4 个并发只会更慢。
+#         取两倍余量 → 必须 > 157。
+#   上界：一轮可用窗口是 ROUND_DEADLINE_S - CLEANUP_RESERVE_S = 1140 秒，
+#         至少要放得下两波（否则首波失败后没有重试余地）→ 必须 ≤ 570。
+# 420 落在 (157, 570] 内，且是 Task 8.2 实测跑通的值。
+#
+# 这个常量原为 60.0，Task 8.3 首次完整扇出时 **4 个 finder 全部超时被杀**，
+# 7 次尝试无一产出终态 result、成本与 turns 全为 0。453 个离线测试全绿也没能
+# 发现——它们用的都是瞬间返回的假件，这个值从未被真实工作量检验过。
+_DEFAULT_REQUEST_TIMEOUT_S = 420.0
 _MICRO_USD_PER_USD = 1_000_000
 
 

@@ -3,6 +3,7 @@ import sqlite3
 import unittest
 from dataclasses import asdict
 
+from harness import fanout
 from harness.claude_runner import InvocationResult, UnsafeInvocationError
 from harness.fanout import dedupe_and_rank
 from harness.role_invocation import RoleInvocationRequest
@@ -1388,3 +1389,39 @@ class TestRunFanout(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerCallTimeoutAccommodatesRealWork(unittest.TestCase):
+    """单次调用的超时上限必须容得下真实工作量（Phase 8 真机发现）。
+
+    真机实测（2026-08-02 Task 8.3）：完整扇出一轮里 **4 个 finder 全部失败**，
+    7 次尝试无一产出终态 `result`，成本与 turns 均为 0。查 stream 日志才判出
+    根因——`_DEFAULT_REQUEST_TIMEOUT_S = 60.0`，而 Task 8.2 单角色冒烟实测
+    一个 finder 需要 **78.5 秒**。每个 finder 都在 60 秒被 `subprocess` 杀掉。
+
+    分类逻辑本身是对的：超时路径 `protocol_errors` 为空 → 判 `failed_transport`
+    且可重试 → 4 次首尝 + 3 次重试，全部同样超时。**缺陷不在分类，在这个常量。**
+
+    为什么 453 个离线测试全绿也发现不了：所有测试都用**瞬间返回的假件**，
+    60 秒这个值从来没被真实工作量检验过。这属于 HANDOVER 记的
+    「『我活多久』这类问题离线测试系统性地看不见」。
+    """
+
+    def test_default_request_timeout_exceeds_observed_real_finder_duration(self):
+        # Task 8.2 真机实测：finder:hygiene 单独跑 78.5 秒（19 turns）。
+        # 完整扇出下 4 个 finder 并发，只会更慢，不会更快。
+        observed_real_seconds = 78.5
+        self.assertGreater(
+            fanout._DEFAULT_REQUEST_TIMEOUT_S, observed_real_seconds * 2,
+            "单次调用超时上限低于真机实测工作量的两倍——真实 finder 会被"
+            "无差别杀掉，且表现为『全部 failed_transport、成本 0』，"
+            "从账本上看不出是超时还是别的")
+
+    def test_default_timeout_leaves_room_for_more_than_one_wave(self):
+        """至少要能在一轮截止内跑完两波，否则重试机制形同虚设。"""
+        from harness import round as round_module
+
+        usable = round_module.ROUND_DEADLINE_S - round_module.CLEANUP_RESERVE_S
+        self.assertGreaterEqual(
+            usable, fanout._DEFAULT_REQUEST_TIMEOUT_S * 2,
+            "单次超时上限太大，一轮截止内放不下两波——首波失败后没有重试余地")
