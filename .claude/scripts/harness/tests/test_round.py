@@ -703,8 +703,12 @@ class TestRound(unittest.TestCase):
         self.assertLess(
             timeout_s, round_module.ROUND_DEADLINE_S,
             "必须为 checkpoint/结算预留时间窗，不能把整轮时间全部给模型")
+        # 引用常量而不是复制它的值：原先这里硬编码 60.0，Phase 8 真机把该常量
+        # 从 60 改到 420 时本条测试立刻误红——它测的是「按剩余窗口动态收缩」
+        # 这个性质，不该绑死上限的具体数值（又一处「第二份真相」）。
+        from harness import fanout as _fanout
         expected = min(
-            60.0,
+            _fanout._DEFAULT_REQUEST_TIMEOUT_S,
             round_module.ROUND_DEADLINE_S - elapsed
             - round_module.CLEANUP_RESERVE_S - 1.0,
         )
